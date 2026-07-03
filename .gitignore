@@ -1,0 +1,78 @@
+# ─────────────────────────────────────────────────────────────
+# User data / PII — NEVER commit (Agent Guideline #12 in CLAUDE.md)
+# Everything specific to a cloned user stays local.
+# ─────────────────────────────────────────────────────────────
+# Profiles & config — keep the folder + its README, ignore real resume/profile data
+profile/*
+!profile/README.md
+profiles/
+config.local.*
+*.local.yaml
+*.local.yml
+*.local.json
+
+# Resumes, cover letters, and generated application documents
+resumes/
+resume.*
+cover_letters/
+generated/
+output/
+*.docx
+*.pdf
+
+# Application history / tracking data
+applications/
+application_history.*
+tracker.db
+*.sqlite
+*.sqlite3
+
+# Credentials & secrets
+.env
+.env.*
+!.env.example
+secrets/
+credentials/
+*.pem
+*.key
+cookies/
+sessions/
+*.session
+auth_state.json
+
+# Agent collaboration bus (Cursor ↔ Claude VS Code) — local session state only
+.agent-bus/
+
+# ─────────────────────────────────────────────────────────────
+# Python
+# ─────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ─────────────────────────────────────────────────────────────
+# Node / TypeScript
+# ─────────────────────────────────────────────────────────────
+node_modules/
+*.tsbuildinfo
+.next/
+coverage/
+
+# ─────────────────────────────────────────────────────────────
+# Editors & OS
+# ─────────────────────────────────────────────────────────────
+.DS_Store
+.idea/
+*.swp
+*.swo
+.vscode/*
+!.vscode/extensions.json

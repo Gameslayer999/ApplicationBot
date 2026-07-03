@@ -1,0 +1,83 @@
+# Synthetic sample resume — NOT a real person. Used as test data for the customizer.
+# Replace with your own resume locally; real resumes are git-ignored (see .gitignore).
+contact:
+  name: Jordan Avery
+  email: jordan.avery@example.com
+  phone: "(555) 010-4477"
+  location: Austin, TX (open to remote)
+  links:
+    - github.com/jordanavery-example
+    - linkedin.com/in/jordanavery-example
+
+summary: >-
+  Full-stack software engineer with 6 years building and operating web
+  applications and the services behind them. Comfortable across the stack, from
+  React front ends to Python and Node backends to the data pipelines that feed
+  them.
+
+# Order sections to match this resume's layout.
+section_order: [summary, skills, experience, projects, education, certifications]
+
+skills:
+  - category: Languages
+    items: [JavaScript, TypeScript, Python, Go, SQL, HTML, CSS]
+  - category: Frameworks and Libraries
+    items: [React, Next.js, Node.js, GraphQL, Pandas]
+  - category: Data and Infrastructure
+    items:
+      [PostgreSQL, Redis, AWS, Docker, Kubernetes, Terraform, Apache Airflow,
+       Apache Spark, Kafka]
+  - category: Practices
+    items: [REST APIs, CI/CD, Playwright]
+
+experience:
+  - organization: Northwind Commerce
+    role: Senior Software Engineer
+    location: Austin, TX
+    start: Mar 2022
+    end: Present
+    bullets:
+      - Led the rebuild of the customer-facing storefront in React and Next.js,
+        cutting median page load time from 4.1s to 1.3s.
+      - Designed and shipped a GraphQL API gateway in Node.js that consolidated
+        six internal REST services behind a single typed schema.
+      - Built a real-time inventory sync service in Go backed by Kafka and
+        Redis, keeping stock levels consistent across 40+ warehouses.
+      - Owned the checkout service's PostgreSQL schema and query performance,
+        adding indexes and read replicas that halved p99 latency.
+      - Introduced Playwright end-to-end tests into CI, reducing production
+        hotfixes by 60%.
+      - Mentored three engineers and ran the team's design-review process.
+  - organization: Brightloop Analytics
+    role: Software Engineer
+    location: Remote
+    start: Jul 2019
+    end: Feb 2022
+    bullets:
+      - Built batch and streaming data pipelines with Apache Airflow and Spark
+        that processed ~2 TB/day of clickstream events into the warehouse.
+      - Developed Python and SQL transformations feeding executive dashboards,
+        replacing manual spreadsheet reporting.
+      - Created a React dashboard for internal analysts to explore cohort
+        metrics without writing SQL.
+      - Containerized services with Docker and deployed to AWS EKS (Kubernetes),
+        with infrastructure defined in Terraform.
+      - Set up CI/CD pipelines that took deploys from twice-weekly to on-demand.
+
+projects:
+  - name: OpenRoster
+    tech: TypeScript, Next.js, PostgreSQL
+    bullets:
+      - Open-source scheduling tool for volunteer organizations with 500+ GitHub
+        stars.
+
+education:
+  - school: University of Texas at Austin
+    degree: B.S. in Computer Science
+    location: Austin, TX
+    graduation: "2019"
+    details:
+      - Coursework in distributed systems, databases, and machine learning.
+
+certifications:
+  - AWS Certified Solutions Architect – Associate

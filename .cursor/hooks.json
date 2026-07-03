@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "command": ".cursor/hooks/agent-bus-session.sh"
+      }
+    ],
+    "stop": [
+      {
+        "command": ".cursor/hooks/agent-bus-stop.sh",
+        "loop_limit": 1
+      }
+    ]
+  }
+}
