@@ -1,0 +1,3 @@
+# ApplicationBot
+
+Initial repository setup.
