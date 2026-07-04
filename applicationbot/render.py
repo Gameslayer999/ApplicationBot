@@ -119,10 +119,17 @@ def _row(left: str, right: str = "") -> str:
     return f'<div class="row"><span class="l">{left}</span>{r}</div>'
 
 
+def _why(entry: object) -> str:
+    """Attach the per-entry tailoring rationale as a data attribute (consumed by the review
+    UI to show 'why this was tailored this way'). Empty for the base resume / no note."""
+    note = getattr(entry, "tailor_note", None)
+    return f' data-why="{_esc(note)}"' if note else ""
+
+
 def _html_experience(exp: Experience) -> str:
     bullets = "".join(f"<li>{_esc(b)}</li>" for b in exp.bullets)
     return (
-        '<div class="entry">'
+        f'<div class="entry"{_why(exp)}>'
         + _row(f"<b>{_esc(exp.organization)}</b>", _esc(exp.location) if exp.location else "")
         + _row(f"<em>{_esc(exp.role)}</em>", f"{_esc(exp.start)} – {_esc(exp.end)}")
         + (f"<ul>{bullets}</ul>" if bullets else "")
@@ -134,7 +141,7 @@ def _html_project(proj: Project) -> str:
     bullets = "".join(f"<li>{_esc(b)}</li>" for b in proj.bullets)
     tech = f'<span class="tech">{_esc(proj.tech)}</span>' if proj.tech else ""
     return (
-        '<div class="entry">'
+        f'<div class="entry"{_why(proj)}>'
         + _row(f"<b>{_esc(proj.name)}</b>", tech)
         + (f"<ul>{bullets}</ul>" if bullets else "")
         + "</div>"

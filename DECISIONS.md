@@ -30,6 +30,13 @@
 | 017 | 2026-07-04 | Apply stage: use the ATS's own native autofill first, fill only the still-empty fields with our resolver; MyGreenhouse via stored credentials + auto-login | Accepted |
 | 018 | 2026-07-04 | Self-improving answer bank: cache learned/generated answers for reuse; draft open-ended questions with Claude (grounded); never cache company-specific ones | Accepted |
 | 019 | 2026-07-04 | Codebase index: a stdlib-`ast` structural repo map (not a vector DB) for faster agent orientation | Accepted |
+| 020 | 2026-07-04 | Web UI: one unified **Profile** screen (merges "Résumé data" + "Apply profile") with collapsible entry cards | Accepted |
+| 021 | 2026-07-04 | Consistent waiting/status feedback for every async action (spinner + label + elapsed; disabled trigger; surface dropped input) | Accepted |
+| 022 | 2026-07-04 | Apply profile: structured Country/State dropdowns + City text, and a start-date preset/date-picker — UI-only, stored formats unchanged | Accepted |
+| 023 | 2026-07-04 | Tailoring quality (concrete + quantified bullets, no fabrication) + per-entry "why tailored" rationale shown in a click-to-reveal Review panel | Accepted |
+| 024 | 2026-07-04 | Track stage: local SQLite store (`applications.db`) as system of record + editable Track tab in the web UI; optional Sheets/CSV export later | Accepted |
+| 025 | 2026-07-04 | Tailoring speed/quality tiers (fast/balanced/max) — extended thinking off by default; ~2 min → ~35s | Accepted |
+| 026 | 2026-07-04 | Discover stage: qualification-driven, pluggable sources (public ATS APIs + one aggregator), hybrid keyword→Claude matcher, testing-mode end-to-end before autonomous | Accepted |
 
 ---
 
@@ -562,3 +569,358 @@ actual scale, with zero dependencies and zero staleness — consistent with the 
 minimal-deps ethos and the "simplicity first / no unrequested future-proofing" guidelines.
 Revisit a local vector DB (sqlite-vec + Voyage `voyage-code-3`) only if first-party code
 grows past ~30–50k lines, where grep stops being enough.
+
+---
+
+## 020 — Web UI: one unified Profile screen with collapsible entry cards
+
+**Date:** 2026-07-04
+**Status:** Accepted
+
+**Context:** The user could edit the "Applicant details" (apply-profile) section but had no
+obvious way to granularly edit experiences/projects: those lived on a *separate* "Résumé
+data" tab, split from the apply profile the same person edits. The request: a clean layout
+that still lets you granularly edit anything in the profile. Two candidate directions —
+unify the two editor tabs, or improve the résumé editor in place.
+
+**Decision:** Merge the "Résumé data" and "Apply profile" tabs into **one "Profile" tab**
+(tabs are now just Review | Profile). It renders, top-to-bottom: Applicant details (kept
+verbatim — it drives form autofill), then Experience / Activities / Projects / Education /
+Skills (from the résumé), then Résumé header & summary, Screening answers, Autofill
+accounts, and Native logins — with a sticky **section-jump nav** at the top and a single
+**Save** that writes both files (`/resume/update` + `/profile/update`). Every list entry
+is now a **collapsible card**: collapsed it shows a one-line summary (e.g. "Acme — SWE"),
+click to expand and edit its fields; new entries open expanded. Bullets stay as a
+"one per line" textarea (user's choice — not per-bullet rows). The two data stores are
+unchanged (résumé YAML + `application_profile.yaml`); only the presentation is unified.
+
+Also fixed a latent bug this surfaced: `list_resumes()` globbed `profile/*.yaml`, which
+included `application_profile.yaml`; alphabetically it sorted first, so the résumé dropdown
+defaulted to the apply-profile file (which fails to load as a `Resume`). It is now excluded
+from the résumé list.
+
+**Reasoning:** One screen for "everything about me" is the obvious path (UI Design Principle
+#1 — one obvious path over several ambiguous ones) and directly fixes the discoverability
+gap. Collapsible cards keep a long profile clean while preserving granular edit-anything
+access. Reused the existing card builders, endpoints, and validated round-trips, so the
+change is presentation-only — no data-model migration, no new dependencies. Verified live
+(headless Chromium): tab loads, entries collapse/expand, summaries update on edit, and the
+single Save round-trips both résumé and apply-profile files; original data restored after.
+
+---
+
+## 021 — Consistent waiting/status feedback for every async action
+
+**Date:** 2026-07-04
+**Status:** Accepted
+
+**Context:** The web UI's async actions gave inconsistent feedback: tailoring showed a static
+"Tailoring…" with no sense of progress on a multi-second Claude call; **PDF export showed
+nothing at all** and reported errors via a bare `alert()`; saves/imports showed ad-hoc inline
+text. The user asked that waiting states always inform them, as a consistent UI/UX decision.
+Separately, tailoring silently dropped résumé entries that didn't fit the length budget, so a
+newly-added experience could look "ignored" (this compounded a real file-mismatch bug —
+`list_resumes()` listed `application_profile.yaml` as a selectable résumé and it sorted first,
+so edits/tailoring pointed at the wrong file; fixed alongside).
+
+**Decision:** Establish **one shared waiting pattern** and apply it to every async action
+(tailor, PDF export, profile save, LinkedIn import, profile load), captured as **UI Design
+Principle #5** in CLAUDE.md. Implementation in `web.py`: shared helpers `btnBusy`/`btnDone`
+(disable the trigger, swap its label to a spinner + specific working verb, restore after) and
+`busyInto(container, label, longRunning)` (spinner + label in-place; a live elapsed-seconds
+counter when `longRunning`, used for the Claude tailoring call). A single `.spin` CSS keyframe
++ `.busy-*` styles; no per-feature spinner/toast variants. Errors now render inline and
+actionable (Principle #3) instead of `alert()` (PDF export gained a `#pdf-msg` line). Every
+action ends in a definite state: the result, "Saved ✓", or an inline error. Additionally,
+`tailor_resume` now appends a **relevance note** when `LengthBudget.enforce` drops entries
+("Omitted N experience entries to fit 1 page — increase Length to include more"), so budget
+truncation is visible rather than silent.
+
+**Reasoning:** A single reusable pattern is what makes "you're never left guessing" a property
+of the whole app rather than a per-screen accident, and it's cheaper to maintain than bespoke
+indicators. Surfacing dropped input follows directly from Guideline #11 (be precise; never
+"silently ignored") and Principle #3 (actionable). Verified live (headless Chromium): spinners
+appear and clear, the tailor timer ticks, PDF/save/import show status and end cleanly, and a
+newly-added experience now flows through save → tailor into the output.
+
+---
+
+## 022 — Apply profile: structured location + start-date inputs (dropdowns), stored formats unchanged
+
+**Date:** 2026-07-04
+**Status:** Accepted
+
+**Context:** The apply profile collected Location, Country, and Earliest start date as free-text
+boxes. The user asked to make them behave like real application forms — dropdown selectors —
+so the profile is entered the way ATS forms actually ask for it. Constraint: these fields feed
+the Apply-stage autofill resolver (`apply.py`), which expects `location` as `"City, ST"` (its
+Greenhouse geocoder handler parses that), `country` as a name, and `earliest_start_date` as a
+string. Changing the *stored* shape would break the resolver.
+
+**Decision (UI-only, model unchanged):** In the web profile editor, replace the three text
+boxes with structured inputs that **compose/parse the same stored strings**:
+- **Country** → dropdown (curated list, United States default, "Other" escape; preserves any
+  pre-existing value not in the list).
+- **State** → US-state dropdown (value = abbreviation, label = "New Jersey (NJ)").
+- **City** → text. On save, `location = "City, ST"` (or just city / just state); on load,
+  `parseLocation()` splits a stored `"City, ST"` back into the dropdown + city.
+- **Earliest start date** → a dropdown of the common form answers (Immediately / 2 weeks'
+  notice / 1 month / Specific date…); choosing "Specific date…" reveals a native date picker.
+  Stored as the preset phrase or an ISO `YYYY-MM-DD`; a pre-existing free-text value is kept as
+  its own option so nothing is lost.
+
+`ApplicationProfile` (Pydantic) is untouched — `location`, `country`, `earliest_start_date`
+stay plain strings — so the resolver and the rest of the pipeline need no changes.
+
+**Reasoning:** Matches how applications collect these (fewer typos, consistent `"City, ST"` for
+the geocoder, valid dates) while staying a presentation change with zero blast radius on the
+autofill/data model. US-centric state list fits the profile's existing US orientation
+(citizenship/EEO fields); non-US users leave State on "—" and the city text carries the value.
+Verified live (headless Chromium): `"Edison, NJ"` parses into US/NJ/Edison; preset start date
+selects with the picker hidden; "Specific date…" reveals it; edits save back as
+`"San Francisco, CA"` and an ISO date — both resolver-compatible.
+
+---
+
+## 023 — Tailoring quality (concrete + quantified bullets) and per-entry "why" rationale
+
+**Date:** 2026-07-04
+**Status:** Accepted
+
+**Context:** Three résumé-building asks from the user: (1) bullets should specify the actual
+work — features built, bugs fixed, systems migrated, etc.; (2) be able to select a section of
+the tailored résumé and see *why* it was tailored that way; (3) every bullet should carry some
+quantification.
+
+**Decision:**
+- **(1) Concreteness + (3) quantification — prompt-only** (`backends.py` SYSTEM_PROMPT, so it
+  applies to the `claude-code` engine; the rules engine can't reword). Bullets must name the
+  specific action and result (feature shipped / bug or bug-class fixed / system automated /
+  migrated / optimized) with the technology and outcome, replacing vague verbs. Quantification
+  is a **strong preference, not an absolute rule**: surface real magnitude wherever the base
+  résumé supports it, but use ONLY numbers present in or safely implied by the base résumé —
+  **never invent, estimate, or round up a metric**. Pushed back on "every bullet must have a
+  number": forcing it would induce fabrication, violating the system's core truthfulness rule
+  (a truthful bullet with no metric beats a fabricated figure).
+- **(2) Per-entry rationale, click-to-reveal** (user-chosen granularity + surfacing). Added an
+  optional `tailor_note` to the `Experience` and `Project` models (TAILORED-only; base résumé
+  leaves it null, and `save_resume`'s `exclude_none` keeps it out of the base YAML). The Claude
+  prompt fills one short "why kept / how tailored for this job" sentence per experience, project,
+  and activity; the **rules engine** fills a deterministic version from its keyword match. The
+  HTML renderer emits it as a `data-why` attribute on each entry; the Review pane shows a
+  sticky **side panel** — clicking an entry highlights it and displays its rationale (falls back
+  to an intro hint). Markdown/PDF renderers ignore `tailor_note`, so it never prints on the
+  résumé.
+
+**Reasoning:** (1)/(3) raise output quality within the existing truthfulness guarantee rather
+than against it — hence the deliberate softening of (3) (Guideline #2: flag the better, safer
+path; #7: don't silently change intent). (2) at per-entry granularity with click-to-reveal was
+the user's pick; carrying the note *on the entry* (`data-why`) is the most robust
+entry→rationale mapping and keeps the resume render clean. Reused the model/renderer/review
+pane already in place — no new deps. Verified: rules emits per-entry notes, renderer emits 8
+`data-why` attrs on the real résumé, the panel shows an entry's title + why on click (live,
+headless Chromium), and markdown/PDF exports carry no note leak.
+
+---
+
+## 024 — Track stage: local SQLite store + editable Track tab
+
+**Date:** 2026-07-04
+**Status:** Accepted
+
+**Context:** The pipeline's fifth stage (Track) needs a system of record for every
+application — the fields already fixed in NEXT_STEPS.md (company, role, location, remote,
+pay, portal, method, source URL, dates, status, tailored-résumé ref, notes). The store is
+written **programmatically** by the (future) autonomous runner and must be **browsable and
+editable by the user themselves**, with application status easy to read at a glance. This
+is a "how data is stored" decision (Agent Decision Framework), so options were presented
+with pros/cons before building.
+
+**Options considered:**
+| Option | Autonomous write? | Cloned-user setup | PII location | Deps | Verdict |
+|---|---|---|---|---|---|
+| **Local SQLite** (stdlib `sqlite3`) | ✅ native, concurrent-safe (WAL) | none — file appears on first run | local, git-ignored | **zero** | **Chosen** |
+| Local JSON/CSV file | ✅ but no concurrent writes; whole-file rewrites; CSV untyped | none | local | zero | Weak for status edits + a live dashboard |
+| Google Sheets (API) | ✅ | Google Cloud project + OAuth per user | Google cloud | `google-api-python-client` | Great *view*, heavy as source of truth; ~60 writes/min |
+| Airtable | ✅ mature API | account + token + base per user | Airtable cloud | HTTP | Free tier caps ~1k records; required external account |
+| Notion | ✅ (newer API) | account + integration token per user | Notion cloud | HTTP | API less mature; rate-limited |
+| Teal / Simplify | ❌ no public API (Chrome extension, human clicks) | install extension | their cloud | — | Rejected — human-in-loop |
+| Huntr | ❌ only an **Organization/recruiter** API, no personal write API | — | their cloud | — | Rejected — not for individual candidates |
+
+**Decision:** Local **SQLite** (`applicationbot/tracker.py`, stdlib `sqlite3`, zero deps) is
+the system of record — one `applications` table matching the fixed field set, `STATUSES`
+lifecycle (`discovered → tailored → dry-run → applied → failed → responded`), WAL mode so
+the runner can write while the UI reads. DB path `applications.db` at repo root, **git-ignored**
+(application history is PII, Guideline #12; added an explicit `.gitignore` line since the
+existing patterns didn't catch that exact name). The primary human view is a new **editable
+"Track" tab** in the web UI: every application in a horizontally-scrollable table with
+**inline editing of any cell** (auto-saves per cell), a **status dropdown** per row, clickable
+**status-count pills** that double as filters ("All · dry-run 3 · applied 1 · responded 1"),
+free-text search, add, and delete. Endpoints: `GET /track`, `POST /track/{add,update,delete}`.
+Dedicated trackers (Teal/Huntr/Simplify) are rejected for the autonomous core because none
+expose a personal write API. Google Sheets / CSV export remains an **optional, one-way mirror**
+for later — not the source of truth, and never required to use the product (keeps the
+clone-and-run, minimal-infra promise).
+
+**Reasoning:** SQLite matches the actual need at the actual scale with zero dependencies and
+keeps PII local — the same "match the tool to the scale/ethos" reasoning that chose `ast` over
+a vector DB (decision 019) and `fpdf2` over Chromium. A real table (vs. a flat file) makes
+status transitions, filtered dashboard queries, and concurrent runner-writes trivial. Putting
+the source of truth in a cloud tool would force every cloned user to create an external account
++ API credentials and ship their PII off-machine by default — a direct hit to the cloneable,
+minimal-infra, PII-local principles. **Verified:** store CRUD + status validation + auto
+date-stamp on `applied` + search (temp DB); all `/track` endpoints over real HTTP; the rendered
+page JS `node --check`-clean; and the full Track tab driven live in headless Chromium (add →
+inline edit "Saved ✓" → status change updates count pills → reload persists → filter → delete),
+zero console errors. See [[019-repo-map-not-vector-db]] (match tool to scale), [[016-apply-stage]]
+(the runner that will write records), [[012-safety-switch]] / Guideline #3 (the `dry-run` status).
+
+### Update (2026-07-04): Apply dry-runs now auto-record
+
+The Apply stage writes to the tracker so records appear without manual entry. `run_apply`
+(`record=True` by default; `--no-record` to opt out) calls `apply._record_dry_run(...)` after
+filling: it derives (role, company) from the posting's page title (`_title_role_company`),
+portal from `detect_ats`, source URL, and the uploaded résumé path, and writes a `dry-run` row.
+Recording is **upserted by source URL** via the new `tracker.find_by_source_url` — re-running a
+posting updates its existing row instead of duplicating it, and on a re-run only runner-owned
+fields refresh (`resume_path`, `portal`, `method`; role/company only-if-empty). It **never
+clobbers user-owned fields** (`status`, `notes`, `pay`), so a row the user advanced to
+`applied`/`responded` or annotated survives repeated dry-runs. The call is best-effort — a
+tracker failure is appended to `report.errors`, not raised, so it can't break the fill run.
+Verified: insert/upsert/no-clobber/fill-if-empty logic (temp DB), and the full path through the
+real `run_apply` against a live browser page — title parsed to role "Staff Backend Engineer" /
+company "Wayfair", one row written, a second run updated the same row (still 1). See
+[[016-apply-stage]], [[017-native-autofill]].
+
+---
+
+## 025 — Tailoring speed/quality tiers (extended thinking off by default)
+
+**Date:** 2026-07-04
+**Status:** Accepted
+
+**Context:** Tailoring one résumé took ~2 minutes — unacceptable for a pipeline meant to
+apply to many postings, and past the "under a minute" goal. This is a "how resumes are
+tailored" decision (Agent Decision Framework #2), so the cause was measured before changing
+anything.
+
+**Diagnosis (benchmarked, real code path — `profile/resume.yaml` → `backend-mid-censys.md`,
+1 page):** the cost is **extended thinking**, which Claude Code enables by default — NOT the
+model, prompt size, or agent/tool overhead. With thinking on, the model burns 10–21k output
+tokens *reasoning* before emitting the ~3k-token résumé JSON, and output-token generation is
+the wall-clock cost. Controlled A/B (same Opus model, only thinking toggled): **113.8s → 39.5s**,
+output tokens **10,224 → 3,125**. Things that did **not** help: switching model with thinking
+left on (Sonnet/Haiku *think more* → 138–180s, slower than Opus); stripping the agent
+system-prompt/tools/MCP (165s, and it *broke* input prompt-caching).
+
+| Config | Model | Thinking | Wall | Out tokens |
+|---|---|---|---|---|
+| (old default) | Opus | on | 113.8s | 10,224 |
+| Sonnet | Sonnet | on | 180.5s | 21,626 |
+| Haiku | Haiku | on | 138.3s | 17,056 |
+| **fast** | **Sonnet** | **off** | **29.7s** | 2,856 |
+| **balanced** (new default) | **Opus** | **off** | **35–40s** | ~3,100 |
+| **max** | Opus | on | ~114s | 10,224 |
+
+**Decision:** Expose a user-chosen **speed/quality tier** rather than hard-coding one point.
+`QUALITY_TIERS` in `backends.py` maps `fast → (sonnet, no-think)`, `balanced → (opus, no-think)`,
+`max → (opus, think)`; **default = `balanced`** (best quality that stays under a minute).
+Thinking is toggled via `MAX_THINKING_TOKENS=0` in the CLI subprocess env (`run_claude_cli(think=...)`);
+`run_claude_cli` still defaults to `think=True`, so the answer-bank path is unchanged. Threaded
+through `select_backend(name, quality)` → `tailor_resume(..., quality=)`. Surfaced as a **Quality**
+dropdown in the web UI (each option labels its model + time estimate) and a `--quality` CLI flag;
+the in-progress status names the expected wait so a Max run doesn't read as frozen (Guideline /
+UI principle #5). Subscription billing via Claude Code is unchanged (decision 011); `max` reproduces
+the exact previous behaviour, so nothing is lost — only a faster default is gained.
+
+**Reasoning:** The bottleneck was empirically isolated to thinking, so the fix targets it
+directly instead of guessing (cheaper models were *worse*). A tier knob keeps the user in
+control of the speed/quality trade-off per Agent Guideline #2 — someone tailoring for a dream
+job can pick Max; the bulk-apply runner can pick Fast — while a sane default (`balanced`) meets
+the stated goal out of the box. **Verified:** end-to-end via the real CLI path at the new
+default — 35.8s, valid `TailoredResume`, factually-grounded output with correct relevance
+notes; all modules import; benchmark table above reproduced across 6 controlled runs. See
+[[011-claude-code-cli-subscription]] (billing path, unchanged), [[008-pluggable-backends]]
+(the backend interface this extends), [[023-tailoring-quality-and-why]] (quality of the tailored
+content), [[021-async-status-feedback]] (the in-progress wait estimate).
+
+---
+
+## 026 — Discover stage: qualification-driven, pluggable sources, hybrid matcher, testing-mode first
+
+**Date:** 2026-07-04
+**Status:** Accepted
+
+**Context:** The Discover stage (Stage 2) had to be designed from scratch — the "how do we
+find jobs to apply to" scraping-strategy decision the framework requires be presented with
+options first. Researched and verified the current (2026) landscape against official docs.
+Two framing choices drove the design: (a) discovery is **qualification-driven, not
+company-driven** — the user explicitly did not want to maintain a target-company list;
+"filter based off qualifications more so than company"; (b) the Apply stage already drives
+Greenhouse/Lever/Ashby (decisions 016/017), so a posting discovered on one of those ATSs
+flows straight through Tailor → Apply with no new work.
+
+**Options considered (source families):**
+| Family | Verdict |
+|---|---|
+| Public ATS job-board APIs (Greenhouse `boards-api`, Lever `v0/postings`, Ashby `posting-api`) | **Chosen (primary).** Official, no-auth, full JD, no scraping (Guideline #4 clean); same ATSs Apply fills. Per-company (needs a board token). |
+| Legitimate aggregator APIs (Adzuna, USAJobs, Muse, remote feeds) | **Chosen (one: Adzuna) as the breadth source** behind the same interface. Free key, broad, but snippet-only + attribution/poll terms. |
+| Scraping Indeed / LinkedIn / Google for Jobs | **Rejected** — Indeed Publisher API closed to individuals; LinkedIn has no individual jobs API; Google has no public API. All require ToS-violating scraping (Guideline #4). |
+| Meta-scrapers (JobSpy) / paid resellers (JSearch) | **Rejected/grey** — JobSpy scrapes Indeed/LinkedIn/Google with proxy evasion; JSearch resells Google-scraped data. Same ToS problems. |
+
+**Options considered (qualification matching):**
+| Option | Verdict |
+|---|---|
+| **Hybrid: free keyword pre-filter → Claude judges the top-N** | **Chosen** — bounded Claude cost regardless of posting count; keyword pass ranks/prunes, Claude reasons about seniority/semantics and names missing requirements. Mirrors decision 013. |
+| Keyword scoring only | Kept as the offline/no-Claude fallback (`--no-claude`). |
+| Claude judges every posting | Rejected — spends subscription tokens on obvious non-matches. |
+
+**Decision:** Build Discover as a **pluggable source layer** (mirroring pluggable backends,
+decision 008) feeding a **hybrid qualification matcher**, with a **testing mode** before the
+autonomous runner:
+
+- `discovery.py` — `Posting` (normalized) + a `Source` interface; `GreenhouseSource`,
+  `LeverSource`, `AshbySource` (public no-auth APIs, full JD), and `AdzunaSource` (aggregator,
+  self-skips without a free key). `Posting.to_job_description()`/`to_markdown()` emit the
+  **exact fixture shape** (Markdown + YAML front matter), so Tailor/Apply need no changes.
+  stdlib `urllib` (certifi CA bundle if present) — zero new deps. HTML→text via stdlib
+  `HTMLParser`. Per-source failures are collected, never abort the run.
+- `relevance.qualification_score()` — token-free skill-overlap score (which of the
+  candidate's skills a posting asks for), reusing the existing `mentions`/`skill_terms`.
+- `matching.py` — `keyword_rank` (drop < `min_skills`, rank by overlap) then `judge_fit`
+  (Claude via the subscription CLI, `run_claude_cli`) on the top-N survivors → `{qualified,
+  score 0-100, why, missing[]}`, grounded strictly in the résumé (judges fit, invents
+  nothing). A Claude failure on one posting leaves it keyword-only.
+- `filters.py` — `DiscoveryFilters` (git-ignored `profile/discovery.yaml`, seeded from
+  `examples/discovery.example.yaml`): target `boards`, coarse gates (`remote_only`,
+  `min_salary`, `title_exclude`), matcher knobs (`min_skills`, `top_n`), optional Adzuna
+  config. Aggregator **search keywords are derived from the profile** (résumé recent titles +
+  top skills), not hand-entered — the qualification-driven query. `apply_gates` applies the
+  coarse gates (salary parser handles both `175000` and `$191K`).
+- `pipeline.py` — the orchestrator. Default: discover → gate → match → print ranked matches
+  (no browser). `--apply-first` = **testing mode**: take the single top match and run
+  tailor → PDF → **headed dry-run apply you watch fill live** (never submits; Guideline #3),
+  which also records a `dry-run` row via the tracker (decision 024). The autonomous
+  many-postings runner builds on this same core.
+
+**Reasoning:** Qualification-driven matching is what the project overview calls for
+("filter-driven … the user controls what gets discovered") and removes the company-list
+burden — companies fall out of the matching. ATS-first is the only fully-legitimate
+full-text source and closes the discover→tailor→apply loop for free since Apply already
+handles those ATSs; the pluggable interface lets the aggregator (and future USAJobs/remote
+feeds) slot in without rework. The hybrid matcher is the same "cheap local pre-select, then
+Claude on the bounded survivors" pattern proven in decision 013, keeping subscription cost
+flat as discovery scales. Testing mode before autonomy follows Guideline #3 (watch one job
+end-to-end before arming) and Guideline #6 (incremental, verifiable).
+
+**Verified live:** 618 real postings fetched across Stripe (Greenhouse) / cin7 (Lever) /
+Ramp (Ashby), 0 errors, full JD bodies; emitted markdown round-trips through the existing
+`load_job_description`. Keyword pre-filter 618→143 (top ranks all engineering roles). Claude
+judge discriminates correctly (Senior SWE 82/100 but flags a missing degree requirement;
+sales AE 4/100 with detailed gaps). Full testing-mode loop ran end-to-end (discover → pick
+top → rules-tailor → PDF → headless dry-run apply on the real Ashby form → `submitted:False`
+→ recorded tracker row #1). Adzuna self-skips without a key and builds with profile-derived
+keywords when configured. All PII/artifacts git-ignored. See [[016-apply-stage]],
+[[017-native-autofill]], [[013-catalogue-preselection]] (the hybrid pattern),
+[[008-pluggable-backends]] (the source interface), [[003-fixtures]] (the JD shape it emits),
+[[024-track-stage]] (the dry-run row it records), [[004-respect-tos]] (Guideline #4).

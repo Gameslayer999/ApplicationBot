@@ -171,6 +171,22 @@ screens, application queues, and review workflows.
    nothing more. Prefer the specific fact over filler; cut words that do not help
    someone act. Every instruction should earn its place on screen.
 
+5. **Never leave the user waiting in silence.** Any action that isn't instant — tailoring a
+   résumé, exporting a PDF, saving, importing, loading, submitting an application — must show
+   its status the whole time it runs, using **one consistent pattern** across the whole app:
+   - **Disable the trigger** and show a spinner + a *specific* working label on it ("Tailoring…",
+     "Generating PDF…", "Saving…") — never a dead, clickable-looking button.
+   - **Show an in-place status** (spinner + what is happening) where the result will appear.
+   - **For anything that can take more than a couple of seconds** (e.g. a Claude call), show
+     **elapsed time or real progress** so it never looks frozen.
+   - **End in a definite state:** the result, a clear success marker ("Saved ✓"), or an
+     actionable inline error (Principle #3) — never just silently stop.
+   - When the system decides to **drop, skip, or truncate** something the user provided (e.g. a
+     résumé entry omitted to fit the length budget), **say so** — silence reads as "ignored my
+     input" and is a bug, not a clean result.
+   Do not invent a new spinner/toast/label style per feature; reuse the shared one so waiting
+   always looks and behaves the same.
+
 ---
 
 ## AI Coding Guidelines (Karpathy)

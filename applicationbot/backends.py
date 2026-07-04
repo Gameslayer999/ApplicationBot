@@ -22,6 +22,7 @@ Claude path shells out to Claude Code.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 from typing import Optional, Protocol
@@ -32,6 +33,18 @@ from .length import LengthBudget
 from .models import Project, Resume, SkillCategory, TailoredResume
 
 CLAUDE_CLI = "claude"
+
+# Speed/quality tiers for the Claude tailoring backend — each maps to a (model, thinking)
+# pair. Wall-clock benchmarked on a 1-page tailor (see DECISIONS.md #013). Extended thinking
+# is the dominant cost: with it on, the model burns 10-21k output tokens reasoning before
+# emitting the ~3k-token résumé JSON, so turning it OFF is the main speed lever; the model
+# choice is secondary. Ordered fastest → highest-quality.
+QUALITY_TIERS: dict[str, tuple[str, bool]] = {
+    "fast": ("sonnet", False),     # ~30s  — Sonnet, no thinking
+    "balanced": ("opus", False),   # ~40s  — Opus, no thinking (best quality under a minute)
+    "max": ("opus", True),         # ~115s — Opus with thinking (the previous default)
+}
+DEFAULT_QUALITY = "balanced"
 
 SYSTEM_PROMPT = """\
 You are a resume-tailoring assistant. You are given a candidate's BASE RESUME (the \
@@ -78,6 +91,22 @@ relevant material comes first.
 - Mirror the job description's vocabulary where the candidate genuinely has that \
 experience (e.g. if the base resume says "built REST services" and the job says \
 "microservices", you may say "built REST microservices" only if that is accurate).
+- Make every bullet CONCRETE about the actual work and its result. Name the specific \
+thing done — a feature built or shipped, a bug or class of bugs fixed, a system \
+automated / migrated / integrated, a process optimized — plus the technology used and \
+what changed because of it. Replace vague verbs ("worked on", "helped with", \
+"responsible for", "assisted") with the specific action and outcome.
+- QUANTIFY impact wherever the base resume supports it — scope, scale, or result (users, \
+requests or events per day, latency, %, counts, revenue, time saved, team/cohort size, \
+number of features or fixes). Prefer bullets that carry a real magnitude. But use ONLY \
+numbers that are present in, or directly and safely implied by, the base resume: if a \
+bullet has no factual basis for a metric, keep it specific and outcome-focused rather \
+than inventing, estimating, or rounding up a number. A truthful bullet with no metric is \
+always better than a fabricated figure.
+- For EVERY experience, project, and activity entry you include, set its `tailor_note` to \
+ONE short sentence explaining why it's here and how you tailored it for THIS job — what \
+made it relevant, why it's ordered where it is, or what you emphasized or cut. This is \
+shown to the user for review and is NEVER printed on the resume.
 - In `relevance_notes`, briefly explain what you emphasized or omitted and why.
 """
 
@@ -105,9 +134,13 @@ class TailorBackend(Protocol):
 
 
 def run_claude_cli(prompt: str, *, cli: str = CLAUDE_CLI,
-                   model: Optional[str] = None, timeout: int = 300) -> str:
+                   model: Optional[str] = None, think: bool = True,
+                   timeout: int = 300) -> str:
     """Run one prompt through the Claude Code CLI (subscription billing, not the API) and
-    return the model's text. Raises RuntimeError if the CLI is missing or fails."""
+    return the model's text. Raises RuntimeError if the CLI is missing or fails.
+
+    `think=False` disables extended thinking (MAX_THINKING_TOKENS=0). Thinking is the
+    dominant latency cost for a JSON-output task like tailoring — off is ~3-4x faster."""
     if shutil.which(cli) is None:
         raise RuntimeError(
             "Claude Code CLI ('claude') not found. Install it and sign in to your Claude "
@@ -116,8 +149,9 @@ def run_claude_cli(prompt: str, *, cli: str = CLAUDE_CLI,
     cmd = [cli, "--print", prompt, "--output-format", "json"]
     if model:
         cmd += ["--model", model]
+    env = {**os.environ, "MAX_THINKING_TOKENS": "0"} if not think else None
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
     except subprocess.TimeoutExpired as e:
         raise RuntimeError(f"Claude Code timed out ({timeout}s).") from e
     if proc.returncode != 0:
@@ -149,9 +183,11 @@ class ClaudeCodeBackend:
 
     name = "claude-code"
 
-    def __init__(self, cli: str = CLAUDE_CLI, model: Optional[str] = None):
+    def __init__(self, cli: str = CLAUDE_CLI, model: Optional[str] = None,
+                 think: bool = True):
         self.cli = cli
         self.model = model
+        self.think = think
 
     def tailor(self, resume: Resume, jd: JobDescription, budget: LengthBudget) -> TailoredResume:
         if shutil.which(self.cli) is None:
@@ -182,7 +218,7 @@ class ClaudeCodeBackend:
         raise RuntimeError(f"Claude Code did not return a valid tailored resume: {last_err}")
 
     def _run(self, prompt: str) -> str:
-        return run_claude_cli(prompt, cli=self.cli, model=self.model)
+        return run_claude_cli(prompt, cli=self.cli, model=self.model, think=self.think)
 
 
 # --------------------------------------------------------------------------- Rules
@@ -213,13 +249,23 @@ class RulesBackend:
             for cat in resume.skills
         ]
 
+        def _note(text: str) -> str:
+            """Deterministic per-entry rationale (rules engine has no LLM to explain itself)."""
+            hits = sorted({t for t in terms if relevance.mentions(t, jd_lower, jd_tokens) and t.lower() in text.lower()})
+            if hits:
+                return "Matched the job on: " + ", ".join(hits) + " — surfaced accordingly."
+            return "No direct job-keyword match; kept for completeness and recency."
+
         def sort_entries(entries):
             scored = [
                 (score(" ".join([e.role, e.organization, *e.bullets])), i, e)
                 for i, e in enumerate(entries)
             ]
             scored.sort(key=lambda t: (-t[0], t[1]))
-            return [e for _, _, e in scored]
+            return [
+                e.model_copy(update={"tailor_note": _note(" ".join([e.role, e.organization, *e.bullets]))})
+                for _, _, e in scored
+            ]
 
         def sort_projects(projects: list[Project]) -> list[Project]:
             scored = [
@@ -227,7 +273,10 @@ class RulesBackend:
                 for i, p in enumerate(projects)
             ]
             scored.sort(key=lambda t: (-t[0], t[1]))
-            return [p for _, _, p in scored]
+            return [
+                p.model_copy(update={"tailor_note": _note(" ".join([p.name, p.tech or "", *p.bullets]))})
+                for _, _, p in scored
+            ]
 
         matched = sorted({s for s in terms if relevance.mentions(s, jd_lower, jd_tokens)})
         notes = [
@@ -256,17 +305,20 @@ def claude_code_available() -> bool:
     return shutil.which(CLAUDE_CLI) is not None
 
 
-def select_backend(name: str = "auto") -> TailorBackend:
+def select_backend(name: str = "auto", quality: str = DEFAULT_QUALITY) -> TailorBackend:
     """Return a backend by name, or the best available one for `auto`.
 
     `auto` uses Claude Code (subscription) when the `claude` CLI is present, else the
-    no-account rules engine.
+    no-account rules engine. `quality` (fast|balanced|max) picks the Claude speed/quality
+    tier — model + whether extended thinking is on; it has no effect on the rules engine.
     """
     name = name.lower()
+    model, think = QUALITY_TIERS.get(quality, QUALITY_TIERS[DEFAULT_QUALITY])
     if name in ("claude-code", "claude"):
-        return ClaudeCodeBackend()
+        return ClaudeCodeBackend(model=model, think=think)
     if name == "rules":
         return RulesBackend()
     if name == "auto":
-        return ClaudeCodeBackend() if claude_code_available() else RulesBackend()
+        return (ClaudeCodeBackend(model=model, think=think)
+                if claude_code_available() else RulesBackend())
     raise ValueError(f"Unknown backend {name!r} (use claude-code|rules|auto).")

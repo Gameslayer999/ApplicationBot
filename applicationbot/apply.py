@@ -769,6 +769,48 @@ def _persist_learning(resolver: AnswerResolver, report: "ApplyReport", profile_p
             f"question(s) for you to answer once in the Apply-profile tab")
 
 
+def _title_role_company(title: str) -> tuple[str, str]:
+    """Best-effort (role, company) from a posting's page title, e.g.
+    'Job Application for Senior Software Engineer at Censys' → ('Senior Software Engineer',
+    'Censys'). Returns ('', '') when the title doesn't match — the row's role/company stay
+    blank for the user (or the Discover stage) to fill."""
+    t = (title or "").strip()
+    m = re.search(r"(?:job application for\s+)?(.+?)\s+at\s+(.+?)\s*$", t, re.I)
+    if not m:
+        return "", ""
+    return m.group(1).strip(), m.group(2).strip()
+
+
+def _record_dry_run(report: ApplyReport, resume_pdf: str, role: str, company: str) -> tuple[int, str]:
+    """Record this dry-run in the tracker (decision 024) — the Track stage's 'record what it
+    WOULD submit'. Upserts by source URL so re-running a posting updates its row instead of
+    duplicating it, and never clobbers user-owned fields (status/notes/pay) on a re-run.
+    Returns (application_id, 'recorded' | 'updated')."""
+    from . import tracker  # lazy — keep apply.py importable without touching the DB
+
+    existing = tracker.find_by_source_url(report.url)
+    if existing:
+        # Runner-owned refresh only; fill role/company just if they were never set.
+        changes: dict = {"resume_path": resume_pdf, "portal": report.ats, "method": "dry-run"}
+        if not existing.get("company") and company:
+            changes["company"] = company
+        if not existing.get("role") and role:
+            changes["role"] = role
+        tracker.update_application(int(existing["id"]), changes)
+        return int(existing["id"]), "updated"
+
+    native = sum(1 for f in report.filled if f.source == "native")
+    drafted = sum(1 for f in report.filled if f.source == "generated")
+    app_id = tracker.add_application({
+        "company": company, "role": role,
+        "portal": report.ats, "method": "dry-run", "status": "dry-run",
+        "source_url": report.url, "resume_path": resume_pdf,
+        "notes": f"[auto] Dry-run: {len(report.filled)} field(s) filled "
+                 f"({native} native, {drafted} AI-drafted); {len(report.skipped)} need attention.",
+    })
+    return app_id, "recorded"
+
+
 def run_apply(
     url: str,
     resume_pdf: str,
@@ -782,6 +824,7 @@ def run_apply(
     debug: bool = False,
     profile_path: str = "profile/application_profile.yaml",
     learn: bool = True,
+    record: bool = True,
 ) -> ApplyReport:
     """DRY-RUN fill an application form. Never submits.
 
@@ -790,7 +833,8 @@ def run_apply(
     still empty — drafting open-ended questions with Claude when enabled. Screenshots the result
     and (when `pause`) leaves the browser open for review. `headed=True` + `slow_mo` let you
     watch it fill in real time. When `learn`, new reusable answers/questions are saved to the
-    answer bank for future runs (decision 018)."""
+    answer bank for future runs (decision 018). When `record`, the run is logged to the tracker
+    as a `dry-run` row, upserted by source URL (decision 024)."""
     from playwright.sync_api import TimeoutError as PWTimeout  # lazy
     from playwright.sync_api import sync_playwright
 
@@ -821,13 +865,15 @@ def run_apply(
             except Exception:
                 pass
 
-            # Company name (from the page title) grounds any Claude-drafted answers.
+            # Role + company from the page title: grounds Claude-drafted answers AND labels
+            # the tracker row.
+            role, company = "", ""
+            try:
+                role, company = _title_role_company(page.title())
+            except Exception:
+                pass
             if resolver.enable_generation and not resolver.company:
-                try:
-                    m = re.search(r"\bat\s+(.+?)\s*$", (page.title() or "").strip())
-                    resolver.company = m.group(1) if m else None
-                except Exception:
-                    pass
+                resolver.company = company or None
 
             if debug:
                 _dump_fields(page)
@@ -858,6 +904,16 @@ def run_apply(
             # capture new reusable (non-company-specific) questions we couldn't answer as blanks.
             if learn:
                 _persist_learning(resolver, report, profile_path)
+
+            # Record this dry-run in the tracker (Track stage, decision 024). Best-effort:
+            # a tracker failure must not break the fill run.
+            if record:
+                try:
+                    rid, action = _record_dry_run(report, resume_pdf, role, company)
+                    print(f"Tracked: {action} application #{rid} (dry-run) — open the Track tab to view/edit.")
+                except Exception as e:
+                    report.errors.append(f"tracker: {type(e).__name__}: {e}")
+                    print(f"Note: could not record to tracker ({type(e).__name__}: {e}).")
 
             # Show the result in the terminal the moment filling finishes, before the pause.
             print("\n" + report.summary())
@@ -904,6 +960,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="Don't draft open-ended answers with Claude (bank/structured only).")
     parser.add_argument("--no-learn", action="store_true",
                         help="Don't save new answers/questions to the answer bank.")
+    parser.add_argument("--no-record", action="store_true",
+                        help="Don't record this dry-run in the tracker (applications.db).")
     args = parser.parse_args(argv)
 
     ats = detect_ats(args.url)
@@ -925,7 +983,7 @@ def main(argv: list[str] | None = None) -> int:
         args.url, args.pdf, resolver,
         headed=not args.headless, pause=not args.no_pause,
         slow_mo=args.slow_mo, screenshot=args.screenshot, debug=args.debug,
-        profile_path=profile_path, learn=not args.no_learn,
+        profile_path=profile_path, learn=not args.no_learn, record=not args.no_record,
     )
     return 0
 

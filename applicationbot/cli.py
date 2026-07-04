@@ -42,6 +42,14 @@ def main(argv: list[str] | None = None) -> int:
         "Claude subscription, not the paid API.",
     )
     parser.add_argument(
+        "--quality",
+        default="balanced",
+        choices=["fast", "balanced", "max"],
+        help="Claude engine speed/quality tier (default: balanced). fast = Sonnet, ~30s; "
+        "balanced = Opus, ~40s; max = Opus with deep reasoning, ~2 min. No effect on the "
+        "rules engine.",
+    )
+    parser.add_argument(
         "--pages",
         type=float,
         default=1.0,
@@ -64,6 +72,7 @@ def main(argv: list[str] | None = None) -> int:
     result = tailor_resume(
         resume, jd, backend=args.backend,
         budget=LengthBudget(pages=args.pages, line_chars=args.line_chars),
+        quality=args.quality,
     )
     print(f"Backend: {result.backend} · target {result.pages:g} page(s)", file=sys.stderr)
     if args.out and args.out.lower().endswith(".pdf"):

@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from . import catalogue
-from .backends import TailorBackend, select_backend
+from .backends import DEFAULT_QUALITY, TailorBackend, select_backend
 from .job_description import JobDescription
 from .length import LengthBudget
 from .models import Resume, TailoredResume
@@ -37,18 +37,38 @@ def tailor_resume(
     jd: JobDescription,
     backend: str | TailorBackend = "auto",
     budget: Optional[LengthBudget] = None,
+    quality: str = DEFAULT_QUALITY,
 ) -> TailorResult:
     """Tailor `resume` to `jd` and return the validated result + factual-drift warnings.
 
     `backend` is a name ("auto"|"claude-code"|"rules") or a backend instance.
     `budget` controls the target length (default: one page).
+    `quality` (fast|balanced|max) is the Claude speed/quality tier; ignored when `backend`
+    is a pre-built instance or the rules engine.
     """
     budget = budget or LengthBudget()
-    engine = select_backend(backend) if isinstance(backend, str) else backend
+    engine = select_backend(backend, quality) if isinstance(backend, str) else backend
 
     subset = catalogue.select_relevant(resume, jd, budget)
     tailored = engine.tailor(subset, jd, budget)
+
+    # Hard-enforce the length budget, then tell the user if it dropped any entries — otherwise
+    # a newly-added experience that didn't make the cut looks like it was silently ignored.
+    before = (len(tailored.experience), len(tailored.projects), len(tailored.activities))
     tailored = budget.enforce(tailored)
+    after = (len(tailored.experience), len(tailored.projects), len(tailored.activities))
+    names = (("experience entry", "experience entries"), ("project", "projects"), ("activity", "activities"))
+    omitted = [
+        f"{b - a} {singular if b - a == 1 else plural}"
+        for (singular, plural), b, a in zip(names, before, after)
+        if b > a
+    ]
+    if omitted:
+        tailored.relevance_notes = [
+            *tailored.relevance_notes,
+            f"Omitted {', '.join(omitted)} to fit {budget.pages:g} page(s) — "
+            "the least job-relevant were dropped. Increase Length to include more.",
+        ]
 
     return TailorResult(
         tailored=tailored,

@@ -44,3 +44,14 @@ def text_score(text: str, terms: list[str], jd_text_lower: str, jd_tokens: set[s
     """How many of the candidate's skills the job mentions AND this text mentions."""
     tl = text.lower()
     return sum(1 for s in terms if mentions(s, jd_text_lower, jd_tokens) and s.lower() in tl)
+
+
+def qualification_score(resume: Resume, jd_text: str) -> tuple[int, list[str]]:
+    """Cheap, token-free signal of fit: how many of the candidate's skills a posting asks
+    for, and which. Used to RANK discovered postings and cut obvious non-matches before
+    spending a Claude call on the survivors — the hybrid matcher (DECISIONS.md #025), the
+    same pre-select-then-Claude pattern as the catalogue (DECISIONS.md #013)."""
+    jd_low = jd_text.lower()
+    jd_tok = tokens(jd_low)
+    matched = sorted({s for s in skill_terms(resume) if mentions(s, jd_low, jd_tok)})
+    return len(matched), matched
