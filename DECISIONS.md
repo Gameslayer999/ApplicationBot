@@ -27,6 +27,9 @@
 | 014 | 2026-07-03 | Parallel agents: git-ignored file bus + canary notify + Cursor hooks | Accepted |
 | 015 | 2026-07-03 | LinkedIn: import the official data export (CSV), not live OAuth/scraping | Accepted |
 | 016 | 2026-07-03 | Apply stage: per-ATS Playwright form automation, autonomous-first with an exception queue; browser extension later | Accepted |
+| 017 | 2026-07-04 | Apply stage: use the ATS's own native autofill first, fill only the still-empty fields with our resolver; MyGreenhouse via stored credentials + auto-login | Accepted |
+| 018 | 2026-07-04 | Self-improving answer bank: cache learned/generated answers for reuse; draft open-ended questions with Claude (grounded); never cache company-specific ones | Accepted |
+| 019 | 2026-07-04 | Codebase index: a stdlib-`ast` structural repo map (not a vector DB) for faster agent orientation | Accepted |
 
 ---
 
@@ -457,3 +460,105 @@ no CAPTCHA evasion, no Easy-Apply automation.
 an **application-answer profile** (work authorization, EEO, salary, start date, links, and
 a growing bank of answers to screening questions) so the autonomous runner rarely gets
 stuck. See [[003-safety-switch]] (Guideline #3), [[004-respect-tos]] (Guideline #4).
+
+
+## 017 — Apply stage: native ATS autofill first, our resolver fills the gaps
+
+**Date:** 2026-07-04
+**Status:** Accepted
+
+**Context:** Our per-ATS autofill (decision 016) fills a Greenhouse form 15/15 live. But many
+ATSs ship their **own** autofill, which is more robust and fills exactly what the ATS expects.
+Empirically (headless Chromium against the live Censys Greenhouse form): Greenhouse exposes
+**"Quick Apply with MyGreenhouse"** (a candidate account at `my.greenhouse.io`; email login)
+and Dropbox/Google-Drive resume sources; **uploading a résumé does NOT auto-populate fields**
+(no parse autofill on the public form). Lever/Ashby/Workday, by contrast, **parse an uploaded
+résumé into fields with no account** — the higher-ROI native autofill.
+
+**Options considered:**
+| Option | Verdict |
+|---|---|
+| Native autofill first, our resolver fills only the still-empty fields | **Chosen** — best of both: native robustness + our coverage of custom/EEO questions the ATS can't fill |
+| Our resolver only (decision 016 as-is) | Kept as the fallback when no native autofill exists (e.g. Greenhouse w/o creds) |
+| Native autofill only | Rejected — never covers per-company custom/screening/EEO questions |
+
+**Decision:** Native-first, ATS-agnostic: **upload résumé → trigger the ATS's native autofill
+→ our resolver fills only fields still empty** (`_fill_all_fields(only_empty=True)`, detecting
+a field's current value incl. react-select `single-value`). Native mechanisms: resume-parse on
+upload (Lever/Ashby), an "Autofill with Resume" button (Workday), and **MyGreenhouse via stored
+credentials + auto-login** (per the user's choice — email+password in the git-ignored profile;
+a login failure is logged and we fall back to our autofill, never blocking). The report tags
+each field `native` vs `resolver`. Build priority: the zero-setup resume-parse ATSs first,
+then MyGreenhouse. The MyGreenhouse login flow is implemented best-effort but **unverified**
+against a real account (needs a live login to confirm). See [[016-apply-stage]].
+
+
+## 018 — Self-improving answer bank (learn + generate)
+
+**Date:** 2026-07-04
+**Status:** Accepted
+
+**Context:** Application questions repeat across companies, so the same ones shouldn't be
+re-answered every time. The user asked that new questions autofill encounters be saved to the
+Q&A bank for reuse — except company-specific ones ("why do you want to work here"), whose
+answer differs per company — and that open-ended experience questions ("describe your
+experience doing X") be drafted with the Claude **subscription** and also cached.
+
+**Decision:** The answer bank (`ApplicationProfile.custom_answers`) becomes self-improving:
+- **Reuse first:** `AnswerResolver.resolve()` checks structured fields then the bank (existing).
+- **Generate open-ended:** on a miss for an open-ended free-text question, draft an answer with
+  Claude via the subscription CLI (`answer_bank.generate_answer`, reusing
+  `backends.run_claude_cli`), **grounded strictly in the résumé** — the system prompt forbids
+  inventing experience and requires honesty when the résumé lacks it (integrity; Guideline #5).
+- **Learn:** generated answers are cached to the bank (flagged `generated=True` for review);
+  new reusable questions we couldn't answer are captured as **blank pending** entries so the
+  user fills each once in the UI, then reuse is automatic.
+- **Exceptions (never cached):** **company-specific** questions (classified by phrase) and
+  **demographic/EEO** questions (handled by the structured optional EEO fields, blank = decline).
+- Persistence happens after the run (`remember_answers` / `capture_questions`, dedup by
+  normalized question). Generation is best-effort: no Claude CLI → skip drafting, fall back to
+  the needs-attention queue. Toggles: `--no-generate`, `--no-learn`.
+
+The UI's answer bank marks entries **✨ AI-drafted — review** and **○ Needs your answer**.
+Classifiers + learning verified; live Claude drafting is unverified in-sandbox (no CLI there).
+See [[016-apply-stage]], [[017-native-autofill]], [[011-claude-code-subscription]].
+
+
+## 019 — Codebase index: structural repo map, not a vector database
+
+**Date:** 2026-07-04
+**Status:** Accepted
+
+**Context:** The user asked for "something like a vector database" so that changing code
+in this repo is faster and more efficient for an agent each session, and asked to compare
+options before committing. Measured size: ~3.9k lines of first-party Python across 17
+files (the repo is pure Python; the only non-Python source is HTML/JS embedded inside
+Python f-strings in `web.py`, which any parser sees as opaque strings).
+
+**Options considered:**
+| Option | Infra / deps | Pros | Cons |
+|---|---|---|---|
+| Status quo (grep/glob + reads) | none | Exact, instant on 4k lines | No one-shot orientation; no dep graph |
+| **Structural repo map (`ast`)** | none (stdlib) | Always fresh, exact, zero deps, gives symbol map + import graph | Python-only until a parser is added |
+| Tree-sitter repo map | `tree-sitter` + grammars | Multi-language | Deps to maintain for no gain on a pure-Python repo |
+| Local vector DB (sqlite-vec / LanceDB + Voyage embeddings) | embedding model/API | Concept search | Overkill at 4k lines; stale on every edit (repo churned by 2 agents); fuzzy top-k less precise than grep; new external dep |
+| Server vector DB (Qdrant / pgvector / Milvus) | runs a service | Scale / multi-repo | Violates the cloneable, minimal-infra ethos |
+
+**Decision:** Build a structural repo map on the stdlib `ast` module
+(`applicationbot/repo_map.py`, run via `python -m applicationbot.repo_map`). It parses
+every first-party `.py` file fresh on each run and emits a compact markdown (or `--json`)
+map: per file → module docstring, first-party imports, constants, and classes/functions
+with signatures and line numbers, plus a reverse-dependency graph (who imports each
+module). Output is generated on demand (default stdout; `--out` writes a git-ignored
+`.repo-map.md`), never committed. Rejected a vector database: semantic search earns its
+keep on large, slow-churning codebases searched by concept — the opposite of this repo,
+where exact grep is already instant and an embedding index would go stale on every edit.
+Rejected tree-sitter: it adds grammar dependencies with no benefit while the repo is pure
+Python; `_symbols_for()` is the single dispatch point where a tree-sitter backend can be
+added if standalone non-Python source ever lands.
+
+**Reasoning:** Matches the actual problem (fast orientation + impact analysis) at the
+actual scale, with zero dependencies and zero staleness — consistent with the cloneable,
+minimal-deps ethos and the "simplicity first / no unrequested future-proofing" guidelines.
+Revisit a local vector DB (sqlite-vec + Voyage `voyage-code-3`) only if first-party code
+grows past ~30–50k lines, where grep stops being enough.

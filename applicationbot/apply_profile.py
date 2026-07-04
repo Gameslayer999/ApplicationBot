@@ -29,6 +29,7 @@ _HEADER = (
 class QA(BaseModel):
     question: str
     answer: str
+    generated: bool = False  # answer drafted by Claude (flag for review); False = user-entered
 
 
 class ApplicationProfile(BaseModel):
@@ -38,6 +39,7 @@ class ApplicationProfile(BaseModel):
     email: str = ""
     phone: str = ""
     location: str = ""
+    country: str = "United States"
     linkedin_url: str = ""
     github_url: str = ""
     portfolio_url: str = ""
@@ -45,6 +47,7 @@ class ApplicationProfile(BaseModel):
     # Work eligibility (tri-state: None = unspecified)
     work_authorized: Optional[bool] = None
     requires_sponsorship: Optional[bool] = None
+    us_citizen: Optional[bool] = None  # set once — citizenship is a fact only you can assert
 
     # Logistics / preferences
     willing_to_relocate: Optional[bool] = None
@@ -53,11 +56,21 @@ class ApplicationProfile(BaseModel):
     earliest_start_date: str = ""
     years_experience: str = ""
 
+    # "How did you hear about this job?" — we discover roles via online search, so this is the
+    # default answer: used verbatim in a text field, or matched to a dropdown's options.
+    how_heard: str = "I found this role through an online job search."
+
     # Voluntary EEO self-identification (blank = decline to self-identify)
     gender: str = ""
     race_ethnicity: str = ""
     veteran_status: str = ""
     disability_status: str = ""
+
+    # ATS-native autofill credentials (git-ignored with the rest of the profile). When set,
+    # the Apply stage logs into the ATS's own candidate account and uses its autofill first,
+    # falling back to our field-by-field autofill (decision 017).
+    greenhouse_email: str = ""
+    greenhouse_password: str = ""
 
     # Growing bank of answers to custom screening questions.
     custom_answers: list[QA] = Field(default_factory=list)
@@ -81,3 +94,45 @@ def replace_profile(data: dict, path: str | Path = DEFAULT_PATH) -> ApplicationP
     profile = ApplicationProfile.model_validate(data)
     save_profile(profile, path)
     return profile
+
+
+def _norm_q(q: str) -> str:
+    return " ".join((q or "").lower().split())
+
+
+def remember_answers(new: list[QA], path: str | Path = DEFAULT_PATH) -> int:
+    """Append newly-learned Q&A to the on-disk answer bank so future autofill reuses them.
+    Reloads from disk first (the run may have started from an in-memory copy), skips questions
+    already banked (case/space-insensitive) and blank answers. Returns how many were added."""
+    profile = load_profile(path)
+    have = {_norm_q(qa.question) for qa in profile.custom_answers}
+    added = 0
+    for qa in new:
+        key = _norm_q(qa.question)
+        if not key or not (qa.answer or "").strip() or key in have:
+            continue
+        profile.custom_answers.append(qa)
+        have.add(key)
+        added += 1
+    if added:
+        save_profile(profile, path)
+    return added
+
+
+def capture_questions(questions: list[str], path: str | Path = DEFAULT_PATH) -> int:
+    """Add new (reusable) questions we couldn't answer to the bank as blank entries, so the user
+    fills each once in the UI and future autofill reuses it. Skips ones already present. Returns
+    how many were added."""
+    profile = load_profile(path)
+    have = {_norm_q(qa.question) for qa in profile.custom_answers}
+    added = 0
+    for q in questions:
+        key = _norm_q(q)
+        if not key or key in have:
+            continue
+        profile.custom_answers.append(QA(question=q, answer=""))
+        have.add(key)
+        added += 1
+    if added:
+        save_profile(profile, path)
+    return added
