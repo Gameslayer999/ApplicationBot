@@ -22,6 +22,9 @@ output/
 
 # Application history / tracking data
 applications/
+applications.db
+applications.db-shm
+applications.db-wal
 application_history.*
 tracker.db
 *.sqlite

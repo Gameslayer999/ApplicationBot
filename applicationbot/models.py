@@ -43,6 +43,12 @@ class Experience(BaseModel):
     start: str = Field(description="Start date, e.g. 'May 2024'")
     end: str = Field(description="End date or 'Present'")
     bullets: list[str] = Field(default_factory=list)
+    tailor_note: Optional[str] = Field(
+        default=None,
+        description="TAILORED RESUME ONLY: one short sentence on why this entry was kept, "
+        "where it was ordered, and how it was tailored for this job. Shown to the user for "
+        "review — never printed on the resume. Leave null on the base resume.",
+    )
 
 
 class Project(BaseModel):
@@ -51,6 +57,12 @@ class Project(BaseModel):
         default=None, description="Tech-stack line, e.g. 'Retool, JavaScript, SQL'"
     )
     bullets: list[str] = Field(default_factory=list)
+    tailor_note: Optional[str] = Field(
+        default=None,
+        description="TAILORED RESUME ONLY: one short sentence on why this project was kept "
+        "and how it was tailored for this job. Shown to the user for review — never printed "
+        "on the resume. Leave null on the base resume.",
+    )
 
 
 class Education(BaseModel):

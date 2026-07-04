@@ -1,0 +1,27 @@
+# ApplicationBot discovery filters — copy to profile/discovery.yaml and edit.
+#
+# Discovery is QUALIFICATION-driven: the matcher decides fit from your résumé + apply
+# profile, so this file stays small. It holds only target boards + coarse gates.
+#
+# `boards` are specific companies whose public ATS board you want polled. Read each token
+# off the careers-page URL:
+#   Greenhouse: boards.greenhouse.io/<token>       -> {ats: greenhouse, token: <token>}
+#   Lever:      jobs.lever.co/<slug>               -> {ats: lever,      token: <slug>}
+#   Ashby:      jobs.ashbyhq.com/<name>            -> {ats: ashby,      token: <name>}
+
+boards:
+  - {ats: greenhouse, token: stripe}
+  - {ats: lever, token: cin7}
+  - {ats: ashby, token: Ramp}
+
+remote_only: false        # drop non-remote postings when true
+min_salary: 0             # annual floor; 0 = no floor. Postings with no stated pay are kept.
+title_exclude:            # cheap title gate before the matcher
+  - sales
+  - recruiter
+  - account executive
+
+min_skills: 2             # keyword pre-filter floor (raise to cut common-word matches)
+top_n: 10                 # how many keyword-ranked survivors Claude judges for true fit
+
+# keywords: []            # optional aggregator search terms; empty = derive from your résumé
