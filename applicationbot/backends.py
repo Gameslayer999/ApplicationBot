@@ -104,6 +104,37 @@ class TailorBackend(Protocol):
 # ------------------------------------------------------------------ Claude (subscription)
 
 
+def run_claude_cli(prompt: str, *, cli: str = CLAUDE_CLI,
+                   model: Optional[str] = None, timeout: int = 300) -> str:
+    """Run one prompt through the Claude Code CLI (subscription billing, not the API) and
+    return the model's text. Raises RuntimeError if the CLI is missing or fails."""
+    if shutil.which(cli) is None:
+        raise RuntimeError(
+            "Claude Code CLI ('claude') not found. Install it and sign in to your Claude "
+            "subscription (https://claude.com/product/claude-code)."
+        )
+    cmd = [cli, "--print", prompt, "--output-format", "json"]
+    if model:
+        cmd += ["--model", model]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(f"Claude Code timed out ({timeout}s).") from e
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"Claude Code failed (exit {proc.returncode}). Are you signed in? "
+            f"Run `claude` and /login if not. Detail: "
+            f"{(proc.stderr or proc.stdout).strip()[-400:]}"
+        )
+    try:
+        env = json.loads(proc.stdout)
+        if isinstance(env, dict) and isinstance(env.get("result"), str):
+            return env["result"]
+    except json.JSONDecodeError:
+        pass
+    return proc.stdout
+
+
 def _extract_json(text: str) -> str:
     """Pull the JSON object out of a model reply (tolerates fences / stray prose)."""
     text = text.strip()
@@ -151,26 +182,7 @@ class ClaudeCodeBackend:
         raise RuntimeError(f"Claude Code did not return a valid tailored resume: {last_err}")
 
     def _run(self, prompt: str) -> str:
-        cmd = [self.cli, "--print", prompt, "--output-format", "json"]
-        if self.model:
-            cmd += ["--model", self.model]
-        try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        except subprocess.TimeoutExpired as e:
-            raise RuntimeError("Claude Code timed out (300s).") from e
-        if proc.returncode != 0:
-            raise RuntimeError(
-                f"Claude Code failed (exit {proc.returncode}). Are you signed in? "
-                f"Run `claude` and /login if not. Detail: "
-                f"{(proc.stderr or proc.stdout).strip()[-400:]}"
-            )
-        try:
-            env = json.loads(proc.stdout)
-            if isinstance(env, dict) and isinstance(env.get("result"), str):
-                return env["result"]
-        except json.JSONDecodeError:
-            pass
-        return proc.stdout
+        return run_claude_cli(prompt, cli=self.cli, model=self.model)
 
 
 # --------------------------------------------------------------------------- Rules

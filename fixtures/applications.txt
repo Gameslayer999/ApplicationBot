@@ -1,0 +1,9 @@
+# Application URLs the dry-run can test against — one per line (# = comment, blank ignored).
+# `./scripts/apply-dry-run.sh` uses the first entry; `./scripts/apply-dry-run.sh random`
+# picks one at random to test the filler's flexibility across different forms.
+# These are live public postings captured 2026-07-03; if one 404s, replace it with any
+# fresh job-boards.greenhouse.io/<company>/jobs/<id> URL.
+https://job-boards.greenhouse.io/censys/jobs/8499166002
+https://job-boards.greenhouse.io/affirm/jobs/7695818003
+https://job-boards.greenhouse.io/axle/jobs/5172769007
+https://job-boards.greenhouse.io/xai/jobs/5167318007

@@ -46,7 +46,18 @@ At a high level, the system has five stages:
 
 These rules apply to every agent working on this project:
 
-<!-- 1. **Get approval before large architecture changes.** If a decision affects file -->
+**0. Always build toward the final product.** Keep the end goal — the five-stage,
+fully-automated, cloneable job-application pipeline in the Project Overview — in mind at
+all times. Before starting any task, be able to state how it moves the project toward
+that final product. If you don't understand how the current piece factors into the end
+result — why it exists, which stage it serves, what depends on it — **stop and figure
+out why before writing code.** Ask the user if the connection is still unclear. Never
+build something just because it was requested or because it seems locally reasonable; a
+task that doesn't advance the final product, or that you can't tie back to it, is a
+signal to pause and reassess, not to proceed. Every change should measurably move the
+pipeline closer to working end-to-end.
+
+1. **Get approval before large architecture changes.** If a decision affects file
    structure, database schema, module boundaries, the scraping strategy, or the
    application-submission method — stop and explain the options to the user before
    writing any code.

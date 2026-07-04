@@ -27,6 +27,10 @@ tracker.db
 *.sqlite
 *.sqlite3
 
+# Filled-form review screenshots — contain the applicant's PII from the filled form
+apply_review*.png
+*.review.png
+
 # Credentials & secrets
 .env
 .env.*
@@ -42,6 +46,10 @@ auth_state.json
 
 # Agent collaboration bus (Cursor ↔ Claude VS Code) — local session state only
 .agent-bus/
+
+# Generated developer artifacts — regenerate on demand, never commit (goes stale)
+.repo-map.md
+.repo-map.json
 
 # ─────────────────────────────────────────────────────────────
 # Python

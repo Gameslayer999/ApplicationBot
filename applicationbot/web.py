@@ -610,39 +610,74 @@ function boolSel(label, key, val) {
 }
 function qaCard(qa) {
   qa = qa || {}; const card = el("div", {class:"card"});
-  card.append(area("Question","question",qa.question), area("Answer","answer",qa.answer), delBtn(card));
+  const hasAns = (qa.answer || "").trim();
+  let badge = null;
+  if (!hasAns) badge = el("div", {style:"font-size:12px;font-weight:600;color:#b26a00;margin-bottom:4px", text:"○ Needs your answer — captured from an application"});
+  else if (qa.generated) badge = el("div", {style:"font-size:12px;font-weight:600;color:#6a4bd0;margin-bottom:4px", text:"✨ AI-drafted — review & edit"});
+  card.append(...(badge ? [badge] : []), area("Question","question",qa.question), area("Answer","answer",qa.answer), delBtn(card));
   return card;
+}
+function acctRow(name, ok, text) {
+  return el("div", {style:"display:flex;align-items:center;gap:10px;padding:7px 0;border-bottom:1px solid var(--line)"}, [
+    el("span", {style:"font-weight:700;font-size:15px;color:"+(ok?"#0b7a3b":"#b0b0b0"), text: ok ? "✓" : "○"}),
+    el("span", {style:"font-weight:600;min-width:130px", text:name}),
+    el("span", {style:"color:var(--muted,#666);font-size:13px", text:text}),
+  ]);
+}
+function nativeAccountsPanel() {
+  const ghOK = !!((P.greenhouse_email||"").trim() && (P.greenhouse_password||"").trim());
+  const card = el("div", {class:"card"}, [
+    el("p", {class:"hint", text:"Which native autofills the Apply stage can use. Greenhouse uses your MyGreenhouse login (set below); Lever/Ashby/Workday parse your uploaded résumé and need no account."}),
+    acctRow("MyGreenhouse", ghOK, ghOK ? ("Connected · " + P.greenhouse_email) : "Not set up — add credentials below"),
+    acctRow("Lever", true, "No login needed — résumé-parse autofill"),
+    acctRow("Ashby", true, "No login needed — résumé-parse autofill"),
+    acctRow("Workday", true, "No login needed — résumé-parse autofill"),
+  ]);
+  return el("div", {class:"sec"}, [el("h3", {text:"Autofill accounts"}), card]);
 }
 function renderProfile() {
   const f = $("profile-form"); f.innerHTML = "";
+  f.append(nativeAccountsPanel());
   const card = el("div", {id:"profile-card", class:"card"});
   card.append(
     row2(fld("First name","first_name",P.first_name), fld("Last name","last_name",P.last_name)),
     row2(fld("Email","email",P.email), fld("Phone","phone",P.phone)),
-    fld("Location","location",P.location),
+    row2(fld("Location","location",P.location), fld("Country","country",P.country)),
     row2(fld("LinkedIn URL","linkedin_url",P.linkedin_url), fld("GitHub URL","github_url",P.github_url)),
     fld("Portfolio / website","portfolio_url",P.portfolio_url),
     row2(boolSel("Authorized to work?","work_authorized",P.work_authorized), boolSel("Requires sponsorship?","requires_sponsorship",P.requires_sponsorship)),
-    row2(boolSel("Willing to relocate?","willing_to_relocate",P.willing_to_relocate), boolSel("Open to remote?","open_to_remote",P.open_to_remote)),
+    row2(boolSel("U.S. citizen?","us_citizen",P.us_citizen), boolSel("Willing to relocate?","willing_to_relocate",P.willing_to_relocate)),
+    boolSel("Open to remote?","open_to_remote",P.open_to_remote),
     row2(fld("Desired salary","desired_salary",P.desired_salary), fld("Earliest start date","earliest_start_date",P.earliest_start_date)),
     fld("Years of experience","years_experience",P.years_experience),
+    fld("How did you hear about this job? (default answer)","how_heard",P.how_heard),
     row2(fld("Gender (optional)","gender",P.gender), fld("Race / ethnicity (optional)","race_ethnicity",P.race_ethnicity)),
     row2(fld("Veteran status (optional)","veteran_status",P.veteran_status), fld("Disability status (optional)","disability_status",P.disability_status)),
   );
   f.append(el("div", {class:"sec"}, [el("h3", {text:"Applicant details"}), card]));
+
+  const creds = el("div", {id:"creds-card", class:"card"});
+  creds.append(
+    el("p", {class:"hint", text:"Optional. If set, the Apply stage logs into Greenhouse's own MyGreenhouse account and uses its autofill first, then fills the rest. Stored locally in your git-ignored profile."}),
+    row2(fld("MyGreenhouse email","greenhouse_email",P.greenhouse_email), fld("MyGreenhouse password","greenhouse_password",P.greenhouse_password)),
+  );
+  f.append(el("div", {class:"sec"}, [el("h3", {text:"Native autofill logins (optional)"}), creds]));
+
   f.append(section("Saved answers to screening questions", "sec-qa", (P.custom_answers||[]).map(qaCard), "+ Add answer", () => qaCard()));
 }
 function collectProfile() {
-  const d = cardData($("profile-card"));
+  const d = Object.assign({}, cardData($("profile-card")), cardData($("creds-card")));
   const tri = k => (d[k] === "yes" ? true : (d[k] === "no" ? false : null));
   const t = k => (d[k] || "").trim();
   return {
     first_name:t("first_name"), last_name:t("last_name"), email:t("email"), phone:t("phone"), location:t("location"),
+    country:t("country"), how_heard:t("how_heard"),
     linkedin_url:t("linkedin_url"), github_url:t("github_url"), portfolio_url:t("portfolio_url"),
-    work_authorized:tri("work_authorized"), requires_sponsorship:tri("requires_sponsorship"),
+    work_authorized:tri("work_authorized"), requires_sponsorship:tri("requires_sponsorship"), us_citizen:tri("us_citizen"),
     willing_to_relocate:tri("willing_to_relocate"), open_to_remote:tri("open_to_remote"),
     desired_salary:t("desired_salary"), earliest_start_date:t("earliest_start_date"), years_experience:t("years_experience"),
     gender:t("gender"), race_ethnicity:t("race_ethnicity"), veteran_status:t("veteran_status"), disability_status:t("disability_status"),
+    greenhouse_email:t("greenhouse_email"), greenhouse_password:t("greenhouse_password"),
     custom_answers: cardsIn("sec-qa").map(c => { const q = cardData(c); return { question:(q.question||"").trim(), answer:(q.answer||"").trim() }; }).filter(x => x.question || x.answer),
   };
 }
