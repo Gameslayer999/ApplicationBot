@@ -203,6 +203,19 @@ and free-form notes.
 
 ## Recently added (this session, latest first)
 
+- 2026-07-05 — **Discover tab shows judged postings (denied + accepted) + judges more.** When a
+  dry-run couldn't find a posting clearing the fit cutoff, the user had no visibility into what
+  the searches returned. Now the Discover tab lists **every Claude-judged posting ranked**, each
+  with its fit score, a ✓ cleared / ✗ denied marker (vs `min_fit`), the one-line "why", and any
+  missing requirements — shown even when nothing clears. The "nothing cleared" message now names
+  all the levers (lower min_fit, raise top_n, set experience_levels to your level, add boards).
+  Raised default `top_n` 10→20 (judge more per run = more chances to clear). Backend: `_test_worker`
+  exposes a `judged` list in the run state; UI `renderJudged`. **Verified live** on the real
+  profile: surfaced 10 denied senior-Stripe roles (scores 8–42) for a junior/intern résumé at
+  min_fit 70 — exactly the diagnostic the user wanted. *Insight it reveals:* senior-heavy boards +
+  a high cutoff → set `experience_levels` (internship/new_grad/junior) to filter senior roles
+  before judging, and/or lower `min_fit`.
+
 - 2026-07-05 — **Dropdown option-matching: country-reside + degree now fill.** Live-DOM debug of
   the Stripe embedded Greenhouse form showed the country dropdown's US option is literally **"US"**
   (abbreviated list: UAE/UK/US) and degree options are standard levels ("Bachelor's Degree"), so

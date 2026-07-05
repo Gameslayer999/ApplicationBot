@@ -87,8 +87,18 @@ def _test_worker() -> None:
 
         res = pipeline.discover_and_match(resume, filters, profile=profile,
                                           use_claude=use_claude, on_progress=on_judge)
+        # Surface every Claude-judged posting — accepted AND denied — so the user can see what
+        # the searches return and why each is rejected (ranked best-first).
+        judged = [{
+            "company": m.posting.company, "title": m.posting.title,
+            "location": m.posting.location, "compensation": m.posting.compensation,
+            "url": m.posting.url, "ats": m.posting.ats,
+            "fit_score": m.fit_score, "qualified": m.qualified,
+            "why": m.why, "missing": (m.missing or [])[:3],
+            "cleared": (m.fit_score is not None and m.fit_score >= filters.min_fit),
+        } for m in res.matches if m.fit_score is not None]
         _set(scanned=res.discovered, matched=len(res.matches), errors=res.errors,
-             skipped_seen=res.skipped_seen)
+             skipped_seen=res.skipped_seen, judged=judged, min_fit=filters.min_fit)
         if not res.matches:
             extra = ["No new postings matched your qualifications."]
             if res.skipped_seen:
@@ -102,8 +112,10 @@ def _test_worker() -> None:
             best_txt = f" Best fit this run was {best}/100." if best is not None else ""
             _set(phase="error", errors=[
                 f"No match reached your minimum fit of {filters.min_fit}/100, so nothing was "
-                f"applied to.{best_txt} Lower “Minimum fit score” in Discovery settings to test "
-                "looser matches, or add boards that better fit your résumé."])
+                f"applied to.{best_txt} See the judged postings below for why. To find a match: "
+                "lower “Minimum fit score”, raise “How many top matches Claude judges”, set "
+                "“Experience levels” to your level (so senior roles are filtered out before "
+                "judging), or add boards that better fit your résumé — all in Discovery settings."])
             return
         p = top.posting
         chosen = {
@@ -542,6 +554,18 @@ INDEX_HTML = """<!doctype html>
   .fitpill { font-size:12px; font-weight:600; color:#fff; background:var(--accent); border-radius:10px; padding:1px 8px; margin-left:6px; }
   .tfinish { margin-top:14px; padding-top:12px; border-top:1px solid var(--line); font-size:13px; }
   .tfinish button { width:auto; margin-top:8px; }
+  .testjudged { margin-top:14px; }
+  .tjhead { font-size:13px; color:var(--muted); margin-bottom:8px; line-height:1.5; }
+  .tjrow { border:1px solid var(--line); border-left-width:4px; border-radius:6px; padding:9px 11px; margin-bottom:7px; }
+  .tjrow.ok { border-left-color:#2a9d5b; background:#f4fbf6; }
+  .tjrow.no { border-left-color:#c0c4cc; background:#fafafa; }
+  .tjtop { display:flex; align-items:baseline; gap:8px; }
+  .tjscore { font-weight:700; font-size:13px; min-width:34px; }
+  .tjrow.ok .tjscore { color:#2a9d5b; } .tjrow.no .tjscore { color:#b26a00; }
+  .tjname { font-weight:600; font-size:14px; }
+  .tjmeta { font-size:12px; color:var(--muted); margin-top:3px; word-break:break-all; }
+  .tjwhy { font-size:12.5px; margin-top:4px; line-height:1.45; }
+  .tjmiss { font-size:12px; color:#8a5a00; margin-top:3px; }
 </style>
 </head>
 <body>
@@ -629,6 +653,7 @@ INDEX_HTML = """<!doctype html>
         </div>
         <div id="test-progress" class="testprog hidden"></div>
         <div id="test-chosen" class="testchosen hidden"></div>
+        <div id="test-judged" class="testjudged hidden"></div>
       </div>
     </div>
 
@@ -992,6 +1017,27 @@ function renderChosen(s) {
   return html;
 }
 
+function renderJudged(s) {
+  const rows = s.judged || [];
+  const cleared = rows.filter(r => r.cleared).length;
+  const minFit = (s.min_fit != null) ? s.min_fit : 50;
+  let html = `<div class="tjhead">Postings Claude judged this run — ${rows.length} scored, `
+    + `${cleared} cleared your ${minFit}/100 cutoff. Denied ones are shown so you can see what the searches return.</div>`;
+  for (const r of rows) {
+    const cls = r.cleared ? "tjrow ok" : "tjrow no";
+    const badge = r.cleared ? `✓ ${r.fit_score}` : `✗ ${r.fit_score}`;
+    const meta = [r.location, r.compensation].filter(Boolean).map(escapeHtml).join(" · ");
+    html += `<div class="${cls}">`
+      + `<div class="tjtop"><span class="tjscore">${badge}</span>`
+      + `<span class="tjname">${escapeHtml(r.company)} — ${escapeHtml(r.title)}</span></div>`;
+    if (meta) html += `<div class="tjmeta">${meta}</div>`;
+    if (r.why) html += `<div class="tjwhy">${escapeHtml(r.why)}</div>`;
+    if (r.missing && r.missing.length) html += `<div class="tjmiss"><b>Missing:</b> ${r.missing.map(escapeHtml).join("; ")}</div>`;
+    html += `<div class="tjmeta"><a href="${escapeHtml(r.url)}" target="_blank" rel="noopener">${escapeHtml(r.url)}</a></div></div>`;
+  }
+  return html;
+}
+
 async function pollTest() {
   let s;
   try { s = await (await fetch("/test-run/status")).json(); } catch (e) { return; }
@@ -1012,6 +1058,10 @@ async function pollTest() {
   prog.innerHTML = body;
 
   if (s.chosen) { chosen.classList.remove("hidden"); chosen.innerHTML = renderChosen(s); }
+
+  const judged = $("test-judged");
+  if (s.judged && s.judged.length) { judged.classList.remove("hidden"); judged.innerHTML = renderJudged(s); }
+  else judged.classList.add("hidden");
 
   if (filled) {
     if (!document.getElementById("test-finish")) {
