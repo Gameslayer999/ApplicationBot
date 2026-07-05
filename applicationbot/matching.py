@@ -55,7 +55,11 @@ def keyword_rank(resume: Resume, postings: list[Posting], *, min_skills: int = 1
         score, matched = relevance.qualification_score(resume, f"{p.title}\n{p.body}")
         if score >= min_skills:
             matches.append(Match(posting=p, keyword_score=score, matched_skills=matched))
-    matches.sort(key=lambda m: m.keyword_score, reverse=True)
+    # Curated early-career postings (already pre-vetted to the user's level) rank ABOVE raw board
+    # postings — otherwise a verbose senior JD's larger skill overlap crowds them out of the
+    # judged top-N, defeating the point of enabling early-career feeds. Within each group, rank
+    # by skill overlap.
+    matches.sort(key=lambda m: (bool(m.posting.extra.get("curated")), m.keyword_score), reverse=True)
     return matches
 
 

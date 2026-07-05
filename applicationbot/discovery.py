@@ -11,11 +11,12 @@ Recruitee are *additional, distinct* form systems added to exercise the Apply au
 many ATS layouts as possible (DECISIONS.md #030) — a discovered posting flows straight
 through Tailor → Apply on whatever system it lives on:
 
-- Greenhouse     : GET boards-api.greenhouse.io/v1/boards/{token}/jobs?content=true
-- Lever          : GET api.lever.co/v0/postings/{slug}?mode=json
-- Ashby          : GET api.ashbyhq.com/posting-api/job-board/{org}?includeCompensation=true
-- SmartRecruiters: GET api.smartrecruiters.com/v1/companies/{company}/postings (+ /{id} detail)
-- Recruitee      : GET {company}.recruitee.com/api/offers/
+- Greenhouse     : GET  boards-api.greenhouse.io/v1/boards/{token}/jobs?content=true
+- Lever          : GET  api.lever.co/v0/postings/{slug}?mode=json
+- Ashby          : GET  api.ashbyhq.com/posting-api/job-board/{org}?includeCompensation=true
+- SmartRecruiters: GET  api.smartrecruiters.com/v1/companies/{company}/postings (+ /{id} detail)
+- Recruitee      : GET  {company}.recruitee.com/api/offers/
+- Workable       : POST apply.workable.com/api/v3/accounts/{account}/jobs (+ v2 /{shortcode} detail)
 
 All return the full job-description text with no scraping and no ToS grey area
 (Agent Guideline #4). Broad aggregator sources (Adzuna, remote feeds) slot in behind the
@@ -27,6 +28,7 @@ pipeline needs no changes when real discovery replaces fixtures.
 from __future__ import annotations
 
 import json
+import re
 import ssl
 import urllib.error
 import urllib.request
@@ -42,9 +44,9 @@ from .job_description import JobDescription
 _UA = "ApplicationBot/0.1 (personal job search; contact: local user)"
 _TIMEOUT = 25
 
-# SmartRecruiters lists postings without the JD body, so we fetch each posting's detail
-# (an N+1). Cap how many we pull per company to keep the run polite and bounded.
-_SR_MAX_POSTINGS = 100
+# SmartRecruiters and Workable list postings without the JD body, so we fetch each posting's
+# detail (an N+1). Cap how many we pull per company to keep the run polite and bounded.
+_DETAIL_MAX_POSTINGS = 100
 
 
 # ---------------------------------------------------------------------------
@@ -66,10 +68,16 @@ def _ssl_context() -> ssl.SSLContext:
 _SSL_CTX = _ssl_context()
 
 
-def fetch_json(url: str) -> Any:
-    """GET a URL and parse JSON. Raises DiscoveryError with a precise message on failure
+def fetch_json(url: str, *, method: str = "GET", body: Any = None) -> Any:
+    """Fetch a URL and parse JSON. Defaults to GET; pass a `body` (dict) to POST it as JSON
+    (Workable's careers API is POST). Raises DiscoveryError with a precise message on failure
     (Agent Guideline #11) so a single bad source never crashes a whole discovery run."""
-    req = urllib.request.Request(url, headers={"User-Agent": _UA, "Accept": "application/json"})
+    headers = {"User-Agent": _UA, "Accept": "application/json"}
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=_TIMEOUT, context=_SSL_CTX) as r:
             raw = r.read().decode("utf-8", errors="replace")
@@ -383,7 +391,7 @@ class SmartRecruitersSource(Source):
     """Public, no-auth SmartRecruiters postings API — a DIFFERENT ATS/form system than
     Greenhouse/Lever/Ashby, so the Apply stage gets exercised on new forms. The list
     endpoint omits the JD body, so we fetch each posting's detail for the full description
-    plus the real jobs.smartrecruiters.com apply URL. Bounded by `_SR_MAX_POSTINGS`
+    plus the real jobs.smartrecruiters.com apply URL. Bounded by `_DETAIL_MAX_POSTINGS`
     (an N+1 of one detail request per kept posting) to stay polite.
 
         list   : GET api.smartrecruiters.com/v1/companies/{company}/postings?limit&offset
@@ -401,7 +409,7 @@ class SmartRecruitersSource(Source):
         base = f"https://api.smartrecruiters.com/v1/companies/{self.company}/postings"
         listed: list[dict] = []
         offset, limit = 0, 100
-        while len(listed) < _SR_MAX_POSTINGS:
+        while len(listed) < _DETAIL_MAX_POSTINGS:
             data = fetch_json(f"{base}?limit={limit}&offset={offset}")
             content = data.get("content", []) if isinstance(data, dict) else []
             if not content:
@@ -411,7 +419,7 @@ class SmartRecruitersSource(Source):
                 break
             offset += limit
         out: list[Posting] = []
-        for p in listed[:_SR_MAX_POSTINGS]:
+        for p in listed[:_DETAIL_MAX_POSTINGS]:
             pid = p.get("id")
             if not pid:
                 continue
@@ -500,6 +508,245 @@ class RecruiteeSource(Source):
         return out
 
 
+class WorkableSource(Source):
+    """Public, no-auth Workable careers API — another distinct ATS/form system. The list
+    endpoint (POST, token-paginated 10 at a time) omits the JD body, so we fetch each
+    posting's detail for the full description; bounded by `_DETAIL_MAX_POSTINGS` (an N+1).
+    `account` is the slug in the careers URL apply.workable.com/{account}/.
+
+        list   : POST apply.workable.com/api/v3/accounts/{account}/jobs  {} (+ {"token": nextPage})
+        detail : GET  apply.workable.com/api/v2/accounts/{account}/jobs/{shortcode}   (note: v2)
+    """
+
+    def __init__(self, account: str) -> None:
+        self.account = account.strip().strip("/")
+        self.name = f"workable:{self.account}"
+
+    def fetch(self) -> list[Posting]:
+        list_url = f"https://apply.workable.com/api/v3/accounts/{self.account}/jobs"
+        listed: list[dict] = []
+        token: Optional[str] = None
+        while len(listed) < _DETAIL_MAX_POSTINGS:
+            data = fetch_json(list_url, method="POST", body=({"token": token} if token else {}))
+            results = data.get("results", []) if isinstance(data, dict) else []
+            if not results:
+                break
+            listed.extend(results)
+            token = data.get("nextPage") if isinstance(data, dict) else None
+            if not token:
+                break
+        out: list[Posting] = []
+        for p in listed[:_DETAIL_MAX_POSTINGS]:
+            sc = p.get("shortcode")
+            if not sc:
+                continue
+            try:
+                det = fetch_json(  # v2 detail carries the full JD (description/requirements/benefits)
+                    f"https://apply.workable.com/api/v2/accounts/{self.account}/jobs/{sc}"
+                )
+            except DiscoveryError:
+                det = p  # detail failed — keep the list entry (title/location, no body)
+            out.append(self._to_posting(det, sc))
+        return out
+
+    def _to_posting(self, j: dict, shortcode: str) -> Posting:
+        loc = j.get("location") or {}
+        loc_str = ", ".join(
+            x for x in [loc.get("city"), loc.get("region"), loc.get("country")] if x
+        )
+        workplace = (j.get("workplace") or "").lower()
+        remote = True if (j.get("remote") or workplace == "remote") else (False if workplace else None)
+        body = "\n\n".join(
+            html_to_text(j.get(k, "") or "")
+            for k in ("description", "requirements", "benefits")
+            if j.get(k)
+        )
+        apply_url = f"https://apply.workable.com/{self.account}/j/{shortcode}/"
+        return Posting(
+            company=self.account,
+            title=(j.get("title") or "").strip(),
+            body=body,
+            url=apply_url,
+            ats="workable",
+            location=loc_str,
+            remote=remote,
+            apply_url=apply_url,
+            updated_at=str(j.get("published", "")),
+        )
+
+
+# --------------------------------------------------------------------------- curated feeds
+#
+# Community-maintained, daily-updated JSON lists of EARLY-CAREER roles (new-grad + internships)
+# — early-career by construction, so no senior roles to filter out (DECISIONS.md #031). The
+# lists are URL-only (a title + an application link, no JD text), and ~40% of active links point
+# at Greenhouse/Lever/Ashby — ATSs we can both fetch a full JD from AND fill. We rank listings by
+# title-relevance to the résumé, resolve the FULL JD for the top-K via the linked ATS, and emit
+# normal full-JD Postings so the matcher/apply pipeline is unchanged. Personal-use only (public
+# job links; the lists carry no explicit redistribution license).
+
+_SIMPLIFY_FEEDS = {
+    "new-grad": "https://raw.githubusercontent.com/SimplifyJobs/New-Grad-Positions/dev/.github/scripts/listings.json",
+    "intern": "https://raw.githubusercontent.com/SimplifyJobs/Summer2026-Internships/dev/.github/scripts/listings.json",
+}
+_CURATED_ATS = ("greenhouse", "lever", "ashby")  # resolvable full JD AND fillable in Apply
+# Tokens that signal LEVEL not role — excluded from title-relevance so "intern" alone doesn't
+# rank a "Marketing Intern" as relevant to a software résumé.
+_LEVEL_TOKENS = {"intern", "internship", "junior", "senior", "staff", "lead", "i", "ii", "iii",
+                 "co", "op", "new", "grad", "graduate", "entry", "level", "of", "the", "and", "a"}
+_WORD_RE = re.compile(r"[a-z0-9+#.]+")
+
+
+def detect_ats_from_url(url: str) -> str:
+    """Identify the ATS from an application URL (routes curated-list links)."""
+    u = (url or "").lower()
+    if "greenhouse.io" in u:
+        return "greenhouse"
+    if "lever.co" in u:
+        return "lever"
+    if "ashbyhq.com" in u:
+        return "ashby"
+    if "smartrecruiters.com" in u:
+        return "smartrecruiters"
+    if "recruitee.com" in u:
+        return "recruitee"
+    if "workable.com" in u:
+        return "workable"
+    if "myworkdayjobs.com" in u or "workday" in u:
+        return "workday"
+    return "other"
+
+
+def _resolve_greenhouse_jd(url: str) -> str:
+    m = re.search(r"greenhouse\.io/([^/?#]+)/jobs/(\d+)", url)
+    if not m:
+        return ""
+    import html as _html
+
+    token, job_id = m.group(1), m.group(2)
+    data = fetch_json(f"https://boards-api.greenhouse.io/v1/boards/{token}/jobs/{job_id}")
+    return html_to_text(_html.unescape((data or {}).get("content", "") or ""))
+
+
+def _resolve_lever_jd(url: str) -> str:
+    m = re.search(r"lever\.co/([^/?#]+)/([0-9a-f-]{8,})", url)
+    if not m:
+        return ""
+    j = fetch_json(f"https://api.lever.co/v0/postings/{m.group(1)}/{m.group(2)}")
+    if not isinstance(j, dict):
+        return ""
+    sections = [j.get("descriptionPlain", "") or ""]
+    for lst in j.get("lists", []) or []:
+        sections.append(f"{(lst.get('text') or '').strip()}\n{html_to_text(lst.get('content', '') or '')}".strip())
+    sections.append(j.get("additionalPlain", "") or "")
+    return "\n\n".join(s for s in sections if s.strip())
+
+
+def _resolve_ashby_jd(url: str, cache: dict) -> str:
+    m = re.search(r"ashbyhq\.com/([^/?#]+)/([0-9a-f-]{8,})", url)
+    if not m:
+        return ""
+    org, uuid = m.group(1), m.group(2)
+    if org not in cache:  # Ashby has no per-job public endpoint — fetch the board once, index it
+        try:
+            data = fetch_json(f"https://api.ashbyhq.com/posting-api/job-board/{org}")
+            cache[org] = {j.get("jobUrl", ""): j for j in (data.get("jobs", []) if isinstance(data, dict) else [])}
+        except DiscoveryError:
+            cache[org] = {}
+    j = next((v for k, v in cache[org].items() if uuid in k), None)
+    if not j:
+        return ""
+    return j.get("descriptionPlain") or html_to_text(j.get("descriptionHtml", "") or "")
+
+
+def _resolve_jd(url: str, ats: str, ashby_cache: dict) -> str:
+    """Fetch one job's full JD via its ATS. Returns '' on any failure (the caller keeps a
+    title-only body so the posting still flows through, just judged on less)."""
+    try:
+        if ats == "greenhouse":
+            return _resolve_greenhouse_jd(url)
+        if ats == "lever":
+            return _resolve_lever_jd(url)
+        if ats == "ashby":
+            return _resolve_ashby_jd(url, ashby_cache)
+    except Exception:
+        return ""
+    return ""
+
+
+def _title_relevance(resume, title: str, category: str = "") -> int:
+    """Cheap score of how relevant a listing's TITLE is to the candidate — used to pick which
+    URL-only listings to resolve+judge. Overlap of title/category tokens with the résumé's role
+    words (weighted) + skills, excluding generic level words so 'intern' alone isn't a match."""
+    toks = {t for t in _WORD_RE.findall(f"{title} {category}".lower()) if t not in _LEVEL_TOKENS}
+    role_words: set[str] = set()
+    for exp in resume.experience:
+        role_words |= {t for t in _WORD_RE.findall((exp.role or "").lower()) if t not in _LEVEL_TOKENS}
+    skills = {it.lower() for cat in resume.skills for it in cat.items}
+    return len(toks & role_words) * 2 + len(toks & skills)
+
+
+class CuratedListSource(Source):
+    """Early-career discovery from the SimplifyJobs new-grad/internship JSON feeds
+    (DECISIONS.md #031). Keeps `active` roles whose apply link is a resolvable+fillable ATS
+    (Greenhouse/Lever/Ashby), ranks them by title-relevance to the résumé, resolves the full JD
+    for the top `max_resolve`, and emits full-JD Postings. Personal-use only (public job links)."""
+
+    def __init__(self, resume, kinds=("new-grad", "intern"), max_resolve: int = 40) -> None:
+        self.resume = resume
+        self.kinds = tuple(kinds)
+        self.max_resolve = max_resolve
+        self.name = "curated:" + ",".join(self.kinds)
+
+    def fetch(self) -> list[Posting]:
+        import html as _html
+
+        def clean(s: str) -> str:
+            return _html.unescape(s or "").strip()
+
+        seen: set[str] = set()
+        listings: list[tuple[dict, str]] = []
+        for kind in self.kinds:
+            feed = _SIMPLIFY_FEEDS.get(kind)
+            if not feed:
+                continue
+            data = fetch_json(feed)
+            for e in data if isinstance(data, list) else []:
+                if not e.get("active"):
+                    continue
+                url = e.get("url", "")
+                ats = detect_ats_from_url(url)
+                if ats not in _CURATED_ATS or not url or url in seen:
+                    continue
+                seen.add(url)
+                listings.append((e, ats))
+
+        listings.sort(
+            key=lambda ea: _title_relevance(self.resume, clean(ea[0].get("title", "")),
+                                            clean(ea[0].get("category", ""))),
+            reverse=True,
+        )
+        ashby_cache: dict = {}
+        out: list[Posting] = []
+        for e, ats in listings[: self.max_resolve]:
+            title = clean(e.get("title", ""))
+            url = e.get("url", "")
+            locs = e.get("locations") or []
+            location = ", ".join(str(x) for x in locs[:2]) if isinstance(locs, list) else str(locs)
+            body = _resolve_jd(url, ats, ashby_cache)
+            if not body:  # resolution failed — keep a minimal body so it still flows (degraded)
+                body = (f"{title}. Early-career role. Category: {clean(e.get('category', ''))}. "
+                        f"Degrees: {', '.join(e.get('degrees') or [])}.")
+            out.append(Posting(
+                company=clean(e.get("company_name", "")) or ats,
+                title=title, body=body, url=url, ats=ats,
+                location=location, apply_url=url,
+                extra={"curated": True, "sponsorship": e.get("sponsorship"),
+                       "category": clean(e.get("category", ""))},
+            ))
+        return out
+
+
 # Map an ATS name to its source constructor, for building sources from config.
 ATS_SOURCES = {
     "greenhouse": GreenhouseSource,
@@ -507,6 +754,7 @@ ATS_SOURCES = {
     "ashby": AshbySource,
     "smartrecruiters": SmartRecruitersSource,
     "recruitee": RecruiteeSource,
+    "workable": WorkableSource,
 }
 
 
@@ -536,3 +784,67 @@ def discover(sources: list[Source]) -> tuple[list[Posting], list[str]]:
         except Exception as e:  # defensive: a malformed field shouldn't kill the run
             errors.append(f"{src.name}: unexpected {type(e).__name__}: {e}")
     return postings, errors
+
+
+# ---------------------------------------------------------------------------
+# Aggregator → ATS bridge (DECISIONS.md #032)
+#
+# Aggregators (Adzuna/Jooble) return a snippet + an apply link that redirects through their
+# OWN domain, so you can't tell the real ATS from the API response. This bridge follows that
+# redirect, and when it lands on an ATS the Apply stage can fill, rewrites the posting's
+# `ats` + `apply_url` so the aggregator hit flows straight into auto-apply — and, for the ATSs
+# with a public JD API, upgrades the snippet body to the full JD via the existing resolvers.
+# ---------------------------------------------------------------------------
+
+# Aggregators whose apply links redirect through their own domain (need resolving to find the ATS).
+_AGGREGATOR_ATS = {"adzuna", "jooble"}
+_BRIDGE_MAX = 60  # cap redirect resolutions per run (one network call each) — polite + bounded
+
+
+def resolve_redirect(url: str) -> str:
+    """Follow HTTP redirects to the final destination URL. Aggregators link through their own
+    domain; this returns the real posting URL so `detect_ats_from_url` can classify it. Tries a
+    cheap HEAD, falls back to GET, and returns the original URL on any failure. urllib follows
+    the 30x chain — JS/meta-refresh interstitials (some Jooble pages) are not followed."""
+    if not url:
+        return url
+    for method in ("HEAD", "GET"):
+        try:
+            req = urllib.request.Request(url, method=method, headers={"User-Agent": _UA})
+            with urllib.request.urlopen(req, timeout=_TIMEOUT, context=_SSL_CTX) as r:
+                return r.geturl()
+        except Exception:
+            continue
+    return url
+
+
+def bridge_aggregator_postings(postings, *, limit: int = _BRIDGE_MAX, upgrade_jd: bool = True, on_progress=None):
+    """Turn aggregator hits into auto-apply candidates. For each posting whose `ats` is an
+    aggregator, resolve its redirect and — when it lands on a recognized ATS — rewrite `ats`
+    + `apply_url` so it flows into Apply, recording the original ats in `extra['bridged_from']`
+    and whether we have a dedicated adapter in `extra['auto_applyable']`. When `upgrade_jd` and
+    the ATS exposes a public JD API (Greenhouse/Lever/Ashby), replace the aggregator's *snippet*
+    body with the full JD. Postings already on a known ATS are left untouched. Mutates and
+    returns (postings, n_bridged); bounded by `limit` redirect resolutions to stay polite."""
+    to_bridge = [p for p in postings if p.ats in _AGGREGATOR_ATS]
+    ashby_cache: dict = {}
+    bridged = 0
+    for i, p in enumerate(to_bridge[:limit]):
+        final = resolve_redirect(p.apply_url or p.url)
+        ats = detect_ats_from_url(final)
+        if ats not in ("other", ""):
+            p.extra["bridged_from"] = p.ats
+            p.extra["auto_applyable"] = ats in ATS_SOURCES  # do we have a dedicated adapter?
+            p.ats = ats
+            p.apply_url = final
+            if upgrade_jd:
+                full = _resolve_jd(final, ats, ashby_cache)  # full JD for GH/Lever/Ashby, else ''
+                if full and len(full) > len(p.body):
+                    p.body = full
+                    p.extra["jd_upgraded"] = True
+            bridged += 1
+        else:
+            p.extra["auto_applyable"] = False
+        if on_progress:
+            on_progress(i + 1, min(len(to_bridge), limit))
+    return postings, bridged

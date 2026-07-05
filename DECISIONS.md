@@ -41,6 +41,8 @@
 | 028 | 2026-07-05 | Semantic question classification: on a keyword miss, Claude maps a novel question onto a known structured field type; cache the mapping (answer stays live) | Accepted |
 | 029 | 2026-07-05 | Persist tailored résumé PDFs to a stable git-ignored store (not `$TMPDIR`); bound growth via per-posting overwrite + cascade delete + size cap | Accepted |
 | 030 | 2026-07-05 | More discovery sources: broaden the ATS layer (SmartRecruiters + Recruitee) over aggregators; reject hiring.cafe (now auth-gated) + LinkedIn (Guideline #4) | Accepted |
+| 031 | 2026-07-05 | Early-career discovery: SimplifyJobs new-grad/intern JSON feeds → rank by title-relevance → resolve full JD for top-K via linked ATS; curated postings judged first | Accepted |
+| 032 | 2026-07-05 | Workable source + aggregator→ATS bridge (resolve redirect → detect ATS → rewrite apply_url + upgrade snippet to full JD); partner APIs (SEEK/Indeed/LinkedIn) out | Accepted |
 
 ---
 
@@ -1123,3 +1125,100 @@ with 0 errors. See [[026-discover-stage]] (the source interface + pipeline this 
 [[016-apply-stage]] (the generic autofill these new ATSs exercise), [[017-native-autofill]],
 [[004-respect-tos]] (Guideline #4, why hiring.cafe/LinkedIn are out), [[015-linkedin-import]]
 (the compliant LinkedIn path).
+
+## 032 — Workable source + aggregator→ATS bridge (turn search-only hits into auto-apply candidates)
+
+**Date:** 2026-07-05
+**Status:** Accepted
+
+**Context:** Continuing decision #030's "broaden the ATS layer for autofill diversity." Two
+follow-ups: (a) add **Workable** (the one gap in the common auto-apply ATS set: Greenhouse,
+Lever, SmartRecruiters, Workable); (b) evaluated **Adzuna / USAJobs / Jooble** and ChatGPT's
+source recommendations. Verified live that the aggregators are **search-only for us**: Adzuna's
+`redirect_url` and Jooble's `link` both point at the aggregator's *own* domain, so the API
+response never reveals the destination ATS — and ChatGPT's "partner ecosystem" row (SEEK / Indeed
+/ LinkedIn) is **inapplicable**: all three are employer/partner-gated and un-onboardable by a solo
+dev (Indeed's Publisher API 301s to partners.indeed.com; SEEK needs a hirer relationship; LinkedIn
+is partner-gated + post-only). So aggregators can only feed auto-apply if we **resolve the
+redirect and detect the ATS** — the bridge.
+
+**Decision:**
+- **`WorkableSource`** (`discovery.py`, registered in `ATS_SOURCES`): `POST
+  apply.workable.com/api/v3/accounts/{account}/jobs` (token-paginated) + `GET api/**v2**/…/{shortcode}`
+  for the full JD (list omits the body — an N+1 like SmartRecruiters, bounded by
+  `_DETAIL_MAX_POSTINGS`). Apply URL constructed as `apply.workable.com/{account}/j/{shortcode}/`.
+  `fetch_json` extended with optional `method`/`body` so it can POST (backward-compatible).
+- **Aggregator→ATS bridge** (`discovery.py`): `resolve_redirect(url)` follows the 30x chain
+  (HEAD→GET) to the real destination; `bridge_aggregator_postings(postings)` — for each posting
+  whose `ats` is an aggregator (`adzuna`/`jooble`) — resolves the link, and when it lands on a
+  recognized ATS (`detect_ats_from_url`, extended here to cover recruitee + workable) **rewrites
+  `ats` + `apply_url`** so the hit flows into Apply, records `extra['bridged_from']` /
+  `['auto_applyable']`, and — for the ATSs with a public JD API (Greenhouse/Lever/Ashby, via the
+  curated-list `_resolve_jd` resolvers) — **upgrades the aggregator's snippet body to the full
+  JD**. Bounded by `_BRIDGE_MAX = 60` redirect resolutions/run. Wired into `pipeline.discover_and_match`
+  (new `bridge=True` param + `PipelineResult.bridged`), before matching so the matcher ranks on the
+  upgraded JD; a **no-op when no aggregator postings are present** (zero added latency on ATS-only runs).
+
+**Reasoning:** Workable completes the practical auto-apply ATS set and is a new form system for the
+autofill (decision #030's goal). The bridge is the only compliant way an aggregator (which just
+hands back a redirect) can feed auto-apply — it also **solves Adzuna/Jooble being snippet-only** by
+re-fetching the full JD from the real ATS, so a bridged hit tailors/matches as well as a native ATS
+hit. Reused the parallel agent's `detect_ats_from_url` + `_resolve_jd` (built for the early-career
+curated feeds, #031) rather than duplicating — coordinated via the agent bus (claimed
+`discovery.py`/`pipeline.py`). USAJobs/Jooble/Muse remain deferred behind the same interface;
+the partner ecosystem is out (Guideline #4).
+
+**Verified live:** Workable (mlabs 4/4 full JD, correct apply-URL format, JD round-trip). Bridge:
+`detect_ats_from_url` correct across all 6 ATSs + workday + aggregator; `resolve_redirect` follows a
+real 30x; a synthetic Adzuna hit → **greenhouse**, snippet **upgraded to the full 7.5k-char JD**
+(`jd_upgraded=True`, `auto_applyable=True`); non-aggregator postings untouched; and the full
+`discover_and_match` bridged an injected aggregator posting in-pipeline (→ greenhouse, 11.7k-char JD)
+through to a match. See [[030-more-ats-sources]] (the layer this extends), [[026-discover-stage]]
+(the pipeline + `detect_ats_from_url`/`_resolve_jd` it reuses), [[016-apply-stage]] (where bridged
+apply URLs land), [[014-agent-bus]] (parallel-work coordination), [[004-respect-tos]].
+
+---
+
+## 031 — Early-career discovery via community-curated JSON feeds
+
+**Date:** 2026-07-05
+**Status:** Accepted
+
+**Context:** With senior-heavy target boards (e.g. Stripe), the Claude fit-judge correctly
+denied every posting for a junior/intern résumé — 0 of 10 judged cleared the fit cutoff. The
+user asked for boards curated toward early career. Verified the 2026 landscape: the dedicated
+early-career platforms (RippleMatch, Handshake, WayUp) are all login/partner-gated with no
+individual API, and Adzuna's ToS only licenses a 14-day trial. The community, however,
+maintains daily-updated machine-readable lists of new-grad and internship roles.
+
+**Options considered:**
+| Option | Verdict |
+|---|---|
+| **SimplifyJobs new-grad + internship `listings.json` feeds** | **Chosen** — early-career by construction (no senior roles), ~2,000 active new-grad + ~1,250 intern, ~40% link to Greenhouse/Lever/Ashby (we fetch JD + fill), free, daily-updated |
+| Adzuna with "new grad"/"intern" keywords | Rejected as a persistent source — ToS licenses only a 14-day trial; keep evaluation-only |
+| RippleMatch / Handshake / WayUp | Rejected — no individual public API (login/partner-gated) |
+| USAJobs Pathways (GRADUATES/STUDENT) | Deferred — clean + full JD, but federal portals aren't autofillable (discovery/tracking only) |
+
+**Decision:** New `CuratedListSource` (`discovery.py`, `DiscoveryFilters.early_career`,
+off by default). It fetches the SimplifyJobs New-Grad + Summer2026-Internships feeds, keeps
+`active==true` roles whose apply URL is a **resolvable + fillable ATS (Greenhouse/Lever/Ashby)**,
+dedupes by URL, ranks them by **title-relevance to the résumé** (role-word + skill overlap,
+excluding generic level tokens), and **resolves the full JD for the top `max_resolve`** via that
+ATS's single-job endpoint (Greenhouse `/jobs/{id}`, Lever `/postings/{site}/{id}`, Ashby board
+index by uuid) — emitting normal full-JD `Posting`s so the matcher/apply pipeline is unchanged.
+The lists are URL-only (title + link, no JD text), which is why JD resolution is needed;
+resolution failures fall back to a title-only body. Because a verbose senior board JD's larger
+skill overlap would otherwise crowd curated roles out of the judged top-N, **curated postings are
+ranked ahead of raw board postings** in `keyword_rank` (they're already pre-vetted to the user's
+level). Config exposed in the Discover-settings editor (enable + kinds + how many to resolve).
+Personal-use only: the feeds carry no explicit redistribution license, so this reads public job
+links to apply for oneself, not to redistribute (Guideline #4).
+
+**Reasoning:** It's the only clean, no-scraping way to get *early-career-specific* breadth — the
+platforms built for it are all gated. Resolving full JD from the linked ATS (rather than judging
+on title alone) keeps fit-judging accurate, and reuses ATS endpoints we already trust. Verified
+end-to-end: enabling early-career on the same senior-heavy config took the run from **0 cleared**
+to **4 cleared** (AppLovin New-Grad 82, MARGO 78, Blitzy 68, Evolver 68), while the senior board
+roles still correctly denied (≤42) — exactly the intended effect. See [[026-discover-stage]] (the
+source interface + matcher), [[027-experience-level-gate]] (complementary title-level gate),
+[[016-apply-stage]] (fills the linked ATS), [[004-respect-tos]] (Guideline #4, personal-use only).

@@ -33,7 +33,7 @@ from pydantic import BaseModel, Field
 import os
 
 from .apply_profile import ApplicationProfile
-from .discovery import AdzunaSource, Source, build_source
+from .discovery import AdzunaSource, CuratedListSource, Source, build_source
 from .models import Resume
 
 DEFAULT_PATH = "profile/discovery.yaml"
@@ -46,8 +46,8 @@ _HEADER = (
 
 
 class Board(BaseModel):
-    ats: str  # greenhouse | lever | ashby | smartrecruiters | recruitee
-    token: str  # the board token/company slug read off the careers URL (e.g. 'stripe', 'Visa', 'bunq')
+    ats: str  # greenhouse | lever | ashby | smartrecruiters | recruitee | workable
+    token: str  # the board token/company slug read off the careers URL (e.g. 'stripe', 'Visa', 'bunq', 'mlabs')
 
 
 class AdzunaConfig(BaseModel):
@@ -58,6 +58,15 @@ class AdzunaConfig(BaseModel):
     app_key: str = ""
     country: str = "us"
     max_pages: int = 1  # 50 results/page; raise for more breadth
+
+
+class EarlyCareerConfig(BaseModel):
+    """Discover from community new-grad/internship JSON feeds (SimplifyJobs) — early-career by
+    construction, no company list needed. Off by default (DECISIONS.md #031)."""
+
+    enabled: bool = False
+    kinds: list[str] = Field(default_factory=lambda: ["new-grad", "intern"])  # new-grad | intern
+    max_resolve: int = 40  # how many top title-relevant listings to resolve full JD for + judge
 
 
 # Experience-level taxonomy (Configure/Discover gate). Each level maps to a regex matched
@@ -114,6 +123,7 @@ class DiscoveryFilters(BaseModel):
     min_fit: int = 50  # only follow through (dry-run/apply) on matches Claude scores ≥ this (0-100)
     skip_seen: bool = True  # drop postings already in the tracker (don't re-apply to the same role)
     adzuna: AdzunaConfig = Field(default_factory=AdzunaConfig)
+    early_career: EarlyCareerConfig = Field(default_factory=EarlyCareerConfig)
 
 
 def load_filters(path: str | Path = DEFAULT_PATH) -> DiscoveryFilters:
@@ -141,6 +151,12 @@ def build_sources(
     agg = build_aggregator(filters, resume, profile)
     if agg is not None:
         sources.append(agg)
+    # Early-career curated feeds (needs the résumé to rank listings by title-relevance).
+    if filters.early_career.enabled and resume is not None:
+        sources.append(CuratedListSource(
+            resume, kinds=tuple(filters.early_career.kinds or ["new-grad", "intern"]),
+            max_resolve=filters.early_career.max_resolve,
+        ))
     return sources
 
 

@@ -41,6 +41,7 @@ class PipelineResult:
     after_gates: int
     errors: list[str]
     skipped_seen: int = 0  # postings dropped because they're already in the tracker
+    bridged: int = 0  # aggregator hits resolved to a fillable ATS (decision 032)
 
 
 def discover_and_match(
@@ -50,10 +51,13 @@ def discover_and_match(
     profile: ApplicationProfile | None = None,
     extra_sources: list[Source] | None = None,
     use_claude: bool = True,
+    bridge: bool = True,
     on_progress=None,
 ) -> PipelineResult:
-    """The reusable core: discover → gate → skip-already-seen → qualification-match. No side
-    effects. `on_progress(done, total)` reports Claude-judging progress for a UI."""
+    """The reusable core: discover → gate → skip-already-seen → bridge → qualification-match.
+    No side effects. `on_progress(done, total)` reports Claude-judging progress for a UI.
+    `bridge` resolves aggregator (Adzuna/Jooble) redirect links to their real ATS so those
+    hits become auto-applyable (a no-op when no aggregator postings are present)."""
     sources = build_sources(filters, resume, profile) + list(extra_sources or [])
     if not sources:
         return PipelineResult([], 0, 0, ["No sources configured. Add boards to profile/discovery.yaml."])
@@ -76,6 +80,14 @@ def discover_and_match(
             postings = [p for p in postings if p.url not in seen]
             skipped_seen = before - len(postings)
 
+    # Bridge aggregator hits (Adzuna/Jooble) to their real ATS before matching, so the matcher
+    # ranks them on the full JD and Apply lands on the fillable form (decision 032). No-op when
+    # no aggregator postings are present, so it adds zero latency to ATS-only runs.
+    bridged = 0
+    if bridge:
+        from .discovery import bridge_aggregator_postings
+        postings, bridged = bridge_aggregator_postings(postings)
+
     matches, match_errors = match(
         resume, postings, top_n=filters.top_n, use_claude=use_claude,
         min_skills=filters.min_skills, on_progress=on_progress,
@@ -86,6 +98,7 @@ def discover_and_match(
         after_gates=len(postings),
         errors=errors + match_errors,
         skipped_seen=skipped_seen,
+        bridged=bridged,
     )
 
 
@@ -234,7 +247,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Discovering from {len(filters.boards)} board(s)…")
     res = discover_and_match(resume, filters, profile=profile, use_claude=use_claude)
     seen_note = f" (skipped {res.skipped_seen} already in tracker)" if res.skipped_seen else ""
-    print(f"Discovered {res.discovered} postings → {res.after_gates} after gates{seen_note} → "
+    bridge_note = f" (bridged {res.bridged} aggregator hit(s) to a fillable ATS)" if res.bridged else ""
+    print(f"Discovered {res.discovered} postings → {res.after_gates} after gates{seen_note}{bridge_note} → "
           f"{len(res.matches)} matched ≥{filters.min_skills} skill(s).")
     for e in res.errors:
         print(f"  ! {e}")

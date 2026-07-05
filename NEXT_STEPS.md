@@ -203,6 +203,39 @@ and free-form notes.
 
 ## Recently added (this session, latest first)
 
+- 2026-07-05 — **Early-career discovery: SimplifyJobs new-grad/intern feeds (decision 031).** With
+  senior-heavy boards, 0 of 10 judged roles cleared the fit cutoff for a junior résumé. New
+  `CuratedListSource` reads the community SimplifyJobs New-Grad + Summer2026-Internships
+  `listings.json` (early-career by construction), keeps `active` roles on a resolvable+fillable ATS
+  (Greenhouse/Lever/Ashby), ranks them by title-relevance to the résumé, and **resolves the full JD
+  for the top-K** via the linked ATS's single-job endpoint — emitting normal full-JD Postings.
+  Curated postings are **judged first** in `keyword_rank` so verbose senior board JDs don't crowd
+  them out. Config: `DiscoveryFilters.early_career` (enable/kinds/max_resolve) + a toggle in the
+  Discover-settings editor; off by default. Personal-use only (public job links; Guideline #4).
+  **Verified live:** on the same senior-heavy config, enabling it took the run from **0 cleared →
+  4 cleared** (AppLovin New-Grad 82, MARGO 78, Blitzy 68, Evolver 68) while senior board roles
+  still correctly denied (≤42). *Follow-ups:* add SmartRecruiters/Workday JD resolution (more of
+  the ~40% supported grows); a "browse all judged / pick manually" view; USAJobs Pathways (discovery-only).
+
+- 2026-07-05 — **Workable source + aggregator→ATS bridge (decision 032).** (1) **`WorkableSource`**
+  added to `ATS_SOURCES` — `POST apply.workable.com/api/v3/accounts/{account}/jobs` (token-paginated)
+  + `GET api/v2/…/{shortcode}` for the full JD (N+1 like SmartRecruiters, bounded by
+  `_DETAIL_MAX_POSTINGS`); apply URL `apply.workable.com/{account}/j/{shortcode}/`. `fetch_json` now
+  supports POST. Config: `{ats: workable, token: <account>}`. Completes the auto-apply ATS set
+  (GH/Lever/SmartRecruiters/Workable). **Verified live:** mlabs 4/4 full JD, apply-URL format, JD
+  round-trip. (2) **Aggregator→ATS bridge** — `resolve_redirect()` follows the 30x chain and
+  `bridge_aggregator_postings()` turns an Adzuna/Jooble hit (which only returns a redirect through
+  its own domain) into an auto-apply candidate: resolve → `detect_ats_from_url` (extended to cover
+  recruitee+workable) → rewrite `ats`+`apply_url`, and for GH/Lever/Ashby **upgrade the snippet body
+  to the full JD** via the curated-list resolvers. Wired into `discover_and_match` (`bridge=True`,
+  `PipelineResult.bridged`), before matching; a **no-op when no aggregator postings are present**.
+  Reused the parallel agent's `detect_ats_from_url`/`_resolve_jd` (coordinated via the agent bus).
+  **Verified live:** detector across all 6 ATSs+workday; real 30x resolved; synthetic Adzuna→greenhouse
+  with snippet→7.5k-char full-JD upgrade; in-pipeline bridge of an injected aggregator hit →
+  greenhouse (11.7k-char JD) → match. *Findings this session:* hiring.cafe now auth-gated (rejected,
+  Guideline #4); LinkedIn/Indeed/SEEK partner-gated (out); USAJobs/Jooble/Muse deferred behind the
+  same interface (USAJobs is full-JD but gov-portal apply = not autofillable).
+
 - 2026-07-05 — **Discover tab shows judged postings (denied + accepted) + judges more.** When a
   dry-run couldn't find a posting clearing the fit cutoff, the user had no visibility into what
   the searches returned. Now the Discover tab lists **every Claude-judged posting ranked**, each

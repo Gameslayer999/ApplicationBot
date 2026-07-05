@@ -1583,6 +1583,18 @@ function renderDiscForm(f, levels) {
     area("Aggregator search keywords (one per line; empty = derive from your résumé)", "keywords", (f.keywords||[]).join("\\n")),
   ]));
 
+  const ec = f.early_career || {};
+  const kinds = ec.kinds || ["new-grad","intern"];
+  const kindBox = (v,label) => { const i = mkChk(null, kinds.includes(v)); i.dataset.eck = v; return el("label", {class:"chkrow"}, [i, " " + label]); };
+  form.appendChild(el("div", {class:"sec"}, [
+    el("h4", {text:"Early-career feeds (new-grad & internships)"}),
+    el("div", {class:"editing", text:"Discover from community-curated SimplifyJobs lists of new-grad and internship roles — early-career by construction, no company list needed. Best when your target boards are senior-heavy. Only roles on ATSs we can fill (Greenhouse/Lever/Ashby) are used."}),
+    chkRow("Enable early-career feeds", "ec_enabled", ec.enabled),
+    el("label", {text:"Include"}),
+    el("div", {class:"lvls"}, [kindBox("new-grad","new-grad"), kindBox("intern","internships")]),
+    numFld("How many top-matching listings to pull full descriptions for (per run)", "ec_max_resolve", ec.max_resolve==null?40:ec.max_resolve),
+  ]));
+
   const a = f.adzuna || {};
   form.appendChild(el("div", {class:"sec"}, [
     el("h4", {text:"Adzuna aggregator (optional)"}),
@@ -1616,6 +1628,11 @@ function collectDisc() {
       app_key: discVal("adz_app_key").trim(),
       country: discVal("adz_country").trim() || "us",
       max_pages: discInt("adz_max_pages", 1),
+    },
+    early_career: {
+      enabled: discChk("ec_enabled"),
+      kinds: [...document.querySelectorAll("#disc-form [data-eck]")].filter(c => c.checked).map(c => c.dataset.eck),
+      max_resolve: discInt("ec_max_resolve", 40),
     },
   };
 }
