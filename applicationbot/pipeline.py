@@ -22,10 +22,10 @@ Run:
 from __future__ import annotations
 
 import os
-import tempfile
 from dataclasses import dataclass
 
 from . import backends
+from . import resume_store
 from .apply_profile import ApplicationProfile, load_profile
 from .discovery import Source, discover
 from .filters import DiscoveryFilters, apply_gates, build_sources, load_filters
@@ -40,6 +40,7 @@ class PipelineResult:
     discovered: int
     after_gates: int
     errors: list[str]
+    skipped_seen: int = 0  # postings dropped because they're already in the tracker
 
 
 def discover_and_match(
@@ -51,8 +52,8 @@ def discover_and_match(
     use_claude: bool = True,
     on_progress=None,
 ) -> PipelineResult:
-    """The reusable core: discover → gate → qualification-match. No side effects.
-    `on_progress(done, total)` reports Claude-judging progress for a UI."""
+    """The reusable core: discover → gate → skip-already-seen → qualification-match. No side
+    effects. `on_progress(done, total)` reports Claude-judging progress for a UI."""
     sources = build_sources(filters, resume, profile) + list(extra_sources or [])
     if not sources:
         return PipelineResult([], 0, 0, ["No sources configured. Add boards to profile/discovery.yaml."])
@@ -60,6 +61,21 @@ def discover_and_match(
     postings, errors = discover(sources)
     discovered = len(postings)
     postings = apply_gates(postings, filters)
+
+    # Skip postings already in the tracker so we don't keep re-surfacing/re-applying to the
+    # same roles (keyed on the posting URL, which is what the Apply stage records).
+    skipped_seen = 0
+    if filters.skip_seen:
+        from . import tracker
+        try:
+            seen = tracker.seen_source_urls()
+        except Exception:
+            seen = set()
+        if seen:
+            before = len(postings)
+            postings = [p for p in postings if p.url not in seen]
+            skipped_seen = before - len(postings)
+
     matches, match_errors = match(
         resume, postings, top_n=filters.top_n, use_claude=use_claude,
         min_skills=filters.min_skills, on_progress=on_progress,
@@ -69,6 +85,7 @@ def discover_and_match(
         discovered=discovered,
         after_gates=len(postings),
         errors=errors + match_errors,
+        skipped_seen=skipped_seen,
     )
 
 
@@ -97,7 +114,11 @@ def pick_top(matches: list[Match], *, min_fit: int) -> Match | None:
     for m in matches:
         if m.fit_score is not None and m.fit_score >= min_fit:
             return m
-    # No Claude judgments (e.g. CLI absent) — fall back to the top keyword match.
+    # If Claude judged any posting, respect the threshold — return None rather than silently
+    # applying to a below-bar match (that bypass is why a 45/100 role got picked at min_fit=50).
+    if any(m.fit_score is not None for m in matches):
+        return None
+    # No Claude judgments at all (e.g. CLI absent) — fall back to the top keyword match.
     return matches[0] if matches else None
 
 
@@ -138,9 +159,9 @@ def run_testing_mode(
         print(f"  note: {note}")
 
     say("pdf", "▶ Exporting tailored résumé to PDF…")
-    pdf_path = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False, prefix="tailored_").name
-    with open(pdf_path, "wb") as f:
-        f.write(render_pdf(resume, result.tailored))
+    # Stable, git-ignored, per-posting path (decision 029) — not $TMPDIR, which macOS
+    # purges out from under the Track row's resume_path.
+    pdf_path = resume_store.write_pdf(render_pdf(resume, result.tailored), p.company, p.title, p.url)
     print(f"  résumé PDF → {pdf_path}")
 
     apply_url = p.apply_url or p.url
@@ -150,11 +171,20 @@ def run_testing_mode(
         resume=load_resume(resume_yaml),
         profile=load_profile(profile_path),
         enable_generation=generate,
+        company=p.company or None,
+        jd=jd.body or None,
     )
+    # Basic info for the Track record comes from the discovered posting (reliable), keyed on
+    # the posting URL for dedup — not scraped from the ATS form page.
+    meta = {
+        "company": p.company, "role": p.title, "location": p.location,
+        "remote": ("remote" if p.remote else ("on-site" if p.remote is False else "")),
+        "pay": p.compensation, "source_url": p.url,
+    }
     return run_apply(
         apply_url, pdf_path, resolver,
         headed=headed, pause=pause, slow_mo=slow_mo,
-        profile_path=profile_path, hold=hold, on_filled=on_filled,
+        profile_path=profile_path, hold=hold, on_filled=on_filled, meta=meta,
     )
 
 
@@ -174,8 +204,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--apply-first", action="store_true",
                         help="TESTING MODE: after ranking, run the full tailor→PDF→dry-run "
                         "apply loop on the single top match (headed, never submits).")
-    parser.add_argument("--min-fit", type=int, default=50,
-                        help="Testing mode: minimum Claude fit score (0-100) to pick a match.")
+    parser.add_argument("--min-fit", type=int, default=None,
+                        help="Testing mode: minimum Claude fit score (0-100) to pick a match. "
+                        "Defaults to min_fit in your discovery filters.")
     parser.add_argument("--backend", default="auto", choices=["auto", "claude-code", "rules"],
                         help="Tailoring backend for testing mode.")
     parser.add_argument("--headless", action="store_true", help="Testing mode: no visible browser.")
@@ -202,7 +233,8 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"Discovering from {len(filters.boards)} board(s)…")
     res = discover_and_match(resume, filters, profile=profile, use_claude=use_claude)
-    print(f"Discovered {res.discovered} postings → {res.after_gates} after gates → "
+    seen_note = f" (skipped {res.skipped_seen} already in tracker)" if res.skipped_seen else ""
+    print(f"Discovered {res.discovered} postings → {res.after_gates} after gates{seen_note} → "
           f"{len(res.matches)} matched ≥{filters.min_skills} skill(s).")
     for e in res.errors:
         print(f"  ! {e}")
@@ -216,9 +248,10 @@ def main(argv: list[str] | None = None) -> int:
             print("\n(Run again with --apply-first to watch the top match go end-to-end in dry-run.)")
         return 0
 
-    top = pick_top(res.matches, min_fit=args.min_fit)
+    min_fit = args.min_fit if args.min_fit is not None else filters.min_fit
+    top = pick_top(res.matches, min_fit=min_fit)
     if top is None:
-        print(f"\nNo match met --min-fit {args.min_fit}; nothing to apply to.")
+        print(f"\nNo match met min-fit {min_fit}; nothing to apply to.")
         return 1
     run_testing_mode(
         resume, top, args.resume, args.profile,

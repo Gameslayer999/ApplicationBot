@@ -103,15 +103,23 @@ and free-form notes.
       testing-mode loop in a background thread, streams step-by-step progress (incl. a Claude
       judged-N/M bar), shows the single chosen match (fit / why / missing), and a **Finish —
       close browser** button (web-friendly review hold, replacing the terminal pause). Never
-      submits; records a `dry-run` Track row. *Remaining:* edit `discovery.yaml` boards/gates
-      from the tab (still hand-edited), and a browse-all-ranked-matches view.
+      submits; records a `dry-run` Track row. Now also has a **full Discovery-settings editor**
+      (boards + all gates/knobs, editable from the tab — no more hand-editing the yaml).
+      *Remaining:* a browse-all-ranked-matches view.
 - [ ] **Aggregator full-JD** — Adzuna is snippet-only; either fetch the `redirect_url` page for
       full text (ToS-permitting) or accept snippet-degraded tailoring for aggregator hits, and
       add a free-key setup path (env or the Discover tab).
-- [ ] **More sources behind the interface** (as needed): USAJobs (federal, full JD, free key),
-      remote feeds (Remotive/Arbeitnow — honor poll/attribution terms). Optional Workday.
-- [ ] **De-dupe against the tracker** — skip postings already discovered/applied (by source URL)
-      so re-runs don't re-surface the same jobs.
+- [~] **More sources behind the interface** — **added (decision 030):** SmartRecruiters +
+      Recruitee, two *distinct* ATS form systems (public no-auth APIs, full JD, direct apply URL),
+      to exercise the Apply autofill on more layouts. **Rejected:** hiring.cafe (its search API is
+      now Bearer-auth-gated — replaying its token would circumvent an access control, Guideline #4)
+      and LinkedIn (no candidate API; scraping breaks ToS). *Follow-ups behind the same interface:*
+      Workable (needs a working no-auth endpoint — the widget returned 0 jobs for every slug tried),
+      The Muse (full JD but apply links go through a themuse.com hop), USAJobs (federal, full JD, but
+      routes into non-autofillable gov portals — discovery/tracking only).
+- [x] **De-dupe against the tracker** — done: discovery skips postings already in the tracker
+      (`tracker.seen_source_urls()`, `DiscoveryFilters.skip_seen=True`), surfaced as "skipped N
+      already in tracker" in the CLI + Discover tab.
 
 - [ ] **Run the customizer live via Claude** on `profile/resume.yaml` once logged in
       (`ant auth login`, no key needed) — confirm bullet-rewriting output is factual, the
@@ -194,6 +202,165 @@ and free-form notes.
 ---
 
 ## Recently added (this session, latest first)
+
+- 2026-07-05 — **Dropdown option-matching: country-reside + degree now fill.** Live-DOM debug of
+  the Stripe embedded Greenhouse form showed the country dropdown's US option is literally **"US"**
+  (abbreviated list: UAE/UK/US) and degree options are standard levels ("Bachelor's Degree"), so
+  our verbose values ("United States", "Bachelor of Science in Computer Science, …") matched
+  nothing. Fixes: (1) `_degree_hints()` maps a résumé degree to the standard level ("Bachelor's
+  Degree", etc.); (2) re-added US/USA country hints — now **safe** because `_matches` whole-words
+  short values; (3) **rewrote `_fill_combobox`** to open the menu ONCE and match any candidate
+  against the shown options (static lists like a 29-country dropdown resolve in one open — faster
+  and more reliable than re-typing each candidate, which made react-select flaky), falling back to
+  per-candidate typing for async lists (geocoder), with an Escape reset between phases so the
+  geocoder still works. **Verified live:** Location→"Edison, New Jersey, United States",
+  country-reside→"US", degree→"Bachelor's Degree", all prior fills intact, no wrong "Australia".
+  *Known perf follow-up:* a full fill is ~2.5 min — the per-combobox `_open_options` timeouts
+  compound; worth trimming later.
+
+- 2026-07-05 — **Two more ATS discovery sources: SmartRecruiters + Recruitee (decision 030).**
+  Researched improving discovery breadth (user named hiring.cafe/LinkedIn) with the explicit goal
+  of exercising the Apply autofill on *more ATS form systems*. **Probed every candidate API live**
+  — which mattered: **hiring.cafe's** search API has moved behind session Bearer-token auth
+  (`/api/search-jobs` now 401/405; frontend uses `/ssr/search-jobs` with an auth-derived token), so
+  the scraper repos the research cited are stale and using it would circumvent an access control
+  (Guideline #4) — **rejected**; **LinkedIn** re-confirmed off-limits (no candidate API; scraping
+  breaks ToS). Chose to **broaden the ATS layer** instead of adding an aggregator, since a new ATS
+  is a genuinely new form system (aggregators dump you on a listing page or an ATS we already
+  handle). Added `SmartRecruitersSource` (`api.smartrecruiters.com/v1/companies/{co}/postings` + a
+  per-posting detail call for the full JD, bounded by `_SR_MAX_POSTINGS=100`) and `RecruiteeSource`
+  (`{co}.recruitee.com/api/offers/`, one call, full JD inline) to `ATS_SOURCES` — **no schema
+  change** (the `Board{ats, token}` model already takes any ats string; config is
+  `{ats: smartrecruiters, token: <Company>}` / `{ats: recruitee, token: <company>}`). Zero new deps.
+  **Verified live:** SmartRecruiters (PublicStorage 5/5, BoschGroup 3/3) + Recruitee (bunq 16/16)
+  return full JD, direct apply URLs, and round-trip through `to_job_description()`/`to_markdown()`;
+  the full pipeline ran discover→gate→match over 505 postings with 0 errors. Caveat: many big
+  SmartRecruiters companies restrict their public postings API (return 0 — surfaced cleanly, not an
+  error). Workable deferred (its anonymous widget returned 0 jobs for every slug tried).
+
+- 2026-07-05 — **Autofill correctness fixes (from a real run).** (1) **Current job** was wrong —
+  résumés aren't always most-recent-first, so `experience[0]` picked an ended role; now derives
+  the CURRENT employer/title from the ongoing entry (`end` = Present), via `_current_experience`.
+  (2) **"Where do you currently reside" / work-auth** now fill — added reside/residence/live
+  coverage; country checked before city; work-eligibility before location. (3) **"Are you
+  Hispanic/Latino?"** now answered (No) by deriving from the profile's `race_ethnicity`; also
+  fixed `_has(n,"city")` matching "ethni-CITY" (word-boundaried). (4) **Wrong-country fill** — the
+  combobox was committing "Australia" for "country: United States": removed the blind "pick first
+  option" fallback, made short values (≤3 chars) match **whole words** only (so "US" ≠ "A-US-tralia",
+  "No" ≠ "Norway", while "Yes" still matches "Yes, I am authorized"), and dropped unsafe US/USA
+  hints. **Verified live on the Stripe embedded Greenhouse form:** 15 fields fill correctly
+  (current employer=Ninth Wave, work-auth=Yes, sponsor=No, Hispanic/Latino=No, race=Asian), **zero
+  wrong fills**, `submitted:False`. *Follow-up:* the "country where you currently reside" and
+  "degree" dropdowns don't positively match their option text (now safely flagged for review, not
+  mis-filled) — needs a live-DOM debug of those specific react-selects + degree normalization.
+
+- 2026-07-05 — **Tailored résumés persist to a stable, bounded store (decision 029).** Dry-run
+  PDFs were written to `$TMPDIR/tailored_*.pdf`, which macOS purges — so a Track row's
+  `resume_path` would dangle and you couldn't review the résumé an application used. New
+  `applicationbot/resume_store.py` writes each PDF to git-ignored `profile/tailored/`, named
+  deterministically from the posting URL so a re-run **overwrites** (one file per posting, ~5 KB).
+  Growth is bounded three ways: per-posting overwrite, **cascade delete** (`tracker.delete_application`
+  removes the row's file, guarded to only touch paths under the store — never a user `--pdf`), and a
+  100 MB **size-cap** backstop (`prune`). `pipeline._apply_one` now calls `resume_store.write_pdf`
+  instead of `tempfile`. `scripts/migrate_tailored_pdfs.py` (idempotent) moved the 3 existing dry-run
+  rows into the store. **Verified:** deterministic naming + overwrite; `is_managed` refuses external
+  deletes; prune keeps newest; cascade delete removes managed / spares user PDFs; migration is a
+  no-op on re-run; PDFs stay git-ignored. **Track tab now links to the stored PDF:** the
+  "Résumé used" column renders a **"View résumé ↗"** link that opens the exact tailored PDF inline
+  (`GET /track/resume?id=N` streams the row's file; actionable 404 when a row has none). *Verified
+  over live HTTP:* the link serves the real 4,705-byte PDF with an inline filename, 404s cleanly for
+  a missing row, and the served page JS is `node --check`-clean.
+
+- 2026-07-05 — **Fit-score threshold for apply + fixed the low-fit bypass bug.** The dry-run was
+  following through on poor matches (a 45/100 role) despite the CLI's `--min-fit 50`. **Root
+  cause:** `pipeline.pick_top` fell back to `matches[0]` whenever nothing cleared the bar —
+  even when Claude *had* judged them — so the threshold was silently bypassed. Fixed: if any
+  posting was judged, respect the threshold (return None) instead of applying to a below-bar
+  role; the keyword-only fallback (no Claude available) is preserved. Made the threshold a
+  first-class setting: new `DiscoveryFilters.min_fit` (default 50), surfaced as **“Minimum fit
+  score (0-100)”** in the Discover settings editor and used by the web dry-run worker (was
+  hardcoded `min_fit=0` — the other reason the web tab ignored fit). CLI `--min-fit` now
+  defaults to `filters.min_fit` (one source of truth). When nothing clears the bar the Discover
+  tab shows an actionable message naming the best fit this run and pointing at the setting.
+  **Verified:** `pick_top` unit tests (82 chosen over 45 at 50; lone 45 rejected at 50, accepted
+  at 40; keyword-only fallback intact) + `/discovery` round-trip persists `min_fit`.
+
+- 2026-07-05 — **Track tab is now spreadsheet-like: resizable + hideable columns.** The
+  applications table ([web.py](applicationbot/web.py)) switched from fixed percentage widths to
+  per-column **pixel widths with drag-to-resize handles** on each header's right edge (table can
+  overflow into a horizontal scroll like a sheet), plus a **Columns ▾ menu** to show/hide any
+  column (keeps at least one; “Reset columns” restores defaults). Width + visibility choices
+  **persist per browser in localStorage**. Inline cell editing / status pills / add / delete all
+  unchanged. **Verified:** served page JS `node --check`-clean; new controls present in the
+  rendered HTML.
+
+- 2026-07-05 — **Semantic question classification (decision 028).** On a keyword miss, Claude
+  maps a novel application question onto a known structured field type (work-auth, sponsorship,
+  remote/onsite, relocate, salary, start-date, location, …) so semantic variants are answered
+  instead of captured blank — e.g. "Are you willing to work out of our NYC/SF office 2-3 days a
+  week?" → `open_to_remote`. The **mapping** is cached (new `QA.maps_to`), not the answer, so it
+  answers **live** from the profile and stays correct if the profile changes; open-ended prose
+  still goes to the drafting path; company-specific/demographic never auto-map. `resolve_semantic`
+  in the resolver + `answer_bank.classify_question` (robust parse of Claude's reply); the Profile
+  tab shows mapped entries as "↔ Auto-answered from your profile" and preserves `maps_to` on save.
+  **Verified:** office example + sponsorship/start-date classify correctly, no-type/company →
+  None, live round-trip flips Yes→No on profile change, served JS `node --check`-clean.
+- 2026-07-05 — **Tracker basic info + de-dup already-applied + smarter answer learning.**
+  (1) Track records now capture company/role/location/remote/pay/source-URL from the discovered
+  posting (`run_apply(meta=…)`) instead of scraping the ATS page title (rows were blank).
+  (2) Discovery skips postings already in the tracker so re-runs don't re-apply to the same roles.
+  (3) Resolver now answers current employer/title/degree/school/field/graduation from the résumé
+  (were captured blank); only genuinely-unanswered questions are banked (not dropdown/format
+  failures or ones naming the company); tighter company-specific detection; near-duplicate
+  question dedup. (4) Fixed work-auth/sponsorship questions being answered with the applicant's
+  city (work-eligibility now matched before location; "sponsor" verb mapped). Verified live on the
+  Stripe embedded Greenhouse form.
+
+- 2026-07-05 — **Discovery settings fully editable from the dashboard (no config-file editing).**
+  New **Discovery-settings editor** at the top of the Discover tab ([web.py](applicationbot/web.py))
+  covering **every** `DiscoveryFilters` field: target boards (ats + token, add/remove rows),
+  filters (remote-only, min salary, title-exclude, experience-level checkboxes), matcher knobs
+  (min-skills, top-n, skip-seen), aggregator keywords, and Adzuna key/country/pages. Backend:
+  `GET /discovery` (current filters + the level taxonomy) and `POST /discovery/update`
+  (`DiscoveryFilters.model_validate` → `save_filters`). Reuses the shared busy/Save-✓ pattern
+  (UI Principle #5) and the existing card/field helpers. **Verified:** served page JS
+  `node --check`-clean; full HTTP round-trip (GET → POST all fields → GET persisted) against a
+  live server, and the saved config drives `apply_gates` correctly — the user's real
+  `discovery.yaml` was backed up and restored byte-for-byte during the test.
+
+- 2026-07-05 — **Experience-level discovery gate (decision 027).** New
+  `DiscoveryFilters.experience_levels` coarse gate in [filters.py](applicationbot/filters.py),
+  alongside `remote_only`/`min_salary`/`title_exclude`: keep only postings at the chosen levels
+  — `internship`, `new_grad`, `junior`, `mid`, `senior`, `staff`, `manager` — detected from the
+  posting **title** via word-boundaried regex (`_LEVEL_PATTERNS` + `detect_levels`). **Lenient**
+  (user's choice): a title naming a *different* level is dropped, a title with no clear level
+  passes to the qualification matcher (same "missing data → keep" rule as the salary gate).
+  User values are normalized ("New Grad" → `new_grad`); unknown values ignored. Set in
+  `profile/discovery.yaml` (example seeded in [examples/discovery.example.yaml](examples/discovery.example.yaml)).
+  **Verified:** 15-title detection suite incl. false-positive traps (internal→manager not intern,
+  leading→∅) all correct; lenient early-career gate keeps intern/new-grad/ambiguous & drops
+  senior/manager; senior gate keeps senior+ambiguous & drops the rest; no-gate keeps all.
+  Editable from the Discover tab (see the settings-editor entry above). *Optional later:*
+  body/"X+ years" detection for level-less titles.
+
+- 2026-07-05 — **Tracker basic info + de-dup already-applied + smarter question learning.**
+  (1) **Track record now captures company/role/location/remote/pay/source-URL** from the
+  discovered posting (reliable) instead of scraping the ATS page title (which left rows blank) —
+  `run_apply(meta=…)` + `_record_dry_run` populate all columns; keyed on the posting URL.
+  (2) **De-dup:** discovery now skips postings already in the tracker so re-runs don't re-surface
+  or re-apply to the same roles (`tracker.seen_source_urls()`, `DiscoveryFilters.skip_seen=True`,
+  surfaced as "skipped N already in tracker" in CLI + Discover tab). (3) **Learning refinements:**
+  the resolver now answers current/previous **employer, job title, degree, school, field of study,
+  graduation** from the résumé (were wrongly captured as blank "needs your answer"); capture only
+  genuinely-unanswered ("no saved answer") questions, never dropdown/format-match failures or ones
+  naming the company; tightened company-specific detection ("excited about {company}", etc.);
+  near-duplicate questions collapse in the bank (punctuation/lead-in–insensitive dedup).
+  (4) **Correctness fixes:** "Are you authorized to work in the location(s)…" / "…sponsor you…"
+  no longer answered with the applicant's city — work-eligibility is matched before location, and
+  "sponsor" (verb) now maps to the sponsorship field. **Verified** live on the Stripe embedded
+  Greenhouse form (9→11 fields; employer/title fill; work-auth=Yes, sponsor=No) and unit tests for
+  dedup, tracker columns, classification. *Remaining:* Greenhouse dropdowns still option-mismatch
+  on some values (country "United States", degree "B.S. in Computer Science") — option-text matching.
 
 - 2026-07-05 — **Fixed autofill failing on embedded (iframe) ATS forms.** Root cause of "fields
   visible on screen but nothing filled": many ATS forms render inside an **iframe** — e.g.

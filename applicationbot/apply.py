@@ -84,6 +84,32 @@ def _link(links: list[str], host: str) -> Optional[str]:
     return next((l for l in links if host in l.lower()), None)
 
 
+def _degree_hints(degree_text: str) -> Optional[list[str]]:
+    """Map a verbose résumé degree ("Bachelor of Science in Computer Science, …") to the
+    standard option texts a degree dropdown uses, most-specific first, so the combobox/select
+    can match a level even though the résumé string never appears verbatim."""
+    d = (degree_text or "").lower()
+    if not d:
+        return None
+    if any(t in d for t in ("ph.d", "phd", "doctor of philosophy", "doctorate", "doctoral")):
+        return ["Doctor of Philosophy (Ph.D.)", "Doctorate", "Ph.D.", "PhD", "Doctoral Degree"]
+    if "juris doctor" in d or "j.d" in d:
+        return ["Juris Doctor (J.D.)", "J.D.", "Law Degree"]
+    if "doctor of medicine" in d or "m.d" in d:
+        return ["Doctor of Medicine (M.D.)", "M.D."]
+    if "mba" in d or "m.b.a" in d or "business administration" in d:
+        return ["Master of Business Administration (M.B.A.)", "MBA", "Master's Degree"]
+    if any(t in d for t in ("master", "m.s.", "m.a.", "msc", "m.eng", "graduate degree")):
+        return ["Master's Degree", "Master's", "Masters", "Master", "Graduate Degree"]
+    if any(t in d for t in ("bachelor", "b.s.", "b.a.", "bsc", "b.eng", "undergrad", "baccalaureate")):
+        return ["Bachelor's Degree", "Bachelor's", "Bachelors", "Bachelor", "Undergraduate Degree"]
+    if "associate" in d or "a.a." in d or "a.s." in d:
+        return ["Associate's Degree", "Associate's", "Associate"]
+    if any(t in d for t in ("high school", "secondary school", "diploma", "ged")):
+        return ["High School", "High School Diploma", "Secondary School", "GED"]
+    return None
+
+
 @dataclass
 class AnswerResolver:
     resume: Resume
@@ -98,6 +124,18 @@ class AnswerResolver:
     def _name_parts(self) -> tuple[str, str]:
         parts = (self.resume.contact.name or "").split()
         return (parts[0] if parts else ""), (parts[-1] if len(parts) > 1 else "")
+
+    def _current_experience(self):
+        """The applicant's CURRENT role — the ongoing one (end says Present/Current), else the
+        first listed. Résumés aren't always ordered most-recent-first, so experience[0] can be a
+        past job; this picks the actually-current one for "current employer / title" questions."""
+        exps = self.resume.experience
+        if not exps:
+            return None
+        for e in exps:
+            if re.search(r"\b(present|current|now|ongoing|to date)\b", e.end or "", re.I):
+                return e
+        return exps[0]
 
     def resolve(self, label: str) -> Optional[str]:
         """Return the answer for a field labelled `label`, or None if we can't answer it."""
@@ -125,15 +163,13 @@ class AnswerResolver:
             return p.github_url or _link(c.links, "github")
         if _has(n, "portfolio", "website", "personal site", "personal website"):
             return p.portfolio_url or None
-        if _has(n, "location", "city", "current location", "where are you based"):
-            return p.location or c.location or None
-        if _has(n, "country"):
-            return p.country or None
 
-        # Work eligibility (Yes/No)
+        # Work eligibility (Yes/No) — checked BEFORE location/country, because questions like
+        # "Are you authorized to work in the location(s) you selected?" or "…sponsor you for the
+        # location(s)…" contain "location"/"country" and must NOT be answered with a place.
         if _has(n, "authorized to work", "legally authorized", "work authorization", "eligible to work"):
             return _yn(p.work_authorized)
-        if _has(n, "sponsorship", "require sponsorship", "visa sponsorship", "need sponsorship"):
+        if _has(n, "sponsor", "sponsorship", "require sponsorship", "visa sponsorship", "need sponsorship"):
             return _yn(p.requires_sponsorship)
         # Citizenship — also answers "confirm you are a US citizen located in the US" gates,
         # since those are Yes/No and citizenship is the binding requirement.
@@ -143,6 +179,18 @@ class AnswerResolver:
             return _yn(p.willing_to_relocate)
         if _has(n, "remote", "work remotely"):
             return _yn(p.open_to_remote)
+
+        # Location / country — after work-eligibility so a Yes/No question that merely mentions
+        # "location"/"country" isn't answered with a place. "Country" is checked first so a
+        # "country where you reside" question resolves to the country, not the city.
+        if _has(n, "country"):
+            return p.country or None
+        # NOTE: match "city" only as a whole word — as a bare substring it hits "ethni-CITY"
+        # (and "simpli-city"), which wrongly answered "Race/Ethnicity" with the applicant's city.
+        if _has(n, "location", "current location", "where are you based",
+                "reside", "residence", "where do you live", "where you live", "based out of") \
+                or re.search(r"\bcity\b", n):
+            return p.location or c.location or None
 
         # Logistics
         if _has(n, "salary", "compensation expectation", "desired pay", "expected compensation"):
@@ -155,12 +203,42 @@ class AnswerResolver:
         # Voluntary EEO
         if _has(n, "gender"):
             return p.gender or None
-        if _has(n, "race", "ethnicity"):
+        # "Are you Hispanic/Latino?" is a Yes/No derived from the stored race/ethnicity, which
+        # may not contain the word "race"/"ethnicity" — handle it before the generic check.
+        if _has(n, "hispanic", "latino", "latinx", "latin"):
+            if not p.race_ethnicity:
+                return None
+            rl = p.race_ethnicity.lower()
+            is_hisp = any(t in rl for t in ("hispanic", "latino", "latinx", "latin")) \
+                and "not hispanic" not in rl and "non-hispanic" not in rl
+            return "Yes" if is_hisp else "No"
+        if _has(n, "race", "ethnicity", "ethnic"):
             return p.race_ethnicity or None
         if _has(n, "veteran"):
             return p.veteran_status or None
         if _has(n, "disability"):
             return p.disability_status or None
+
+        # Facts derivable from the résumé — answer them instead of capturing them blank for
+        # the user (they were showing up as "needs your answer" despite being on the résumé).
+        recent = self._current_experience()
+        edu = self.resume.education[0] if self.resume.education else None
+        if recent and _has(n, "current employer", "previous employer", "current company",
+                           "recent employer", "name of your employer", "current or previous employer"):
+            return recent.organization or None
+        if recent and _has(n, "current title", "job title", "current position", "recent title",
+                           "current or previous job title", "your title", "current role"):
+            return recent.role or None
+        if edu and _has(n, "most recent degree", "highest degree", "degree obtained",
+                        "degree earned", "level of education", "education level") or (edu and n == "degree"):
+            return edu.degree or None
+        if edu and _has(n, "school", "university", "college", "institution", "alma mater"):
+            return edu.school or None
+        if edu and _has(n, "field of study", "major", "area of study", "course of study"):
+            return edu.degree or None
+        if edu and _has(n, "graduation", "grad year", "graduated", "year of graduation",
+                        "expected graduation"):
+            return edu.graduation or None
 
         # "How did you hear about this job?" — default reflects our online-search discovery.
         if _has(n, "how did you hear", "how did you find", "where did you hear",
@@ -173,13 +251,54 @@ class AnswerResolver:
                 _has(n, "complete", "fill", "assist", "generate", "used", "use", "help"):
             return "Yes"
 
-        # Saved answer bank for custom screening questions (conservative match)
+        # Saved answer bank for custom screening questions (conservative match). An entry with
+        # `maps_to` was Claude-classified onto a structured field — answer it LIVE from that
+        # field so it stays correct if the profile changes.
         for qa in p.custom_answers:
             qn = _norm(qa.question)
             if qn and (qn == n or (len(qn) > 15 and (qn in n or n in qn))):
-                return qa.answer or None
+                mt = getattr(qa, "maps_to", "")
+                return self.answer_for_type(mt) if mt else (qa.answer or None)
 
         return None
+
+    def answer_for_type(self, key: str) -> Optional[str]:
+        """The live answer for a classified question type (a key of
+        answer_bank.CLASSIFIABLE_TYPES), read from the current profile/résumé."""
+        p, c = self.profile, self.resume.contact
+        return {
+            "work_authorized": _yn(p.work_authorized),
+            "requires_sponsorship": _yn(p.requires_sponsorship),
+            "us_citizen": _yn(p.us_citizen),
+            "willing_to_relocate": _yn(p.willing_to_relocate),
+            "open_to_remote": _yn(p.open_to_remote),
+            "desired_salary": p.desired_salary or None,
+            "earliest_start_date": p.earliest_start_date or None,
+            "years_experience": p.years_experience or None,
+            "how_heard": p.how_heard or None,
+            "location": p.location or c.location or None,
+            "country": p.country or None,
+        }.get(key)
+
+    def resolve_semantic(self, label: str) -> Optional[str]:
+        """Keyword-resolve first; on a miss, use Claude to CLASSIFY the question onto a known
+        structured type (catching semantic variants the keyword rules miss, e.g. "willing to
+        work from our office 3 days/week?" → open_to_remote), answer from that field, and cache
+        the mapping so it's learned. Best-effort: no Claude / no match → None (caller falls back
+        to the drafting/needs-attention path)."""
+        value = self.resolve(label)
+        if value is not None:
+            return value
+        if not self.enable_generation:
+            return None
+        key = answer_bank.classify_question(label, model=self.model)
+        if not key:
+            return None
+        ans = self.answer_for_type(key)
+        if ans is None:
+            return None  # matched a type but the profile field is unset — leave for the user
+        self.learned.append(QA(question=label, answer="", maps_to=key, generated=True))
+        return ans
 
     def option_hints(self, label: str) -> Optional[list[str]]:
         """Ranked substrings to match against a dropdown's options when the free-text answer
@@ -191,6 +310,21 @@ class AnswerResolver:
                 "referral source", "how were you referred"):
             return ["job board", "online", "search", "company website", "website",
                     "google", "linkedin", "indeed", "glassdoor", "other"]
+        # Country dropdowns spell "United States" many ways ("United States", "US", "USA", …).
+        # Offer full forms first, then the abbreviations — these are now SAFE to include because
+        # _matches whole-words short values, so "US" matches the option "US" but not "Australia".
+        if _has(n, "country") and (self.profile.country or "").strip().lower() in (
+                "united states", "usa", "us", "u.s.", "united states of america"):
+            return ["United States", "United States of America", "United States (USA)",
+                    "USA", "US", "U.S.A.", "America"]
+        # Degree dropdowns list standard levels ("Bachelor's Degree", "Master's Degree", …) but the
+        # résumé stores a verbose degree ("Bachelor of Science in Computer Science, …"). Map it to
+        # the level so the dropdown can match.
+        edu = self.resume.education[0] if self.resume.education else None
+        if edu and (n == "degree" or _has(n, "degree", "level of education", "education level")):
+            hints = _degree_hints(edu.degree)
+            if hints:
+                return hints
         return None
 
     def freetext_answer(self, label: str, is_textarea: bool = False) -> tuple[Optional[str], str]:
@@ -523,9 +657,17 @@ def _upload_resume(frame, resume_pdf: str, report: "ApplyReport") -> None:
 
 def _matches(option: str, want: str) -> bool:
     """Case-insensitive: option equals/contains `want`, or (for non-tiny option text) is
-    contained by it — so "online" matches both an "Online" option and a longer sentence."""
+    contained by it — so "online" matches both an "Online" option and a longer sentence.
+    A very short `want` (≤3 chars, e.g. "US", "No") must match the WHOLE option, never as a
+    substring — otherwise "US" matched "A-US-tralia" and answered a country with "Australia"."""
     o, w = option.strip().lower(), want.strip().lower()
-    return bool(o) and bool(w) and (o == w or w in o or (len(o) >= 3 and o in w))
+    if not (o and w):
+        return False
+    if len(w) <= 3:
+        # Whole-word match: "Yes" matches "Yes, I am authorized" but "US" does NOT match
+        # "A-US-tralia" and "No" does NOT match "Norway".
+        return re.search(r"\b" + re.escape(w) + r"\b", o) is not None
+    return o == w or w in o or (len(o) >= 3 and o in w)
 
 
 def _fill_select(loc, value: Optional[str], hints: Optional[list[str]] = None) -> str:
@@ -638,9 +780,9 @@ def _pick_from_open(page, want: str, want_full: Optional[str] = None) -> Optiona
     if bi >= 0 and score > 0:
         opts.nth(bi).click(timeout=4000)
         return texts[bi]
-    if count > 3:  # 3) async search top suggestion
-        opts.first.click(timeout=4000)
-        return texts[0]
+    # No option fuzzy-matches or shares a token with what we wanted. Do NOT blind-pick the first
+    # option — that committed a wrong value (e.g. answering "country: United States" with
+    # "Australia"). Leave it unselected so it surfaces for review instead of a confident-wrong fill.
     return None
 
 
@@ -673,10 +815,38 @@ def _combo_try(page, loc, text: str) -> Optional[str]:
 
 
 def _fill_combobox(page, loc, value: Optional[str], hints: Optional[list[str]] = None) -> Optional[str]:
-    """react-select combobox: try the answer, then each ranked hint; return the committed option
-    text, or None. Never leaves uncommitted typed text (which would look filled but submit as an
-    invalid/empty selection) — clears the field if nothing could be selected."""
-    for want in ([value] if value else []) + (hints or []):
+    """react-select combobox: commit the option matching the answer (or a ranked hint). Returns
+    the committed option text, or None. Never leaves uncommitted typed text (which would look
+    filled but submit as an invalid/empty selection) — clears the field if nothing selected.
+
+    Two-phase: (1) open ONCE and match any candidate against the options already shown — static
+    lists (e.g. a country dropdown showing all options) resolve here in a single open, which is
+    both faster and more reliable than re-typing each candidate (repeated type-cycles on one
+    react-select make it flaky). (2) Fall back to typing each candidate to filter async lists
+    (e.g. a location geocoder that returns nothing until you type)."""
+    candidates = [w for w in ([value] if value else []) + (hints or []) if w]
+
+    # Phase 1 — match against the options shown on open (no typing).
+    if _open_combobox(page, loc):
+        page.wait_for_timeout(250)
+        opts = _open_options(page)
+        if opts is not None:
+            cnt = min(opts.count(), 60)
+            texts = [(opts.nth(i).inner_text() or "").strip() for i in range(cnt)]
+            for want in candidates:
+                for i, t in enumerate(texts):
+                    if _matches(t, want):
+                        opts.nth(i).click(timeout=4000)
+                        return t
+        # No match among the shown options — close the menu so Phase 2 reopens/types cleanly
+        # (leaving it open makes Phase 2's reopen toggle it CLOSED, which broke the geocoder).
+        try:
+            loc.press("Escape")
+        except Exception:
+            pass
+
+    # Phase 2 — type each candidate to filter an async list.
+    for want in candidates:
         chosen = _combo_try(page, loc, want)
         if chosen:
             return chosen
@@ -750,6 +920,11 @@ def _fill_all_fields(page, resolver: AnswerResolver, report: "ApplyReport", done
         value = resolver.resolve(label)
         hints = resolver.option_hints(label)
         is_free = (tag == "textarea" or typ in _TEXTLIKE) and role != "combobox"
+        # For structured (non-open-ended) fields the keyword rules missed, ask Claude to
+        # classify the question onto a known type (e.g. an office-days phrasing → remote) and
+        # answer from the profile. Open-ended text goes to the drafting path instead.
+        if value is None and not is_free:
+            value = resolver.resolve_semantic(label)
         if value is None and not hints and not is_free:
             report.skipped.append(f"{label} — no saved answer")
             done.add(label)
@@ -801,6 +976,8 @@ def _fill_radio_groups(page, resolver: AnswerResolver, report: "ApplyReport", do
         if not q or q in done:
             continue
         value = resolver.resolve(q)
+        if value is None:  # semantic classify onto a known type (Claude, cached) on a miss
+            value = resolver.resolve_semantic(q)
         if value is None:
             report.skipped.append(f"{q} — no saved answer")
             done.add(q)
@@ -875,14 +1052,23 @@ def _persist_learning(resolver: AnswerResolver, report: "ApplyReport", profile_p
     """Save AI-drafted answers and capture new reusable questions to the answer bank."""
     from . import apply_profile
     saved = apply_profile.remember_answers(resolver.learned, profile_path) if resolver.learned else 0
-    # New questions we couldn't answer — capture the reusable (non-company-specific) ones so the
-    # user fills each once. Labels come off the "needs attention" list (strip the " — reason").
+    # Capture new REUSABLE questions we genuinely couldn't answer, so the user fills each once.
+    # Only "no saved answer" gaps qualify — a "no dropdown option matched" / "unsupported field"
+    # gap means we HAD an answer, so capturing it blank would be wrong. Skip company-specific,
+    # demographic, and anything that names the company (that answer doesn't generalize).
+    company = (resolver.company or "").strip().lower()
     pending = []
     for s in report.skipped:
-        q = s.split(" — ")[0].strip()
-        if (len(q) > 12 and not answer_bank.is_company_specific(q)
-                and not answer_bank.is_demographic(q)):
-            pending.append(q)
+        parts = s.split(" — ", 1)
+        q = parts[0].strip()
+        reason = parts[1].strip().lower() if len(parts) > 1 else ""
+        if not reason.startswith("no saved answer"):
+            continue
+        if len(q) <= 12 or answer_bank.is_company_specific(q) or answer_bank.is_demographic(q):
+            continue
+        if company and company in q.lower():
+            continue
+        pending.append(q)
     captured = apply_profile.capture_questions(pending, profile_path) if pending else 0
     if saved or captured:
         report.skipped.append(
@@ -902,30 +1088,43 @@ def _title_role_company(title: str) -> tuple[str, str]:
     return m.group(1).strip(), m.group(2).strip()
 
 
-def _record_dry_run(report: ApplyReport, resume_pdf: str, role: str, company: str) -> tuple[int, str]:
+def _record_dry_run(report: ApplyReport, resume_pdf: str, role: str, company: str,
+                    meta: Optional[dict] = None) -> tuple[int, str]:
     """Record this dry-run in the tracker (decision 024) — the Track stage's 'record what it
-    WOULD submit'. Upserts by source URL so re-running a posting updates its row instead of
-    duplicating it, and never clobbers user-owned fields (status/notes/pay) on a re-run.
-    Returns (application_id, 'recorded' | 'updated')."""
+    WOULD submit'. Basic info (company, role, location, remote, pay, source URL) comes from the
+    discovered posting via `meta` when available — the reliable source — falling back to the
+    page-title-derived role/company for a bare CLI run against a URL. Upserts by source URL so
+    re-running a posting updates its row instead of duplicating it, and never clobbers
+    user-owned fields (status/notes) on a re-run. Returns (id, 'recorded' | 'updated')."""
     from . import tracker  # lazy — keep apply.py importable without touching the DB
 
-    existing = tracker.find_by_source_url(report.url)
+    m = meta or {}
+    company = (m.get("company") or company or "").strip()
+    role = (m.get("role") or role or "").strip()
+    location = (m.get("location") or "").strip()
+    remote = (m.get("remote") or "").strip()
+    pay = (m.get("pay") or "").strip()
+    # Key the tracker on the POSTING url (for dedup), not the ATS form/embed url.
+    source_url = (m.get("source_url") or report.url or "").strip()
+
+    existing = tracker.find_by_source_url(source_url)
     if existing:
-        # Runner-owned refresh only; fill role/company just if they were never set.
+        # Runner-owned refresh; fill any basic-info field only if it was never set (don't
+        # clobber user edits).
         changes: dict = {"resume_path": resume_pdf, "portal": report.ats, "method": "dry-run"}
-        if not existing.get("company") and company:
-            changes["company"] = company
-        if not existing.get("role") and role:
-            changes["role"] = role
+        for col, val in (("company", company), ("role", role), ("location", location),
+                         ("remote", remote), ("pay", pay)):
+            if val and not existing.get(col):
+                changes[col] = val
         tracker.update_application(int(existing["id"]), changes)
         return int(existing["id"]), "updated"
 
     native = sum(1 for f in report.filled if f.source == "native")
     drafted = sum(1 for f in report.filled if f.source == "generated")
     app_id = tracker.add_application({
-        "company": company, "role": role,
+        "company": company, "role": role, "location": location, "remote": remote, "pay": pay,
         "portal": report.ats, "method": "dry-run", "status": "dry-run",
-        "source_url": report.url, "resume_path": resume_pdf,
+        "source_url": source_url, "resume_path": resume_pdf,
         "notes": f"[auto] Dry-run: {len(report.filled)} field(s) filled "
                  f"({native} native, {drafted} AI-drafted); {len(report.skipped)} need attention.",
     })
@@ -948,6 +1147,7 @@ def run_apply(
     record: bool = True,
     hold: "object | None" = None,
     on_filled: "object | None" = None,
+    meta: Optional[dict] = None,
 ) -> ApplyReport:
     """DRY-RUN fill an application form. Never submits.
 
@@ -1033,7 +1233,7 @@ def run_apply(
             # a tracker failure must not break the fill run.
             if record:
                 try:
-                    rid, action = _record_dry_run(report, resume_pdf, role, company)
+                    rid, action = _record_dry_run(report, resume_pdf, role, company, meta)
                     print(f"Tracked: {action} application #{rid} (dry-run) — open the Track tab to view/edit.")
                 except Exception as e:
                     report.errors.append(f"tracker: {type(e).__name__}: {e}")

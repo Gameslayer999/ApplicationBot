@@ -46,8 +46,8 @@ _HEADER = (
 
 
 class Board(BaseModel):
-    ats: str  # greenhouse | lever | ashby
-    token: str  # the board token/slug read off the careers URL (e.g. 'stripe')
+    ats: str  # greenhouse | lever | ashby | smartrecruiters | recruitee
+    token: str  # the board token/company slug read off the careers URL (e.g. 'stripe', 'Visa', 'bunq')
 
 
 class AdzunaConfig(BaseModel):
@@ -60,6 +60,35 @@ class AdzunaConfig(BaseModel):
     max_pages: int = 1  # 50 results/page; raise for more breadth
 
 
+# Experience-level taxonomy (Configure/Discover gate). Each level maps to a regex matched
+# against the posting TITLE — where seniority reliably appears (same signal as title_exclude).
+# Word-boundaried so "intern" doesn't hit "international", "lead" doesn't hit "leading", etc.
+_LEVEL_PATTERNS: dict[str, str] = {
+    "internship": r"\bintern(?:s|ship)?\b|\bco-?op\b",
+    "new_grad": (
+        r"\bnew[\s-]*grad(?:uate)?s?\b|\brecent[\s-]*grad(?:uate)?s?\b|"
+        r"\bentry[\s-]*level\b|\bearly[\s-]*career\b|\buniversity[\s-]*grad(?:uate)?\b|\bcampus\b"
+    ),
+    "junior": r"\bjunior\b|\bjr\.?\b",
+    "mid": r"\bmid[\s-]*(?:level|senior)?\b",
+    "senior": r"\bsenior\b|\bsr\.?\b",
+    "staff": r"\bstaff\b|\bprincipal\b|\bdistinguished\b",
+    "manager": r"\bmanager\b|\bdirector\b|\bhead\s+of\b|\bvp\b|\bvice\s+president\b|\blead\b",
+}
+EXPERIENCE_LEVELS: list[str] = list(_LEVEL_PATTERNS)  # valid values, for config/UI/docs
+_LEVEL_RE = {lvl: re.compile(pat, re.IGNORECASE) for lvl, pat in _LEVEL_PATTERNS.items()}
+
+
+def _norm_level(s: str) -> str:
+    """Normalize a user-written level ('New Grad', 'new-grad') to a taxonomy key ('new_grad')."""
+    return re.sub(r"[\s-]+", "_", s.strip().lower())
+
+
+def detect_levels(title: str) -> set[str]:
+    """Experience levels named in a posting title (may be empty, or more than one)."""
+    return {lvl for lvl, rx in _LEVEL_RE.items() if rx.search(title)}
+
+
 class DiscoveryFilters(BaseModel):
     boards: list[Board] = Field(default_factory=list)
     remote_only: bool = False
@@ -69,12 +98,21 @@ class DiscoveryFilters(BaseModel):
         description="Drop postings whose TITLE contains any of these (case-insensitive), "
         "e.g. 'sales', 'recruiter' — a cheap gate before the matcher.",
     )
+    experience_levels: list[str] = Field(
+        default_factory=list,
+        description="Keep only postings at these experience levels, detected from the TITLE: "
+        + ", ".join(EXPERIENCE_LEVELS)
+        + ". Empty = no level gate. Lenient: a posting whose title clearly names a "
+        "DIFFERENT level is dropped; a title with no clear level passes to the matcher.",
+    )
     keywords: list[str] = Field(
         default_factory=list,
         description="Optional aggregator search terms. Empty = derive from the résumé.",
     )
     min_skills: int = 2  # keyword pre-filter floor (raise to cut common-word false positives)
     top_n: int = 10  # how many keyword-ranked survivors Claude judges
+    min_fit: int = 50  # only follow through (dry-run/apply) on matches Claude scores ≥ this (0-100)
+    skip_seen: bool = True  # drop postings already in the tracker (don't re-apply to the same role)
     adzuna: AdzunaConfig = Field(default_factory=AdzunaConfig)
 
 
@@ -170,16 +208,24 @@ def _annual_salary(comp: str) -> Optional[int]:
 
 
 def apply_gates(postings, filters: DiscoveryFilters):
-    """Cheap pre-matcher gates from the filter config: remote_only, title_exclude, and a
-    salary floor when the posting states pay. Returns the kept postings. Postings with no
-    stated salary pass the salary gate (we don't drop for missing data)."""
+    """Cheap pre-matcher gates from the filter config: remote_only, title_exclude, a salary
+    floor when the posting states pay, and an experience-level gate (by title). Returns the
+    kept postings. Postings with no stated salary — or no detectable level — pass their gate
+    (we don't drop for missing data)."""
     excl = [t.lower() for t in filters.title_exclude]
+    want_levels = {_norm_level(l) for l in filters.experience_levels} & set(EXPERIENCE_LEVELS)
     kept = []
     for p in postings:
         if filters.remote_only and p.remote is False:
             continue
         if excl and any(x in p.title.lower() for x in excl):
             continue
+        if want_levels:
+            # Lenient: drop only when the title clearly names a level and none is wanted;
+            # a title with no detectable level passes through to the matcher.
+            detected = detect_levels(p.title)
+            if detected and detected.isdisjoint(want_levels):
+                continue
         if filters.min_salary:
             sal = _annual_salary(p.compensation)
             if sal is not None and sal < filters.min_salary:

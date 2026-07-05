@@ -23,7 +23,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from . import apply_profile, auth, catalogue, linkedin, tracker
+from . import apply_profile, auth, catalogue, filters, linkedin, tracker
 from .job_description import JobDescription, load_job_description
 from .backends import DEFAULT_QUALITY
 from .length import LengthBudget
@@ -87,12 +87,24 @@ def _test_worker() -> None:
 
         res = pipeline.discover_and_match(resume, filters, profile=profile,
                                           use_claude=use_claude, on_progress=on_judge)
-        _set(scanned=res.discovered, matched=len(res.matches), errors=res.errors)
+        _set(scanned=res.discovered, matched=len(res.matches), errors=res.errors,
+             skipped_seen=res.skipped_seen)
         if not res.matches:
-            _set(phase="error", errors=(res.errors or []) + ["No postings matched your qualifications."])
+            extra = ["No new postings matched your qualifications."]
+            if res.skipped_seen:
+                extra.append(f"({res.skipped_seen} already in your tracker were skipped.)")
+            _set(phase="error", errors=(res.errors or []) + extra)
             return
 
-        top = pipeline.pick_top(res.matches, min_fit=0)
+        top = pipeline.pick_top(res.matches, min_fit=filters.min_fit)
+        if top is None:
+            best = max((m.fit_score for m in res.matches if m.fit_score is not None), default=None)
+            best_txt = f" Best fit this run was {best}/100." if best is not None else ""
+            _set(phase="error", errors=[
+                f"No match reached your minimum fit of {filters.min_fit}/100, so nothing was "
+                f"applied to.{best_txt} Lower “Minimum fit score” in Discovery settings to test "
+                "looser matches, or add boards that better fit your résumé."])
+            return
         p = top.posting
         chosen = {
             "company": p.company, "title": p.title, "location": p.location,
@@ -241,6 +253,12 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/profile":
             self._json(200, {"profile": apply_profile.load_profile().model_dump()})
             return
+        if path == "/discovery":
+            self._json(200, {
+                "filters": filters.load_filters().model_dump(),
+                "levels": filters.EXPERIENCE_LEVELS,
+            })
+            return
         if path == "/track":
             q = parse_qs(urlparse(self.path).query)
             self._json(200, {
@@ -252,6 +270,25 @@ class Handler(BaseHTTPRequestHandler):
                 "statuses": tracker.STATUSES,
                 "fields": tracker.EDITABLE,
             })
+            return
+        if path == "/track/resume":
+            # Stream the tailored PDF a Track row used, so the Track tab can link to it
+            # (decision 029). Serves only an existing .pdf the row points at; the path
+            # comes from our own DB (localhost-only server), never from the request.
+            q = parse_qs(urlparse(self.path).query)
+            try:
+                app = tracker.get_application(int(q.get("id", ["0"])[0]))
+            except (ValueError, TypeError):
+                app = None
+            rp = (app or {}).get("resume_path", "")
+            f = Path(rp) if rp else None
+            if not f or f.suffix.lower() != ".pdf" or not f.is_file():
+                self._json(404, {"error":
+                    "No stored résumé for this application. It records one only after a "
+                    "dry-run/apply that tailored a PDF."})
+                return
+            self._send(200, f.read_bytes(), "application/pdf",
+                       {"Content-Disposition": 'inline; filename="' + f.name + '"'})
             return
         if path == "/test-run/status":
             with _TEST_LOCK:
@@ -291,6 +328,10 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/profile/update":
                 p = json.loads(raw or b"{}")
                 apply_profile.replace_profile(p["data"])
+                self._json(200, {"ok": True})
+            elif path == "/discovery/update":
+                p = json.loads(raw or b"{}")
+                filters.save_filters(filters.DiscoveryFilters.model_validate(p["data"]))
                 self._json(200, {"ok": True})
             elif path == "/track/add":
                 p = json.loads(raw or b"{}")
@@ -372,8 +413,20 @@ INDEX_HTML = """<!doctype html>
   /* Track view uses the full screen width — no 640px editor cap. */
   .track-editor { max-width:none; }
   .track-editor .editing { max-width:820px; }
-  .ttable { width:100%; table-layout:fixed; border-collapse:collapse; background:#fff; border:1px solid var(--line); border-radius:8px; font-size:13px; }
-  .ttable th { text-align:left; font-size:11px; text-transform:uppercase; letter-spacing:.03em; color:var(--muted); padding:8px 8px; border-bottom:1px solid var(--line); white-space:normal; }
+  .ttable { width:auto; table-layout:fixed; border-collapse:collapse; background:#fff; border:1px solid var(--line); border-radius:8px; font-size:13px; }
+  .ttable th { position:relative; text-align:left; font-size:11px; text-transform:uppercase; letter-spacing:.03em; color:var(--muted); padding:8px 8px; border-bottom:1px solid var(--line); white-space:nowrap; overflow:hidden; }
+  .ttable th .lbl { display:block; overflow:hidden; text-overflow:ellipsis; padding-right:6px; }
+  /* Spreadsheet-style drag-to-resize handle on each column's right edge. */
+  .ttable th .rz { position:absolute; top:0; right:0; width:7px; height:100%; cursor:col-resize; user-select:none; }
+  .ttable th .rz:hover, .ttable th.rzing .rz { background:var(--accent); opacity:.4; }
+  body.rz-drag { cursor:col-resize; user-select:none; }
+  /* Show/hide-columns menu */
+  .colmenu { position:relative; }
+  .colmenu .menu { position:absolute; z-index:30; top:calc(100% + 4px); left:0; background:#fff; border:1px solid var(--line); border-radius:8px; box-shadow:0 6px 24px rgba(0,0,0,.12); padding:8px; min-width:190px; max-height:340px; overflow:auto; }
+  .colmenu .menu label { display:flex; align-items:center; gap:8px; margin:2px 0; padding:2px; font-size:13px; font-weight:400; text-transform:none; letter-spacing:normal; color:var(--ink); cursor:pointer; }
+  .colmenu .menu label:hover { background:var(--bg); border-radius:4px; }
+  .colmenu .menu input { width:auto; }
+  .colmenu .menu .rst { width:100%; margin:8px 0 0; padding:6px 10px; background:#eef1fb; color:var(--accent); font-size:12px; }
   .ttable td { padding:3px 4px; border-bottom:1px solid var(--line); vertical-align:middle; overflow:hidden; }
   .ttable tr:last-child td { border-bottom:0; }
   .ttable input, .ttable select { width:100%; border:1px solid transparent; background:transparent; padding:5px 6px; margin:0; border-radius:4px; text-overflow:ellipsis; }
@@ -384,6 +437,9 @@ INDEX_HTML = """<!doctype html>
   .ttable .st-discovered, .ttable .st-tailored { color:var(--muted); }
   .ttable .delrow { width:auto; margin:0; padding:4px 8px; background:#fff; color:#c0392b; border:1px solid var(--line); font-size:12px; }
   .ttable .rowsaved { color:#2a9d5b; font-size:12px; }
+  .ttable .reslink { color:var(--accent); text-decoration:none; font-size:12px; white-space:nowrap; padding:5px 6px; display:inline-block; }
+  .ttable .reslink:hover { text-decoration:underline; }
+  .ttable .muted { color:var(--muted); padding:5px 6px; display:inline-block; }
   .twrap { overflow-x:auto; }
   .tempty { color:var(--muted); padding:24px; text-align:center; border:1px dashed var(--line); border-radius:8px; }
   /* Consistent waiting indicator: spinner + label (+ elapsed seconds for long waits). */
@@ -395,6 +451,14 @@ INDEX_HTML = """<!doctype html>
   .busy-l { font-weight:600; }
   .busy-s { color:var(--muted); margin-left:8px; font-variant-numeric:tabular-nums; }
   .sec { margin-bottom:18px; }
+  .editor h4 { margin:16px 0 6px; font-size:13px; }
+  .chkrow { display:flex; align-items:center; gap:8px; margin:8px 0; font-size:13px; font-weight:400; text-transform:none; letter-spacing:normal; color:var(--ink); }
+  .chkrow input { width:auto; }
+  .lvls { display:flex; flex-wrap:wrap; gap:2px 20px; }
+  .lvls .chkrow { margin:4px 0; }
+  .brd-row { display:flex; gap:8px; align-items:center; margin:6px 0; }
+  .brd-row .bd-ats { width:130px; flex:none; }
+  .brd-row .del { width:auto; margin:0; padding:4px 10px; background:#f4f4f4; color:#a11; }
   .cards { display:flex; flex-direction:column; gap:10px; }
   .card { position:relative; border:1px solid var(--line); border-radius:8px; padding:12px 12px 10px; background:#fff; }
   .card .del { position:absolute; top:8px; right:8px; width:auto; margin:0; padding:1px 8px; background:#f4f4f4; color:#a11; font-size:13px; }
@@ -542,13 +606,23 @@ INDEX_HTML = """<!doctype html>
 
     <div id="view-discover" class="hidden">
       <div class="editor">
-        <p class="editing">Run one full end-to-end <b>dry-run</b>: the bot searches your target
-          boards, ranks every posting by how well it fits <i>your</i> qualifications, then
-          <b>follows through on exactly one</b> — the single best match — tailoring your résumé
-          and auto-filling that application in a browser you can watch. It <b>never submits</b>
-          (Agent Guideline #3); when it finishes filling, review it in the browser and click
-          <b>Finish</b>. A <code>dry-run</code> row is recorded in Track. Edit your target boards
-          in <code>profile/discovery.yaml</code>.</p>
+        <h3 style="margin-top:0">Discovery settings</h3>
+        <p class="editing">Control what the bot searches and how it filters matches — every
+          setting is editable here, no code or config files to touch. Saved to
+          <code>profile/discovery.yaml</code> (git-ignored).</p>
+        <div id="disc-form">Loading…</div>
+        <div class="saverow">
+          <button id="save-disc">Save settings</button>
+          <span id="disc-msg" class="msg"></span>
+        </div>
+
+        <h3>Run a dry-run</h3>
+        <p class="editing">Run one full end-to-end <b>dry-run</b> with the settings above: the
+          bot searches your target boards, ranks every posting by how well it fits <i>your</i>
+          qualifications, then <b>follows through on exactly one</b> — the single best match —
+          tailoring your résumé and auto-filling that application in a browser you can watch. It
+          <b>never submits</b> (Agent Guideline #3); when it finishes filling, review it in the
+          browser and click <b>Finish</b>. A <code>dry-run</code> row is recorded in Track.</p>
         <div class="saverow">
           <button id="test-run" type="button">▶ Find &amp; fill one application (dry-run)</button>
           <span id="test-msg" class="msg"></span>
@@ -604,10 +678,15 @@ INDEX_HTML = """<!doctype html>
         <p class="editing">Every application the pipeline discovered, tailored, and (in
           <code>dry_run</code>) would have submitted — the local system of record
           (<code>applications.db</code>, git-ignored). Edit any cell inline; changes save
-          as you go.</p>
+          as you go. <b>Drag a column's right edge to resize it</b>, and use <b>Columns</b>
+          to hide any you don't need — your layout is remembered on this browser.</p>
         <div id="track-counts" class="tcounts"></div>
         <div class="trackbar">
           <input id="track-search" type="text" placeholder="Search company, role, location, notes…">
+          <div class="colmenu">
+            <button id="track-cols-btn" type="button" class="tbtn">Columns ▾</button>
+            <div id="track-cols-menu" class="menu hidden"></div>
+          </div>
           <button id="track-add" type="button" class="tbtn">+ Add application</button>
           <span id="track-msg" class="msg"></span>
         </div>
@@ -868,7 +947,7 @@ document.querySelectorAll(".tab").forEach(t => t.addEventListener("click", () =>
   $("view-track").classList.toggle("hidden", v !== "track");
   if (v === "profile") loadProfile();
   if (v === "track") loadTrack();
-  if (v === "discover") pollTest();
+  if (v === "discover") { loadDisc(); pollTest(); }
 }));
 $("resume").addEventListener("change", () => { if (!$("view-profile").classList.contains("hidden")) loadProfile(); });
 
@@ -927,7 +1006,7 @@ async function pollTest() {
     const pct = Math.round(100 * (s.judged||0) / s.judged_total);
     body += `<div class="tbar"><div class="tbarfill" style="width:${pct}%"></div></div>`;
   }
-  if (s.scanned) body += `<div class="tmeta">Scanned ${s.scanned} postings · ${s.matched} matched your skills</div>`;
+  if (s.scanned) body += `<div class="tmeta">Scanned ${s.scanned} postings · ${s.matched} matched your skills${s.skipped_seen ? ` · ${s.skipped_seen} already in tracker skipped` : ""}</div>`;
   const el = TEST_T0 ? Math.round((Date.now()-TEST_T0)/1000) : null;
   if ((running || filled) && el!=null) body += `<div class="tmeta">${el}s elapsed</div>`;
   prog.innerHTML = body;
@@ -955,15 +1034,26 @@ async function pollTest() {
 
 // ---- Track tab: the local application store (applications.db) ----
 // Columns to show, in order. status/dates get special controls; the rest are text inputs.
-// [key, label, relative width %] — widths drive the fixed table layout so all
-// columns share the screen and nothing forces a horizontal scroll.
+// [key, label, default pixel width] — a fixed-layout table with per-column pixel widths so
+// columns are individually resizable (drag the right edge) and can overflow into a horizontal
+// scroll, like a spreadsheet. Per-user width/hidden overrides persist in localStorage.
 const TRACK_COLS = [
-  ["status","Status",8], ["company","Company",9], ["role","Role",12], ["location","Location",9],
-  ["remote","Remote",5], ["pay","Pay",7], ["portal","Portal",7], ["method","Method",6],
-  ["source_url","Source URL",11], ["date_discovered","Discovered",7], ["date_applied","Applied",7],
-  ["resume_path","Résumé used",10], ["notes","Notes",12],
+  ["status","Status",120], ["company","Company",140], ["role","Role",180], ["location","Location",140],
+  ["remote","Remote",80], ["pay","Pay",100], ["portal","Portal",110], ["method","Method",90],
+  ["source_url","Source URL",220], ["date_discovered","Discovered",120], ["date_applied","Applied",120],
+  ["resume_path","Résumé used",160], ["notes","Notes",240],
 ];
 let TRACK_STATE = { status:null, search:"", statuses:[] };
+
+// Spreadsheet column layout (width + visibility), remembered per browser.
+const TRACK_LS_W = "ab_track_colw", TRACK_LS_H = "ab_track_hidden";
+let TRACK_COLW = {}, TRACK_HIDDEN = new Set(), TRACK_APPS = [];
+try { TRACK_COLW = JSON.parse(localStorage.getItem(TRACK_LS_W) || "{}") || {}; } catch (e) {}
+try { TRACK_HIDDEN = new Set(JSON.parse(localStorage.getItem(TRACK_LS_H) || "[]")); } catch (e) {}
+const saveColW = () => { try { localStorage.setItem(TRACK_LS_W, JSON.stringify(TRACK_COLW)); } catch (e) {} };
+const saveHidden = () => { try { localStorage.setItem(TRACK_LS_H, JSON.stringify([...TRACK_HIDDEN])); } catch (e) {} };
+const colWidth = (key, def) => TRACK_COLW[key] || def;
+const visibleCols = () => TRACK_COLS.filter(([k]) => !TRACK_HIDDEN.has(k));
 
 async function loadTrack() {
   const body = $("track-body");
@@ -1001,6 +1091,7 @@ function statusCell(app) {
 }
 
 function renderTrack(apps) {
+  TRACK_APPS = apps;
   const body = $("track-body"); body.innerHTML = "";
   if (!apps.length) {
     body.append(el("div", {class:"tempty", text:
@@ -1009,15 +1100,28 @@ function renderTrack(apps) {
         : "No applications yet. The pipeline records them here as it runs — or add one manually."}));
     return;
   }
-  const cols = TRACK_COLS.map(([,,w]) => el("col", {style:"width:"+w+"%"}))
-    .concat([el("col", {style:"width:70px"})]);
-  const head = el("tr", {}, TRACK_COLS.map(([,label]) => el("th", {text:label})).concat([el("th", {text:""})]));
+  const vis = visibleCols();
+  const colEls = {};
+  const cols = vis.map(([key,,def]) => { const c = el("col", {style:"width:"+colWidth(key,def)+"px"}); colEls[key] = c; return c; })
+    .concat([el("col", {style:"width:96px"})]);
+  const ths = vis.map(([key,label,def]) => {
+    const rz = el("div", {class:"rz", title:"Drag to resize"});
+    const th = el("th", {}, [el("span", {class:"lbl", text:label}), rz]);
+    rz.addEventListener("mousedown", (ev) => startResize(ev, key, colEls[key], def, th));
+    return th;
+  });
+  const head = el("tr", {}, ths.concat([el("th", {text:""})]));
   const rows = apps.map(app => {
-    const tds = TRACK_COLS.map(([key]) => {
+    const tds = vis.map(([key]) => {
       let input;
       if (key === "status") input = statusCell(app);
       else if (key === "date_discovered" || key === "date_applied")
         input = el("input", {type:"date", value:app[key] || "", on:{change:e=>saveCell(app.id, key, e.target.value)}});
+      else if (key === "resume_path")
+        input = app.resume_path
+          ? el("a", {class:"reslink", href:"/track/resume?id=" + app.id, target:"_blank",
+                     title:app.resume_path, text:"View résumé ↗"})
+          : el("span", {class:"muted", text:"—"});
       else input = el("input", {type:"text", value:app[key] || "", on:{change:e=>saveCell(app.id, key, e.target.value)}});
       return el("td", {}, [input]);
     });
@@ -1032,6 +1136,55 @@ function renderTrack(apps) {
     [el("colgroup", {}, cols), el("thead", {}, [head]), el("tbody", {}, rows)]);
   body.append(el("div", {class:"twrap"}, [table]));
 }
+
+// Drag a column's right edge to resize it; persist the new width.
+function startResize(ev, key, colEl, def, th) {
+  ev.preventDefault(); ev.stopPropagation();
+  const startX = ev.clientX;
+  const startW = (colEl && colEl.getBoundingClientRect().width) || colWidth(key, def);
+  document.body.classList.add("rz-drag"); if (th) th.classList.add("rzing");
+  const move = (e) => {
+    const w = Math.max(50, Math.round(startW + (e.clientX - startX)));
+    TRACK_COLW[key] = w; if (colEl) colEl.style.width = w + "px";
+  };
+  const up = () => {
+    document.removeEventListener("mousemove", move);
+    document.removeEventListener("mouseup", up);
+    document.body.classList.remove("rz-drag"); if (th) th.classList.remove("rzing");
+    saveColW();
+  };
+  document.addEventListener("mousemove", move);
+  document.addEventListener("mouseup", up);
+}
+
+// Show/hide columns — one checkbox per column, plus a reset.
+function renderColMenu() {
+  const m = $("track-cols-menu"); m.innerHTML = "";
+  TRACK_COLS.forEach(([key, label]) => {
+    const cb = el("input", {type:"checkbox"}); cb.checked = !TRACK_HIDDEN.has(key);
+    cb.addEventListener("change", () => {
+      if (cb.checked) { TRACK_HIDDEN.delete(key); }
+      else if (visibleCols().length <= 1) { cb.checked = true; return; }  // keep at least one column
+      else { TRACK_HIDDEN.add(key); }
+      saveHidden(); renderTrack(TRACK_APPS);
+    });
+    m.appendChild(el("label", {}, [cb, " " + label]));
+  });
+  m.appendChild(el("button", {class:"rst", type:"button", text:"Reset columns", on:{click:()=>{
+    TRACK_HIDDEN.clear(); TRACK_COLW = {}; saveHidden(); saveColW(); renderColMenu(); renderTrack(TRACK_APPS);
+  }}}));
+}
+$("track-cols-btn").addEventListener("click", (e) => {
+  e.stopPropagation();
+  const m = $("track-cols-menu");
+  const show = m.classList.contains("hidden");
+  if (show) renderColMenu();
+  m.classList.toggle("hidden");
+});
+document.addEventListener("click", (e) => {
+  const m = $("track-cols-menu");
+  if (m && !m.classList.contains("hidden") && !e.target.closest(".colmenu")) m.classList.add("hidden");
+});
 
 async function saveCell(id, field, value) {
   const tr = document.querySelector('#track-body tr[data-id="' + id + '"]');
@@ -1176,10 +1329,15 @@ function startDateField(value) {
 function qaCard(qa) {
   qa = qa || {};
   const hasAns = (qa.answer || "").trim();
+  const mapped = (qa.maps_to || "").trim();
   const fields = [];
-  if (!hasAns) fields.push(el("div", {style:"font-size:12px;font-weight:600;color:#b26a00;margin-bottom:4px", text:"○ Needs your answer — captured from an application"}));
+  if (mapped) fields.push(el("div", {style:"font-size:12px;font-weight:600;color:#0b7a3b;margin-bottom:4px", text:"↔ Auto-answered from your profile ("+mapped+") — no action needed"}));
+  else if (!hasAns) fields.push(el("div", {style:"font-size:12px;font-weight:600;color:#b26a00;margin-bottom:4px", text:"○ Needs your answer — captured from an application"}));
   else if (qa.generated) fields.push(el("div", {style:"font-size:12px;font-weight:600;color:#6a4bd0;margin-bottom:4px", text:"✨ AI-drafted — review & edit"}));
   fields.push(area("Question","question",qa.question), area("Answer","answer",qa.answer));
+  // Preserve the classification/flag through the save round-trip (cardData reads any [data-k]).
+  fields.push(el("input", {type:"hidden", "data-k":"maps_to", value: mapped}));
+  fields.push(el("input", {type:"hidden", "data-k":"generated", value: qa.generated ? "1" : ""}));
   return entryCard(fields, c => { const q = (cardData(c).question||"").trim(); return q.length > 70 ? q.slice(0,70)+"…" : q; });
 }
 function acctRow(name, ok, text) {
@@ -1292,7 +1450,7 @@ function collectProfile() {
     desired_salary:t("desired_salary"), earliest_start_date:earliest_start_date, years_experience:t("years_experience"),
     gender:t("gender"), race_ethnicity:t("race_ethnicity"), veteran_status:t("veteran_status"), disability_status:t("disability_status"),
     greenhouse_email:t("greenhouse_email"), greenhouse_password:t("greenhouse_password"),
-    custom_answers: cardsIn("sec-qa").map(c => { const q = cardData(c); return { question:(q.question||"").trim(), answer:(q.answer||"").trim() }; }).filter(x => x.question || x.answer),
+    custom_answers: cardsIn("sec-qa").map(c => { const q = cardData(c); return { question:(q.question||"").trim(), answer:(q.answer||"").trim(), maps_to:(q.maps_to||"").trim(), generated: q.generated === "1" }; }).filter(x => x.question || x.answer || x.maps_to),
   };
 }
 async function loadProfile() {
@@ -1324,6 +1482,115 @@ async function saveProfile() {
   finally { stop(); btnDone(btn); }
 }
 $("save-profile").addEventListener("click", saveProfile);
+
+// ---- Discovery settings editor (all of profile/discovery.yaml, from the dashboard) ----
+function mkChk(key, checked) { const i = el("input", {type:"checkbox"}); i.checked = !!checked; if (key) i.dataset.k = key; return i; }
+function chkRow(label, key, checked) { return el("label", {class:"chkrow"}, [mkChk(key, checked), " " + label]); }
+function numFld(label, key, value) {
+  const i = el("input", {type:"number", class:"f", value:(value==null?"":value)}); i.dataset.k = key;
+  return el("div", {class:"fld"}, [el("label", {text:label}), i]);
+}
+function boardRow(b) {
+  b = b || {};
+  const sel = el("select", {class:"f bd-ats"}, ["greenhouse","lever","ashby"].map(a => el("option", {value:a, text:a})));
+  sel.value = b.ats || "greenhouse";
+  const tok = el("input", {class:"f bd-token", placeholder:"board token — e.g. stripe", value:b.token || ""});
+  const row = el("div", {class:"brd-row"});
+  const del = el("button", {class:"del", type:"button", text:"✕", title:"Remove board", on:{click:()=>row.remove()}});
+  row.append(sel, tok, del);
+  return row;
+}
+function renderDiscForm(f, levels) {
+  const form = $("disc-form"); form.innerHTML = "";
+
+  const boards = el("div", {id:"disc-boards", class:"cards"}, (f.boards||[]).map(boardRow));
+  const addBoard = el("button", {class:"addbtn", type:"button", text:"+ Add board",
+    on:{click:()=>boards.appendChild(boardRow({}))}});
+  form.appendChild(el("div", {class:"sec"}, [
+    el("h4", {text:"Target boards"}), boards, addBoard,
+    el("div", {class:"editing", text:"Companies whose public ATS board to poll. Read the token off the careers URL: boards.greenhouse.io/<token>, jobs.lever.co/<slug>, jobs.ashbyhq.com/<name>."}),
+  ]));
+
+  const lvlBoxes = el("div", {class:"lvls"}, levels.map(l => {
+    const i = mkChk(null, (f.experience_levels||[]).includes(l)); i.dataset.lvl = l;
+    return el("label", {class:"chkrow"}, [i, " " + l]);
+  }));
+  form.appendChild(el("div", {class:"sec"}, [
+    el("h4", {text:"Filters"}),
+    chkRow("Remote only — drop non-remote postings", "remote_only", f.remote_only),
+    numFld("Minimum annual salary (0 = no floor; postings with no stated pay are kept)", "min_salary", f.min_salary),
+    area("Exclude titles containing (one per line)", "title_exclude", (f.title_exclude||[]).join("\\n")),
+    el("label", {text:"Experience levels (none checked = any level)"}),
+    lvlBoxes,
+  ]));
+
+  form.appendChild(el("div", {class:"sec"}, [
+    el("h4", {text:"Matching"}),
+    numFld("Min skill matches to keep a posting (keyword floor)", "min_skills", f.min_skills),
+    numFld("How many top matches Claude judges for fit", "top_n", f.top_n),
+    numFld("Minimum fit score to apply — 0-100 (dry-run/apply only follow through at or above this)", "min_fit", f.min_fit),
+    chkRow("Skip postings already in my tracker (don't re-surface)", "skip_seen", f.skip_seen),
+    area("Aggregator search keywords (one per line; empty = derive from your résumé)", "keywords", (f.keywords||[]).join("\\n")),
+  ]));
+
+  const a = f.adzuna || {};
+  form.appendChild(el("div", {class:"sec"}, [
+    el("h4", {text:"Adzuna aggregator (optional)"}),
+    el("div", {class:"editing", text:"A broad job aggregator beyond your target boards. Free key from developer.adzuna.com — leave blank to search only the boards above."}),
+    fld("App ID", "adz_app_id", a.app_id),
+    fld("App key", "adz_app_key", a.app_key),
+    fld("Country code — e.g. us", "adz_country", a.country || "us"),
+    numFld("Max pages to fetch (50 results each)", "adz_max_pages", a.max_pages==null?1:a.max_pages),
+  ]));
+}
+const discEl = k => $("disc-form").querySelector('[data-k="' + k + '"]');
+const discVal = k => { const e = discEl(k); return e ? e.value : ""; };
+const discChk = k => { const e = discEl(k); return e ? e.checked : false; };
+const discInt = (k, d) => { const v = parseInt(discVal(k), 10); return isNaN(v) ? d : v; };
+function collectDisc() {
+  return {
+    boards: [...document.querySelectorAll("#disc-boards .brd-row")]
+      .map(r => ({ ats: r.querySelector(".bd-ats").value, token: r.querySelector(".bd-token").value.trim() }))
+      .filter(b => b.token),
+    remote_only: discChk("remote_only"),
+    min_salary: discInt("min_salary", 0),
+    title_exclude: linesOf(discVal("title_exclude")),
+    experience_levels: [...document.querySelectorAll("#disc-form [data-lvl]")].filter(c => c.checked).map(c => c.dataset.lvl),
+    keywords: linesOf(discVal("keywords")),
+    min_skills: discInt("min_skills", 2),
+    top_n: discInt("top_n", 10),
+    min_fit: discInt("min_fit", 50),
+    skip_seen: discChk("skip_seen"),
+    adzuna: {
+      app_id: discVal("adz_app_id").trim(),
+      app_key: discVal("adz_app_key").trim(),
+      country: discVal("adz_country").trim() || "us",
+      max_pages: discInt("adz_max_pages", 1),
+    },
+  };
+}
+async function loadDisc() {
+  $("disc-msg").textContent = "";
+  busyInto($("disc-form"), "Loading settings…", false);
+  try {
+    const d = await (await fetch("/discovery")).json();
+    if (d.error) throw new Error(d.error);
+    renderDiscForm(d.filters, d.levels);
+  } catch (e) { $("disc-form").innerHTML = ""; $("disc-form").appendChild(el("div", {class:"msg err", text:String(e.message || e)})); }
+}
+async function saveDisc() {
+  const btn = $("save-disc"), msg = $("disc-msg");
+  btnBusy(btn, "Saving…"); msg.className = "msg busy";
+  const stop = busyInto(msg, "Saving settings…", false);
+  try {
+    const r = await (await fetch("/discovery/update", { method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ data: collectDisc() }) })).json();
+    if (!r.ok) throw new Error(r.error || "save failed");
+    msg.className = "msg ok"; msg.textContent = "Saved ✓";
+  } catch (e) { msg.className = "msg err"; msg.textContent = String(e.message || e); }
+  finally { stop(); btnDone(btn); }
+}
+$("save-disc").addEventListener("click", saveDisc);
 
 function escapeHtml(s){ const d=document.createElement("div"); d.textContent=s; return d.innerHTML; }
 </script>

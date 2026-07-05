@@ -5,15 +5,19 @@ finds roles that fit the user, rather than making the user maintain a company li
 module is the *source* layer — the pluggable set of places postings come from — mirroring
 the pluggable-backends design (DECISIONS.md #008).
 
-Sources implemented here are the three public, no-auth ATS job-board APIs — the SAME ATSs
-the Apply stage drives (DECISIONS.md #016/#017), so a discovered posting flows straight
-through Tailor → Apply:
+Sources implemented here are public, no-auth ATS job-board APIs. Greenhouse/Lever/Ashby are
+the SAME ATSs the Apply stage natively drives (DECISIONS.md #016/#017); SmartRecruiters and
+Recruitee are *additional, distinct* form systems added to exercise the Apply autofill on as
+many ATS layouts as possible (DECISIONS.md #030) — a discovered posting flows straight
+through Tailor → Apply on whatever system it lives on:
 
-- Greenhouse : GET boards-api.greenhouse.io/v1/boards/{token}/jobs?content=true
-- Lever      : GET api.lever.co/v0/postings/{slug}?mode=json
-- Ashby      : GET api.ashbyhq.com/posting-api/job-board/{org}?includeCompensation=true
+- Greenhouse     : GET boards-api.greenhouse.io/v1/boards/{token}/jobs?content=true
+- Lever          : GET api.lever.co/v0/postings/{slug}?mode=json
+- Ashby          : GET api.ashbyhq.com/posting-api/job-board/{org}?includeCompensation=true
+- SmartRecruiters: GET api.smartrecruiters.com/v1/companies/{company}/postings (+ /{id} detail)
+- Recruitee      : GET {company}.recruitee.com/api/offers/
 
-All three return the full job-description text with no scraping and no ToS grey area
+All return the full job-description text with no scraping and no ToS grey area
 (Agent Guideline #4). Broad aggregator sources (Adzuna, remote feeds) slot in behind the
 same `Source` interface later. Every source yields `Posting`s; `Posting.to_job_description()`
 emits the exact Markdown + YAML front-matter shape the fixtures use, so the Tailor/Apply
@@ -37,6 +41,10 @@ from .job_description import JobDescription
 
 _UA = "ApplicationBot/0.1 (personal job search; contact: local user)"
 _TIMEOUT = 25
+
+# SmartRecruiters lists postings without the JD body, so we fetch each posting's detail
+# (an N+1). Cap how many we pull per company to keep the run polite and bounded.
+_SR_MAX_POSTINGS = 100
 
 
 # ---------------------------------------------------------------------------
@@ -371,11 +379,134 @@ class AdzunaSource(Source):
         return out
 
 
+class SmartRecruitersSource(Source):
+    """Public, no-auth SmartRecruiters postings API — a DIFFERENT ATS/form system than
+    Greenhouse/Lever/Ashby, so the Apply stage gets exercised on new forms. The list
+    endpoint omits the JD body, so we fetch each posting's detail for the full description
+    plus the real jobs.smartrecruiters.com apply URL. Bounded by `_SR_MAX_POSTINGS`
+    (an N+1 of one detail request per kept posting) to stay polite.
+
+        list   : GET api.smartrecruiters.com/v1/companies/{company}/postings?limit&offset
+        detail : GET api.smartrecruiters.com/v1/companies/{company}/postings/{id}
+    """
+
+    # jobAd sections in the order SmartRecruiters presents them; unknown ones append after.
+    _SECTION_ORDER = ("companyDescription", "jobDescription", "qualifications", "additionalInformation")
+
+    def __init__(self, company: str) -> None:
+        self.company = company.strip().strip("/")
+        self.name = f"smartrecruiters:{self.company}"
+
+    def fetch(self) -> list[Posting]:
+        base = f"https://api.smartrecruiters.com/v1/companies/{self.company}/postings"
+        listed: list[dict] = []
+        offset, limit = 0, 100
+        while len(listed) < _SR_MAX_POSTINGS:
+            data = fetch_json(f"{base}?limit={limit}&offset={offset}")
+            content = data.get("content", []) if isinstance(data, dict) else []
+            if not content:
+                break
+            listed.extend(content)
+            if len(content) < limit:
+                break
+            offset += limit
+        out: list[Posting] = []
+        for p in listed[:_SR_MAX_POSTINGS]:
+            pid = p.get("id")
+            if not pid:
+                continue
+            try:
+                det = fetch_json(f"{base}/{pid}")  # full JD + real apply URL
+            except DiscoveryError:
+                det = p  # detail failed — keep the list entry (title/location, no body)
+            out.append(self._to_posting(det))
+        return out
+
+    def _to_posting(self, j: dict) -> Posting:
+        loc = j.get("location") or {}
+        loc_str = loc.get("fullLocation") or ", ".join(
+            x for x in [loc.get("city"), loc.get("region"), (loc.get("country") or "").upper()] if x
+        )
+        remote = loc.get("remote")
+        sections = ((j.get("jobAd") or {}).get("sections")) or {}
+        apply_url = j.get("applyUrl") or j.get("postingUrl") or ""
+        return Posting(
+            company=(j.get("company") or {}).get("name") or self.company,
+            title=(j.get("name") or "").strip(),
+            body=self._body_from_sections(sections),
+            url=j.get("postingUrl") or apply_url,
+            ats="smartrecruiters",
+            location=loc_str,
+            remote=remote if isinstance(remote, bool) else None,
+            apply_url=apply_url,
+            updated_at=str(j.get("releasedDate", "")),
+        )
+
+    def _body_from_sections(self, sections: dict) -> str:
+        keys = list(self._SECTION_ORDER) + [k for k in sections if k not in self._SECTION_ORDER]
+        parts: list[str] = []
+        for key in keys:
+            sec = sections.get(key)
+            if not isinstance(sec, dict):
+                continue
+            title = (sec.get("title") or "").strip()
+            text = html_to_text(sec.get("text", "") or "")
+            if text:
+                parts.append(f"{title}\n{text}".strip() if title else text)
+        return "\n\n".join(parts)
+
+
+class RecruiteeSource(Source):
+    """Public, no-auth Recruitee careers API — another distinct ATS/form system. One call
+    returns every published offer with the full JD inline (description + requirements) and
+    the direct careers apply URL.
+
+        GET https://{company}.recruitee.com/api/offers/
+    """
+
+    def __init__(self, company: str) -> None:
+        self.company = company.strip().strip("/")
+        self.name = f"recruitee:{self.company}"
+
+    def fetch(self) -> list[Posting]:
+        data = fetch_json(f"https://{self.company}.recruitee.com/api/offers/")
+        offers = data.get("offers", []) if isinstance(data, dict) else []
+        out: list[Posting] = []
+        for o in offers:
+            status = o.get("status")
+            if status and status != "published":
+                continue
+            desc = html_to_text(o.get("description", "") or "")
+            reqs = html_to_text(o.get("requirements", "") or "")
+            body = "\n\n".join(x for x in [desc, reqs] if x)
+            apply_url = o.get("careers_apply_url") or o.get("careers_url") or ""
+            comp = o.get("salary") if isinstance(o.get("salary"), str) else ""
+            out.append(
+                Posting(
+                    company=o.get("company_name") or self.company,
+                    title=(o.get("title") or o.get("position") or "").strip(),
+                    body=body,
+                    url=o.get("careers_url") or apply_url,
+                    ats="recruitee",
+                    location=o.get("location") or ", ".join(
+                        x for x in [o.get("city"), o.get("country")] if x
+                    ),
+                    compensation=comp,
+                    remote=True if o.get("remote") else (False if o.get("on_site") else None),
+                    apply_url=apply_url,
+                    updated_at=str(o.get("published_at") or o.get("created_at") or ""),
+                )
+            )
+        return out
+
+
 # Map an ATS name to its source constructor, for building sources from config.
 ATS_SOURCES = {
     "greenhouse": GreenhouseSource,
     "lever": LeverSource,
     "ashby": AshbySource,
+    "smartrecruiters": SmartRecruitersSource,
+    "recruitee": RecruiteeSource,
 }
 
 

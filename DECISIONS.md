@@ -37,6 +37,10 @@
 | 024 | 2026-07-04 | Track stage: local SQLite store (`applications.db`) as system of record + editable Track tab in the web UI; optional Sheets/CSV export later | Accepted |
 | 025 | 2026-07-04 | Tailoring speed/quality tiers (fast/balanced/max) — extended thinking off by default; ~2 min → ~35s | Accepted |
 | 026 | 2026-07-04 | Discover stage: qualification-driven, pluggable sources (public ATS APIs + one aggregator), hybrid keyword→Claude matcher, testing-mode end-to-end before autonomous | Accepted |
+| 027 | 2026-07-05 | Experience-level discovery gate: title-based detection, lenient (drop a clearly-different level; keep undetected) | Accepted |
+| 028 | 2026-07-05 | Semantic question classification: on a keyword miss, Claude maps a novel question onto a known structured field type; cache the mapping (answer stays live) | Accepted |
+| 029 | 2026-07-05 | Persist tailored résumé PDFs to a stable git-ignored store (not `$TMPDIR`); bound growth via per-posting overwrite + cascade delete + size cap | Accepted |
+| 030 | 2026-07-05 | More discovery sources: broaden the ATS layer (SmartRecruiters + Recruitee) over aggregators; reject hiring.cafe (now auth-gated) + LinkedIn (Guideline #4) | Accepted |
 
 ---
 
@@ -924,3 +928,198 @@ keywords when configured. All PII/artifacts git-ignored. See [[016-apply-stage]]
 [[017-native-autofill]], [[013-catalogue-preselection]] (the hybrid pattern),
 [[008-pluggable-backends]] (the source interface), [[003-fixtures]] (the JD shape it emits),
 [[024-track-stage]] (the dry-run row it records), [[004-respect-tos]] (Guideline #4).
+
+## 027 — Experience-level discovery gate (title-based, lenient)
+
+**Date:** 2026-07-05
+**Status:** Accepted
+
+**Context:** The user wants to filter discovery by experience level — intern, new grad,
+etc. — so early-career runs stop surfacing senior/staff/manager roles. Needed a positive
+level gate alongside the existing coarse gates in `filters.py` (`remote_only`, `min_salary`,
+`title_exclude`), which run before the qualification matcher.
+
+**Options considered:**
+
+| Approach | Signal | Pros | Cons |
+|---|---|---|---|
+| **Title regex (chosen)** | Posting title | Free, deterministic; seniority reliably lives in the title; same philosophy as `title_exclude`; no extra Claude call | Titles that omit the level go undetected |
+| Description/"X+ years" parse | Body text | Catches level-less titles | Noisy ("5+ years" ≠ a level), more code, still heuristic |
+| Ask the Claude judge to gate level | Full JD | Most accurate | Spends a Claude call on obvious drops; the matcher already judges fit |
+
+Second axis — how to treat titles with **no** detectable level (e.g. plain "Software
+Engineer"): **strict** (keep only clearly-matching titles) vs **lenient** (drop only titles
+that clearly name a *different* level; let undetected ones pass to the matcher).
+
+**Decision:** Title regex, **lenient**. `_LEVEL_PATTERNS` maps 7 levels — `internship`,
+`new_grad`, `junior`, `mid`, `senior`, `staff`, `manager` — to word-boundaried regexes;
+`detect_levels(title)` returns the set named in a title. `apply_gates` drops a posting only
+when the title names a level and **none** of the user's `experience_levels` is among them;
+undetected titles pass through (same "missing data → keep" rule as the salary gate). New
+`DiscoveryFilters.experience_levels` list; user values are normalized ("New Grad" →
+`new_grad`) and unknown values ignored. Config in `profile/discovery.yaml` (example seeded).
+
+**Reasoning:** The user chose lenient — undetected titles are more often the mid-level roles
+a candidate still wants judged than noise, and the résumé+Claude matcher is the real fit
+arbiter; this gate only strips the obvious wrong-tier postings cheaply. Word boundaries avoid
+the false positives substring matching would cause ("intern" in "internal", "lead" in
+"leading"). Title-only keeps it a zero-cost pre-matcher gate.
+
+**Verified:** 15-title detection suite incl. false-positive traps (internal→manager not
+intern; leading→∅) all correct; lenient early-career gate keeps intern/new-grad/ambiguous and
+drops senior/manager; senior gate keeps senior+ambiguous and drops the rest; no-gate keeps
+all. See [[026-discover-stage]] (the gates it joins), [[003-fixtures]] (the posting shape).
+
+---
+
+## 028 — Semantic question classification onto known field types
+
+**Date:** 2026-07-05
+**Status:** Accepted
+
+**Context:** The Apply resolver answers form questions by keyword-matching a label to a
+structured profile field or a saved bank answer (decision 018). Keyword matching misses
+semantic variants: "Are you willing to work either out of our NYC office or San Francisco
+office 2-3 days per week?" is functionally the same as the structured **remote/onsite**
+question but shares no keywords with it, so it was captured as a brand-new blank "needs your
+answer" instead of being answered. The user asked that Claude classify novel questions so they
+either reuse an existing answer type or become a genuinely new one.
+
+**Options considered:**
+| Option | Verdict |
+|---|---|
+| Claude classifies a missed question onto a known field type; answer live from that field; **cache the mapping** | **Chosen** — correct answers survive profile edits; one Claude call per novel question, then cached |
+| Cache the classified **answer** string (like generated answers) | Rejected — goes stale if the profile changes (e.g. relocate Yes→No); a mapping stays live |
+| Expand keyword lists to cover more phrasings | Rejected — unbounded; can't anticipate office-specific/company-specific paraphrases |
+| Embed + nearest-neighbour match to field types | Rejected — new dependency/index for a handful of fields; the LLM already available does it better |
+
+**Decision:** Add a semantic layer **after** keyword resolution. `answer_bank.classify_question`
+sends the question + a fixed set of classifiable structured types (work_authorized,
+requires_sponsorship, us_citizen, willing_to_relocate, open_to_remote, desired_salary,
+earliest_start_date, years_experience, how_heard, location, country) to Claude (subscription
+CLI, no thinking) and returns the matching type key or None. Company-specific and demographic
+questions are gated out (never auto-mapped). The resolver's `resolve_semantic()` runs on a
+keyword miss for non-open-ended fields, answers **live** via `answer_for_type(key)`, and caches
+the result as a `QA(maps_to=key)` in the answer bank — so future runs answer it instantly and it
+tracks profile edits (a mapped entry's `answer` is intentionally blank; `resolve()` reads the
+live field when `maps_to` is set). Open-ended prose questions still go to the grounded drafting
+path (decision 018), not classification. The Profile UI shows mapped entries as "↔ Auto-answered
+from your profile (type)" and preserves `maps_to`/`generated` through save. The Claude reply is
+parsed robustly (it may reason before answering — take the last type key mentioned, unless it
+concludes "none").
+
+**Reasoning:** Directly extends the self-improving bank (decision 018) from "learn answers" to
+"learn how a question maps to what we already know," which is where most repetition lives —
+work-eligibility, location/remote, salary, and start-date questions are asked a hundred ways.
+Caching the **mapping** rather than the answer keeps every reuse correct if the profile changes,
+matching the system's truthfulness-by-construction stance. Cost stays bounded: one classification
+per genuinely-novel question, then free. **Verified:** the user's office-days example →
+`open_to_remote`; sponsorship/start-date variants classify correctly; company-specific and
+no-type questions → None; the mapped entry answers live and flips Yes→No when the profile field
+changes; UI save round-trips `maps_to`. See [[018-self-improving-answer-bank]] (the bank this
+extends), [[011-claude-code-cli-subscription]] (billing path), [[016-apply-stage]] (the resolver).
+
+## 029 — Persist tailored résumé PDFs to a stable, bounded store
+
+**Date:** 2026-07-05
+**Status:** Accepted
+
+**Context:** Each dry-run tailors a résumé and writes the PDF the Apply form uploads. That PDF
+was written to `$TMPDIR/tailored_*.pdf` via `tempfile.NamedTemporaryFile(delete=False)`, and the
+Track row's `resume_path` pointed at it. macOS purges `$TMPDIR`, so the file backing a recorded
+application would eventually vanish — you could not go back and see the résumé a given
+application used, which is a Track-stage requirement (NEXT_STEPS lists "tailored resume used" as a
+tracked field). The user wanted to review dry-run output quality but also flagged a real concern:
+persisting a PDF per application could bloat storage.
+
+**Sizing (measured, not assumed):** one tailored PDF is ~4.7 KB (fpdf2, real text, no embedded
+fonts). Discovery/apply already **upserts by `source_url`**, so files scale with *unique postings
+applied to*, not runs: 1,000 → 4.6 MB, 10,000 → 46 MB, 50,000 → 230 MB. Bloat is a minor concern
+at this scale (the base résumé PDF alone is 281 KB, 60× one tailored file); the goal is a bounded,
+self-cleaning store, not crisis-aversion.
+
+**Options considered:**
+| Question | Choice | Rejected alternatives |
+|---|---|---|
+| What to store per application | **The exact PDF uploaded** (~5 KB) | Structured JSON + regenerate PDF — a regenerated PDF wouldn't match what was actually submitted once the base résumé is edited (drift), losing the exact-record property; JSON-only has the same drift problem |
+| How to bound growth | **Per-posting overwrite + cascade delete + size cap** | Cascade-only (no hard ceiling); upsert-only (files linger after a row is deleted) |
+
+**Decision:** New leaf module `applicationbot/resume_store.py` (imported by both `pipeline` and
+`tracker`, imports neither — no cycle):
+- **Location:** `profile/tailored/`, git-ignored (covered by `profile/*` and `*.pdf`).
+- **Naming:** `<company-slug>-<role-slug>-<sha1(source_url)[:8]>.pdf` — deterministic on the
+  posting URL (the same dedup key the tracker upserts on), so a re-run **overwrites** the same
+  file rather than accumulating. `pipeline._apply_one` now calls `resume_store.write_pdf(...)`
+  instead of `tempfile.NamedTemporaryFile`.
+- **Cascade delete:** `tracker.delete_application` deletes the row's file, but only via
+  `resume_store.delete_if_managed`, which unlinks **only** paths resolving under
+  `profile/tailored/` — a user-supplied `--pdf` outside the store is never touched.
+- **Size cap:** `prune()` drops the oldest PDFs (by mtime) once the folder passes `MAX_BYTES`
+  (100 MB ≈ 20k files); runs on each write, never removes the file just written. A backstop that
+  shouldn't trip given the first two mechanisms.
+- **Migration:** `scripts/migrate_tailored_pdfs.py` (idempotent) copies any existing row's
+  `$TMPDIR` PDF into the store and repoints `resume_path`; skips already-managed rows and reports
+  missing files.
+
+**Reasoning:** The exact PDF is the honest record of what a form received and is cheap; JSON
+regeneration would drift from what was submitted the moment the base résumé changes. Growth is
+bounded structurally (one file per posting) with a hard ceiling as insurance, so the store stays
+tied to what's actually in the tracker. **Verified:** deterministic naming + re-run overwrite;
+`is_managed` refuses to delete an external file; prune drops oldest and keeps the newest; cascade
+delete through a temp-DB tracker removes the managed PDF and leaves a user-supplied one intact;
+the migration moved the 3 real dry-run rows into `profile/tailored/` and is a no-op on re-run.
+See [[024-track-stage-sqlite]] (the store this feeds `resume_path`), [[026-discover-stage]]
+(`_apply_one`, where the PDF is written), [[016-apply-stage]] (upload of the uploaded file).
+
+## 030 — More discovery sources: broaden the ATS layer (SmartRecruiters + Recruitee), not aggregators
+
+**Date:** 2026-07-05
+**Status:** Accepted
+
+**Context:** The user asked to improve web-scraping/discovery breadth, naming **hiring.cafe**
+and **LinkedIn** as candidates, with an explicit goal: *"expose ourselves to as many job
+postings as possible to train our autofill to work on any site/system"* — i.e. breadth is
+wanted primarily to exercise the Apply autofill across **diverse ATS form systems**, not just
+Greenhouse/Lever/Ashby (decisions #016/#017/#026). Researched the 2026 landscape (two parallel
+web-research passes) **and probed every candidate API live** rather than trusting third-party
+docs — which proved essential, because the headline candidates had changed.
+
+**Options considered (verified live this session):**
+
+| Candidate | Live probe result | Verdict |
+|---|---|---|
+| **hiring.cafe** (the user's #1) | `POST /api/search-jobs` → **405**; `GET` → **401 Unauthorized**. Frontend now calls `/ssr/search-jobs` with `Authorization: Bearer ${token}` where the token comes from a **session auth call** (not a public constant). The scraper repos the research cited are **stale**. | **Rejected.** Using it requires replaying an auth token issued to their logged-in frontend = circumventing an access control, against Guideline #4 + their ToS "don't reproduce/redistribute" clause. |
+| **LinkedIn** | No public/candidate jobs API; partner Job Posting API is post-only **and closed to new partners**; scraping breaches their User Agreement (hiQ v. LinkedIn). | **Rejected** (confirms #026). |
+| **The Muse** | Works; full JD (`contents`), but `landing_page` → **themuse.com pages, not the underlying ATS** (extra hop to the real form); heavily international. | Deferred — weak for the ATS-form-diversity goal. |
+| **USAJobs** | Full JD, clean, but routes into non-autofillable government portals. | Deferred — discovery/tracking only, not an Apply target. |
+| **SmartRecruiters** | `GET api.smartrecruiters.com/v1/companies/{company}/postings` (+ `/{id}` detail) → full JD in `jobAd.sections`, real `jobs.smartrecruiters.com` apply URL. **Verified:** PublicStorage 5/5, BoschGroup 3/3 full JD. | **Chosen.** A distinct form system; public, no-auth, full JD, direct apply. |
+| **Recruitee** | `GET {company}.recruitee.com/api/offers/` → one call, full JD inline (`description`+`requirements`), `careers_apply_url`. **Verified:** bunq 16/16. | **Chosen.** Distinct form system; cleanest (single call, like GH/Lever/Ashby). |
+| **Workable** | Anonymous widget `apply.workable.com/api/v1/widget/accounts/{sub}` returned **0 jobs for every slug tried**; reliable path needs an SPI token. | **Deferred** — couldn't verify a working no-auth endpoint; don't ship unverified (Guideline #11). |
+
+**Decision:** Instead of adding an aggregator (whose apply links are indirect or ToS-encumbered),
+**broaden the ATS source layer itself** — add `SmartRecruitersSource` and `RecruiteeSource` as new
+`Source` subclasses in `discovery.py`, registered in `ATS_SOURCES`. **No schema change**: the
+existing `Board{ats, token}` model already accepts any `ats` string, so config is just
+`{ats: smartrecruiters, token: <Company>}` / `{ats: recruitee, token: <company>}`. SmartRecruiters'
+list endpoint omits the JD body, so it fetches per-posting detail (an N+1) bounded by
+`_SR_MAX_POSTINGS = 100` per company. Both normalize to the same `Posting` shape and flow straight
+through Tailor → Apply; postings on these ATSs hit the Apply driver's **generic** per-field path
+(no native adapter yet), which is exactly the "test autofill on new systems" the user wants.
+
+**Reasoning:** The user's goal is autofill robustness across form systems, and a *new ATS* delivers
+that far more directly than an aggregator that dumps the applicant on a listing page or an
+ATS-we-already-handle. Both chosen sources are fully compliant (public, documented-shape, no-auth,
+full JD), reuse the entire pipeline, and add zero dependencies (stdlib `urllib`, like #026).
+hiring.cafe and LinkedIn were rejected on Guideline #4 — and the hiring.cafe finding is a reminder
+to **probe live, not trust research**: its API had moved behind auth since the cited scrapers were
+written. Caveat surfaced: not every SmartRecruiters company exposes its postings API publicly (many
+big names return 0 postings — surfaced cleanly, not as an error); Workable and The Muse remain
+available follow-ups behind the same interface.
+
+**Verified live:** SmartRecruiters (PublicStorage 5/5, BoschGroup 3/3) + Recruitee (bunq 16/16)
+return full JD, direct apply URLs, and round-trip through `to_job_description()`/`to_markdown()`;
+the full pipeline ran discover → gate → match over 505 postings (recruitee:bunq + greenhouse:stripe)
+with 0 errors. See [[026-discover-stage]] (the source interface + pipeline this extends),
+[[016-apply-stage]] (the generic autofill these new ATSs exercise), [[017-native-autofill]],
+[[004-respect-tos]] (Guideline #4, why hiring.cafe/LinkedIn are out), [[015-linkedin-import]]
+(the compliant LinkedIn path).

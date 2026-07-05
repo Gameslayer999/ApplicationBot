@@ -123,8 +123,17 @@ def update_application(app_id: int, changes: dict[str, Any], *, path: str | Path
 
 def delete_application(app_id: int, *, path: str | Path = DEFAULT_DB) -> bool:
     with _connect(path) as conn:
+        row = conn.execute(
+            "SELECT resume_path FROM applications WHERE id=?", (app_id,)
+        ).fetchone()
         cur = conn.execute("DELETE FROM applications WHERE id=?", (app_id,))
-        return cur.rowcount > 0
+        deleted = cur.rowcount > 0
+    # Cascade: remove the tailored PDF this row owned (decision 029) — but only if it's
+    # a file we manage under profile/tailored/, never a user-supplied path.
+    if deleted and row and row["resume_path"]:
+        from . import resume_store
+        resume_store.delete_if_managed(row["resume_path"])
+    return deleted
 
 
 def get_application(app_id: int, *, path: str | Path = DEFAULT_DB) -> Optional[dict[str, Any]]:
@@ -145,6 +154,22 @@ def find_by_source_url(url: str, *, path: str | Path = DEFAULT_DB) -> Optional[d
         )
         row = cur.fetchone()
     return dict(row) if row else None
+
+
+def seen_source_urls(*, statuses: Optional[list[str]] = None, path: str | Path = DEFAULT_DB) -> set[str]:
+    """Every non-empty source URL already in the tracker (optionally limited to `statuses`).
+    The Discover stage uses this to skip postings it has already processed/applied to, so
+    re-runs don't keep surfacing and re-applying to the same roles."""
+    where = ["source_url != ''"]
+    params: list[Any] = []
+    if statuses:
+        where.append("status IN (%s)" % ",".join("?" * len(statuses)))
+        params += list(statuses)
+    with _connect(path) as conn:
+        cur = conn.execute(
+            "SELECT DISTINCT source_url FROM applications WHERE " + " AND ".join(where), params
+        )
+        return {r["source_url"] for r in cur.fetchall()}
 
 
 def list_applications(

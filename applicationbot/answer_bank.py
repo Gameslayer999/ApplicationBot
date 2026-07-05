@@ -27,9 +27,12 @@ _COMPANY_SPECIFIC = (
     "why do you want to work", "why do you want to join", "why are you interested",
     "why this company", "why this role", "why this position", "why our", "why us",
     "what interests you", "what excites you", "what draws you", "what attracts you",
+    "excited about", "excited to join", "excited to work", "excited to be",
+    "drew you to", "draws you to", "attracted you to", "interested in joining",
+    "want to work here", "want to work at", "why do you want", "motivates you to",
     "our mission", "our company", "our team", "our product", "our values", "our culture",
     "this company", "this role", "this position", "about our", "why here",
-    "cover letter", "what do you know about",
+    "cover letter", "what do you know about", "why are you applying",
 )
 
 # Signals that a question wants a written, multi-sentence answer (vs a short field).
@@ -82,6 +85,64 @@ what IS there — do not fabricate to fill space.
 - Write in the first person, professional and specific, drawing on concrete résumé details.
 - Answer ONLY the question. No preamble, no sign-off, no markdown, no quotes around it.
 - Keep it concise: {max_chars} characters or fewer (a tight paragraph)."""
+
+
+# Structured profile fields a novel question can be semantically mapped onto. The key is the
+# field the resolver answers from; the text is what that field means (used in the classifier
+# prompt). Demographic/EEO and company-specific questions are intentionally NOT here — they're
+# handled separately and must never be auto-mapped.
+CLASSIFIABLE_TYPES: dict[str, str] = {
+    "work_authorized": "Already legally allowed to work in the country WITHOUT any employer "
+                       "action (yes/no). NOT about needing a visa sponsored.",
+    "requires_sponsorship": "Needs the EMPLOYER to sponsor a visa or work permit, now or in the "
+                            "future (yes/no). Distinct from already being authorized.",
+    "us_citizen": "Is a citizen of the country (yes/no).",
+    "willing_to_relocate": "Willing to relocate / move to a new city for the job (yes/no).",
+    "open_to_remote": "Willingness about WORK LOCATION/ARRANGEMENT — working remotely, hybrid, "
+                      "or in-person from a specific office some days per week (yes/no).",
+    "desired_salary": "Expected or desired salary / compensation.",
+    "earliest_start_date": "When they can start / begin, their availability, or notice period.",
+    "years_experience": "Total years of relevant professional experience.",
+    "how_heard": "How they heard about or found this job.",
+    "location": "Their current city / where they are based.",
+    "country": "The country they live in.",
+}
+
+
+def classify_question(question: str, *, model: Optional[str] = None) -> Optional[str]:
+    """Use Claude to map a novel question onto a known structured field type (a key of
+    CLASSIFIABLE_TYPES), or None if it doesn't correspond to any. This catches semantic
+    variants the keyword resolver misses — e.g. "Are you willing to work out of our NYC or SF
+    office 2-3 days per week?" → 'open_to_remote'. Best-effort: returns None if the Claude CLI
+    is unavailable, the answer isn't a known key, or it's explicitly 'none'."""
+    n = _norm(question)
+    if not n or is_company_specific(question) or is_demographic(question):
+        return None  # these are handled elsewhere and must never be auto-mapped
+    from . import backends  # lazy
+
+    types = "\n".join(f"- {k}: {v}" for k, v in CLASSIFIABLE_TYPES.items())
+    prompt = (
+        "Map a job-application question to ONE of these known answer types, or 'none'.\n\n"
+        f"TYPES:\n{types}\n- none: does not correspond to any type above.\n\n"
+        f"QUESTION: {question!r}\n\n"
+        "A type matches only if answering that field would correctly answer the question "
+        "(functional equivalence, not just topical similarity). Reply with just the type key "
+        "(e.g. open_to_remote) or none. If you reason, end your reply with the final key on "
+        "its own line."
+    )
+    try:
+        out = backends.run_claude_cli(prompt, model=model, think=False, timeout=60).strip().lower()
+    except Exception:
+        return None
+    # Robust parse: the model may reason before answering, so take the LAST known type key it
+    # mentions — unless it concludes 'none' after that (a rejection wins).
+    key_pos = {k: out.rfind(k) for k in CLASSIFIABLE_TYPES}
+    best_key = max(key_pos, key=key_pos.get)
+    best_pos = key_pos[best_key]
+    none_pos = max((m.start() for m in re.finditer(r"\bnone\b", out)), default=-1)
+    if best_pos < 0 or none_pos > best_pos:
+        return None
+    return best_key
 
 
 def generate_answer(

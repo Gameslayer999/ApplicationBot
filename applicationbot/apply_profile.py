@@ -30,6 +30,10 @@ class QA(BaseModel):
     question: str
     answer: str
     generated: bool = False  # answer drafted by Claude (flag for review); False = user-entered
+    maps_to: str = ""  # if set, answer this question LIVE from a structured profile field
+    #                    (a Claude-classified semantic match, e.g. a novel "willing to work from
+    #                    our office 3 days?" phrasing → "open_to_remote"). Keeps answers correct
+    #                    if the profile changes, and records how the question was interpreted.
 
 
 class ApplicationProfile(BaseModel):
@@ -97,7 +101,13 @@ def replace_profile(data: dict, path: str | Path = DEFAULT_PATH) -> ApplicationP
 
 
 def _norm_q(q: str) -> str:
-    return " ".join((q or "").lower().split())
+    """Normalize a question for dedup: lowercase, drop punctuation, collapse whitespace, and
+    strip common polite lead-ins so near-duplicate phrasings collapse to one bank entry
+    ("Please describe your experience with X." ≈ "Describe your experience with X?")."""
+    import re
+    s = re.sub(r"[^a-z0-9 ]", " ", (q or "").lower())
+    s = re.sub(r"^\s*(please|kindly|briefly|so|and|also)\s+", "", s)
+    return " ".join(s.split())
 
 
 def remember_answers(new: list[QA], path: str | Path = DEFAULT_PATH) -> int:
@@ -109,7 +119,10 @@ def remember_answers(new: list[QA], path: str | Path = DEFAULT_PATH) -> int:
     added = 0
     for qa in new:
         key = _norm_q(qa.question)
-        if not key or not (qa.answer or "").strip() or key in have:
+        # Keep entries that carry either a written answer OR a structured mapping (maps_to);
+        # a mapped entry answers live from the profile, so its `answer` is intentionally blank.
+        has_content = bool((qa.answer or "").strip()) or bool(getattr(qa, "maps_to", ""))
+        if not key or not has_content or key in have:
             continue
         profile.custom_answers.append(qa)
         have.add(key)
