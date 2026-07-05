@@ -49,8 +49,10 @@ def discover_and_match(
     profile: ApplicationProfile | None = None,
     extra_sources: list[Source] | None = None,
     use_claude: bool = True,
+    on_progress=None,
 ) -> PipelineResult:
-    """The reusable core: discover → gate → qualification-match. No side effects."""
+    """The reusable core: discover → gate → qualification-match. No side effects.
+    `on_progress(done, total)` reports Claude-judging progress for a UI."""
     sources = build_sources(filters, resume, profile) + list(extra_sources or [])
     if not sources:
         return PipelineResult([], 0, 0, ["No sources configured. Add boards to profile/discovery.yaml."])
@@ -59,7 +61,8 @@ def discover_and_match(
     discovered = len(postings)
     postings = apply_gates(postings, filters)
     matches, match_errors = match(
-        resume, postings, top_n=filters.top_n, use_claude=use_claude, min_skills=filters.min_skills
+        resume, postings, top_n=filters.top_n, use_claude=use_claude,
+        min_skills=filters.min_skills, on_progress=on_progress,
     )
     return PipelineResult(
         matches=matches,
@@ -108,38 +111,50 @@ def run_testing_mode(
     headed: bool = True,
     slow_mo: int = 350,
     pause: bool = True,
-) -> None:
-    """Tailor → PDF → dry-run apply for ONE posting, watched live. Never submits."""
+    status_cb=None,
+    hold=None,
+    on_filled=None,
+):
+    """Tailor → PDF → dry-run apply for ONE posting, watched live. Never submits. Returns the
+    ApplyReport. `status_cb(step, message)` receives progress (in addition to printing) so a UI
+    can surface it; `hold` (a threading.Event) replaces the terminal review pause for web runs;
+    `on_filled(report)` fires the moment filling finishes, before the hold."""
     from .apply import AnswerResolver, run_apply
     from .pdf import render_pdf
     from .tailor import tailor_resume
 
+    def say(step, message):
+        print(message)
+        if status_cb is not None:
+            status_cb(step, message)
+
     p = match_obj.posting
     jd = p.to_job_description()
 
-    print(f"\n▶ Tailoring résumé for: {p.company} — {p.title}")
+    say("tailor", f"▶ Tailoring résumé for: {p.company} — {p.title}")
     result = tailor_resume(resume, jd, backend=backend)
     print(f"  tailored via {result.backend}" + (f" — {'; '.join(result.warnings)}" if result.warnings else ""))
     for note in result.tailored.relevance_notes:
         print(f"  note: {note}")
 
+    say("pdf", "▶ Exporting tailored résumé to PDF…")
     pdf_path = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False, prefix="tailored_").name
     with open(pdf_path, "wb") as f:
         f.write(render_pdf(resume, result.tailored))
     print(f"  résumé PDF → {pdf_path}")
 
     apply_url = p.apply_url or p.url
-    print(f"\n▶ DRY-RUN apply (headed — watch it fill; never submits): {apply_url}")
+    say("apply", f"▶ DRY-RUN apply (watch it fill; never submits): {apply_url}")
     generate = backends.claude_code_available()
     resolver = AnswerResolver(
         resume=load_resume(resume_yaml),
         profile=load_profile(profile_path),
         enable_generation=generate,
     )
-    run_apply(
+    return run_apply(
         apply_url, pdf_path, resolver,
         headed=headed, pause=pause, slow_mo=slow_mo,
-        profile_path=profile_path,
+        profile_path=profile_path, hold=hold, on_filled=on_filled,
     )
 
 

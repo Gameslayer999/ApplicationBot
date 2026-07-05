@@ -265,10 +265,10 @@ _GROUP_QUESTION_JS = r"""(el) => {
 }"""
 
 # JS: every required field's label text (Greenhouse marks required with "*").
-_REQUIRED_LABELS_JS = r"""() => {
+_REQUIRED_LABELS_JS = r"""(scope) => {
   const clean = s => (s || '').replace(/\s+/g, ' ').replace(/\*/g, '').trim();
   const out = [];
-  document.querySelectorAll('form label, form legend').forEach(l => {
+  document.querySelectorAll(scope + 'label, ' + scope + 'legend').forEach(l => {
     if ((l.innerText || '').includes('*')) {
       const c = clean(l.innerText);
       if (c && !out.includes(c)) out.push(c);
@@ -281,8 +281,8 @@ _TEXTLIKE = {"", "text", "email", "tel", "url", "number", "search"}
 
 # JS: inventory every form control with its derived label + kind + visibility (diagnostics).
 _DUMP_JS = (
-    "() => { const labelOf = " + _LABEL_JS + ";"
-    " const els = document.querySelectorAll('form input, form textarea, form select, form [role=combobox]');"
+    "(scope) => { const labelOf = " + _LABEL_JS + ";"
+    " const els = document.querySelectorAll(scope+'input, '+scope+'textarea, '+scope+'select, '+scope+'[role=combobox]');"
     " return Array.from(els).map(el => { const r = el.getBoundingClientRect(); return {"
     " tag: el.tagName.toLowerCase(), type: (el.getAttribute('type')||'').toLowerCase(),"
     " role: (el.getAttribute('role')||'').toLowerCase(), cls: (el.getAttribute('class')||'').slice(0, 40),"
@@ -295,7 +295,7 @@ def _dump_fields(page) -> None:
     a live run reveals the real DOM when a field won't fill."""
     import sys
     try:
-        rows = page.evaluate(_DUMP_JS)
+        rows = page.evaluate(_DUMP_JS, _scope_prefix(page))
     except Exception as e:
         print(f"[debug] field dump failed: {e}", file=sys.stderr)
         return
@@ -342,17 +342,18 @@ _VALUE_JS = r"""(el) => {
 _NATIVE_AUTOFILL_BUTTONS = (r"autofill with resume", r"autofill from resume", r"^\s*autofill")
 
 
-def _trigger_native_autofill(page, ats: str, report: "ApplyReport") -> None:
+def _trigger_native_autofill(frame, ats: str, report: "ApplyReport") -> None:
     """Click the ATS's resume-parse autofill button if it exposes one (e.g. Workday's "Autofill
     with Resume"). Lever/Ashby parse on upload and need no click — the resume upload already
-    happened, so their fields populate on their own before our only-empty pass."""
+    happened, so their fields populate on their own before our only-empty pass. `frame` is the
+    form's frame (main page or embedded iframe)."""
     for pat in _NATIVE_AUTOFILL_BUTTONS:
         try:
-            btn = page.get_by_role("button", name=re.compile(pat, re.I)).first
+            btn = frame.get_by_role("button", name=re.compile(pat, re.I)).first
             if btn.count() and btn.is_visible():
                 btn.click(timeout=4000)
                 report.native_autofill = f"{ats}: {pat.strip('^\\s*')} button"
-                page.wait_for_timeout(2500)  # let the parse populate fields
+                frame.page.wait_for_timeout(2500)  # let the parse populate fields
                 return
         except Exception:
             continue
@@ -399,15 +400,114 @@ def _greenhouse_native_autofill(page, ctx, profile, report: "ApplyReport") -> No
         report.errors.append(f"MyGreenhouse autofill (falling back to our autofill): {type(e).__name__}: {e}")
 
 
-def _upload_resume(page, resume_pdf: str, report: "ApplyReport") -> None:
+# A visible field that reliably signals the real application form has rendered. ATS forms
+# mount their inputs via JS after domcontentloaded, so we must wait for one of these before
+# filling — otherwise the field scan runs against an empty DOM and fills nothing.
+_FORM_FIELD_SIGNAL = (
+    'input[type="email"], input[name*="email" i], input[id*="email" i], '
+    'input[name*="first" i], input[id*="first" i], input[autocomplete="given-name"], '
+    'textarea[name], form input[type="text"]'
+)
+
+
+# Frame URLs that are never the application form — skip them when hunting for the form frame.
+_NON_FORM_FRAME = ("recaptcha", "captcha", "googletagmanager", "google-analytics", "doubleclick",
+                   "/gtm", "privacycompliance", "content.googleapis", "hcaptcha")
+
+
+def _count_fields(frame) -> int:
+    """Number of real (non-hidden) form controls in a frame."""
+    try:
+        return frame.evaluate(
+            "() => document.querySelectorAll("
+            "'input:not([type=hidden]):not([type=submit]):not([type=button]), textarea, select'"
+            ").length"
+        )
+    except Exception:
+        return 0
+
+
+def _find_form_frame(page):
+    """Return (frame, field_count) for the frame that actually holds the application form.
+    ATS forms are frequently embedded in an IFRAME — e.g. Greenhouse's job_app embed on a
+    company's own careers site (stripe.com → job-boards.greenhouse.io/embed/job_app). Our
+    locators don't cross frames, so we must pick the frame with the fields, not just the main
+    page. Returns the richest non-chrome frame."""
+    best, best_n = page.main_frame, _count_fields(page.main_frame)
+    for fr in page.frames:
+        if fr is page.main_frame:
+            continue
+        if any(s in (fr.url or "").lower() for s in _NON_FORM_FRAME):
+            continue
+        n = _count_fields(fr)
+        if n > best_n:
+            best, best_n = fr, n
+    return best, best_n
+
+
+def _ats_from_frame(frame, fallback: str) -> str:
+    """Re-derive the ATS from the frame that holds the form. A Greenhouse form embedded on a
+    company domain (stripe.com) is detected as 'generic' from the outer URL but is really
+    greenhouse — the embed frame URL reveals it."""
+    u = (getattr(frame, "url", "") or "").lower()
+    for name in ("greenhouse", "lever", "ashby", "workday", "icims"):
+        if name in u:
+            return "greenhouse" if name == "greenhouse" else name
+    return fallback
+
+
+def _open_application_form(page, ats: str, report: "ApplyReport", timeout_ms: int = 25000):
+    """Reveal the application form (click an Apply control if needed) and WAIT until it has
+    actually rendered — IN WHICHEVER FRAME it lives (main page or an embedded iframe). Returns
+    (loaded, frame, ats): the frame to fill and the ATS re-derived from that frame. On failure
+    returns (False, main_frame, ats) with an actionable error, and the caller must not fill.
+    This is what makes 'verify the application loaded before filling' true rather than assumed."""
+    import time
+
+    # If no form is visible anywhere yet, try to reveal it via an "Apply" control.
+    frame, n = _find_form_frame(page)
+    if n < 2:
+        for role in ("link", "button"):
+            try:
+                btn = page.get_by_role(role, name=re.compile(r"\bapply\b", re.I)).first
+                if btn.count() and btn.is_visible():
+                    btn.click(timeout=4000)
+                    break
+            except Exception:
+                continue
+
+    # Poll every frame until one holds a real form (covers navigation + async/iframe mounts).
+    deadline = time.time() + timeout_ms / 1000
+    while time.time() < deadline:
+        frame, n = _find_form_frame(page)
+        if n >= 2:
+            # Settle: wait for a labelled field to be visible in that frame, then a beat for the rest.
+            try:
+                frame.wait_for_selector(_FORM_FIELD_SIGNAL, state="visible", timeout=4000)
+            except Exception:
+                pass
+            page.wait_for_timeout(600)
+            return True, frame, _ats_from_frame(frame, ats)
+        page.wait_for_timeout(500)
+
+    report.errors.append(
+        f"Application form did not load within {timeout_ms // 1000}s at {page.url}. "
+        "The page may require sign-in, redirect to an external application portal, or use a "
+        "form ApplicationBot doesn't support yet — so no fields were filled. Open the URL to check."
+    )
+    return False, page.main_frame, ats
+
+
+def _upload_resume(frame, resume_pdf: str, report: "ApplyReport") -> None:
     """Attach the résumé. Prefer Greenhouse's own "Attach" button through the file chooser —
     poking the raw hidden <input type=file> makes the site's onchange handler throw
-    "Cannot read properties of undefined (reading 'uploadFile')"."""
+    "Cannot read properties of undefined (reading 'uploadFile')". `frame` is the form's frame
+    (main page or an embedded iframe); the file chooser is captured at the page level."""
     for name in (r"attach", r"upload"):
         try:
-            btn = page.get_by_role("button", name=re.compile(name, re.I)).first
+            btn = frame.get_by_role("button", name=re.compile(name, re.I)).first
             if btn.count() and btn.is_visible():
-                with page.expect_file_chooser(timeout=4000) as fc:
+                with frame.page.expect_file_chooser(timeout=4000) as fc:
                     btn.click()
                 fc.value.set_files(resume_pdf)
                 report.filled.append(FilledField("Resume", resume_pdf, "file"))
@@ -415,7 +515,7 @@ def _upload_resume(page, resume_pdf: str, report: "ApplyReport") -> None:
         except Exception:
             continue
     try:  # classic/older forms expose a direct file input
-        page.locator('input[type="file"]').first.set_input_files(resume_pdf)
+        frame.locator('input[type="file"]').first.set_input_files(resume_pdf)
         report.filled.append(FilledField("Resume", resume_pdf, "file"))
     except Exception as e:
         report.errors.append(f"resume upload: {type(e).__name__}: {e}")
@@ -587,9 +687,20 @@ def _fill_combobox(page, loc, value: Optional[str], hints: Optional[list[str]] =
     return None
 
 
+def _scope_prefix(page) -> str:
+    """Return "form " when the page wraps its fields in a <form> (Greenhouse/Lever), else ""
+    to scan page-wide. Ashby renders its application fields OUTSIDE any <form>, so a
+    form-scoped selector matches nothing — this is why only the résumé filled before."""
+    try:
+        return "form " if page.locator("form").count() > 0 else ""
+    except Exception:
+        return ""
+
+
 def _fill_all_fields(page, resolver: AnswerResolver, report: "ApplyReport", done: set,
                      only_empty: bool = True) -> None:
-    controls = page.locator("form input, form textarea, form select")
+    sp = _scope_prefix(page)
+    controls = page.locator(f"{sp}input, {sp}textarea, {sp}select")
     try:
         count = controls.count()
     except Exception:
@@ -600,13 +711,16 @@ def _fill_all_fields(page, resolver: AnswerResolver, report: "ApplyReport", done
             k = loc.evaluate(
                 "el => ({tag: el.tagName.toLowerCase(), "
                 "type: (el.getAttribute('type')||'').toLowerCase(), "
-                "role: (el.getAttribute('role')||'').toLowerCase()})"
+                "role: (el.getAttribute('role')||'').toLowerCase(), "
+                "chrome: !!el.closest('nav,header,footer,[role=search],[role=navigation]')})"
             )
         except Exception:
             continue
         tag, typ, role = k["tag"], k["type"], k["role"]
-        if typ in ("hidden", "submit", "button", "file", "checkbox", "radio"):
-            continue  # radios are handled as groups below
+        if typ in ("hidden", "submit", "button", "file", "checkbox", "radio", "search"):
+            continue  # radios handled as groups below; search boxes aren't application fields
+        if k.get("chrome"):
+            continue  # page nav/header/footer/search chrome, not the application form
         # react-select combobox inputs are often 1px / opacity:0 — don't skip them on
         # visibility; we open them via their (visible) control container.
         try:
@@ -667,7 +781,7 @@ def _fill_all_fields(page, resolver: AnswerResolver, report: "ApplyReport", done
 
 
 def _fill_radio_groups(page, resolver: AnswerResolver, report: "ApplyReport", done: set) -> None:
-    radios = page.locator('form input[type="radio"]')
+    radios = page.locator(f'{_scope_prefix(page)}input[type="radio"]')
     try:
         n = radios.count()
     except Exception:
@@ -714,7 +828,7 @@ def _fill_radio_groups(page, resolver: AnswerResolver, report: "ApplyReport", do
 def _flag_missing_required(page, report: "ApplyReport", done: set) -> None:
     """Report required fields we never filled — the safety net against silent gaps."""
     try:
-        required = page.evaluate(_REQUIRED_LABELS_JS)
+        required = page.evaluate(_REQUIRED_LABELS_JS, _scope_prefix(page))
     except Exception:
         return
     filled = {f.label for f in report.filled}
@@ -724,27 +838,34 @@ def _flag_missing_required(page, report: "ApplyReport", done: set) -> None:
         report.skipped.append(f"{r} — REQUIRED, not filled (no matching answer or unsupported field)")
 
 
-def _show_done_banner(page, report: "ApplyReport") -> None:
-    """Inject a fixed overlay into the page so the watching user gets a clear, visible "done
-    filling" signal — with counts and an unmistakable DRY-RUN / not-submitted notice."""
+def _show_done_banner(page, report: "ApplyReport", ok: bool = True) -> None:
+    """Inject a fixed overlay so the watching user gets a clear, visible signal — green when
+    fields were filled, red when the form didn't load or nothing filled (with the reason)."""
     attention = len(report.skipped) + len(report.errors)
-    msg = (f"ApplicationBot finished filling — {len(report.filled)} field(s) filled"
-           + (f", {attention} need your attention" if attention else "")
-           + ". DRY RUN — nothing submitted. Review here, then press Enter in the terminal.")
+    failed = (not ok) or len(report.filled) == 0
+    if failed:
+        reason = report.errors[0] if report.errors else "No fillable fields were found on the page."
+        mark, color = "⚠", "#b21f2d"
+        msg = f"ApplicationBot could not fill this application. {reason} DRY RUN — nothing submitted."
+    else:
+        mark, color = "✓", "#0b7a3b"
+        msg = (f"ApplicationBot finished filling — {len(report.filled)} field(s) filled"
+               + (f", {attention} need your attention" if attention else "")
+               + ". DRY RUN — nothing submitted. Review here, then finish.")
     try:
         page.evaluate(
-            """(msg) => {
+            """([msg, mark, color]) => {
               document.getElementById('applicationbot-banner')?.remove();
               const b = document.createElement('div');
               b.id = 'applicationbot-banner';
-              b.textContent = '✓ ' + msg;
+              b.textContent = mark + ' ' + msg;
               b.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:2147483647;'
-                + 'background:#0b7a3b;color:#fff;font:600 15px/1.5 system-ui,sans-serif;'
+                + 'background:' + color + ';color:#fff;font:600 15px/1.5 system-ui,sans-serif;'
                 + 'padding:12px 18px;text-align:center;box-shadow:0 2px 8px rgba(0,0,0,.3)';
               document.body.appendChild(b);
               document.body.style.scrollMarginTop = '48px';
             }""",
-            msg,
+            [msg, mark, color],
         )
     except Exception:
         pass  # a cosmetic banner must never break the run
@@ -825,6 +946,8 @@ def run_apply(
     profile_path: str = "profile/application_profile.yaml",
     learn: bool = True,
     record: bool = True,
+    hold: "object | None" = None,
+    on_filled: "object | None" = None,
 ) -> ApplyReport:
     """DRY-RUN fill an application form. Never submits.
 
@@ -855,15 +978,14 @@ def run_apply(
         page.set_default_timeout(timeout_ms)
         try:
             page.goto(url, wait_until="domcontentloaded")
-            # Some pages need the application form revealed first.
-            try:
-                btn = page.get_by_role("link", name=re.compile(r"apply", re.I)).first
-                if btn.is_visible(timeout=2000):
-                    btn.click()
-            except PWTimeout:
-                pass
-            except Exception:
-                pass
+
+            # Verify the application form has actually loaded before touching anything — ATS
+            # forms render their fields via JS after domcontentloaded (and are often inside an
+            # embedded iframe), so filling too early or on the wrong frame fills nothing. This
+            # reveals the form, waits for it, and returns the FRAME it lives in + the ATS
+            # re-derived from that frame (e.g. a Greenhouse form embedded on stripe.com).
+            form_loaded, frame, ats = _open_application_form(page, ats, report)
+            report.ats = ats  # re-derived from the form's frame (e.g. greenhouse embedded on stripe.com)
 
             # Role + company from the page title: grounds Claude-drafted answers AND labels
             # the tracker row.
@@ -876,23 +998,25 @@ def run_apply(
                 resolver.company = company or None
 
             if debug:
-                _dump_fields(page)
+                _dump_fields(frame)
 
-            _upload_resume(page, resume_pdf, report)
+            if form_loaded:
+                _upload_resume(frame, resume_pdf, report)
 
-            # ---- native autofill FIRST (decision 017) ----
-            if ats == "greenhouse":
-                _greenhouse_native_autofill(page, ctx, resolver.profile, report)
-            _trigger_native_autofill(page, ats, report)  # resume-parse button (Workday etc.)
-            page.wait_for_timeout(1500)  # let any parse-on-upload settle
+                # ---- native autofill FIRST (decision 017) ----
+                if ats == "greenhouse":
+                    _greenhouse_native_autofill(page, ctx, resolver.profile, report)
+                _trigger_native_autofill(frame, ats, report)  # resume-parse button (Workday etc.)
+                page.wait_for_timeout(1500)  # let any parse-on-upload settle
 
-            # ---- our resolver fills only what's still empty ----
-            _fill_all_fields(page, resolver, report, done, only_empty=True)
-            _fill_radio_groups(page, resolver, report, done)
-            _flag_missing_required(page, report, done)
+                # ---- our resolver fills only what's still empty, in the form's frame ----
+                _fill_all_fields(frame, resolver, report, done, only_empty=True)
+                _fill_radio_groups(frame, resolver, report, done)
+                _flag_missing_required(frame, report, done)
+            # else: report carries an actionable "form did not load" error; skip filling.
 
             report.submitted = False  # DRY-RUN — never submit in dev (Guideline #3)
-            _show_done_banner(page, report)  # visible "done filling" signal in the browser
+            _show_done_banner(page, report, ok=form_loaded)  # visible signal in the browser
 
             try:
                 page.screenshot(path=screenshot, full_page=True)
@@ -917,13 +1041,23 @@ def run_apply(
 
             # Show the result in the terminal the moment filling finishes, before the pause.
             print("\n" + report.summary())
+            if on_filled is not None:
+                try:
+                    on_filled(report)  # let a UI surface the result before we hold/close
+                except Exception:
+                    pass
 
             if pause:
-                try:
-                    input("\n✓ Done filling (DRY RUN — not submitted). Review the browser, "
-                          "then press Enter to close… ")
-                except EOFError:
-                    pass
+                if hold is not None:
+                    # Web-driven: wait until the caller (e.g. a "Finish" button) releases us,
+                    # instead of blocking on terminal input which has no TTY in a server.
+                    hold.wait()
+                else:
+                    try:
+                        input("\n✓ Done filling (DRY RUN — not submitted). Review the browser, "
+                              "then press Enter to close… ")
+                    except EOFError:
+                        pass
         finally:
             ctx.close()
             browser.close()

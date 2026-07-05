@@ -115,16 +115,20 @@ def match(
     top_n: int = 10,
     use_claude: bool = True,
     min_skills: int = 1,
+    on_progress=None,
 ) -> tuple[list[Match], list[str]]:
     """Rank postings against the user's qualifications. Keyword-ranks all of them, then (if
     enabled and the Claude CLI is present) has Claude judge the top `top_n`. Returns
     (matches sorted best-first, errors). A Claude failure on one posting is recorded and
-    leaves that posting keyword-only — it never aborts the run (Agent Guideline #11)."""
+    leaves that posting keyword-only — it never aborts the run (Agent Guideline #11).
+    `on_progress(done, total)` is called after each judged posting (for a UI progress bar)."""
     ranked = keyword_rank(resume, postings, min_skills=min_skills)
     errors: list[str] = []
 
     if use_claude and claude_code_available():
-        for m in ranked[:top_n]:
+        survivors = ranked[:top_n]
+        total = len(survivors)
+        for i, m in enumerate(survivors):
             try:
                 verdict = judge_fit(resume, m.posting)
                 m.qualified = verdict["qualified"]
@@ -134,6 +138,8 @@ def match(
                 m.judged_by = "claude"
             except Exception as e:
                 errors.append(f"{m.posting.company} — {m.posting.title}: judge failed: {e}")
+            if on_progress is not None:
+                on_progress(i + 1, total)
     elif use_claude:
         errors.append("Claude Code CLI not found — ranked by keyword only (install `claude` to judge fit).")
 

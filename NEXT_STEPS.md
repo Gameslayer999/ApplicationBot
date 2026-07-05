@@ -98,9 +98,13 @@ and free-form notes.
 - [ ] **Autonomous runner over ALL qualified matches** — loop the testing-mode core across the
       ranked list (not just the top match), dry-run by default, global kill switch, blockers as
       periodic updates not prompts. Builds directly on `pipeline.run_testing_mode`.
-- [ ] **Surface Discover in the web UI** — a "Discover" tab: edit `discovery.yaml` (boards,
-      gates), run discovery, and show ranked matches with fit score / why / missing, each with
-      a one-click "tailor + dry-run apply". (Currently CLI-only.)
+- [~] **Surface Discover in the web UI** — **done (first cut):** a **"Discover" tab** with a
+      one-click **"Find & fill one application (dry-run)"** button that runs the whole
+      testing-mode loop in a background thread, streams step-by-step progress (incl. a Claude
+      judged-N/M bar), shows the single chosen match (fit / why / missing), and a **Finish —
+      close browser** button (web-friendly review hold, replacing the terminal pause). Never
+      submits; records a `dry-run` Track row. *Remaining:* edit `discovery.yaml` boards/gates
+      from the tab (still hand-edited), and a browse-all-ranked-matches view.
 - [ ] **Aggregator full-JD** — Adzuna is snippet-only; either fetch the `redirect_url` page for
       full text (ToS-permitting) or accept snippet-degraded tailoring for aggregator hits, and
       add a free-key setup path (env or the Discover tab).
@@ -190,6 +194,48 @@ and free-form notes.
 ---
 
 ## Recently added (this session, latest first)
+
+- 2026-07-05 — **Fixed autofill failing on embedded (iframe) ATS forms.** Root cause of "fields
+  visible on screen but nothing filled": many ATS forms render inside an **iframe** — e.g.
+  Greenhouse's `job_app` embed on a company's own careers site (stripe.com → the 61-field form
+  lives in `job-boards.greenhouse.io/embed/job_app`). The driver only queried the main frame, so
+  it saw ~1 field while the user saw the full form. Made the driver **iframe-aware**:
+  `_find_form_frame()` picks the frame that actually holds the fields (skipping recaptcha/analytics
+  chrome), `_open_application_form()` now returns that frame + the ATS **re-derived from the frame
+  URL** (a Greenhouse form on stripe.com was mis-detected as `generic`), and all fill helpers
+  (`_upload_resume`/`_fill_all_fields`/`_fill_radio_groups`/`_flag_missing_required`/native-autofill)
+  run against that frame. **Verified:** the exact failing pick (Stripe FDE Privy) went **0 → 9
+  fields filled, 0 errors** (First/Last/Email/Phone/Country/Location/Gender), with company-specific
+  + EEO questions correctly surfaced as needs-attention; **no regression** on the non-iframe Ashby
+  form (still 5/5). *Follow-ups surfaced (separate, smaller):* a few Greenhouse dropdowns don't
+  option-match the resolver value (e.g. country "United States"), and work-auth questions get
+  mislabeled with the location value — resolver refinements, not the frame bug.
+
+- 2026-07-05 — **Fixed dry-run filling nothing but the résumé.** Two bugs: (1) the driver
+  filled before the ATS form's JS-rendered fields existed — added `_open_application_form()`
+  which reveals the form (clicks Apply if needed) and **waits for a real application field to
+  be visible** before filling, and on timeout skips with an actionable red banner instead of a
+  silent no-op; (2) the fill/radio/required scans were hardcoded to `form …`, but **Ashby
+  renders its fields outside any `<form>`** (0 form elements), so they matched nothing — added
+  `_scope_prefix()` (form-scoped when a `<form>` exists → Greenhouse/Lever unchanged; page-wide
+  otherwise, excluding nav/header/footer/search chrome). **Verified** live on a real Ashby form:
+  1 field → **5** (Résumé, Name, Email, Phone, LinkedIn), 2 open-ended questions correctly
+  surfaced as needs-attention, 0 errors, `submitted:False`.
+
+- 2026-07-05 — **Discover "Run test" button in the web UI.** New **Discover** tab with a single
+  **"Find & fill one application (dry-run)"** button: a background worker runs discover → match →
+  pick the **one** best match → tailor → PDF → headed dry-run apply, streaming step progress
+  (with a Claude judged-N/M bar and elapsed time) to the page via `GET /test-run/status`. When
+  filling finishes it shows the chosen posting (fit/why/missing) and a **Finish — close browser**
+  button; the browser stays open for review until clicked (`POST /test-run/close`) — a
+  web-friendly replacement for the CLI's terminal pause (new `hold`/`on_filled` params on
+  `run_apply`; `status_cb`/`hold`/`on_filled` on `run_testing_mode`; `on_progress` on
+  `match`/`discover_and_match`). Never submits (Guideline #3); records a `dry-run` Track row.
+  **Verified:** web.py imports, served page JS `node --check`-clean, `/`, `/test-run`,
+  `/test-run/status` over HTTP, and the full worker path (status_cb + on_filled + hold release +
+  returned report, `submitted:False`) headless. Also fixed the **Profile page crash**:
+  `list_resumes()` listed the new `profile/discovery.yaml`, which failed to load as a `Resume`
+  (no `contact`) — now excluded alongside `application_profile.yaml`.
 
 - 2026-07-04 — **Discover stage: qualification-driven pipeline (decision 026).** Researched the
   2026 job-discovery landscape (verified against official docs) and built Stage 2. **Sources**

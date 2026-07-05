@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -35,10 +36,117 @@ from .tailor import tailor_resume
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
+# --------------------------------------------------------------------------- test run
+# A single "Find & fill one application (dry-run)" run at a time. The worker thread runs the
+# discover → match → tailor → PDF → dry-run apply pipeline; the page polls /test-run/status,
+# and a "Finish" button releases the browser (POST /test-run/close) instead of the terminal
+# pause. Never submits (Agent Guideline #3).
+
+_TEST_LOCK = threading.Lock()
+_TEST_STATE: dict = {"phase": "idle"}  # idle|running|filled|done|error
+_TEST_HOLD = threading.Event()
+
+
+def _test_reset() -> dict:
+    return {
+        "phase": "running", "step": "start",
+        "message": "Starting…", "elapsed_note": "",
+        "scanned": 0, "matched": 0, "judged": 0, "judged_total": 0,
+        "chosen": None, "report": None, "errors": [],
+    }
+
+
+def _set(**kw) -> None:
+    with _TEST_LOCK:
+        _TEST_STATE.update(kw)
+
+
+def _test_worker() -> None:
+    """Run the full testing-mode pipeline in the background, updating _TEST_STATE."""
+    from . import backends, pipeline
+    from .filters import load_filters
+
+    try:
+        resume = load_resume("profile/resume.yaml")
+        filters = load_filters()
+        try:
+            profile = apply_profile.load_profile()
+        except Exception:
+            profile = None
+
+        if not filters.boards and not filters.adzuna.app_id:
+            _set(phase="error", errors=["No target boards in profile/discovery.yaml. Add some in the Discover tab."])
+            return
+
+        use_claude = backends.claude_code_available()
+        _set(step="discover", message="Discovering postings from your target boards…")
+
+        def on_judge(done, total):
+            _set(step="match", judged=done, judged_total=total,
+                 message=f"Judging fit with Claude — {done}/{total} postings…")
+
+        res = pipeline.discover_and_match(resume, filters, profile=profile,
+                                          use_claude=use_claude, on_progress=on_judge)
+        _set(scanned=res.discovered, matched=len(res.matches), errors=res.errors)
+        if not res.matches:
+            _set(phase="error", errors=(res.errors or []) + ["No postings matched your qualifications."])
+            return
+
+        top = pipeline.pick_top(res.matches, min_fit=0)
+        p = top.posting
+        chosen = {
+            "company": p.company, "title": p.title, "location": p.location,
+            "compensation": p.compensation, "url": p.url, "ats": p.ats,
+            "fit_score": top.fit_score, "qualified": top.qualified,
+            "why": top.why, "missing": top.missing,
+            "judged_by": top.judged_by,
+        }
+        _set(chosen=chosen, message=f"Best match: {p.company} — {p.title}. Tailoring…")
+
+        def status_cb(step, message):
+            _set(step=step, message=message.lstrip("▶ ").strip())
+
+        def on_filled(report):
+            _set(phase="filled", step="review",
+                 message="Filled — review the browser window. Nothing was submitted.",
+                 report={"summary": report.summary(), "submitted": report.submitted,
+                         "url": report.url, "screenshot": report.screenshot})
+
+        _TEST_HOLD.clear()
+        report = pipeline.run_testing_mode(
+            resume, top, "profile/resume.yaml", apply_profile.DEFAULT_PATH,
+            backend="auto", headed=True, pause=True,
+            status_cb=status_cb, hold=_TEST_HOLD, on_filled=on_filled,
+        )
+        _set(phase="done", step="done",
+             message="Done — browser closed. A dry-run row was recorded in Track.",
+             report={"summary": report.summary(), "submitted": report.submitted,
+                     "url": report.url, "screenshot": report.screenshot})
+    except Exception as e:
+        _set(phase="error", errors=[f"{type(e).__name__}: {e}"])
+
+
+def start_test_run() -> dict:
+    with _TEST_LOCK:
+        if _TEST_STATE.get("phase") == "running":
+            return {"ok": False, "error": "A test run is already in progress."}
+        _TEST_STATE.clear()
+        _TEST_STATE.update(_test_reset())
+    threading.Thread(target=_test_worker, daemon=True).start()
+    return {"ok": True}
+
+
 def list_resumes() -> list[dict[str, str]]:
-    # The apply profile lives alongside résumés in profile/ but is not a résumé — exclude it
-    # so it never shows up as a selectable resume (it fails to load as a Resume).
-    exclude = {Path(apply_profile.DEFAULT_PATH).name}
+    # The apply profile and discovery filters live alongside résumés in profile/ but are not
+    # résumés — exclude them so they never show up as a selectable resume (they fail to load
+    # as a Resume, which broke the Profile page). Keep this in sync with the config modules.
+    from . import filters
+
+    exclude = {
+        Path(apply_profile.DEFAULT_PATH).name,  # application_profile.yaml
+        Path(filters.DEFAULT_PATH).name,        # discovery.yaml
+        "discovery.example.yaml",               # the committed example template (examples/)
+    }
     out = []
     for folder in ("profile", "examples"):
         for p in sorted((REPO_ROOT / folder).glob("*.yaml")):
@@ -145,6 +253,10 @@ class Handler(BaseHTTPRequestHandler):
                 "fields": tracker.EDITABLE,
             })
             return
+        if path == "/test-run/status":
+            with _TEST_LOCK:
+                self._json(200, dict(_TEST_STATE))
+            return
         if path != "/":
             self._json(404, {"error": "not found"})
             return
@@ -198,6 +310,11 @@ class Handler(BaseHTTPRequestHandler):
                 tailored = TailoredResume.model_validate(p["tailored"])
                 self._send(200, render_pdf(base, tailored), "application/pdf",
                            {"Content-Disposition": 'attachment; filename="tailored_resume.pdf"'})
+            elif path == "/test-run":
+                self._json(200, start_test_run())
+            elif path == "/test-run/close":
+                _TEST_HOLD.set()  # release the review hold so the browser closes
+                self._json(200, {"ok": True})
             else:
                 self._json(404, {"error": "not found"})
         except Exception as e:  # surface a readable message to the UI
@@ -252,11 +369,14 @@ INDEX_HTML = """<!doctype html>
   .trackbar input { flex:1; min-width:200px; margin:0; }
   .trackbar select { width:auto; margin:0; }
   .tbtn { width:auto; margin:0; padding:8px 14px; }
-  .ttable { width:100%; border-collapse:collapse; background:#fff; border:1px solid var(--line); border-radius:8px; font-size:13px; }
-  .ttable th { text-align:left; font-size:11px; text-transform:uppercase; letter-spacing:.03em; color:var(--muted); padding:8px 10px; border-bottom:1px solid var(--line); white-space:nowrap; }
-  .ttable td { padding:4px 6px; border-bottom:1px solid var(--line); vertical-align:middle; }
+  /* Track view uses the full screen width — no 640px editor cap. */
+  .track-editor { max-width:none; }
+  .track-editor .editing { max-width:820px; }
+  .ttable { width:100%; table-layout:fixed; border-collapse:collapse; background:#fff; border:1px solid var(--line); border-radius:8px; font-size:13px; }
+  .ttable th { text-align:left; font-size:11px; text-transform:uppercase; letter-spacing:.03em; color:var(--muted); padding:8px 8px; border-bottom:1px solid var(--line); white-space:normal; }
+  .ttable td { padding:3px 4px; border-bottom:1px solid var(--line); vertical-align:middle; overflow:hidden; }
   .ttable tr:last-child td { border-bottom:0; }
-  .ttable input, .ttable select { border:1px solid transparent; background:transparent; padding:5px 6px; margin:0; border-radius:4px; }
+  .ttable input, .ttable select { width:100%; border:1px solid transparent; background:transparent; padding:5px 6px; margin:0; border-radius:4px; text-overflow:ellipsis; }
   .ttable input:hover, .ttable select:hover { border-color:var(--line); }
   .ttable input:focus, .ttable select:focus { border-color:var(--accent); background:#fff; outline:none; }
   .ttable .st-dryrun { color:#8a6d00; } .ttable .st-applied { color:#2a5bd7; }
@@ -341,6 +461,23 @@ INDEX_HTML = """<!doctype html>
   .resume .entry[data-why]:hover { background:#f3f6ff; box-shadow:inset 3px 0 0 var(--accent); }
   .resume .entry.why-active { background:#eef1fb; box-shadow:inset 3px 0 0 var(--accent); }
   @media (max-width: 900px) { .reviewwrap { flex-direction:column; } .why-panel { width:100%; position:static; } }
+  /* Discover / test run */
+  .testprog { margin-top:14px; padding:14px; border:1px solid var(--line); border-radius:8px; background:#fff; }
+  .tstep { font-size:13px; color:var(--muted); padding:2px 0; }
+  .tstep.act { color:var(--accent); font-weight:600; }
+  .tstep.done { color:#2a9d5b; }
+  .tmsg { margin-top:8px; font-size:14px; color:var(--ink); }
+  .tmeta { margin-top:6px; font-size:12px; color:var(--muted); }
+  .tbar { margin-top:8px; height:7px; background:var(--line); border-radius:4px; overflow:hidden; }
+  .tbarfill { height:100%; background:var(--accent); transition:width .3s; }
+  .testchosen { margin-top:14px; padding:14px; border:1px solid var(--accent); border-radius:8px; background:#f7f9ff; }
+  .tclabel { font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.04em; }
+  .tctitle { font-size:15px; font-weight:600; margin-top:4px; }
+  .tcmeta { font-size:12px; color:var(--muted); margin-top:4px; word-break:break-all; }
+  .tcwhy { font-size:13px; margin-top:6px; line-height:1.5; }
+  .fitpill { font-size:12px; font-weight:600; color:#fff; background:var(--accent); border-radius:10px; padding:1px 8px; margin-left:6px; }
+  .tfinish { margin-top:14px; padding-top:12px; border-top:1px solid var(--line); font-size:13px; }
+  .tfinish button { width:auto; margin-top:8px; }
 </style>
 </head>
 <body>
@@ -398,8 +535,27 @@ INDEX_HTML = """<!doctype html>
   <main>
     <div class="tabs">
       <button class="tab active" data-view="review">Review</button>
+      <button class="tab" data-view="discover">Discover</button>
       <button class="tab" data-view="profile">Profile</button>
       <button class="tab" data-view="track">Track</button>
+    </div>
+
+    <div id="view-discover" class="hidden">
+      <div class="editor">
+        <p class="editing">Run one full end-to-end <b>dry-run</b>: the bot searches your target
+          boards, ranks every posting by how well it fits <i>your</i> qualifications, then
+          <b>follows through on exactly one</b> — the single best match — tailoring your résumé
+          and auto-filling that application in a browser you can watch. It <b>never submits</b>
+          (Agent Guideline #3); when it finishes filling, review it in the browser and click
+          <b>Finish</b>. A <code>dry-run</code> row is recorded in Track. Edit your target boards
+          in <code>profile/discovery.yaml</code>.</p>
+        <div class="saverow">
+          <button id="test-run" type="button">▶ Find &amp; fill one application (dry-run)</button>
+          <span id="test-msg" class="msg"></span>
+        </div>
+        <div id="test-progress" class="testprog hidden"></div>
+        <div id="test-chosen" class="testchosen hidden"></div>
+      </div>
     </div>
 
     <div id="view-review">
@@ -444,7 +600,7 @@ INDEX_HTML = """<!doctype html>
     </div>
 
     <div id="view-track" class="hidden">
-      <div class="editor">
+      <div class="editor track-editor">
         <p class="editing">Every application the pipeline discovered, tailored, and (in
           <code>dry_run</code>) would have submitted — the local system of record
           (<code>applications.db</code>, git-ignored). Edit any cell inline; changes save
@@ -707,20 +863,105 @@ document.querySelectorAll(".tab").forEach(t => t.addEventListener("click", () =>
   t.classList.add("active");
   const v = t.dataset.view;
   $("view-review").classList.toggle("hidden", v !== "review");
+  $("view-discover").classList.toggle("hidden", v !== "discover");
   $("view-profile").classList.toggle("hidden", v !== "profile");
   $("view-track").classList.toggle("hidden", v !== "track");
   if (v === "profile") loadProfile();
   if (v === "track") loadTrack();
+  if (v === "discover") pollTest();
 }));
 $("resume").addEventListener("change", () => { if (!$("view-profile").classList.contains("hidden")) loadProfile(); });
 
+// ---- Discover: run one full dry-run test ------------------------------------
+let TEST_TIMER = null, TEST_T0 = null;
+$("test-run").addEventListener("click", async () => {
+  const btn = $("test-run"), msg = $("test-msg");
+  msg.className = "msg"; msg.textContent = "";
+  btnBusy(btn, "Starting…");
+  try {
+    const r = await (await fetch("/test-run", {method:"POST", headers:{"Content-Type":"application/json"}, body:"{}"})).json();
+    if (!r.ok) { msg.className = "msg err"; msg.textContent = r.error || "Could not start."; btnDone(btn); return; }
+    TEST_T0 = Date.now();
+    pollTest();
+  } catch (e) { msg.className = "msg err"; msg.textContent = String(e.message || e); btnDone(btn); }
+});
+
+function testStepList(s) {
+  const steps = [["discover","Discovering postings"],["match","Judging fit"],
+                 ["tailor","Tailoring résumé"],["pdf","Exporting PDF"],
+                 ["apply","Filling the form"],["review","Filled — review"]];
+  const order = steps.map(x => x[0]);
+  const cur = order.indexOf(s.step);
+  return steps.map(([k,label],i) => {
+    const done = (s.phase==="done") || (cur>i);
+    const active = cur===i && s.phase!=="done";
+    const mark = done ? "✓" : (active ? "●" : "○");
+    return `<div class="tstep ${active?'act':''} ${done?'done':''}">${mark} ${label}</div>`;
+  }).join("");
+}
+
+function renderChosen(s) {
+  const c = s.chosen; if (!c) return "";
+  const fit = (c.fit_score!=null) ? `<span class="fitpill">fit ${c.fit_score}/100 ${c.qualified?'✓ qualified':'✗ not qualified'}</span>` : "";
+  const meta = [c.location, c.compensation].filter(Boolean).map(escapeHtml).join(" · ");
+  let html = `<div class="tclabel">Following through on this one posting:</div>`;
+  html += `<div class="tctitle">${escapeHtml(c.company)} — ${escapeHtml(c.title)} ${fit}</div>`;
+  if (meta) html += `<div class="tcmeta">${meta}</div>`;
+  if (c.why) html += `<div class="tcwhy"><b>Why:</b> ${escapeHtml(c.why)}</div>`;
+  if (c.missing && c.missing.length) html += `<div class="tcwhy"><b>Missing:</b> ${c.missing.slice(0,3).map(escapeHtml).join("; ")}</div>`;
+  html += `<div class="tcmeta"><a href="${escapeHtml(c.url)}" target="_blank" rel="noopener">${escapeHtml(c.url)}</a></div>`;
+  return html;
+}
+
+async function pollTest() {
+  let s;
+  try { s = await (await fetch("/test-run/status")).json(); } catch (e) { return; }
+  const prog = $("test-progress"), chosen = $("test-chosen"), btn = $("test-run"), msg = $("test-msg");
+  if (!s || s.phase === "idle") { prog.classList.add("hidden"); chosen.classList.add("hidden"); btnDone(btn); return; }
+
+  const running = s.phase === "running", filled = s.phase === "filled";
+  prog.classList.remove("hidden");
+  let body = testStepList(s);
+  body += `<div class="tmsg">${escapeHtml(s.message || "")}</div>`;
+  if (s.step === "match" && s.judged_total) {
+    const pct = Math.round(100 * (s.judged||0) / s.judged_total);
+    body += `<div class="tbar"><div class="tbarfill" style="width:${pct}%"></div></div>`;
+  }
+  if (s.scanned) body += `<div class="tmeta">Scanned ${s.scanned} postings · ${s.matched} matched your skills</div>`;
+  const el = TEST_T0 ? Math.round((Date.now()-TEST_T0)/1000) : null;
+  if ((running || filled) && el!=null) body += `<div class="tmeta">${el}s elapsed</div>`;
+  prog.innerHTML = body;
+
+  if (s.chosen) { chosen.classList.remove("hidden"); chosen.innerHTML = renderChosen(s); }
+
+  if (filled) {
+    if (!document.getElementById("test-finish")) {
+      const box = document.createElement("div"); box.className = "tfinish";
+      box.innerHTML = `<b>✓ Form filled — nothing was submitted.</b> Review it in the browser window that opened, then finish.`;
+      const fb = document.createElement("button"); fb.id = "test-finish"; fb.textContent = "Finish — close browser";
+      fb.addEventListener("click", async () => { fb.disabled = true; fb.textContent = "Closing…"; await fetch("/test-run/close",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"}); });
+      box.appendChild(fb); prog.appendChild(box);
+    }
+  }
+  if (s.errors && s.errors.length && (s.phase==="error")) {
+    msg.className = "msg err"; msg.textContent = s.errors.join(" · ");
+  }
+  if (s.phase === "done") { btnDone(btn); msg.className = "msg ok"; msg.textContent = "Done — recorded a dry-run row in Track."; }
+  if (s.phase === "error") { btnDone(btn); }
+
+  if (running || filled) { clearTimeout(TEST_TIMER); TEST_TIMER = setTimeout(pollTest, 1200); }
+  else { btnDone(btn); }
+}
+
 // ---- Track tab: the local application store (applications.db) ----
 // Columns to show, in order. status/dates get special controls; the rest are text inputs.
+// [key, label, relative width %] — widths drive the fixed table layout so all
+// columns share the screen and nothing forces a horizontal scroll.
 const TRACK_COLS = [
-  ["status","Status"], ["company","Company"], ["role","Role"], ["location","Location"],
-  ["remote","Remote"], ["pay","Pay"], ["portal","Portal"], ["method","Method"],
-  ["source_url","Source URL"], ["date_discovered","Discovered"], ["date_applied","Applied"],
-  ["resume_path","Résumé used"], ["notes","Notes"],
+  ["status","Status",8], ["company","Company",9], ["role","Role",12], ["location","Location",9],
+  ["remote","Remote",5], ["pay","Pay",7], ["portal","Portal",7], ["method","Method",6],
+  ["source_url","Source URL",11], ["date_discovered","Discovered",7], ["date_applied","Applied",7],
+  ["resume_path","Résumé used",10], ["notes","Notes",12],
 ];
 let TRACK_STATE = { status:null, search:"", statuses:[] };
 
@@ -768,6 +1009,8 @@ function renderTrack(apps) {
         : "No applications yet. The pipeline records them here as it runs — or add one manually."}));
     return;
   }
+  const cols = TRACK_COLS.map(([,,w]) => el("col", {style:"width:"+w+"%"}))
+    .concat([el("col", {style:"width:70px"})]);
   const head = el("tr", {}, TRACK_COLS.map(([,label]) => el("th", {text:label})).concat([el("th", {text:""})]));
   const rows = apps.map(app => {
     const tds = TRACK_COLS.map(([key]) => {
@@ -785,7 +1028,8 @@ function renderTrack(apps) {
     const tr = el("tr", {}, tds); tr._saved = saved; tr.dataset.id = app.id;
     return tr;
   });
-  const table = el("table", {class:"ttable"}, [el("thead", {}, [head]), el("tbody", {}, rows)]);
+  const table = el("table", {class:"ttable"},
+    [el("colgroup", {}, cols), el("thead", {}, [head]), el("tbody", {}, rows)]);
   body.append(el("div", {class:"twrap"}, [table]));
 }
 
