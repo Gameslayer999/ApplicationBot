@@ -79,6 +79,12 @@ class ApplicationProfile(BaseModel):
     # Growing bank of answers to custom screening questions.
     custom_answers: list[QA] = Field(default_factory=list)
 
+    # Learned dropdown option mappings: normalized answer value -> the option TEXT(s) it matched
+    # on real forms (e.g. "rutgers university" -> ["Rutgers University-New Brunswick"], a verbose
+    # degree -> ["Bachelor's Degree"]). Grown automatically as autofill resolves dropdowns via
+    # Claude, so repeat encounters match instantly without another Claude call (decision 033).
+    dropdown_aliases: dict[str, list[str]] = Field(default_factory=dict)
+
 
 def load_profile(path: str | Path = DEFAULT_PATH) -> ApplicationProfile:
     p = Path(path)
@@ -94,7 +100,14 @@ def save_profile(profile: ApplicationProfile, path: str | Path = DEFAULT_PATH) -
 
 
 def replace_profile(data: dict, path: str | Path = DEFAULT_PATH) -> ApplicationProfile:
-    """Validate an edited profile and save it."""
+    """Validate an edited profile and save it. Preserve the server-managed learning store
+    (`dropdown_aliases`) that the UI editor doesn't send, so saving the Profile tab doesn't
+    wipe dropdown mappings learned during autofill (decision 033)."""
+    if "dropdown_aliases" not in data:
+        try:
+            data = {**data, "dropdown_aliases": load_profile(path).dropdown_aliases}
+        except Exception:
+            pass
     profile = ApplicationProfile.model_validate(data)
     save_profile(profile, path)
     return profile
@@ -108,6 +121,28 @@ def _norm_q(q: str) -> str:
     s = re.sub(r"[^a-z0-9 ]", " ", (q or "").lower())
     s = re.sub(r"^\s*(please|kindly|briefly|so|and|also)\s+", "", s)
     return " ".join(s.split())
+
+
+def remember_dropdown_aliases(new: dict[str, list[str]], path: str | Path = DEFAULT_PATH) -> int:
+    """Merge newly-learned dropdown option mappings (normalized value -> matched option text)
+    into the on-disk store so future autofill matches the same value instantly. Reloads first,
+    dedupes option strings per value. Returns how many new (value, option) pairs were added."""
+    if not new:
+        return 0
+    profile = load_profile(path)
+    added = 0
+    for value, options in new.items():
+        key = " ".join((value or "").lower().split())
+        if not key:
+            continue
+        have = profile.dropdown_aliases.setdefault(key, [])
+        for opt in options:
+            if opt and opt not in have:
+                have.append(opt)
+                added += 1
+    if added:
+        save_profile(profile, path)
+    return added
 
 
 def remember_answers(new: list[QA], path: str | Path = DEFAULT_PATH) -> int:

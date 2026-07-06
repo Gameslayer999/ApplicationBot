@@ -120,6 +120,24 @@ class AnswerResolver:
     jd: Optional[str] = None
     model: Optional[str] = None
     learned: list = field(default_factory=list)  # generated Q&A to persist after the run
+    learned_options: dict = field(default_factory=dict)  # value -> [option texts] learned this run
+
+    def learned_option_hints(self, value: Optional[str]) -> list[str]:
+        """Dropdown options this value has matched before (learned across runs), so a repeat
+        encounter matches instantly without another Claude call (decision 033)."""
+        if not value:
+            return []
+        key = " ".join(value.lower().split())
+        return list(self.profile.dropdown_aliases.get(key, [])) + list(self.learned_options.get(key, []))
+
+    def learn_option(self, value: Optional[str], chosen: str) -> None:
+        """Record that `value` matched dropdown option `chosen` (persisted after the run)."""
+        if not (value and chosen):
+            return
+        key = " ".join(value.lower().split())
+        opts = self.learned_options.setdefault(key, [])
+        if chosen not in opts:
+            opts.append(chosen)
 
     def _name_parts(self) -> tuple[str, str]:
         parts = (self.resume.contact.name or "").split()
@@ -814,42 +832,87 @@ def _combo_try(page, loc, text: str) -> Optional[str]:
     return None
 
 
-def _fill_combobox(page, loc, value: Optional[str], hints: Optional[list[str]] = None) -> Optional[str]:
+def _open_options_and_texts(page):
+    """Open the menu's options and return (locator, texts) TOGETHER so a match can be clicked
+    by index on the same locator — re-querying options separately to click is flaky."""
+    opts = _open_options(page)
+    if opts is None:
+        return None, []
+    n = min(opts.count(), 60)
+    return opts, [(opts.nth(i).inner_text() or "").strip() for i in range(n)]
+
+
+def _claude_pick_click(page, opts, texts, label, value, resolver) -> Optional[str]:
+    """Ask Claude to pick the best option from `texts` and click it by index, learning the
+    mapping. Returns the chosen text or None. `opts`/`texts` must come from the SAME open."""
+    if not texts:
+        return None
+    chosen = answer_bank.pick_dropdown_option(label, value, texts, model=resolver.model)
+    if not chosen:
+        return None
+    for i, t in enumerate(texts):
+        if t == chosen:
+            opts.nth(i).click(timeout=4000)
+            resolver.learn_option(value, chosen)
+            return chosen
+    return None
+
+
+def _fill_combobox(page, loc, value: Optional[str], hints: Optional[list[str]] = None,
+                   resolver=None, label: str = "") -> Optional[str]:
     """react-select combobox: commit the option matching the answer (or a ranked hint). Returns
     the committed option text, or None. Never leaves uncommitted typed text (which would look
     filled but submit as an invalid/empty selection) — clears the field if nothing selected.
 
-    Two-phase: (1) open ONCE and match any candidate against the options already shown — static
-    lists (e.g. a country dropdown showing all options) resolve here in a single open, which is
-    both faster and more reliable than re-typing each candidate (repeated type-cycles on one
-    react-select make it flaky). (2) Fall back to typing each candidate to filter async lists
-    (e.g. a location geocoder that returns nothing until you type)."""
-    candidates = [w for w in ([value] if value else []) + (hints or []) if w]
+    (1) On the FIRST open, literal-match any candidate (answer + hints + LEARNED aliases). If no
+    match and it's a static list (options already shown), let Claude pick from those FRESH
+    options and LEARN it — done here, before any typing pollutes the react-select filter.
+    (2) Otherwise type each candidate to filter a searchable list; if a typed filter yields
+    options but none literally match, let Claude pick from them and learn. Learned mappings make
+    the same value match instantly next time without another Claude call (decision 033)."""
+    learned = resolver.learned_option_hints(value) if resolver is not None else []
+    candidates = [w for w in ([value] if value else []) + (hints or []) + learned if w]
+    use_claude = resolver is not None and getattr(resolver, "enable_generation", False) and bool(value)
 
-    # Phase 1 — match against the options shown on open (no typing).
+    # Phase 1 — literal match on the options shown on open; then Claude-pick for static lists.
     if _open_combobox(page, loc):
         page.wait_for_timeout(250)
-        opts = _open_options(page)
-        if opts is not None:
-            cnt = min(opts.count(), 60)
-            texts = [(opts.nth(i).inner_text() or "").strip() for i in range(cnt)]
-            for want in candidates:
-                for i, t in enumerate(texts):
-                    if _matches(t, want):
-                        opts.nth(i).click(timeout=4000)
-                        return t
-        # No match among the shown options — close the menu so Phase 2 reopens/types cleanly
-        # (leaving it open makes Phase 2's reopen toggle it CLOSED, which broke the geocoder).
+        opts, texts = _open_options_and_texts(page)
+        for want in candidates:
+            for i, t in enumerate(texts):
+                if _matches(t, want):
+                    opts.nth(i).click(timeout=4000)
+                    return t
+        if use_claude and len(texts) >= 3:  # static list fully shown — pick now, before pollution
+            chosen = _claude_pick_click(page, opts, texts, label, value, resolver)
+            if chosen:
+                return chosen
         try:
-            loc.press("Escape")
+            loc.press("Escape")  # close so Phase 2 reopens/types cleanly
         except Exception:
             pass
 
-    # Phase 2 — type each candidate to filter an async list.
+    # Phase 2 — type each candidate to filter a searchable list (literal match).
     for want in candidates:
         chosen = _combo_try(page, loc, want)
         if chosen:
             return chosen
+
+    # Phase 2b — searchable list, no literal match: type the value, Claude-picks from the results.
+    if use_claude:
+        for q in (value, (value.split() or [value])[0]):
+            if not _open_combobox(page, loc):
+                break
+            try:
+                loc.fill(q, timeout=4000)
+            except Exception:
+                continue
+            page.wait_for_timeout(900)
+            opts, texts = _open_options_and_texts(page)
+            chosen = _claude_pick_click(page, opts, texts, label, value, resolver)
+            if chosen:
+                return chosen
+
     try:
         loc.fill("", timeout=2000)  # discard any typed-but-uncommitted text
     except Exception:
@@ -933,7 +996,7 @@ def _fill_all_fields(page, resolver: AnswerResolver, report: "ApplyReport", done
             # Same question can be a dropdown or a text box depending on the company —
             # dispatch on the control type discovered live.
             if role == "combobox":
-                chosen = _fill_combobox(page, loc, value, hints)
+                chosen = _fill_combobox(page, loc, value, hints, resolver=resolver, label=label)
                 if chosen:
                     report.filled.append(FilledField(label, chosen, "combobox"))
                 else:
@@ -1052,6 +1115,9 @@ def _persist_learning(resolver: AnswerResolver, report: "ApplyReport", profile_p
     """Save AI-drafted answers and capture new reusable questions to the answer bank."""
     from . import apply_profile
     saved = apply_profile.remember_answers(resolver.learned, profile_path) if resolver.learned else 0
+    # Persist dropdown option mappings Claude resolved this run, so the same value matches
+    # instantly next time without another Claude call (decision 033).
+    aliased = apply_profile.remember_dropdown_aliases(resolver.learned_options, profile_path)
     # Capture new REUSABLE questions we genuinely couldn't answer, so the user fills each once.
     # Only "no saved answer" gaps qualify — a "no dropdown option matched" / "unsupported field"
     # gap means we HAD an answer, so capturing it blank would be wrong. Skip company-specific,
@@ -1070,10 +1136,10 @@ def _persist_learning(resolver: AnswerResolver, report: "ApplyReport", profile_p
             continue
         pending.append(q)
     captured = apply_profile.capture_questions(pending, profile_path) if pending else 0
-    if saved or captured:
+    if saved or captured or aliased:
         report.skipped.append(
-            f"[answer bank] saved {saved} AI-drafted answer(s), captured {captured} new "
-            f"question(s) for you to answer once in the Apply-profile tab")
+            f"[answer bank] saved {saved} AI-drafted answer(s), learned {aliased} dropdown "
+            f"mapping(s), captured {captured} new question(s) for you to answer once in the Apply-profile tab")
 
 
 def _title_role_company(title: str) -> tuple[str, str]:

@@ -106,9 +106,11 @@ and free-form notes.
       submits; records a `dry-run` Track row. Now also has a **full Discovery-settings editor**
       (boards + all gates/knobs, editable from the tab — no more hand-editing the yaml).
       *Remaining:* a browse-all-ranked-matches view.
-- [ ] **Aggregator full-JD** — Adzuna is snippet-only; either fetch the `redirect_url` page for
-      full text (ToS-permitting) or accept snippet-degraded tailoring for aggregator hits, and
-      add a free-key setup path (env or the Discover tab).
+- [x] **Aggregator full-JD** — **done (decision 032):** the aggregator→ATS bridge resolves an
+      Adzuna/Jooble redirect to its real ATS and, for all six fillable ATSs
+      (GH/Lever/Ashby/SmartRecruiters/Recruitee/Workable), **re-fetches the full JD** (`_resolve_jd`)
+      to replace the snippet. Free-key setup path wired into the Discover tab (clickable
+      developer.adzuna.com link + `ADZUNA_APP_ID`/`ADZUNA_APP_KEY` env-var / own-key option).
 - [~] **More sources behind the interface** — **added (decision 030):** SmartRecruiters +
       Recruitee, two *distinct* ATS form systems (public no-auth APIs, full JD, direct apply URL),
       to exercise the Apply autofill on more layouts. **Rejected:** hiring.cafe (its search API is
@@ -202,6 +204,35 @@ and free-form notes.
 ---
 
 ## Recently added (this session, latest first)
+
+- 2026-07-05 — **Self-improving dropdown resolver (decision 033).** Dropdowns kept breaking one at
+  a time (country, degree, now school), each needing a hardcoded hint. Now the combobox filler
+  learns: `_fill_combobox` literal-matches the answer + hints + **learned aliases** on first open;
+  on a static list with no match, **Claude picks the best option from those fresh options**
+  (`answer_bank.pick_dropdown_option`, guarded by a token-overlap check so it never picks an
+  unrelated option — "Harvard" for "Penn State" → none); searchable lists type-then-pick. The
+  value→option mapping is stored on the resolver, persisted to `ApplicationProfile.dropdown_aliases`,
+  and consulted first next time — so a value that once needed Claude matches instantly with no
+  call. **Verified live** on the Stripe form: no regression (country "US", gender "Male"); a
+  hint-less degree resolved to "Bachelor's Degree" via Claude and was **learned**; a later fill
+  with generation OFF matched it from the learned alias, zero Claude calls. This is the mechanism
+  for the reported "school dropdown broke" — school (and any new dropdown) is now handled +
+  learned automatically. *Note:* a full fill adds a Claude call only for genuinely-new dropdown
+  values; the token guard rejects short-code options (e.g. "US"), which still rely on hints.
+
+- 2026-07-05 — **JD-upgrade for all 6 ATSs + dashboard "Sources" section (decision 032 update).**
+  (1) `_resolve_jd` extended to **SmartRecruiters / Workable / Recruitee** (was GH/Lever/Ashby only),
+  so a bridged aggregator hit on any fillable ATS gets its snippet replaced with the full JD — also
+  broadens what the early-career curated feeds can resolve. Verified live (SR 5601, Workable 6130,
+  Recruitee 4133 chars; bridge upgraded an SR snippet). (2) New **"Where your postings come from"**
+  overview at the top of the Discover tab (`GET /sources`): target boards by ATS, Adzuna status
+  (active via your key / env vars / not set up), early-career on/off, the bridge, and the
+  auto-fillable ATS list. **Fixed** the board-picker to offer all six ATSs (it only listed
+  greenhouse/lever/ashby — the SmartRecruiters/Recruitee/Workable sources were unselectable). **Wired
+  the Adzuna setup path**: clickable developer.adzuna.com free-key link + env-var/own-key note.
+  Verified: served JS `node --check`-clean, `/sources` HTTP round-trip (real discovery.yaml backed
+  up/restored), and a headless-Chromium drive of the tab (overview + 6-ATS dropdown + link, 0 console
+  errors). Coordinated with the parallel Cursor agent via the bus (claimed discovery.py/web.py).
 
 - 2026-07-05 — **Early-career discovery: SimplifyJobs new-grad/intern feeds (decision 031).** With
   senior-heavy boards, 0 of 10 judged roles cleared the fit cutoff for a junior résumé. New

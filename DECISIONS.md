@@ -43,6 +43,7 @@
 | 030 | 2026-07-05 | More discovery sources: broaden the ATS layer (SmartRecruiters + Recruitee) over aggregators; reject hiring.cafe (now auth-gated) + LinkedIn (Guideline #4) | Accepted |
 | 031 | 2026-07-05 | Early-career discovery: SimplifyJobs new-grad/intern JSON feeds → rank by title-relevance → resolve full JD for top-K via linked ATS; curated postings judged first | Accepted |
 | 032 | 2026-07-05 | Workable source + aggregator→ATS bridge (resolve redirect → detect ATS → rewrite apply_url + upgrade snippet to full JD); partner APIs (SEEK/Indeed/LinkedIn) out | Accepted |
+| 033 | 2026-07-05 | Self-improving dropdown resolver: Claude picks the option (guarded) when literal/hint match fails, and the value→option mapping is learned + reused without another Claude call | Accepted |
 
 ---
 
@@ -1177,6 +1178,25 @@ through to a match. See [[030-more-ats-sources]] (the layer this extends), [[026
 (the pipeline + `detect_ats_from_url`/`_resolve_jd` it reuses), [[016-apply-stage]] (where bridged
 apply URLs land), [[014-agent-bus]] (parallel-work coordination), [[004-respect-tos]].
 
+**Update (same session):** (1) **JD upgrade extended to all six ATSs.** `_resolve_jd` now also
+resolves SmartRecruiters (`api.smartrecruiters.com/…/postings/{id}`), Workable
+(`api/v2/accounts/{acct}/jobs/{shortcode}`), and Recruitee (`{co}.recruitee.com/api/offers/{slug}`)
+— so a bridged aggregator hit on any of our fillable ATSs gets its snippet replaced with the full
+JD (previously only GH/Lever/Ashby). This also broadens what the curated early-career feeds (#031)
+can resolve. *Verified live:* SmartRecruiters 5601, Workable 6130, Recruitee 4133 chars; bridge
+upgraded a SmartRecruiters snippet → full JD. (2) **Dashboard "Sources" section.** Added a live,
+read-only **"Where your postings come from"** overview at the top of the Discover tab (new
+`GET /sources`) — target boards grouped by ATS, Adzuna status (**active via your key /
+environment variables / not set up**), early-career feeds on/off, the bridge, and the list of
+auto-fillable ATSs. Fixed the board-picker to offer **all six** ATSs (it only listed
+greenhouse/lever/ashby, so the SmartRecruiters/Recruitee/Workable sources built in #030/#032 were
+unselectable). Wired the **Adzuna setup path**: a clickable `developer.adzuna.com` free-key link in
+the settings editor, keeping the **own-key option** (paste your `app_id`/`app_key`, or set
+`ADZUNA_APP_ID`/`ADZUNA_APP_KEY` env vars — `build_aggregator` reads either). *Verified live:*
+served JS `node --check`-clean, `/sources` HTTP round-trip reflects a saved config (real
+`discovery.yaml` backed up + restored byte-for-byte), and a headless-Chromium drive of the Discover
+tab renders the overview + all-six-ATS dropdown + free-key link with zero console errors.
+
 ---
 
 ## 031 — Early-career discovery via community-curated JSON feeds
@@ -1222,3 +1242,48 @@ to **4 cleared** (AppLovin New-Grad 82, MARGO 78, Blitzy 68, Evolver 68), while 
 roles still correctly denied (≤42) — exactly the intended effect. See [[026-discover-stage]] (the
 source interface + matcher), [[027-experience-level-gate]] (complementary title-level gate),
 [[016-apply-stage]] (fills the linked ATS), [[004-respect-tos]] (Guideline #4, personal-use only).
+
+---
+
+## 033 — Self-improving dropdown resolver
+
+**Date:** 2026-07-05
+**Status:** Accepted
+
+**Context:** Dropdown fields kept breaking one at a time — country ("US" vs "United States"),
+degree ("Bachelor's Degree" vs the verbose résumé string), and then school (a big searchable
+list). Each was patched with a hardcoded option-hint. The user's point: this is exactly what the
+system should learn automatically as it runs more autofills, not something to hardcode per field.
+
+**Options considered:**
+| Option | Verdict |
+|---|---|
+| Keep hardcoding per-field option hints | Rejected — doesn't scale; a new dropdown always breaks until patched |
+| **Claude picks the option at fill time when literal/hint match fails, and we cache the value→option mapping** | **Chosen** — generic across any dropdown; self-improves; one Claude call per novel value, then free |
+| Ship a static aliases table (schools/degrees/countries) | Rejected — huge, stale, still misses site-specific option text; the learned cache subsumes it |
+
+**Decision:** Extend the combobox filler into a self-improving resolver (extends the answer-bank
+decisions 018/028). `_fill_combobox` now: (1) literal-matches the answer + hints + **learned
+aliases** against the options shown on first open; (2) if no match and it's a static list, has
+**Claude pick the best option from those FRESH options** (`answer_bank.pick_dropdown_option`) —
+done before any typing pollutes the react-select filter; (3) for searchable lists, types to
+filter and Claude-picks from the results. Every Claude pick is guarded by a deterministic
+**token-overlap check** (the chosen option must share a meaningful, non-generic word with the
+answer) so it can never commit an unrelated same-category option ("Harvard" for "Penn State").
+The chosen mapping is stored on `AnswerResolver.learned_options`, persisted to
+`ApplicationProfile.dropdown_aliases` (normalized value → matched option texts) after the run,
+and consulted first on future fills — so a value that once needed Claude matches instantly with
+no call. The pick prompt is decisive about "same institution / campus variant / broader-narrower
+degree → pick the primary one; different entity → none".
+
+**Reasoning:** Matches how the answer bank already learns (cache what Claude resolved, reuse it),
+applied to the last brittle surface — dropdown option matching. It removes the need to hardcode a
+hint per dropdown while staying safe (the token guard prevents confident-wrong picks, which on a
+submitted form are worse than a flagged gap). Verified live on the Stripe embedded Greenhouse
+form: country still "US" and gender "Male" (no regression from the rewrite); a hint-less degree
+resolved to "Bachelor's Degree" via the Claude pick and was **learned**; a subsequent fill with
+generation OFF matched "Bachelor's Degree" from the learned alias with no Claude call. Picker
+unit tests: "The Pennsylvania State University" → "…-Main Campus", "Rutgers University" →
+"…-New Brunswick", and Penn-State-vs-Harvard/MIT/Stanford → none (guard). See
+[[018-self-improving-answer-bank]], [[028-semantic-question-classification]] (the learning
+pattern this extends), [[016-apply-stage]] (the filler), [[011-claude-code-cli-subscription]].

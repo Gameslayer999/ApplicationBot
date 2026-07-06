@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import os
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -269,6 +270,34 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {
                 "filters": filters.load_filters().model_dump(),
                 "levels": filters.EXPERIENCE_LEVELS,
+            })
+            return
+        if path == "/sources":
+            # A live "where & how" view of every source feeding discovery (decision 032):
+            # target boards grouped by ATS, the optional Adzuna aggregator + how it's
+            # configured, early-career feeds, and the aggregator→ATS bridge.
+            from .discovery import ATS_SOURCES
+
+            f = filters.load_filters()
+            adz = f.adzuna
+            adz_cfg = bool(adz.app_id and adz.app_key)
+            adz_env = bool(os.environ.get("ADZUNA_APP_ID") and os.environ.get("ADZUNA_APP_KEY"))
+            boards_by_ats: dict[str, list[str]] = {}
+            for b in f.boards:
+                boards_by_ats.setdefault(b.ats, []).append(b.token)
+            self._json(200, {
+                "boards_by_ats": boards_by_ats,
+                "fillable_ats": list(ATS_SOURCES),
+                "aggregator": {
+                    "active": adz_cfg or adz_env,
+                    "via": ("your key" if adz_cfg else ("environment variables" if adz_env else None)),
+                    "country": adz.country,
+                },
+                "early_career": {
+                    "enabled": f.early_career.enabled,
+                    "kinds": f.early_career.kinds,
+                },
+                "bridge": {"enabled": True, "upgrade_ats": list(ATS_SOURCES)},
             })
             return
         if path == "/track":
@@ -629,6 +658,13 @@ INDEX_HTML = """<!doctype html>
     </div>
 
     <div id="view-discover" class="hidden">
+      <div class="editor" id="sources-overview">
+        <h3 style="margin-top:0">Where your postings come from</h3>
+        <p class="editing">The live view of every source feeding discovery — target boards by
+          ATS, the optional aggregator, early-career feeds, and the aggregator→ATS bridge.
+          Configure them in <b>Discovery settings</b> below.</p>
+        <div id="sources-body">Loading…</div>
+      </div>
       <div class="editor">
         <h3 style="margin-top:0">Discovery settings</h3>
         <p class="editing">Control what the bot searches and how it filters matches — every
@@ -972,7 +1008,7 @@ document.querySelectorAll(".tab").forEach(t => t.addEventListener("click", () =>
   $("view-track").classList.toggle("hidden", v !== "track");
   if (v === "profile") loadProfile();
   if (v === "track") loadTrack();
-  if (v === "discover") { loadDisc(); pollTest(); }
+  if (v === "discover") { loadSources(); loadDisc(); pollTest(); }
 }));
 $("resume").addEventListener("change", () => { if (!$("view-profile").classList.contains("hidden")) loadProfile(); });
 
@@ -1542,9 +1578,9 @@ function numFld(label, key, value) {
 }
 function boardRow(b) {
   b = b || {};
-  const sel = el("select", {class:"f bd-ats"}, ["greenhouse","lever","ashby"].map(a => el("option", {value:a, text:a})));
+  const sel = el("select", {class:"f bd-ats"}, ["greenhouse","lever","ashby","smartrecruiters","recruitee","workable"].map(a => el("option", {value:a, text:a})));
   sel.value = b.ats || "greenhouse";
-  const tok = el("input", {class:"f bd-token", placeholder:"board token — e.g. stripe", value:b.token || ""});
+  const tok = el("input", {class:"f bd-token", placeholder:"board token / company slug — e.g. stripe", value:b.token || ""});
   const row = el("div", {class:"brd-row"});
   const del = el("button", {class:"del", type:"button", text:"✕", title:"Remove board", on:{click:()=>row.remove()}});
   row.append(sel, tok, del);
@@ -1558,7 +1594,7 @@ function renderDiscForm(f, levels) {
     on:{click:()=>boards.appendChild(boardRow({}))}});
   form.appendChild(el("div", {class:"sec"}, [
     el("h4", {text:"Target boards"}), boards, addBoard,
-    el("div", {class:"editing", text:"Companies whose public ATS board to poll. Read the token off the careers URL: boards.greenhouse.io/<token>, jobs.lever.co/<slug>, jobs.ashbyhq.com/<name>."}),
+    el("div", {class:"editing", text:"Companies whose public ATS board to poll. Read the token/slug off the careers URL: boards.greenhouse.io/<token>, jobs.lever.co/<slug>, jobs.ashbyhq.com/<name>, jobs.smartrecruiters.com/<Company>, <company>.recruitee.com, apply.workable.com/<account>."}),
   ]));
 
   const lvlBoxes = el("div", {class:"lvls"}, levels.map(l => {
@@ -1598,7 +1634,13 @@ function renderDiscForm(f, levels) {
   const a = f.adzuna || {};
   form.appendChild(el("div", {class:"sec"}, [
     el("h4", {text:"Adzuna aggregator (optional)"}),
-    el("div", {class:"editing", text:"A broad job aggregator beyond your target boards. Free key from developer.adzuna.com — leave blank to search only the boards above."}),
+    el("div", {class:"editing"}, [
+      "A broad job aggregator beyond your target boards. Get a free key at ",
+      el("a", {href:"https://developer.adzuna.com", target:"_blank", rel:"noopener", text:"developer.adzuna.com"}),
+      " and paste it below — or use your own by setting the ",
+      el("code", {text:"ADZUNA_APP_ID"}), " / ", el("code", {text:"ADZUNA_APP_KEY"}),
+      " environment variables. Leave blank to search only the boards above. Aggregator hits are auto-bridged to their real ATS and upgraded to the full job description.",
+    ]),
     fld("App ID", "adz_app_id", a.app_id),
     fld("App key", "adz_app_key", a.app_key),
     fld("Country code — e.g. us", "adz_country", a.country || "us"),
@@ -1658,6 +1700,32 @@ async function saveDisc() {
   finally { stop(); btnDone(btn); }
 }
 $("save-disc").addEventListener("click", saveDisc);
+
+// ---- Sources overview (read-only "where & how" for the Discover tab) ----
+function srcRow(label, text){ return el("div", {class:"editing"}, [el("b", {text: label + ": "}), text]); }
+async function loadSources(){
+  const box = $("sources-body");
+  busyInto(box, "Loading sources…", false);
+  try {
+    const s = await (await fetch("/sources")).json();
+    if (s.error) throw new Error(s.error);
+    box.innerHTML = "";
+    const bk = Object.keys(s.boards_by_ats || {});
+    box.appendChild(srcRow("Target boards",
+      bk.length ? bk.map(a => a + " (" + s.boards_by_ats[a].join(", ") + ")").join("  ·  ")
+                : "none yet — add some in Discovery settings below"));
+    const agg = s.aggregator || {};
+    box.appendChild(srcRow("Adzuna aggregator",
+      agg.active ? ("active — via " + agg.via + ", country " + agg.country)
+                 : "not set up — add a free key in Discovery settings below"));
+    const ec = s.early_career || {};
+    box.appendChild(srcRow("New-grad & internship feeds",
+      ec.enabled ? ("on (" + (ec.kinds || []).join(", ") + ")") : "off"));
+    box.appendChild(srcRow("Aggregator→ATS bridge",
+      "on — aggregator hits are resolved to their real ATS and upgraded to the full job description"));
+    box.appendChild(el("div", {class:"editing", text:"Forms we can auto-fill: " + (s.fillable_ats || []).join(", ") + "."}));
+  } catch(e){ box.innerHTML = ""; box.appendChild(el("div", {class:"msg err", text:String(e.message || e)})); }
+}
 
 function escapeHtml(s){ const d=document.createElement("div"); d.textContent=s; return d.innerHTML; }
 </script>

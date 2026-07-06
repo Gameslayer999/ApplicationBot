@@ -659,6 +659,47 @@ def _resolve_ashby_jd(url: str, cache: dict) -> str:
     return j.get("descriptionPlain") or html_to_text(j.get("descriptionHtml", "") or "")
 
 
+def _resolve_smartrecruiters_jd(url: str) -> str:
+    m = re.search(r"smartrecruiters\.com/([^/?#]+)/(\d+)", url)
+    if not m:
+        return ""
+    company, pid = m.group(1), m.group(2)
+    det = fetch_json(f"https://api.smartrecruiters.com/v1/companies/{company}/postings/{pid}")
+    sections = ((det.get("jobAd") or {}).get("sections")) or {} if isinstance(det, dict) else {}
+    return SmartRecruitersSource(company)._body_from_sections(sections)
+
+
+def _resolve_workable_jd(url: str) -> str:
+    m = re.search(r"apply\.workable\.com/([^/?#]+)/j/([^/?#]+)", url) or re.search(
+        r"([^/.]+)\.workable\.com/j/([^/?#]+)", url
+    )
+    if not m:
+        return ""
+    account, sc = m.group(1).strip("/"), m.group(2).strip("/")
+    det = fetch_json(f"https://apply.workable.com/api/v2/accounts/{account}/jobs/{sc}")
+    if not isinstance(det, dict):
+        return ""
+    return "\n\n".join(
+        html_to_text(det.get(k, "") or "")
+        for k in ("description", "requirements", "benefits")
+        if det.get(k)
+    )
+
+
+def _resolve_recruitee_jd(url: str) -> str:
+    m = re.search(r"([^/.]+)\.recruitee\.com/o/([^/?#]+)", url)
+    if not m:
+        return ""
+    company, slug = m.group(1), m.group(2)
+    data = fetch_json(f"https://{company}.recruitee.com/api/offers/{slug}")
+    o = data.get("offer") if isinstance(data, dict) else None
+    if not isinstance(o, dict):
+        return ""
+    desc = html_to_text(o.get("description", "") or "")
+    reqs = html_to_text(o.get("requirements", "") or "")
+    return "\n\n".join(x for x in [desc, reqs] if x)
+
+
 def _resolve_jd(url: str, ats: str, ashby_cache: dict) -> str:
     """Fetch one job's full JD via its ATS. Returns '' on any failure (the caller keeps a
     title-only body so the posting still flows through, just judged on less)."""
@@ -669,6 +710,12 @@ def _resolve_jd(url: str, ats: str, ashby_cache: dict) -> str:
             return _resolve_lever_jd(url)
         if ats == "ashby":
             return _resolve_ashby_jd(url, ashby_cache)
+        if ats == "smartrecruiters":
+            return _resolve_smartrecruiters_jd(url)
+        if ats == "workable":
+            return _resolve_workable_jd(url)
+        if ats == "recruitee":
+            return _resolve_recruitee_jd(url)
     except Exception:
         return ""
     return ""
@@ -823,8 +870,8 @@ def bridge_aggregator_postings(postings, *, limit: int = _BRIDGE_MAX, upgrade_jd
     aggregator, resolve its redirect and — when it lands on a recognized ATS — rewrite `ats`
     + `apply_url` so it flows into Apply, recording the original ats in `extra['bridged_from']`
     and whether we have a dedicated adapter in `extra['auto_applyable']`. When `upgrade_jd` and
-    the ATS exposes a public JD API (Greenhouse/Lever/Ashby), replace the aggregator's *snippet*
-    body with the full JD. Postings already on a known ATS are left untouched. Mutates and
+    the ATS exposes a public JD API (Greenhouse/Lever/Ashby/SmartRecruiters/Workable/Recruitee),
+    replace the aggregator's *snippet* body with the full JD. Left untouched otherwise. Mutates and
     returns (postings, n_bridged); bounded by `limit` redirect resolutions to stay polite."""
     to_bridge = [p for p in postings if p.ats in _AGGREGATOR_ATS]
     ashby_cache: dict = {}

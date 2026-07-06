@@ -145,6 +145,56 @@ def classify_question(question: str, *, model: Optional[str] = None) -> Optional
     return best_key
 
 
+def pick_dropdown_option(label: str, value: str, options: list[str], *,
+                         model: Optional[str] = None) -> Optional[str]:
+    """Use Claude to choose the dropdown option that best represents `value` for a field
+    labelled `label` — the general fallback when literal/hint matching fails (e.g. answer
+    "Rutgers University" vs option "Rutgers University-New Brunswick", or a verbose degree vs
+    "Bachelor's Degree"). Returns the chosen option VERBATIM from `options`, or None if none
+    genuinely fits (never force a wrong pick). Best-effort: None if the CLI is unavailable."""
+    opts = [o for o in options if (o or "").strip()][:60]
+    if not (value and opts):
+        return None
+    from . import backends  # lazy
+
+    numbered = "\n".join(f"{i}. {o}" for i, o in enumerate(opts))
+    prompt = (
+        f"A job-application dropdown labelled {label!r} must be set to the applicant's answer: "
+        f"{value!r}.\nChoose the option below that best represents that answer.\n\n"
+        f"OPTIONS:\n{numbered}\n\n"
+        "An option MATCHES if it refers to the same institution/organization/value as the "
+        "answer — i.e. it shares the answer's core name, possibly with an extra qualifier (a "
+        "campus/location), or is a broader/narrower form of the same degree. Among matching "
+        "options pick the primary/main/closest one (e.g. answer 'The Pennsylvania State "
+        "University' → 'Pennsylvania State University-Main Campus'). If NO option shares the "
+        "answer's core identity — every option names a DIFFERENT institution (answer 'Penn "
+        "State' but options Harvard/MIT/Stanford) — reply 'none'.\n"
+        "Reply with ONLY the number of the best option, or 'none'."
+    )
+    try:
+        out = backends.run_claude_cli(prompt, model=model, think=False, timeout=60).strip().lower()
+    except Exception:
+        return None
+    m = re.search(r"\d+", out)
+    if "none" in out and (not m or out.index("none") < m.start()):
+        return None
+    if not m:
+        return None
+    idx = int(m.group())
+    if not (0 <= idx < len(opts)):
+        return None
+    chosen = opts[idx]
+    # Deterministic guard: the pick must share a meaningful (non-generic) token with the answer,
+    # so Claude can never return an UNRELATED same-category option ("Harvard" for "Penn State").
+    stop = {"university", "college", "the", "of", "school", "institute", "and", "at", "for",
+            "degree", "in", "a", "an", "on", "inc", "llc"}
+    vtok = {t for t in re.findall(r"[a-z]+", value.lower()) if len(t) > 2 and t not in stop}
+    otok = {t for t in re.findall(r"[a-z]+", chosen.lower()) if len(t) > 2 and t not in stop}
+    if vtok and not (vtok & otok):
+        return None
+    return chosen
+
+
 def generate_answer(
     question: str,
     resume: Resume,
