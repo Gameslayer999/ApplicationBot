@@ -205,6 +205,23 @@ and free-form notes.
 
 ## Recently added (this session, latest first)
 
+- 2026-07-05 — **Autofill: per-country work authorization + sponsorship.** "Are you legally
+  authorized to work in Japan for our Company?" was answered "Yes" off the applicant's *generic*
+  work-auth flag — wrong for a US applicant applying to a foreign-country role. Now the work-auth
+  and sponsorship rules detect a **concrete foreign country** named in the question and override:
+  `_named_foreign_country(n)` extracts the place from a "work in <X>" clause, returns it only when
+  it's a real country the applicant is NOT authorized in — None when the clause is absent, **vague**
+  ("the location(s) you selected", "the country in which you are applying", "this country" — a
+  `_VAGUE_PLACE` word list), or their **own** country (`_authorized_countries()` = home country,
+  US spelled its many ways). Work-auth flips to **No** for a foreign country (else the general
+  flag); sponsorship flips to **Yes** for a foreign country when they need none at home (else the
+  general flag). No new schema/UI — the home country is the honest default. **Verified:** 14 unit
+  cases (Japan/Canada/UK → No; US/vague/generic → the general flag unchanged; sponsorship symmetric)
+  + **live headed dry-run** on the Discord "Account Executive – Japan" form — work-in-Japan now
+  **No**, everything else intact, `submitted:False`. *Follow-up:* a dual-national / multi-visa
+  applicant with authorization beyond their home country would need an explicit
+  `work_authorized_countries` list (schema + Profile-tab field) — deferred until a real user needs it.
+
 - 2026-07-05 — **Autofill: Discipline field + "located in <country>?" Yes/No (education/location edges).**
   Two correctness gaps the Discord Greenhouse form exposed. (1) **Discipline** (the education
   section's field-of-study dropdown) was left blank — the résumé stores the major inside the degree

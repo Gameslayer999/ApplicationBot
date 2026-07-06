@@ -84,6 +84,16 @@ def _link(links: list[str], host: str) -> Optional[str]:
     return next((l for l in links if host in l.lower()), None)
 
 
+# Words that mark a "work in <X>" reference as VAGUE (not a concrete country we can adjudicate) —
+# e.g. "the location(s) you selected", "the country in which you are applying", "this role". When
+# the place is vague we fall back to the applicant's general work-auth/sponsorship flag.
+_VAGUE_PLACE = (
+    "location", "country", "countries", "office", "region", "area", "role", "position",
+    "selected", "this", "these", "those", "your", "our", "above", "below", "previous",
+    "listed", "applying", "applied", "jurisdiction", "place", "where", "here", "any",
+)
+
+
 def _degree_hints(degree_text: str) -> Optional[list[str]]:
     """Map a verbose résumé degree ("Bachelor of Science in Computer Science, …") to the
     standard option texts a degree dropdown uses, most-specific first, so the combobox/select
@@ -186,6 +196,38 @@ class AnswerResolver:
         return any(place == m or (len(place) > 2 and place in m) or (len(m) > 2 and m in place)
                    for m in mine)
 
+    def _authorized_countries(self) -> set:
+        """Countries the applicant can work in without sponsorship — their own country (spelled the
+        US's many ways when applicable). No per-country data model today; the home country is the
+        honest default. A dual-national with extra authorizations is a documented follow-up."""
+        US = {"united states", "united states of america", "usa", "us", "u s", "u s a", "america"}
+        out: set = set()
+        c = (self.profile.country or "").strip().lower()
+        if c:
+            out.add(c)
+            if c in US:
+                out |= US
+        return out
+
+    def _named_foreign_country(self, n: str) -> Optional[str]:
+        """If the question names a CONCRETE country the applicant is NOT authorized in (e.g.
+        "…work in Japan…" for a US applicant), return that place; None if there's no "work in <X>"
+        clause, the place is vague ("the location(s) you selected"), or it IS their own country.
+        This is the only case where the generic work-auth/sponsorship flag gives a wrong answer."""
+        m = re.search(r"\b(?:work|employed|employment|permit)\s+in\s+(.+?)(?:\s+for\b|$)", n)
+        if not m:
+            return None
+        place = m.group(1).strip()
+        if any(w in place for w in _VAGUE_PLACE):
+            return None
+        p = re.sub(r"^the\b", "", place).strip(" .?,")
+        if not p:
+            return None
+        auth = self._authorized_countries()
+        if any(a == p or (len(p) > 2 and p in a) or (len(a) > 2 and a in p) for a in auth):
+            return None  # their own/authorized country — the generic flag (authorized) is correct
+        return p
+
     def resolve(self, label: str) -> Optional[str]:
         """Return the answer for a field labelled `label`, or None if we can't answer it."""
         n = _norm(label)
@@ -216,9 +258,19 @@ class AnswerResolver:
         # Work eligibility (Yes/No) — checked BEFORE location/country, because questions like
         # "Are you authorized to work in the location(s) you selected?" or "…sponsor you for the
         # location(s)…" contain "location"/"country" and must NOT be answered with a place.
-        if _has(n, "authorized to work", "legally authorized", "work authorization", "eligible to work"):
+        if _has(n, "authorized to work", "legally authorized", "work authorization",
+                "eligible to work", "entitled to work", "right to work"):
+            # A US applicant's generic work-auth flag says "authorized" — but that's WRONG for a
+            # posting that asks about a specific foreign country ("…authorized to work in Japan?").
+            # Override to No only when a concrete non-home country is named; else use the flag.
+            if p.work_authorized is True and self._named_foreign_country(n):
+                return "No"
             return _yn(p.work_authorized)
         if _has(n, "sponsor", "sponsorship", "require sponsorship", "visa sponsorship", "need sponsorship"):
+            # Symmetric: someone who needs no sponsorship at home WOULD need it for a foreign
+            # country ("…require sponsorship to work in Japan?" → Yes), so override in that case.
+            if p.requires_sponsorship is False and self._named_foreign_country(n):
+                return "Yes"
             return _yn(p.requires_sponsorship)
         # Citizenship — also answers "confirm you are a US citizen located in the US" gates,
         # since those are Yes/No and citizenship is the binding requirement.
