@@ -66,6 +66,7 @@ class ApplicationProfile(BaseModel):
 
     # Voluntary EEO self-identification (blank = decline to self-identify)
     gender: str = ""
+    pronouns: str = ""  # explicit; else the resolver derives He/Him / She/Her from gender
     race_ethnicity: str = ""
     veteran_status: str = ""
     disability_status: str = ""

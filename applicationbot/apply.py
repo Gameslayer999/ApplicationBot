@@ -245,8 +245,10 @@ class AnswerResolver:
         return None
 
     def _pronouns(self) -> Optional[str]:
-        """Pronouns derived from the stored gender, for a "preferred pronouns" field. None for an
-        unset/non-binary gender — never guess pronouns; leave those for the user."""
+        """The explicit pronouns field if set; otherwise derived from the stored gender, for a
+        "preferred pronouns" field. None for an unset/non-binary gender — never guess pronouns."""
+        if (self.profile.pronouns or "").strip():
+            return self.profile.pronouns.strip()
         g = (self.profile.gender or "").strip().lower()
         if g in ("male", "man", "m"):
             return "He/Him"

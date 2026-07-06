@@ -205,6 +205,22 @@ and free-form notes.
 
 ## Recently added (this session, latest first)
 
+- 2026-07-06 — **Profile tab: EEO fields are now dropdowns + a pronouns field (wiring discovered
+  gaps).** The sweep's recurring "Veteran Status / Disability Status — no saved answer" gaps weren't
+  missing UI — the fields existed but were **free-text**, so they sat blank (you'd have to guess the
+  exact EEO wording). Converted **gender / race-ethnicity / veteran-status / disability-status** from
+  free-text to **dropdowns with standard EEO self-identification options** (`GENDER_OPTS`/`RACE_OPTS`/
+  `VETERAN_OPTS`/`DISABILITY_OPTS` in [web.py](applicationbot/web.py), each starting with a blank "—"
+  so declining stays possible), and added a new **Pronouns** dropdown + `ApplicationProfile.pronouns`
+  field — the resolver's `_pronouns()` prefers it and only derives He/Him from gender when it's unset
+  (so non-binary users get the right answer). `selField` preserves any previously-stored value, so no
+  data migration. Standard wording maximizes direct option-matching; the combobox's Claude-pick maps
+  onto a form's exact text otherwise. **Verified:** schema round-trip + resolver (pronouns explicit
+  wins over derived; veteran/disability now resolve) + served JS `node --check`-clean + **live headless
+  drive of the Profile tab** — all 5 dropdowns render with the right options, set pronouns=They/Them &
+  veteran → Save → reload **persisted**, 0 console errors (real profile backed up/restored byte-safe).
+  *Note:* "preferred office location" still has no field (genuinely per-company); left for the user.
+
 - 2026-07-06 — **Checkbox support (consent/agreement + multi-select groups).** The driver skipped
   all `type=checkbox` controls, so Robinhood's REQUIRED demographic-consent box ("By checking this
   box, I consent to…") was never filled — blocking submission. New `_fill_checkboxes()` handles two

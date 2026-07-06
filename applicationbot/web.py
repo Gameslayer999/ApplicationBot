@@ -1373,6 +1373,18 @@ const COUNTRIES = ["United States","Canada","United Kingdom","Ireland","Australi
   "Germany","France","Netherlands","Spain","Italy","Switzerland","Sweden","Poland","Portugal","Mexico",
   "Brazil","Argentina","Singapore","Japan","China","South Korea","Israel","United Arab Emirates","Other"];
 const START_PRESETS = ["Immediately", "2 weeks' notice", "1 month"];
+// Voluntary EEO option lists — standard self-identification wording that matches most ATS forms;
+// the autofill combobox falls back to Claude to map onto a form's exact option text. Each starts
+// with a blank "—" so leaving it unanswered (decline to self-identify) stays possible.
+const PRONOUN_OPTS = [["","—"],"He/Him","She/Her","They/Them","Ze/Zir","Prefer not to say"];
+const GENDER_OPTS = [["","—"],"Male","Female","Non-binary","Prefer not to say"];
+const RACE_OPTS = [["","—"],"American Indian or Alaska Native","Asian","Black or African American",
+  "Hispanic or Latino","Native Hawaiian or Other Pacific Islander","White","Two or More Races",
+  "Prefer not to say"];
+const VETERAN_OPTS = [["","—"],"I am not a protected veteran",
+  "I identify as one or more of the classifications of a protected veteran","I don't wish to answer"];
+const DISABILITY_OPTS = [["","—"],"No, I do not have a disability and have not had one in the past",
+  "Yes, I have a disability, or have had one in the past","I do not want to answer"];
 
 // Generic <select>: opts is an array of "value" strings or [value,label] pairs. Preserves an
 // existing value that isn't in the list (so we never silently drop saved data).
@@ -1467,8 +1479,10 @@ function renderProfileForm() {
     row2(fld("Desired salary","desired_salary",P.desired_salary), startDateField(P.earliest_start_date)),
     fld("Years of experience","years_experience",P.years_experience),
     fld("How did you hear about this job? (default answer)","how_heard",P.how_heard),
-    row2(fld("Gender (optional)","gender",P.gender), fld("Race / ethnicity (optional)","race_ethnicity",P.race_ethnicity)),
-    row2(fld("Veteran status (optional)","veteran_status",P.veteran_status), fld("Disability status (optional)","disability_status",P.disability_status)),
+    row2(selField("Gender (optional)","gender",P.gender,GENDER_OPTS), selField("Pronouns (optional)","pronouns",P.pronouns,PRONOUN_OPTS)),
+    selField("Race / ethnicity (optional)","race_ethnicity",P.race_ethnicity,RACE_OPTS),
+    selField("Veteran status (optional)","veteran_status",P.veteran_status,VETERAN_OPTS),
+    selField("Disability status (optional)","disability_status",P.disability_status,DISABILITY_OPTS),
   );
   put("s-applicant", el("div", {class:"sec"}, [
     el("h3", {text:"Applicant details"}),
@@ -1534,7 +1548,7 @@ function collectProfile() {
     work_authorized:tri("work_authorized"), requires_sponsorship:tri("requires_sponsorship"), us_citizen:tri("us_citizen"),
     willing_to_relocate:tri("willing_to_relocate"), open_to_remote:tri("open_to_remote"),
     desired_salary:t("desired_salary"), earliest_start_date:earliest_start_date, years_experience:t("years_experience"),
-    gender:t("gender"), race_ethnicity:t("race_ethnicity"), veteran_status:t("veteran_status"), disability_status:t("disability_status"),
+    gender:t("gender"), pronouns:t("pronouns"), race_ethnicity:t("race_ethnicity"), veteran_status:t("veteran_status"), disability_status:t("disability_status"),
     greenhouse_email:t("greenhouse_email"), greenhouse_password:t("greenhouse_password"),
     custom_answers: cardsIn("sec-qa").map(c => { const q = cardData(c); return { question:(q.question||"").trim(), answer:(q.answer||"").trim(), maps_to:(q.maps_to||"").trim(), generated: q.generated === "1" }; }).filter(x => x.question || x.answer || x.maps_to),
   };
