@@ -205,6 +205,25 @@ and free-form notes.
 
 ## Recently added (this session, latest first)
 
+- 2026-07-05 — **Autofill: Discipline field + "located in <country>?" Yes/No (education/location edges).**
+  Two correctness gaps the Discord Greenhouse form exposed. (1) **Discipline** (the education
+  section's field-of-study dropdown) was left blank — the résumé stores the major inside the degree
+  string ("Bachelor of Science in Computer Science, …") with no separate field. New
+  `AnswerResolver._field_of_study()` parses the phrase after "in" up to the first comma
+  ("Computer Science"); the resolver now matches `discipline`/`concentration`/`field of study`/
+  `major` and returns it. (2) **"Are you currently located in Japan?"** was wrongly answered with
+  the applicant's country ("United States") — Claude's semantic classifier mapped it to the
+  `country` type. It's a Yes/No: new `_place_matches_applicant()` compares the named place to the
+  applicant's country + location (US spelled its many ways, state abbrevs expanded), and a rule
+  before the location/country block answers "Yes"/"No" for "are you (located|based|residing|living)
+  in <place>?" / "do you live in <place>?". **Verified:** unit tests (Discipline→"Computer Science";
+  Japan→No, US→Yes, Canada→No; real Location/Country/work-auth fields unchanged) + **live headed
+  dry-run** on the Discord form — Discipline "Computer Science", located-in-Japan "No", 15 fields
+  filled, only "Website" (genuinely empty) left, `submitted:False`. *New follow-up spotted:* "Are
+  you legally authorized to work in Japan?" answers "Yes" from the applicant's *general* work-auth
+  flag — a US-based applicant isn't necessarily authorized for a Japan role; per-country work
+  authorization is a separate, thornier gap (no per-country data today).
+
 - 2026-07-05 — **School dropdown fill fixed + main-campus precision (decision 033 follow-up).** The
   school typeahead still never filled after decision 033. **Root cause:** the searchable-combobox
   path typed the *full* résumé value ("The Pennsylvania State University") and then its first word

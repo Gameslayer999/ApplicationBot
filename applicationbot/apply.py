@@ -155,6 +155,37 @@ class AnswerResolver:
                 return e
         return exps[0]
 
+    def _field_of_study(self) -> Optional[str]:
+        """The academic field/major/discipline for a 'Discipline'/'Field of study' field. The
+        résumé stores it inside the degree string ("Bachelor of Science in Computer Science,
+        Minor in …"), with no separate field, so parse the phrase after "in" up to the first comma."""
+        edu = self.resume.education[0] if self.resume.education else None
+        if not edu:
+            return None
+        m = re.search(r"\bin\s+(.+)", edu.degree or "", re.I)
+        return (m.group(1).split(",")[0].strip() or None) if m else None
+
+    def _place_matches_applicant(self, place: str) -> bool:
+        """True if `place` (a country/region named in a Yes/No "are you located in X?" question)
+        is where the applicant actually is — compared against their country and location, with the
+        US spelled its many ways and state abbreviations expanded (NJ → new jersey)."""
+        place = re.sub(r"^the\b", "", place.strip().lower()).strip(" .?,")
+        if not place:
+            return False
+        US = {"united states", "united states of america", "usa", "us", "u s", "u s a", "america"}
+        mine: set = set()
+        country = (self.profile.country or "").strip().lower()
+        if country:
+            mine.add(country)
+            if country in US:
+                mine |= US
+        loc = (self.profile.location or self.resume.contact.location or "").lower()
+        for tok in re.split(r"[,\s]+", loc):
+            if tok:
+                mine.add(_US_STATES.get(tok, tok))
+        return any(place == m or (len(place) > 2 and place in m) or (len(m) > 2 and m in place)
+                   for m in mine)
+
     def resolve(self, label: str) -> Optional[str]:
         """Return the answer for a field labelled `label`, or None if we can't answer it."""
         n = _norm(label)
@@ -197,6 +228,14 @@ class AnswerResolver:
             return _yn(p.willing_to_relocate)
         if _has(n, "remote", "work remotely"):
             return _yn(p.open_to_remote)
+
+        # "Are you currently located in <place>?" / "Do you live in <place>?" — a Yes/No, answered
+        # by comparing the named place to where the applicant IS (country + location); NOT a place
+        # to enter. Before the location/country rules so it isn't answered with the applicant's own
+        # city/country (e.g. "located in Japan?" was wrongly answered "United States").
+        mloc = re.search(r"\b(?:located|based|residing|reside|living|live)\s+in\s+(.+)$", n)
+        if mloc and re.match(r"(are|do|does|will|is|have|currently)\b", n):
+            return "Yes" if self._place_matches_applicant(mloc.group(1)) else "No"
 
         # Location / country — after work-eligibility so a Yes/No question that merely mentions
         # "location"/"country" isn't answered with a place. "Country" is checked first so a
@@ -252,8 +291,9 @@ class AnswerResolver:
             return edu.degree or None
         if edu and _has(n, "school", "university", "college", "institution", "alma mater"):
             return edu.school or None
-        if edu and _has(n, "field of study", "major", "area of study", "course of study"):
-            return edu.degree or None
+        if edu and _has(n, "field of study", "major", "area of study", "course of study",
+                        "discipline", "concentration"):
+            return self._field_of_study() or edu.degree or None
         if edu and _has(n, "graduation", "grad year", "graduated", "year of graduation",
                         "expected graduation"):
             return edu.graduation or None
