@@ -205,6 +205,30 @@ and free-form notes.
 
 ## Recently added (this session, latest first)
 
+- 2026-07-06 — **Autofill gap sweep: 8 fixes across 4 real ATS forms.** Drove dry-runs against
+  Robinhood / Instacart / GitLab / Anthropic Greenhouse forms, collected every unanswered/mis-filled
+  field, and fixed the cross-form patterns. **New answers:** (1) **state/province** dropdown from the
+  location's state (`_state_from_location()`; "Edison, NJ" → "New Jersey", + abbrev hint — live:
+  Instacart "(US) New Jersey"); (2) **preferred name** → first name (GitLab "Gabriel"); (3)
+  **start-date** keyword broadening ("earliest you would want to start", "start working");
+  (4) **pronouns** derived from gender (`_pronouns()`; before the gender rule so "gender pronouns"
+  isn't answered "Male" — live: Robinhood "He / Him") + pronoun/gender option hints (Male→**Man**,
+  live: Instacart "Man", Robinhood "Cisgender man"). **Mis-fills fixed:** (5) **"military status"**
+  was answered "Yes" by the semantic classifier — added `military`/`pronoun`/`lgbt`/`transgender`/
+  `sexual orientation` to `answer_bank._DEMOGRAPHIC` so it's never auto-classified (live: now
+  cleanly "no saved answer"); (6) **"subject to employment agreements with your current employer"**
+  returned the employer name ("Ninth Wave") — guarded the employer rule against
+  agreement/restriction/non-compete phrasing; (7) **"preferred office location"** was answered with
+  the home city — the location rule now excludes "office" (that asks which company office). **New
+  default:** (8) **prior relationship with the hiring company** ("worked/interned/consulted/
+  interviewed at <Company>") → "No", gated on the hiring company being named (so "worked with
+  <tech>" and "used <product>" are never caught). **Verified:** ~25 unit assertions + live re-sweep
+  — Robinhood 11→19 filled (needs 15→7), Instacart needs 7→4, GitLab needs 6→4; remaining misses are
+  genuine (empty profile veteran/disability fields, LGBTQ/consent/government-official questions with
+  no data). *Follow-ups:* Robinhood's demographic **consent checkbox** (REQUIRED, we don't handle
+  checkboxes); "preferred office location" still needs an office-preference profile field; the prior-
+  company default is unit-tested only (the CLI passes no company — it fires in the real pipeline).
+
 - 2026-07-05 — **Autofill: per-country work authorization + sponsorship.** "Are you legally
   authorized to work in Japan for our Company?" was answered "Yes" off the applicant's *generic*
   work-auth flag — wrong for a US applicant applying to a foreign-country role. Now the work-auth

@@ -51,7 +51,8 @@ def _norm(q: str) -> str:
 
 # Voluntary EEO / demographic questions — handled by the structured EEO profile fields
 # (blank = decline to self-identify), never the answer bank.
-_DEMOGRAPHIC = ("gender", "race", "ethnicity", "hispanic", "latino", "veteran", "disability")
+_DEMOGRAPHIC = ("gender", "race", "ethnicity", "hispanic", "latino", "veteran", "disability",
+                "military", "pronoun", "lgbt", "transgender", "sexual orientation")
 
 
 def is_company_specific(question: str) -> bool:

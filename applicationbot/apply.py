@@ -228,6 +228,32 @@ class AnswerResolver:
             return None  # their own/authorized country — the generic flag (authorized) is correct
         return p
 
+    def _state_from_location(self) -> Optional[str]:
+        """The US state (full name) from the applicant's location, for a "state/province" field.
+        "Edison, NJ" → "New Jersey"; "San Francisco, California" → "California"."""
+        loc = (self.profile.location or self.resume.contact.location or "").strip()
+        for tok in re.split(r"[,\s]+", loc):
+            t = tok.strip().lower()
+            if t in _US_STATES:
+                return _US_STATES[t].title()
+            if t in _US_STATES.values():
+                return t.title()
+        low = loc.lower()  # multi-word states ("new jersey") don't survive the token split
+        for full in _US_STATES.values():
+            if full in low:
+                return full.title()
+        return None
+
+    def _pronouns(self) -> Optional[str]:
+        """Pronouns derived from the stored gender, for a "preferred pronouns" field. None for an
+        unset/non-binary gender — never guess pronouns; leave those for the user."""
+        g = (self.profile.gender or "").strip().lower()
+        if g in ("male", "man", "m"):
+            return "He/Him"
+        if g in ("female", "woman", "f"):
+            return "She/Her"
+        return None
+
     def resolve(self, label: str) -> Optional[str]:
         """Return the answer for a field labelled `label`, or None if we can't answer it."""
         n = _norm(label)
@@ -244,6 +270,11 @@ class AnswerResolver:
             return p.last_name or last or None
         if _has(n, "full name") or n in ("name", "your name", "legal name"):
             return c.name or None
+        # "What's the name you'd prefer us to use?" / "preferred name" → the first name.
+        if _has(n, "preferred name", "preferred first name", "what should we call you",
+                "name you go by", "goes by") or ("prefer" in n and "name" in n) \
+                or ("name" in n and _has(n, "like us to use", "want us to use", "call you")):
+            return p.first_name or first or None
         if _has(n, "email"):
             return p.email or c.email or None
         if _has(n, "phone", "mobile", "telephone"):
@@ -281,6 +312,16 @@ class AnswerResolver:
         if _has(n, "remote", "work remotely"):
             return _yn(p.open_to_remote)
 
+        # Prior relationship with the HIRING company (worked/interned/consulted/interviewed there).
+        # Honest default for a fresh applicant is "No". Gated on the company actually being named,
+        # so "have you worked with <technology>?" is never caught (and product-use like "have you
+        # used Robinhood?" isn't, since "used" isn't an employment/interview verb).
+        if self.company:
+            cn = _norm(self.company)
+            if cn and cn in n and _has(n, "worked", "work for", "employed", "employee",
+                                       "intern", "consult", "interviewed", "contractor"):
+                return "No"
+
         # "Are you currently located in <place>?" / "Do you live in <place>?" — a Yes/No, answered
         # by comparing the named place to where the applicant IS (country + location); NOT a place
         # to enter. Before the location/country rules so it isn't answered with the applicant's own
@@ -289,6 +330,16 @@ class AnswerResolver:
         if mloc and re.match(r"(are|do|does|will|is|have|currently)\b", n):
             return "Yes" if self._place_matches_applicant(mloc.group(1)) else "No"
 
+        # "Which state/province do you live in?" — answered from the location's state, not the
+        # full "City, ST". Guarded so the verb "state" ("please state your salary") never triggers
+        # it. Before the location rule so a state field isn't answered with the whole city.
+        if ("province" in n or re.search(r"\bstate\b", n)) and _has(
+                n, "province", "reside", "residence", "live", "located", "which state",
+                "home state", "current state", "state of", "your state"):
+            st = self._state_from_location()
+            if st:
+                return st
+
         # Location / country — after work-eligibility so a Yes/No question that merely mentions
         # "location"/"country" isn't answered with a place. "Country" is checked first so a
         # "country where you reside" question resolves to the country, not the city.
@@ -296,20 +347,29 @@ class AnswerResolver:
             return p.country or None
         # NOTE: match "city" only as a whole word — as a bare substring it hits "ethni-CITY"
         # (and "simpli-city"), which wrongly answered "Race/Ethnicity" with the applicant's city.
-        if _has(n, "location", "current location", "where are you based",
-                "reside", "residence", "where do you live", "where you live", "based out of") \
-                or re.search(r"\bcity\b", n):
+        # NB: exclude "office" — "preferred office location" asks which COMPANY office you'd work
+        # from (from the job's office list), not where you live; answering it with the home city is
+        # wrong, so leave it for the user.
+        if (_has(n, "location", "current location", "where are you based", "reside", "residence",
+                 "where do you live", "where you live", "based out of")
+                or re.search(r"\b(city|live)\b", n)) and not _has(n, "office"):
             return p.location or c.location or None
 
         # Logistics
         if _has(n, "salary", "compensation expectation", "desired pay", "expected compensation"):
             return p.desired_salary or None
-        if _has(n, "start date", "available to start", "notice period", "when can you start"):
+        if _has(n, "start date", "available to start", "notice period", "when can you start",
+                "earliest", "start working", "want to start", "like to start", "when would you start",
+                "when could you start", "availability to start", "available start"):
             return p.earliest_start_date or None
         if _has(n, "years of experience", "years experience"):
             return p.years_experience or None
 
         # Voluntary EEO
+        # Pronouns before gender: "What gender pronouns do you prefer?" contains "gender" but wants
+        # pronouns ("He/Him"), not "Male".
+        if _has(n, "pronoun"):
+            return self._pronouns()
         if _has(n, "gender"):
             return p.gender or None
         # "Are you Hispanic/Latino?" is a Yes/No derived from the stored race/ethnicity, which
@@ -323,7 +383,7 @@ class AnswerResolver:
             return "Yes" if is_hisp else "No"
         if _has(n, "race", "ethnicity", "ethnic"):
             return p.race_ethnicity or None
-        if _has(n, "veteran"):
+        if _has(n, "veteran", "military"):
             return p.veteran_status or None
         if _has(n, "disability"):
             return p.disability_status or None
@@ -333,7 +393,9 @@ class AnswerResolver:
         recent = self._current_experience()
         edu = self.resume.education[0] if self.resume.education else None
         if recent and _has(n, "current employer", "previous employer", "current company",
-                           "recent employer", "name of your employer", "current or previous employer"):
+                           "recent employer", "name of your employer", "current or previous employer") \
+                and not _has(n, "subject to", "agreement", "restriction", "non-compete", "noncompete",
+                             "obligation", "worked for", "worked at"):
             return recent.organization or None
         if recent and _has(n, "current title", "job title", "current position", "recent title",
                            "current or previous job title", "your title", "current role"):
@@ -435,6 +497,27 @@ class AnswerResolver:
             hints = _degree_hints(edu.degree)
             if hints:
                 return hints
+        # Gender-identity dropdowns often list "Man"/"Woman" rather than "Male"/"Female".
+        g = (self.profile.gender or "").strip().lower()
+        if _has(n, "pronoun"):
+            pr = self._pronouns()
+            if pr == "He/Him":
+                return ["He/Him", "He/Him/His", "He", "Him"]
+            if pr == "She/Her":
+                return ["She/Her", "She/Her/Hers", "She", "Her"]
+        if _has(n, "gender") and g:
+            if g in ("male", "man"):
+                return ["Male", "Man"]
+            if g in ("female", "woman"):
+                return ["Female", "Woman"]
+        # State/province dropdowns: offer the full name, then the abbreviation.
+        if ("province" in n or re.search(r"\bstate\b", n)) and _has(
+                n, "province", "reside", "residence", "live", "located", "which state",
+                "home state", "current state", "state of", "your state"):
+            st = self._state_from_location()
+            if st:
+                abbr = next((a.upper() for a, full in _US_STATES.items() if full == st.lower()), None)
+                return [st] + ([abbr] if abbr else [])
         return None
 
     def freetext_answer(self, label: str, is_textarea: bool = False) -> tuple[Optional[str], str]:
