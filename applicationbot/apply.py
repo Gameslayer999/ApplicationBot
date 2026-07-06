@@ -858,6 +858,35 @@ def _claude_pick_click(page, opts, texts, label, value, resolver) -> Optional[st
     return None
 
 
+def _search_queries(value: str) -> list[str]:
+    """Progressive typeahead search queries for an async combobox, longest→shortest, with any
+    leading article stripped. A prefix-indexed list (e.g. a school picker that stores Penn State
+    as "Pennsylvania State University-Main Campus") returns NOTHING for the full résumé value
+    "The Pennsylvania State University" or its first word "The" — so also try the article-stripped
+    form and its leading words, then let token/Claude matching pick the right option from whatever
+    those retrieve. Root cause of the school dropdown never filling (decision 033 follow-up)."""
+    v = " ".join((value or "").split())
+    if not v:
+        return []
+    out = [v]
+    low = v.lower()
+    for art in ("the ", "a ", "an "):
+        if low.startswith(art):
+            out.append(v[len(art):].strip())
+            break
+    words = out[-1].split()
+    for k in (3, 2):  # distinctive leading prefixes; 1 word is usually too broad to match on
+        if len(words) > k:
+            out.append(" ".join(words[:k]))
+    seen, uniq = set(), []
+    for q in out:
+        ql = q.lower()
+        if q and ql not in seen:
+            seen.add(ql)
+            uniq.append(q)
+    return uniq
+
+
 def _fill_combobox(page, loc, value: Optional[str], hints: Optional[list[str]] = None,
                    resolver=None, label: str = "") -> Optional[str]:
     """react-select combobox: commit the option matching the answer (or a ranked hint). Returns
@@ -898,9 +927,22 @@ def _fill_combobox(page, loc, value: Optional[str], hints: Optional[list[str]] =
         if chosen:
             return chosen
 
-    # Phase 2b — searchable list, no literal match: type the value, Claude-picks from the results.
+    # Phase 2a — for a comma-free name value (e.g. a school), the async list is often prefix-indexed
+    # under a normalized name, so the full/verbose value retrieves nothing. Retry with shorter,
+    # article-stripped queries; token-matching in _pick_from_open then commits the right option
+    # even without Claude. Learn the mapping so next time the full value matches instantly.
+    if value and "," not in value:
+        for q in _search_queries(value)[1:]:  # [0] == value, already tried above
+            chosen = _combo_try(page, loc, q)
+            if chosen:
+                if resolver is not None:
+                    resolver.learn_option(value, chosen)
+                return chosen
+
+    # Phase 2b — searchable list, no literal match: type progressively-shorter queries and let
+    # Claude pick from the results (learning the mapping via _claude_pick_click).
     if use_claude:
-        for q in (value, (value.split() or [value])[0]):
+        for q in _search_queries(value):
             if not _open_combobox(page, loc):
                 break
             try:

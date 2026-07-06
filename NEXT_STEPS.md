@@ -205,6 +205,22 @@ and free-form notes.
 
 ## Recently added (this session, latest first)
 
+- 2026-07-05 — **School dropdown fill fixed (decision 033 follow-up).** The school typeahead still
+  never filled after decision 033. **Root cause:** the searchable-combobox path typed the *full*
+  résumé value ("The Pennsylvania State University") and then its first word ("The") as the search
+  query — but a school picker is prefix-indexed under the normalized name ("Pennsylvania State
+  University-Main Campus"), so neither query retrieved any option, so there was nothing to match or
+  learn (self-improvement never bootstrapped because it never got one successful pick). Fix: new
+  `_search_queries(value)` yields article-stripped, progressively-shorter queries
+  ("The Pennsylvania State University" → "Pennsylvania State University" → "Pennsylvania State"),
+  used in both `_fill_combobox` paths — a new **Phase 2a** (comma-free name values: retry shorter
+  queries, token-match, and **learn** the mapping, works with generation OFF) and **Phase 2b**
+  (Claude picks from the retrieved options). Comma values like "Edison, NJ" are skipped by 2a so the
+  location path is unchanged. **Verified:** `_search_queries` output for Penn State / Rutgers /
+  Edison,NJ / MIT / "University of California, Berkeley"; module imports clean. *Not yet verified
+  live* — needs a headed dry-run against a form with an education section to confirm the async
+  school search returns within the wait and Penn State commits.
+
 - 2026-07-05 — **Self-improving dropdown resolver (decision 033).** Dropdowns kept breaking one at
   a time (country, degree, now school), each needing a hardcoded hint. Now the combobox filler
   learns: `_fill_combobox` literal-matches the answer + hints + **learned aliases** on first open;
