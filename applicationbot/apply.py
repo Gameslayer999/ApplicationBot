@@ -927,20 +927,12 @@ def _fill_combobox(page, loc, value: Optional[str], hints: Optional[list[str]] =
         if chosen:
             return chosen
 
-    # Phase 2a — for a comma-free name value (e.g. a school), the async list is often prefix-indexed
-    # under a normalized name, so the full/verbose value retrieves nothing. Retry with shorter,
-    # article-stripped queries; token-matching in _pick_from_open then commits the right option
-    # even without Claude. Learn the mapping so next time the full value matches instantly.
-    if value and "," not in value:
-        for q in _search_queries(value)[1:]:  # [0] == value, already tried above
-            chosen = _combo_try(page, loc, q)
-            if chosen:
-                if resolver is not None:
-                    resolver.learn_option(value, chosen)
-                return chosen
-
-    # Phase 2b — searchable list, no literal match: type progressively-shorter queries and let
-    # Claude pick from the results (learning the mapping via _claude_pick_click).
+    # Phase 2b — searchable list, no literal match on the full value: type progressively-shorter,
+    # article-stripped queries (a school picker indexes "The Pennsylvania State University" under
+    # "Pennsylvania State University-…", so the full value retrieves nothing) and let Claude pick
+    # the best option from the results — it's told to prefer the primary/main campus. Claude runs
+    # BEFORE the non-Claude substring fallback so an ambiguous multi-campus list resolves to the
+    # main campus, not whichever campus appears first. Learns the vetted mapping for next time.
     if use_claude:
         for q in _search_queries(value):
             if not _open_combobox(page, loc):
@@ -952,6 +944,16 @@ def _fill_combobox(page, loc, value: Optional[str], hints: Optional[list[str]] =
             page.wait_for_timeout(900)
             opts, texts = _open_options_and_texts(page)
             chosen = _claude_pick_click(page, opts, texts, label, value, resolver)
+            if chosen:
+                return chosen
+
+    # Phase 2c — no Claude (or it declined): best-effort substring match on the shortened queries
+    # for a comma-free name value (e.g. a school), so the field still fills when generation is off.
+    # NOT learned — this is an unvetted first-substring pick (it can land on a non-primary campus),
+    # not a confirmed mapping, so we don't persist it.
+    if value and "," not in value:
+        for q in _search_queries(value)[1:]:  # [0] == value, already tried in Phase 2
+            chosen = _combo_try(page, loc, q)
             if chosen:
                 return chosen
 
