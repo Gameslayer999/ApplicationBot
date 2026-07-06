@@ -223,13 +223,16 @@ def do_tailor(payload: dict) -> dict:
         budget=LengthBudget(pages=pages, line_chars=line_chars),
         quality=payload.get("quality") or DEFAULT_QUALITY,
     )
+    # Show the applicant's links (LinkedIn/GitHub/portfolio) from the apply profile when the
+    # résumé header itself has none, so the preview/PDF match what gets submitted.
+    rl = apply_profile.resume_with_profile_links(resume, apply_profile.load_profile())
     return {
         "backend": result.backend,
         "pages": result.pages,
         "title": jd.title,
         "company": jd.company,
-        "html": render_html(resume, result.tailored),
-        "markdown": render_markdown(resume, result.tailored),
+        "html": render_html(rl, result.tailored),
+        "markdown": render_markdown(rl, result.tailored),
         "tailored": result.tailored.model_dump(),
         "notes": result.tailored.relevance_notes,
         "warnings": result.warnings,
@@ -389,6 +392,7 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/pdf":
                 p = json.loads(raw or b"{}")
                 base = load_resume(_allowlisted(p["resume"], list_resumes()))
+                base = apply_profile.resume_with_profile_links(base, apply_profile.load_profile())
                 tailored = TailoredResume.model_validate(p["tailored"])
                 self._send(200, render_pdf(base, tailored), "application/pdf",
                            {"Content-Disposition": 'attachment; filename="tailored_resume.pdf"'})

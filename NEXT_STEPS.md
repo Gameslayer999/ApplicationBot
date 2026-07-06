@@ -205,6 +205,20 @@ and free-form notes.
 
 ## Recently added (this session, latest first)
 
+- 2026-07-06 — **LinkedIn now renders on the tailored résumé/PDF (reported "LinkedIn not filling").**
+  Reported as a form-autofill miss, but reproduced on ALL the user's actual dry-run forms (from the
+  tracker: MARGO/Lever, SpaceX×2/Greenhouse, Ramp/Ashby) and the LinkedIn FIELD fills correctly
+  everywhere it exists — the Stripe forms simply have no LinkedIn field. **Real root cause:** the
+  résumé's `contact.links` is empty (the LinkedIn/GitHub live only in the apply profile's Applicant
+  details, a separate field from the résumé header's Links), so `_render_contact` emitted no links —
+  the tailored résumé/PDF the user reviews and submits had no LinkedIn. Fix: new
+  `apply_profile.resume_with_profile_links(resume, profile)` fills the résumé's contact links from
+  the profile's linkedin/github/portfolio URLs **when the résumé itself has none** (deep-copy,
+  no-op otherwise), wired into every render path — pipeline dry-run PDF, web preview + PDF export,
+  CLI `--out`. **Verified:** unit (fills when empty, no-op when present, original untouched) + the
+  rendered résumé header now shows `…| linkedin.com/in/… | github.com/…` + PDF generates + served JS
+  clean + all modules import. *Note:* the form autofill was never broken; the résumé content was.
+
 - 2026-07-06 — **Preferred office location: ranked-list preference (chose over a map).** "What is
   your preferred office location?" is a dropdown of the *company's* discrete offices, so a map
   (arbitrary lat/long + external tiles + geocoding every office name — network deps that break the

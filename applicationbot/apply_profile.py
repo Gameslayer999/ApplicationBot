@@ -117,6 +117,23 @@ def replace_profile(data: dict, path: str | Path = DEFAULT_PATH) -> ApplicationP
     return profile
 
 
+def resume_with_profile_links(resume, profile: ApplicationProfile):
+    """Return the résumé with its contact links filled from the apply profile's LinkedIn / GitHub /
+    portfolio URLs when the résumé itself carries none — so the tailored résumé/PDF shows the
+    applicant's links. They live once in the apply profile (Applicant details); the résumé header's
+    own Links field is separate and often left empty, which is why LinkedIn was missing from the
+    rendered résumé. No-op when the résumé already has links or the profile has no URLs."""
+    if resume.contact.links:
+        return resume
+    links = [u.strip() for u in (profile.linkedin_url, profile.github_url, profile.portfolio_url)
+             if u and u.strip()]
+    if not links:
+        return resume
+    enriched = resume.model_copy(deep=True)
+    enriched.contact.links = links
+    return enriched
+
+
 def _norm_q(q: str) -> str:
     """Normalize a question for dedup: lowercase, drop punctuation, collapse whitespace, and
     strip common polite lead-ins so near-duplicate phrasings collapse to one bank entry

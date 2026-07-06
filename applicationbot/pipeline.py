@@ -26,7 +26,7 @@ from dataclasses import dataclass
 
 from . import backends
 from . import resume_store
-from .apply_profile import ApplicationProfile, load_profile
+from .apply_profile import ApplicationProfile, load_profile, resume_with_profile_links
 from .discovery import Source, discover
 from .filters import DiscoveryFilters, apply_gates, build_sources, load_filters
 from .matching import Match, match
@@ -174,7 +174,11 @@ def run_testing_mode(
     say("pdf", "▶ Exporting tailored résumé to PDF…")
     # Stable, git-ignored, per-posting path (decision 029) — not $TMPDIR, which macOS
     # purges out from under the Track row's resume_path.
-    pdf_path = resume_store.write_pdf(render_pdf(resume, result.tailored), p.company, p.title, p.url)
+    # Flow the apply-profile links (LinkedIn/GitHub/portfolio) onto the résumé header when it has
+    # none, so the submitted PDF carries them (they're stored once, in the apply profile).
+    profile = load_profile(profile_path)
+    pdf_resume = resume_with_profile_links(resume, profile)
+    pdf_path = resume_store.write_pdf(render_pdf(pdf_resume, result.tailored), p.company, p.title, p.url)
     print(f"  résumé PDF → {pdf_path}")
 
     apply_url = p.apply_url or p.url
@@ -182,7 +186,7 @@ def run_testing_mode(
     generate = backends.claude_code_available()
     resolver = AnswerResolver(
         resume=load_resume(resume_yaml),
-        profile=load_profile(profile_path),
+        profile=profile,
         enable_generation=generate,
         company=p.company or None,
         jd=jd.body or None,
