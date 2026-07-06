@@ -205,6 +205,23 @@ and free-form notes.
 
 ## Recently added (this session, latest first)
 
+- 2026-07-06 — **Preferred office location: ranked-list preference (chose over a map).** "What is
+  your preferred office location?" is a dropdown of the *company's* discrete offices, so a map
+  (arbitrary lat/long + external tiles + geocoding every office name — network deps that break the
+  local UI) is the wrong tool; the user agreed to a **ranked list** instead. New
+  `ApplicationProfile.preferred_locations: list[str]` (most-preferred first) + a Profile-tab textarea
+  ("one per line"). Resolver `_office_prefs()` builds the ranked candidates (explicit list → Remote
+  if open_to_remote → home city as last resort); `_office_hints()` expands each with its city-only
+  form ("New York, NY" → also "New York") so it matches whether the form option is the bare city or
+  suffixed ("New York (HQ)"); a resolve rule + option_hints fire for office-CHOICE questions (guarded
+  off the Yes/No "willing to work from the office"). The highest-ranked office the form actually
+  offers wins; if none are offered it stays captured (never forces a wrong office). Reusable by
+  Discover later for location ranking. **Verified:** 7 unit cases (rank-1 wins, falls to Remote then
+  home, suffix match, none-offered→captured, doesn't hijack the yes/no) + served JS `node --check` +
+  **live**: Profile-tab drive set/saved/persisted the list, then a Robinhood dry-run filled
+  "What is your preferred office location? → New York, NY" (filled 19→20; real profile backed
+  up/restored).
+
 - 2026-07-06 — **Profile tab: EEO fields are now dropdowns + a pronouns field (wiring discovered
   gaps).** The sweep's recurring "Veteran Status / Disability Status — no saved answer" gaps weren't
   missing UI — the fields existed but were **free-text**, so they sat blank (you'd have to guess the

@@ -244,6 +244,34 @@ class AnswerResolver:
                 return full.title()
         return None
 
+    def _office_prefs(self) -> list[str]:
+        """Ranked office-location candidates for a "preferred office location" dropdown: the explicit
+        preferred_locations first, then Remote (if open to it), then the home city as a last resort."""
+        out = [x.strip() for x in (self.profile.preferred_locations or []) if x and x.strip()]
+        if self.profile.open_to_remote and not any("remote" in x.lower() for x in out):
+            out.append("Remote")
+        home = (self.profile.location or self.resume.contact.location or "").strip()
+        if home and home not in out:
+            out.append(home)
+        return out
+
+    def _office_hints(self) -> Optional[list[str]]:
+        """The ranked office prefs, each expanded with its city-only form ("New York, NY" → also
+        "New York"), so the combobox matches whether a form's option is the bare city or has a
+        suffix ("New York (HQ)"). Order = rank, so the highest-ranked offered option wins."""
+        hints: list[str] = []
+        for p in self._office_prefs():
+            hints.append(p)
+            city = p.split(",")[0].strip()
+            if city and city.lower() != p.lower():
+                hints.append(city)
+        seen, out = set(), []
+        for h in hints:
+            if h.lower() not in seen:
+                seen.add(h.lower())
+                out.append(h)
+        return out or None
+
     def _pronouns(self) -> Optional[str]:
         """The explicit pronouns field if set; otherwise derived from the stored gender, for a
         "preferred pronouns" field. None for an unset/non-binary gender — never guess pronouns."""
@@ -341,6 +369,15 @@ class AnswerResolver:
             st = self._state_from_location()
             if st:
                 return st
+
+        # "What is your preferred office location?" — pick the highest-ranked office the form offers
+        # from the applicant's ranked preferences. NOT a Yes/No like "willing to work from the
+        # office" (guarded), and distinct from the home-location rule below (which excludes "office").
+        if _has(n, "office") and _has(n, "preferred", "which", "select", "location", "prefer",
+                                      "choose", "primary") \
+                and not _has(n, "willing", "days per week", "days a week", "commute", "able to"):
+            prefs = self._office_prefs()
+            return prefs[0] if prefs else None
 
         # Location / country — after work-eligibility so a Yes/No question that merely mentions
         # "location"/"country" isn't answered with a place. "Country" is checked first so a
@@ -480,6 +517,12 @@ class AnswerResolver:
         options vary by company — since we discover roles via online search, prefer
         online/job-board/company-site options, then a generic bucket."""
         n = _norm(label)
+        # Preferred office location: the ranked office prefs (city-expanded), so the highest-ranked
+        # option the form actually offers is the one that matches.
+        if _has(n, "office") and _has(n, "preferred", "which", "select", "location", "prefer",
+                                      "choose", "primary") \
+                and not _has(n, "willing", "days per week", "days a week", "commute", "able to"):
+            return self._office_hints()
         if _has(n, "how did you hear", "how did you find", "where did you hear",
                 "referral source", "how were you referred"):
             return ["job board", "online", "search", "company website", "website",

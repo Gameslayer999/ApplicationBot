@@ -56,6 +56,9 @@ class ApplicationProfile(BaseModel):
     # Logistics / preferences
     willing_to_relocate: Optional[bool] = None
     open_to_remote: Optional[bool] = None
+    # Ranked office-location preferences (most-preferred first, e.g. ["New York, NY", "Remote"]).
+    # An office-choice dropdown gets filled with the highest-ranked option the form actually offers.
+    preferred_locations: list[str] = Field(default_factory=list)
     desired_salary: str = ""
     earliest_start_date: str = ""
     years_experience: str = ""
