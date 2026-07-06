@@ -205,6 +205,31 @@ and free-form notes.
 
 ## Recently added (this session, latest first)
 
+- 2026-07-06 — **Descriptive-option dropdowns + polluted answer bank (required fields left blank).**
+  Toward "consistently fully fill dry-runs", debugged the SpaceX Greenhouse form (from the tracker):
+  required fields we know the answers to were blank/wrong. **Root causes + fixes:** (1) **Descriptive
+  dropdowns** — work-auth options are "I am authorized to work in the United States for any employer"
+  (not Yes/No), citizenship is "(a) U.S. citizen or national…"; our "Yes" shared no word so the
+  Claude-pick **token guard rejected it**. Added deterministic `option_hints` for work-auth
+  (any-employer / sponsorship / not-authorized, phrased to not substring-match the negative option)
+  and citizenship (U.S. citizen), and **exempted booleans (yes/no/true/false) from the token guard**
+  so Claude can map "Yes"→a descriptive option. (2) **ADA** "Can you perform the essential functions…"
+  → answered **Yes** (new rule). (3) **Wrong "Yes"** on Security Clearance / Employment History from
+  the **semantic classifier** — added `clearance`/`employment history`/GPA/test-score terms to the
+  `classify_question` skip so enumerated questions are captured, not boolean-mapped. (4) **Polluted
+  answer bank (the deep one):** a pre-fix run had learned WRONG `maps_to` and banked it —
+  "SpaceX…Employment History → work_authorized" (→ "Yes") and "located in Japan → country" — and a
+  banked mapping OVERRIDES the corrected structured rules. New idempotent
+  [scripts/prune_answer_bank.py](scripts/prune_answer_bank.py) clears a banked `maps_to` when it's now
+  invalid (enumerated/demographic/company-specific, or a structured rule now answers it) and drops
+  garbage entries; ran it (3 fixed, answer text preserved). Added "employment" to the prior-company
+  verbs so "Employment History" maps to No→"never worked" (company set in the pipeline). **Verified:**
+  unit (all descriptive options map to the real SpaceX option text; guard/classify/prune) + prune
+  idempotent + **live SpaceX**: filled 19→23, work-auth/citizenship/essential/employment/EEO all
+  correct, clearance cleanly captured, **zero wrong fills**. *Remaining SpaceX gaps are genuine:* GPA
+  / SAT / ACT / GRE (no data) and security clearance (no profile field). *EEO note:* gender/race fill;
+  set **veteran/disability** in the Profile tab (the new dropdowns) to fill those too.
+
 - 2026-07-06 — **LinkedIn now renders on the tailored résumé/PDF (reported "LinkedIn not filling").**
   Reported as a form-autofill miss, but reproduced on ALL the user's actual dry-run forms (from the
   tracker: MARGO/Lever, SpaceX×2/Greenhouse, Ramp/Ashby) and the LinkedIn FIELD fills correctly

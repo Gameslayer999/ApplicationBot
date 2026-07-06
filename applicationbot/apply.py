@@ -349,7 +349,7 @@ class AnswerResolver:
         if self.company:
             cn = _norm(self.company)
             if cn and cn in n and _has(n, "worked", "work for", "employed", "employee",
-                                       "intern", "consult", "interviewed", "contractor"):
+                                       "employment", "intern", "consult", "interviewed", "contractor"):
                 return "No"
 
         # "Are you currently located in <place>?" / "Do you live in <place>?" — a Yes/No, answered
@@ -403,6 +403,11 @@ class AnswerResolver:
             return p.earliest_start_date or None
         if _has(n, "years of experience", "years experience"):
             return p.years_experience or None
+        # ADA: "Can you perform the essential functions of this role, with or without reasonable
+        # accommodation?" — answered Yes (the applicant can do the job); a standard required Yes/No.
+        if _has(n, "essential functions", "perform the essential", "essential function",
+                "perform the duties of", "perform the job duties"):
+            return "Yes"
 
         # Voluntary EEO
         # Pronouns before gender: "What gender pronouns do you prefer?" contains "gender" but wants
@@ -523,6 +528,27 @@ class AnswerResolver:
                                       "choose", "primary") \
                 and not _has(n, "willing", "days per week", "days a week", "commute", "able to"):
             return self._office_hints()
+        # Work-authorization dropdowns sometimes use DESCRIPTIVE options ("I am authorized to work
+        # in the United States for any employer") instead of Yes/No — map from the profile. Hints
+        # are specific enough not to substring-match the negative option ("for any employer" only
+        # appears in the positive one; bare "authorized to work" would also hit "NOT authorized").
+        if _has(n, "authorized to work", "legally authorized", "work authorization",
+                "eligible to work", "entitled to work", "right to work") \
+                and not self._named_foreign_country(n):
+            if self.profile.work_authorized is True:
+                return (["I require sponsorship to work", "require sponsorship", "Yes"]
+                        if self.profile.requires_sponsorship else
+                        ["authorized to work in the United States for any employer",
+                         "for any employer", "Yes"])
+            if self.profile.work_authorized is False:
+                return ["I am not authorized to work", "not authorized to work", "No"]
+        # Citizenship-status dropdowns list statuses ("(a) U.S. citizen or national…"), not Yes/No.
+        if _has(n, "citizen"):
+            if self.profile.us_citizen is True:
+                return ["U.S. citizen or national", "U.S. citizen", "US citizen",
+                        "citizen or national of the United States", "Yes"]
+            if self.profile.us_citizen is False:
+                return ["No"]
         if _has(n, "how did you hear", "how did you find", "where did you hear",
                 "referral source", "how were you referred"):
             return ["job board", "online", "search", "company website", "website",

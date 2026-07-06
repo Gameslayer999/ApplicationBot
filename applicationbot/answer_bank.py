@@ -119,6 +119,11 @@ def classify_question(question: str, *, model: Optional[str] = None) -> Optional
     n = _norm(question)
     if not n or is_company_specific(question) or is_demographic(question):
         return None  # these are handled elsewhere and must never be auto-mapped
+    # Enumerated-answer questions have their own specific option set (not a Yes/No / profile field);
+    # mapping them onto a boolean type produces a confident-wrong "Yes" (e.g. security clearance).
+    if any(t in n for t in ("clearance", "employment history", "gpa", "sat score", "act score",
+                            "gre score", "test score")):
+        return None
     from . import backends  # lazy
 
     types = "\n".join(f"- {k}: {v}" for k, v in CLASSIFIABLE_TYPES.items())
@@ -187,8 +192,11 @@ def pick_dropdown_option(label: str, value: str, options: list[str], *,
     chosen = opts[idx]
     # Deterministic guard: the pick must share a meaningful (non-generic) token with the answer,
     # so Claude can never return an UNRELATED same-category option ("Harvard" for "Penn State").
+    # Booleans/short answers are EXEMPT — a "Yes" answer legitimately maps to a descriptive option
+    # sharing no word ("I am authorized to work for any employer"), and the label gives Claude the
+    # context to pick correctly; the prompt already makes it reply "none" when nothing fits.
     stop = {"university", "college", "the", "of", "school", "institute", "and", "at", "for",
-            "degree", "in", "a", "an", "on", "inc", "llc"}
+            "degree", "in", "a", "an", "on", "inc", "llc", "yes", "no", "true", "false", "none"}
     vtok = {t for t in re.findall(r"[a-z]+", value.lower()) if len(t) > 2 and t not in stop}
     otok = {t for t in re.findall(r"[a-z]+", chosen.lower()) if len(t) > 2 and t not in stop}
     if vtok and not (vtok & otok):
