@@ -1284,6 +1284,110 @@ def _fill_radio_groups(page, resolver: AnswerResolver, report: "ApplyReport", do
         done.add(q)
 
 
+# Checkbox classification. Agreements/consents/certifications gate submission and are inherent to
+# applying (checking them is what the armed user authorized; dry-run never submits regardless).
+# Optional opt-ins (marketing, talent community, SMS) must never be auto-checked.
+_AGREEMENT_KW = (
+    "agree", "consent", "certify", "acknowledge", "authorize", "confirm", "i attest",
+    "i have read", "read and understood", "i understand", "by checking", "by submitting",
+    "terms", "privacy", "true and accurate", "accurate and complete", "acknowledgment",
+)
+_OPTIN_KW = (
+    "marketing", "newsletter", "promotional", "subscribe", "talent community", "talent pool",
+    "talent network", "future opportunit", "other opportunit", "other roles", "keep me informed",
+    "keep me updated", "receive updates", "contact me about", "opt in", "opt-in", "text message",
+    "sms", "phone call",
+)
+
+
+def _is_agreement(n: str) -> bool:
+    return any(k in n for k in _AGREEMENT_KW)
+
+
+def _is_optional_optin(n: str) -> bool:
+    return any(k in n for k in _OPTIN_KW)
+
+
+def _fill_checkboxes(page, resolver: AnswerResolver, report: "ApplyReport", done: set) -> None:
+    """Two checkbox cases the field/radio passes skip: (1) multi-select GROUPS — several checkboxes
+    under one question ("race — check all that apply") — check the option(s) matching the resolved
+    answer; (2) standalone AGREEMENT/consent/certification checkboxes — check them (required to
+    submit; the armed user authorized applying, and dry-run never submits). Optional opt-ins
+    (marketing/talent-community/SMS) are always left unchecked."""
+    boxes = page.locator(f'{_scope_prefix(page)}input[type="checkbox"]')
+    try:
+        n = boxes.count()
+    except Exception:
+        return
+    info: list = []
+    groups: dict[str, list[int]] = {}
+    for i in range(n):
+        b = boxes.nth(i)
+        try:
+            d = b.evaluate(
+                "el => ({chrome: !!el.closest('nav,header,footer,[role=search],[role=navigation]'),"
+                " checked: !!el.checked, disabled: !!el.disabled})")
+            lbl = (b.evaluate(_LABEL_JS) or "").strip()
+            q = (b.evaluate(_GROUP_QUESTION_JS) or "").strip()
+        except Exception:
+            info.append(None)
+            continue
+        if d["chrome"] or d["disabled"]:
+            info.append(None)
+            continue
+        info.append({"lbl": lbl, "q": q, "checked": d["checked"]})
+        if q:
+            groups.setdefault(q, []).append(i)
+
+    handled: set = set()
+    # (1) Multi-select groups: a question shared by >1 checkbox → check options matching the answer.
+    for q, idxs in groups.items():
+        if len(idxs) < 2 or q in done:
+            continue
+        for i in idxs:
+            handled.add(i)
+        value = resolver.resolve(q) or resolver.resolve_semantic(q)
+        done.add(q)
+        if value is None:
+            report.skipped.append(f"{q} — no saved answer")
+            continue
+        matched = False
+        for i in idxs:
+            opt = info[i]["lbl"]
+            if opt and _matches(opt, value):
+                if not info[i]["checked"]:
+                    try:
+                        boxes.nth(i).check(timeout=4000)
+                    except Exception as e:
+                        report.errors.append(f"{q}: {type(e).__name__}: {e}")
+                        continue
+                report.filled.append(FilledField(q, opt, "checkbox"))
+                matched = True
+        if not matched:
+            report.skipped.append(f"{q} — no checkbox option matching {value!r}")
+
+    # (2) Standalone agreement/consent checkboxes.
+    for i in range(n):
+        if info[i] is None or i in handled:
+            continue
+        lbl = info[i]["lbl"]
+        if not lbl or lbl in done:
+            continue
+        if info[i]["checked"]:
+            report.filled.append(FilledField(lbl, "checked", "checkbox", source="native"))
+            done.add(lbl)
+            continue
+        nlbl = _norm(lbl)
+        if _is_optional_optin(nlbl) or not _is_agreement(nlbl):
+            continue  # optional opt-in, or a checkbox we can't confidently classify — leave it
+        try:
+            boxes.nth(i).check(timeout=4000)
+            report.filled.append(FilledField(lbl, "checked", "checkbox"))
+            done.add(lbl)
+        except Exception as e:
+            report.errors.append(f"{lbl[:40]}: {type(e).__name__}: {e}")
+
+
 def _flag_missing_required(page, report: "ApplyReport", done: set) -> None:
     """Report required fields we never filled — the safety net against silent gaps."""
     try:
@@ -1497,6 +1601,7 @@ def run_apply(
                 # ---- our resolver fills only what's still empty, in the form's frame ----
                 _fill_all_fields(frame, resolver, report, done, only_empty=True)
                 _fill_radio_groups(frame, resolver, report, done)
+                _fill_checkboxes(frame, resolver, report, done)
                 _flag_missing_required(frame, report, done)
             # else: report carries an actionable "form did not load" error; skip filling.
 

@@ -205,6 +205,24 @@ and free-form notes.
 
 ## Recently added (this session, latest first)
 
+- 2026-07-06 — **Checkbox support (consent/agreement + multi-select groups).** The driver skipped
+  all `type=checkbox` controls, so Robinhood's REQUIRED demographic-consent box ("By checking this
+  box, I consent to…") was never filled — blocking submission. New `_fill_checkboxes()` handles two
+  cases the field/radio passes miss: (1) **standalone agreement/consent/certification** checkboxes
+  → checked (`_is_agreement`: agree/consent/certify/acknowledge/authorize/terms/privacy/…), since
+  they gate submission and checking them is inherent to applying (the armed user authorized it;
+  dry-run never submits) — **optional opt-ins are always left** (`_is_optional_optin`: marketing/
+  newsletter/talent-community/SMS/"contact me about other roles"; opt-in wins even when an agreement
+  word is also present, e.g. "consent to marketing SMS"); (2) **multi-select groups** (>1 checkbox
+  under one question, "race — check all that apply") → check the option(s) matching the resolved
+  answer, like radios. Wired after `_fill_radio_groups`, before `_flag_missing_required` (so a
+  checked consent isn't flagged missing). Native-checked boxes are recorded, not re-toggled.
+  **Verified:** 10 unit assertions (5 agreements checked, 5 opt-ins/unknowns left) + **live** on
+  Robinhood — the consent box is now checked (✓ in the screenshot), out of REQUIRED-not-filled,
+  filled 18→19, and NO other checkbox was touched (conservative). *Follow-up:* checkbox groups
+  without a `<fieldset>` may not group (each box's nearest long label differs) — the fieldset case
+  works; revisit if a real form needs it.
+
 - 2026-07-06 — **Autofill gap sweep: 8 fixes across 4 real ATS forms.** Drove dry-runs against
   Robinhood / Instacart / GitLab / Anthropic Greenhouse forms, collected every unanswered/mis-filled
   field, and fixed the cross-form patterns. **New answers:** (1) **state/province** dropdown from the
