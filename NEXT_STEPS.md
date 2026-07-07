@@ -205,6 +205,23 @@ and free-form notes.
 
 ## Recently added (this session, latest first)
 
+- 2026-07-06 — **8-form sweep across all 4 ATSs + checkbox-group aliasing fix.** Ran dry-runs over
+  Stripe×2 (greenhouse), cin7×2 (lever), Ramp×2 (ashby), SpaceX×2 (greenhouse) to shake out gaps
+  before the autonomous runner. **Result:** cin7 and Ramp fully clean (only Twitter/Portfolio/Other-
+  website data gaps the user doesn't have); SpaceX 23 filled (remaining = genuine GPA/SAT/ACT/GRE/
+  clearance data gaps); Stripe had ONE new code gap. **Fixed:** the "Please select the country or
+  countries you anticipate working in" **checkbox group** — Stripe labels the option **"US"** (its
+  list uses abbreviations UAE/UK/US), and `_fill_checkboxes` matched only the resolved *value*
+  ("United States"), ignoring `option_hints`. Now the multi-select checkbox pass consults
+  `option_hints` too (like the combobox/select passes), so the US-alias hint matches the "US" box.
+  **Verified:** unit (ticks exactly ["US"], no over-match on Australia/etc. thanks to whole-word
+  short-value matching) + **live Stripe**: country checkbox now "US", filled 21→22, only an OPTIONAL
+  WhatsApp-marketing opt-in left (correctly not auto-checked). *Net state after this session's fixes:*
+  across the sweep, every required field we have data for now fills; the only blanks are true data
+  gaps (test scores, security clearance, secondary URLs) and correctly-skipped marketing opt-ins.
+  *To push higher:* set veteran/disability in the Profile tab; consider a GPA profile field (SpaceX/
+  new-grad forms ask for it).
+
 - 2026-07-06 — **Descriptive-option dropdowns + polluted answer bank (required fields left blank).**
   Toward "consistently fully fill dry-runs", debugged the SpaceX Greenhouse form (from the tracker):
   required fields we know the answers to were blank/wrong. **Root causes + fixes:** (1) **Descriptive

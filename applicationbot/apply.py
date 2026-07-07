@@ -1418,14 +1418,17 @@ def _fill_checkboxes(page, resolver: AnswerResolver, report: "ApplyReport", done
         for i in idxs:
             handled.add(i)
         value = resolver.resolve(q) or resolver.resolve_semantic(q)
+        # Also consult option_hints — e.g. a "US" checkbox vs our "United States" value (Stripe's
+        # country list uses abbreviations UAE/UK/US), matched via the country aliases.
+        candidates = [c for c in ([value] if value else []) + (resolver.option_hints(q) or []) if c]
         done.add(q)
-        if value is None:
+        if not candidates:
             report.skipped.append(f"{q} — no saved answer")
             continue
         matched = False
         for i in idxs:
             opt = info[i]["lbl"]
-            if opt and _matches(opt, value):
+            if opt and any(_matches(opt, c) for c in candidates):
                 if not info[i]["checked"]:
                     try:
                         boxes.nth(i).check(timeout=4000)
