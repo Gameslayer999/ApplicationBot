@@ -40,6 +40,8 @@ class ApplyReport:
     ats: str = "greenhouse"
     filled: list[FilledField] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)  # fields we couldn't answer
+    captured: dict = field(default_factory=dict)  # question -> {kind, options}, so the UI can
+    #                                               recreate an unanswered field as its real control
     errors: list[str] = field(default_factory=list)
     screenshot: Optional[str] = None
     submitted: bool = False
@@ -1088,6 +1090,33 @@ def _open_options_and_texts(page):
     return opts, [(opts.nth(i).inner_text() or "").strip() for i in range(n)]
 
 
+def _record_capture(report: "ApplyReport", question: str, kind: str, options=None) -> None:
+    """Remember an unanswered field's control TYPE and options so the Profile UI can recreate it
+    faithfully (a dropdown question becomes a dropdown, not a free-text box)."""
+    report.captured[question] = {"kind": kind, "options": [o for o in (options or []) if o][:40]}
+
+
+def _field_options(page, loc, tag: str, role: str) -> list[str]:
+    """Selectable option texts for a native <select> or a react-select combobox, for recreating the
+    field. Empty for a text input or a searchable typeahead with nothing shown (falls back to text).
+    Best-effort; opens then closes a combobox menu."""
+    try:
+        if tag == "select":
+            return [o.strip() for o in loc.evaluate(
+                "el => Array.from(el.options).map(o => (o.textContent||'').trim())") if (o or "").strip()]
+        if role == "combobox" and _open_combobox(page, loc):
+            page.wait_for_timeout(300)
+            _, texts = _open_options_and_texts(page)
+            try:
+                loc.press("Escape")
+            except Exception:
+                pass
+            return [t for t in texts if t]
+    except Exception:
+        pass
+    return []
+
+
 def _claude_pick_click(page, opts, texts, label, value, resolver) -> Optional[str]:
     """Ask Claude to pick the best option from `texts` and click it by index, learning the
     mapping. Returns the chosen text or None. `opts`/`texts` must come from the SAME open."""
@@ -1279,6 +1308,8 @@ def _fill_all_fields(page, resolver: AnswerResolver, report: "ApplyReport", done
         if value is None and not is_free:
             value = resolver.resolve_semantic(label)
         if value is None and not hints and not is_free:
+            kind = "select" if tag == "select" else ("dropdown" if role == "combobox" else "text")
+            _record_capture(report, label, kind, _field_options(page, loc, tag, role))
             report.skipped.append(f"{label} — no saved answer")
             done.add(label)
             continue
@@ -1297,6 +1328,7 @@ def _fill_all_fields(page, resolver: AnswerResolver, report: "ApplyReport", done
                 # Banked/structured answer, else a grounded Claude draft for open-ended questions.
                 ans, source = resolver.freetext_answer(label, is_textarea=(tag == "textarea"))
                 if ans is None:
+                    _record_capture(report, label, "textarea" if tag == "textarea" else "text")
                     report.skipped.append(f"{label} — no saved answer")
                 else:
                     loc.fill(ans, timeout=5000)
@@ -1332,6 +1364,15 @@ def _fill_radio_groups(page, resolver: AnswerResolver, report: "ApplyReport", do
         if value is None:  # semantic classify onto a known type (Claude, cached) on a miss
             value = resolver.resolve_semantic(q)
         if value is None:
+            labels = []
+            for i in idxs:
+                try:
+                    lb = (radios.nth(i).evaluate(_LABEL_JS) or "").strip()
+                except Exception:
+                    lb = ""
+                if lb:
+                    labels.append(lb)
+            _record_capture(report, q, "radio", labels)
             report.skipped.append(f"{q} — no saved answer")
             done.add(q)
             continue
@@ -1423,6 +1464,7 @@ def _fill_checkboxes(page, resolver: AnswerResolver, report: "ApplyReport", done
         candidates = [c for c in ([value] if value else []) + (resolver.option_hints(q) or []) if c]
         done.add(q)
         if not candidates:
+            _record_capture(report, q, "checkbox", [info[i]["lbl"] for i in idxs])
             report.skipped.append(f"{q} — no saved answer")
             continue
         matched = False
@@ -1532,7 +1574,7 @@ def _persist_learning(resolver: AnswerResolver, report: "ApplyReport", profile_p
         if company and company in q.lower():
             continue
         pending.append(q)
-    captured = apply_profile.capture_questions(pending, profile_path) if pending else 0
+    captured = apply_profile.capture_questions(pending, profile_path, meta=report.captured) if pending else 0
     if saved or captured or aliased:
         report.skipped.append(
             f"[answer bank] saved {saved} AI-drafted answer(s), learned {aliased} dropdown "

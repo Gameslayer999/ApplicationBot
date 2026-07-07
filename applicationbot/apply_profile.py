@@ -31,6 +31,10 @@ class QA(BaseModel):
     answer: str
     seen_count: int = 0  # how many times autofill hit this question and couldn't answer it —
     #                      ranks the "needs your answer" list so the most-common gaps come first
+    input_kind: str = ""  # the form control it was captured from: text | textarea | select |
+    #                       dropdown | radio | checkbox — so the UI recreates the right input
+    options: list[str] = Field(default_factory=list)  # selectable options (for select/radio/checkbox),
+    #                                                    so the UI offers the exact choices the form had
     generated: bool = False  # answer drafted by Claude (flag for review); False = user-entered
     maps_to: str = ""  # if set, answer this question LIVE from a structured profile field
     #                    (a Claude-classified semantic match, e.g. a novel "willing to work from
@@ -190,11 +194,14 @@ def remember_answers(new: list[QA], path: str | Path = DEFAULT_PATH) -> int:
     return added
 
 
-def capture_questions(questions: list[str], path: str | Path = DEFAULT_PATH) -> int:
+def capture_questions(questions: list[str], path: str | Path = DEFAULT_PATH,
+                      meta: dict | None = None) -> int:
     """Add new (reusable) questions we couldn't answer to the bank as blank entries, so the user
     fills each once in the UI and future autofill reuses it. A question we've seen before but still
-    can't answer has its `seen_count` bumped (this ranks the "needs your answer" list). Answered
-    entries are left alone. Returns how many NEW questions were added."""
+    can't answer has its `seen_count` bumped (this ranks the "needs your answer" list). `meta` maps
+    a question to its captured control {kind, options}, so the UI recreates the real input (a
+    dropdown question stays a dropdown). Answered entries are left alone. Returns NEW questions added."""
+    meta = meta or {}
     profile = load_profile(path)
     by_key = {_norm_q(qa.question): qa for qa in profile.custom_answers}
     added = 0
@@ -203,15 +210,21 @@ def capture_questions(questions: list[str], path: str | Path = DEFAULT_PATH) -> 
         key = _norm_q(q)
         if not key:
             continue
+        m = meta.get(q) or {}
+        kind, options = (m.get("kind") or ""), list(m.get("options") or [])
         existing = by_key.get(key)
         if existing is None:
-            qa = QA(question=q, answer="", seen_count=1)
-            profile.custom_answers.append(qa)
-            by_key[key] = qa
+            profile.custom_answers.append(
+                QA(question=q, answer="", seen_count=1, input_kind=kind, options=options))
+            by_key[key] = profile.custom_answers[-1]
             added += 1
             touched = True
         elif not (existing.answer or "").strip() and not (getattr(existing, "maps_to", "") or ""):
             existing.seen_count = (existing.seen_count or 0) + 1  # still unanswered — count the hit
+            if kind and not existing.input_kind:      # backfill control info if we now have it
+                existing.input_kind = kind
+            if options and not existing.options:
+                existing.options = options
             touched = True
     if touched:
         save_profile(profile, path)

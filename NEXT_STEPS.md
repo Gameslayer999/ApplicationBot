@@ -205,6 +205,20 @@ and free-form notes.
 
 ## Recently added (this session, latest first)
 
+- 2026-07-06 — **Captured questions recreate their real form control (dropdown stays a dropdown).**
+  An unanswered question was always shown as a free-text box, even when the form field was a dropdown
+  — so the user's typed answer often didn't match an option at fill time. Now the Apply stage records
+  each unanswered field's **control kind + options** (`ApplyReport.captured`; `_field_options` reads a
+  native `<select>`'s options or opens a react-select to read them; radio/checkbox groups pass their
+  labels), threads it through `capture_questions(meta=…)` onto new `QA.input_kind` / `QA.options`
+  (backfilled onto pre-existing blank entries when re-seen), and the Profile UI's `qaAnswerInput`
+  renders a **dropdown with those exact options** when present, else a textarea. Round-trips through
+  save. **Verified:** unit (kind/options stored + round-trip) + served JS clean + **live SpaceX**
+  capture — GPA×3 and Active Security Clearance recorded as `dropdown` with their real option lists
+  ("4.0 out of 4.0", "Never held a clearance", …), "Please specify" as `text`; the Profile tab then
+  renders those as native `<select>`s (screenshot) and free-text as textareas, 0 console errors. Now
+  the user picks the actual option, so it matches at fill time.
+
 - 2026-07-06 — **Claude cost/latency overhaul for tailoring + fit judging (decision 034).**
   Root cause measured: every `run_claude_cli` spawned a full default Claude Code session —
   ~40,000 tokens of coding-agent context (system prompt, tool schemas, MCP, CLAUDE.md) per

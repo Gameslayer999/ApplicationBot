@@ -1463,7 +1463,22 @@ function qaHidden(qa) {
     el("input", {type:"hidden", "data-k":"maps_to", value:(qa.maps_to||"").trim()}),
     el("input", {type:"hidden", "data-k":"generated", value: qa.generated ? "1" : ""}),
     el("input", {type:"hidden", "data-k":"seen_count", value: String(qa.seen_count||0)}),
+    el("input", {type:"hidden", "data-k":"input_kind", value: qa.input_kind||""}),
+    el("input", {type:"hidden", "data-k":"options", value: JSON.stringify(qa.options||[])}),
   ];
+}
+// The answer input, recreated as the form's real control: a dropdown when the field had options
+// (so the answer matches at fill time), else a free-text box.
+function qaAnswerInput(qa, cls) {
+  const opts = Array.isArray(qa.options) ? qa.options.filter(Boolean) : [];
+  if (opts.length) {
+    const list = [["","— choose an option —"]].concat(opts.map(o => [o, o]));
+    if ((qa.answer||"") && !opts.includes(qa.answer)) list.push([qa.answer, qa.answer]);  // keep a stored value
+    const sel = el("select", {class:cls, "data-k":"answer"}, list.map(([v,l]) => el("option", {value:v, text:l})));
+    sel.value = qa.answer || "";
+    return sel;
+  }
+  return el("textarea", {class:cls, "data-k":"answer", placeholder:"Type your answer…", value: qa.answer||""});
 }
 // Compact collapsed card for an ANSWERED / auto-handled question.
 function qaCard(qa) {
@@ -1471,7 +1486,8 @@ function qaCard(qa) {
   const st = qaStatus(qa);
   const fields = [
     el("div", {style:"font-size:12px;font-weight:600;margin-bottom:4px;color:"+st.color, text: st.mark+" "+st.label}),
-    area("Question","question",qa.question), area("Answer","answer",qa.answer),
+    area("Question","question",qa.question),
+    el("div", {class:"fld"}, [el("label", {text:"Answer"}), qaAnswerInput(qa, "f")]),
     ...qaHidden(qa),
   ];
   return entryCard(fields, c => { const q=(cardData(c).question||"").trim(); const s=q.length>64?q.slice(0,64)+"…":q; return st.mark+"  "+(s||"New answer"); });
@@ -1491,7 +1507,7 @@ function qaOpenCard(qa) {
   } else {
     qrow.append(el("input", {class:"f qa-q", "data-k":"question", placeholder:"Type the question…"}));
   }
-  kids.push(el("textarea", {class:"f qa-a", "data-k":"answer", placeholder:"Type your answer…", value:qa.answer||""}));
+  kids.push(qaAnswerInput(qa, "f qa-a"));
   kids.push(...qaHidden(qa));
   card.append(...kids);
   return card;
@@ -1662,7 +1678,7 @@ function collectProfile() {
     desired_salary:t("desired_salary"), earliest_start_date:earliest_start_date, years_experience:t("years_experience"),
     gender:t("gender"), pronouns:t("pronouns"), race_ethnicity:t("race_ethnicity"), veteran_status:t("veteran_status"), disability_status:t("disability_status"),
     greenhouse_email:t("greenhouse_email"), greenhouse_password:t("greenhouse_password"),
-    custom_answers: [...$("sec-qa").querySelectorAll(".card")].map(c => { const q = cardData(c); return { question:(q.question||"").trim(), answer:(q.answer||"").trim(), maps_to:(q.maps_to||"").trim(), generated: q.generated === "1", seen_count: parseInt(q.seen_count||"0",10)||0 }; }).filter(x => x.question || x.answer || x.maps_to),
+    custom_answers: [...$("sec-qa").querySelectorAll(".card")].map(c => { const q = cardData(c); let opts=[]; try { opts = JSON.parse(q.options||"[]"); } catch(e){} return { question:(q.question||"").trim(), answer:(q.answer||"").trim(), maps_to:(q.maps_to||"").trim(), generated: q.generated === "1", seen_count: parseInt(q.seen_count||"0",10)||0, input_kind:(q.input_kind||""), options: Array.isArray(opts)?opts:[] }; }).filter(x => x.question || x.answer || x.maps_to),
   };
 }
 async function loadProfile() {
