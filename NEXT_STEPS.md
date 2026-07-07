@@ -205,6 +205,33 @@ and free-form notes.
 
 ## Recently added (this session, latest first)
 
+- 2026-07-06 — **Claude cost/latency overhaul for tailoring + fit judging (decision 034).**
+  Root cause measured: every `run_claude_cli` spawned a full default Claude Code session —
+  ~40,000 tokens of coding-agent context (system prompt, tool schemas, MCP, CLAUDE.md) per
+  call, and the fit judge ran 10 serial spawns on the CLI's default model. Now every headless
+  call is stripped (`--system-prompt`/`--tools ""`/`--strict-mcp-config`/`--setting-sources ""`
+  — measured 184 tokens vs ~40k, 74x), the judge is pinned to Sonnet and batched 5 postings per
+  call (`judge_fit_batch`), and both tailor + judge use `--json-schema` for guaranteed-valid
+  JSON (kills the retry double-spend and the schema dump in the prompt). Prompts and quality
+  tiers unchanged. Verified end-to-end: batch judge 7.1s/2 postings with correct verdicts;
+  fast-tier tailor 13.9s (was ~30s), no drift warnings. Net for a 10-posting run: ~400k+
+  overhead tokens → ~15k; judging minutes → under a minute.
+- 2026-07-06 — **Screening-answers section redesigned (readable, ranked, quick-answer).** The
+  "Saved answers to screening questions" list was a flat wall of collapsed cards, hard to tell
+  answered from unanswered. Rebuilt it: (1) split into **"Needs your answer"** (open full-width
+  panels, ready to type) vs a compact **"Answered & auto-handled"** 2-column grid (✓/✨/↔ marked);
+  (2) unanswered are **ranked by a new `QA.seen_count`** — how many times autofill hit the question
+  and couldn't answer it (`capture_questions` bumps it each recurrence; a "seen N×" badge shows it);
+  (3) a **summary bar** (need / answered / auto-from-profile counts) + a **"Start answering" button**
+  that scrolls to and focuses the first answer box; (4) the profile editor widened 640→1040px to use
+  the page. `seen_count` round-trips through save (`collectProfile` now reads all `.card`s under
+  `#sec-qa`, nested in the two groups, + a hidden `seen_count`). **Verified:** unit
+  (`capture_questions` increments on recurrence, leaves answered alone, round-trips) + served JS
+  `node --check` + **live headless drive**: ranked badges (6×/3×/1×), both groups populated, Start
+  focuses an answer box, answer→Save→reload moves the item to Answered with counts preserved, 0
+  console errors + screenshot. *Note:* existing entries start at seen_count 0 (predate this); ranks
+  differentiate as autofill runs accumulate counts.
+
 - 2026-07-06 — **8-form sweep across all 4 ATSs + checkbox-group aliasing fix.** Ran dry-runs over
   Stripe×2 (greenhouse), cin7×2 (lever), Ramp×2 (ashby), SpaceX×2 (greenhouse) to shake out gaps
   before the autonomous runner. **Result:** cin7 and Ramp fully clean (only Twitter/Portfolio/Other-

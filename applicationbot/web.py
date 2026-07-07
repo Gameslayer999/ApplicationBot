@@ -529,6 +529,28 @@ INDEX_HTML = """<!doctype html>
   .entry-head .del { position:static; }
   .entry-body { padding:0 12px 12px; }
   .card.entry.collapsed .entry-body { display:none; }
+  /* Screening answers — wider profile editor + a ranked "needs answer" list vs a compact grid. */
+  #view-profile .editor { max-width:1040px; }
+  .qa-summary { display:flex; align-items:center; flex-wrap:wrap; gap:10px 16px; margin:2px 0 14px; font-size:13px; }
+  .qa-summary .pill { display:inline-flex; align-items:center; gap:6px; font-weight:600; }
+  .qa-summary .pill b { font-size:15px; }
+  .qa-summary .dot { width:9px; height:9px; border-radius:99px; display:inline-block; }
+  .qa-start { width:auto; margin:0; padding:7px 14px; font-weight:600; }
+  .qa-start[disabled] { opacity:.45; cursor:default; }
+  .qa-grouphead { font-size:12px; font-weight:700; letter-spacing:.04em; text-transform:uppercase;
+    color:var(--muted); margin:18px 2px 8px; }
+  .qa-grouphead:first-child { margin-top:2px; }
+  .card.qa-open { border-left:3px solid #e0a400; background:#fffdf6; padding:12px 14px; }
+  .card.qa-open .qa-qrow { display:flex; align-items:flex-start; gap:8px; margin-bottom:8px; }
+  .qa-badge { flex:none; font-size:11px; font-weight:700; color:#8a5a00; background:#ffe9b8;
+    border-radius:99px; padding:2px 9px; white-space:nowrap; margin-top:1px; }
+  .qa-q { flex:1; font-weight:600; font-size:14px; line-height:1.35; }
+  .card.qa-open textarea.qa-a { min-height:56px; }
+  .card.qa-open .del { top:8px; right:8px; }
+  /* Answered / auto-handled: compact two-column grid of collapsed cards to use the width. */
+  .qa-answered { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+  @media (max-width: 780px) { .qa-answered { grid-template-columns:1fr; } }
+  .qa-tag { font-size:11px; font-weight:700; border-radius:99px; padding:1px 7px; margin-right:6px; white-space:nowrap; }
   .linkedin { border:1px solid var(--line); border-radius:8px; padding:14px; margin-bottom:18px; background:#fff; }
   .linkedin input[type=file] { width:auto; border:0; padding:0; }
   .linkedin button { width:auto; margin:8px 8px 0 0; padding:7px 14px; }
@@ -1428,19 +1450,103 @@ function startDateField(value) {
   sel.addEventListener("change", () => date.classList.toggle("hidden", sel.value !== "specific"));
   return el("div", {class:"fld"}, [el("label", {text:"Earliest start date"}), sel, date]);
 }
+function qaStatus(qa) {
+  if ((qa.maps_to||"").trim()) return {mark:"↔", label:"Auto-answered from your profile ("+qa.maps_to.trim()+")", color:"#0b7a3b"};
+  if ((qa.answer||"").trim()) return qa.generated
+    ? {mark:"✨", label:"AI-drafted — review & edit", color:"#6a4bd0"}
+    : {mark:"✓", label:"Answered", color:"#0b7a3b"};
+  return {mark:"○", label:"Needs your answer", color:"#b26a00"};
+}
+// Hidden fields that carry the classification/flags through the save round-trip (cardData reads any [data-k]).
+function qaHidden(qa) {
+  return [
+    el("input", {type:"hidden", "data-k":"maps_to", value:(qa.maps_to||"").trim()}),
+    el("input", {type:"hidden", "data-k":"generated", value: qa.generated ? "1" : ""}),
+    el("input", {type:"hidden", "data-k":"seen_count", value: String(qa.seen_count||0)}),
+  ];
+}
+// Compact collapsed card for an ANSWERED / auto-handled question.
 function qaCard(qa) {
   qa = qa || {};
-  const hasAns = (qa.answer || "").trim();
-  const mapped = (qa.maps_to || "").trim();
-  const fields = [];
-  if (mapped) fields.push(el("div", {style:"font-size:12px;font-weight:600;color:#0b7a3b;margin-bottom:4px", text:"↔ Auto-answered from your profile ("+mapped+") — no action needed"}));
-  else if (!hasAns) fields.push(el("div", {style:"font-size:12px;font-weight:600;color:#b26a00;margin-bottom:4px", text:"○ Needs your answer — captured from an application"}));
-  else if (qa.generated) fields.push(el("div", {style:"font-size:12px;font-weight:600;color:#6a4bd0;margin-bottom:4px", text:"✨ AI-drafted — review & edit"}));
-  fields.push(area("Question","question",qa.question), area("Answer","answer",qa.answer));
-  // Preserve the classification/flag through the save round-trip (cardData reads any [data-k]).
-  fields.push(el("input", {type:"hidden", "data-k":"maps_to", value: mapped}));
-  fields.push(el("input", {type:"hidden", "data-k":"generated", value: qa.generated ? "1" : ""}));
-  return entryCard(fields, c => { const q = (cardData(c).question||"").trim(); return q.length > 70 ? q.slice(0,70)+"…" : q; });
+  const st = qaStatus(qa);
+  const fields = [
+    el("div", {style:"font-size:12px;font-weight:600;margin-bottom:4px;color:"+st.color, text: st.mark+" "+st.label}),
+    area("Question","question",qa.question), area("Answer","answer",qa.answer),
+    ...qaHidden(qa),
+  ];
+  return entryCard(fields, c => { const q=(cardData(c).question||"").trim(); const s=q.length>64?q.slice(0,64)+"…":q; return st.mark+"  "+(s||"New answer"); });
+}
+// Prominent OPEN card for an UNANSWERED question: seen-badge + question + answer box, ready to type.
+function qaOpenCard(qa) {
+  qa = qa || {};
+  const seen = qa.seen_count||0;
+  const card = el("div", {class:"card qa-open"});
+  const del = el("button", {class:"del", type:"button", text:"✕", title:"Remove", on:{click:(ev)=>{ ev.stopPropagation(); card.remove(); refreshQaSummary(); }}});
+  const qrow = el("div", {class:"qa-qrow"});
+  if (seen>0) qrow.append(el("span", {class:"qa-badge", text:"seen "+seen+"×"}));
+  const kids = [del, qrow];
+  if ((qa.question||"").trim()) {
+    qrow.append(el("span", {class:"qa-q", text:qa.question}));
+    kids.push(el("input", {type:"hidden", "data-k":"question", value:qa.question}));
+  } else {
+    qrow.append(el("input", {class:"f qa-q", "data-k":"question", placeholder:"Type the question…"}));
+  }
+  kids.push(el("textarea", {class:"f qa-a", "data-k":"answer", placeholder:"Type your answer…", value:qa.answer||""}));
+  kids.push(...qaHidden(qa));
+  card.append(...kids);
+  return card;
+}
+function qaPill(color, n, label) {
+  return el("span", {class:"pill"}, [el("span",{class:"dot",style:"background:"+color}), el("b",{text:String(n)}), el("span",{text:label})]);
+}
+function refreshQaSummary() {
+  const box = $("qa-summary-counts"); if (!box) return;
+  const cards = [...document.querySelectorAll("#qa-need > .card")];
+  const need = cards.length;
+  const start = $("qa-start");
+  if (start) { start.textContent = need ? ("Start answering ("+need+")") : "All answered ✓"; start.disabled = !need; }
+  const nb = $("qa-need-count"); if (nb) nb.textContent = String(need);
+}
+// The whole "Saved answers" section: ranked unanswered list on top, compact answered grid below.
+function screeningSection(list) {
+  list = (list||[]).slice();
+  const isAns = qa => (qa.answer||"").trim() || (qa.maps_to||"").trim();
+  const need = list.filter(qa => !isAns(qa)).sort((a,b) => (b.seen_count||0)-(a.seen_count||0));
+  const done = list.filter(isAns);
+  const mapped = done.filter(qa => (qa.maps_to||"").trim()).length;
+
+  const body = el("div", {id:"sec-qa"});
+  const needHead = el("div", {class:"qa-grouphead"}, [
+    el("span", {text: need.length ? "Needs your answer — ranked by how often they've come up" : "Needs your answer — all caught up ✓"})]);
+  const needWrap = el("div", {id:"qa-need", class:"cards"});
+  need.forEach(qa => needWrap.appendChild(qaOpenCard(qa)));
+  const addBtn = el("button", {class:"addbtn", type:"button", text:"+ Add a question manually", on:{click:()=>{
+    const c = qaOpenCard(); needWrap.appendChild(c);
+    const inp = c.querySelector("input.qa-q, textarea"); if (inp) inp.focus();
+    refreshQaSummary();
+  }}});
+
+  const doneWrap = el("div", {class:"qa-answered"});
+  done.forEach(qa => doneWrap.appendChild(qaCard(qa)));
+
+  const startBtn = el("button", {id:"qa-start", class:"qa-start", type:"button", on:{click:()=>{
+    const t = needWrap.querySelector("textarea.qa-a, input.qa-q");
+    if (t) { t.scrollIntoView({behavior:"smooth", block:"center"}); t.focus(); }
+  }}});
+  const summary = el("div", {id:"qa-summary-counts", class:"qa-summary"}, [
+    qaPill("#e0a400", need.length, "need your answer"),
+    qaPill("#0b7a3b", done.length-mapped, "answered"),
+    qaPill("#6a4bd0", mapped, "auto from profile"),
+    startBtn,
+  ]);
+  // A tiny hidden counter element so refreshQaSummary can update the pill without a rebuild.
+  summary.querySelector(".pill b").id = "qa-need-count";
+
+  body.append(needHead, needWrap, addBtn);
+  if (done.length) body.append(el("div", {class:"qa-grouphead", text:"Answered & auto-handled ("+done.length+")"}), doneWrap);
+  const sec = el("div", {class:"sec"}, [el("h3", {text:"Saved answers to screening questions"}), summary, body]);
+  setTimeout(refreshQaSummary, 0);
+  return sec;
 }
 function acctRow(name, ok, text) {
   return el("div", {style:"display:flex;align-items:center;gap:10px;padding:7px 0;border-bottom:1px solid var(--line)"}, [
@@ -1516,7 +1622,7 @@ function renderProfileForm() {
     basic]));
 
   // Screening answers (apply profile) — collapsible entries.
-  put("s-screening", section("Saved answers to screening questions","sec-qa",(P.custom_answers||[]).map(qaCard),"+ Add answer",()=>qaCard()));
+  put("s-screening", screeningSection(P.custom_answers||[]));
 
   // Autofill accounts status + native logins (apply profile).
   put("s-accounts", nativeAccountsPanel());
@@ -1556,7 +1662,7 @@ function collectProfile() {
     desired_salary:t("desired_salary"), earliest_start_date:earliest_start_date, years_experience:t("years_experience"),
     gender:t("gender"), pronouns:t("pronouns"), race_ethnicity:t("race_ethnicity"), veteran_status:t("veteran_status"), disability_status:t("disability_status"),
     greenhouse_email:t("greenhouse_email"), greenhouse_password:t("greenhouse_password"),
-    custom_answers: cardsIn("sec-qa").map(c => { const q = cardData(c); return { question:(q.question||"").trim(), answer:(q.answer||"").trim(), maps_to:(q.maps_to||"").trim(), generated: q.generated === "1" }; }).filter(x => x.question || x.answer || x.maps_to),
+    custom_answers: [...$("sec-qa").querySelectorAll(".card")].map(c => { const q = cardData(c); return { question:(q.question||"").trim(), answer:(q.answer||"").trim(), maps_to:(q.maps_to||"").trim(), generated: q.generated === "1", seen_count: parseInt(q.seen_count||"0",10)||0 }; }).filter(x => x.question || x.answer || x.maps_to),
   };
 }
 async function loadProfile() {

@@ -29,6 +29,8 @@ _HEADER = (
 class QA(BaseModel):
     question: str
     answer: str
+    seen_count: int = 0  # how many times autofill hit this question and couldn't answer it —
+    #                      ranks the "needs your answer" list so the most-common gaps come first
     generated: bool = False  # answer drafted by Claude (flag for review); False = user-entered
     maps_to: str = ""  # if set, answer this question LIVE from a structured profile field
     #                    (a Claude-classified semantic match, e.g. a novel "willing to work from
@@ -190,18 +192,27 @@ def remember_answers(new: list[QA], path: str | Path = DEFAULT_PATH) -> int:
 
 def capture_questions(questions: list[str], path: str | Path = DEFAULT_PATH) -> int:
     """Add new (reusable) questions we couldn't answer to the bank as blank entries, so the user
-    fills each once in the UI and future autofill reuses it. Skips ones already present. Returns
-    how many were added."""
+    fills each once in the UI and future autofill reuses it. A question we've seen before but still
+    can't answer has its `seen_count` bumped (this ranks the "needs your answer" list). Answered
+    entries are left alone. Returns how many NEW questions were added."""
     profile = load_profile(path)
-    have = {_norm_q(qa.question) for qa in profile.custom_answers}
+    by_key = {_norm_q(qa.question): qa for qa in profile.custom_answers}
     added = 0
+    touched = False
     for q in questions:
         key = _norm_q(q)
-        if not key or key in have:
+        if not key:
             continue
-        profile.custom_answers.append(QA(question=q, answer=""))
-        have.add(key)
-        added += 1
-    if added:
+        existing = by_key.get(key)
+        if existing is None:
+            qa = QA(question=q, answer="", seen_count=1)
+            profile.custom_answers.append(qa)
+            by_key[key] = qa
+            added += 1
+            touched = True
+        elif not (existing.answer or "").strip() and not (getattr(existing, "maps_to", "") or ""):
+            existing.seen_count = (existing.seen_count or 0) + 1  # still unanswered — count the hit
+            touched = True
+    if touched:
         save_profile(profile, path)
     return added
