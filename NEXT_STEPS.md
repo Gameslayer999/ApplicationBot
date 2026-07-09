@@ -32,6 +32,14 @@
   no human intervention, gated by a `dry_run` safety switch.
 - Stack decided: **Python** (decision 001); LLM is **Claude `claude-opus-4-8`** via the
   Anthropic SDK (decision 004).
+- **Full-system audit (2026-07-06) folded into this queue.** Four deep-dives (autofill,
+  discovery/pipeline, UI/tracking, tailoring/cloneability) mapped every gap against the
+  final goal. Headline blockers: **no real submit path exists** (`apply.py` hardcodes
+  `submitted=False`), no autonomous multi-application runner, account-gated portals
+  (Workday ≈32% / iCIMS ≈10% of US enterprise postings) unsupported, no Claude
+  usage-cap resilience mid-run, and fresh-clone onboarding is missing. Heavy engine
+  work is queued at the top of **Now**; UI/UX items are delegated to parallel agents
+  (see **Next**).
 
 ### The customizer (implemented)
 
@@ -88,6 +96,87 @@ and free-form notes.
 ---
 
 ## Now
+
+### Heaviest engine work (audit 2026-07-06) — build toward "fill AND submit any application, any site"
+
+Ordered by value ÷ difficulty. Verification policy: **minimize live dry-runs** (token-heavy)
+— verify with unit tests + local HTML form fixtures driven by Playwright (zero tokens, no
+real postings), one consolidated live dry-run per milestone.
+
+- [x] **Fillability gate** — done (2026-07-06, decision 035): `pipeline._is_fillable`
+      drops workday/icims/`auto_applyable=False` postings BEFORE matching (no judge tokens
+      on them), returns them as `PipelineResult.non_fillable`, surfaced in the CLI counts.
+      *Deviation from the audit note:* not recorded as tracker rows yet (they're unjudged —
+      would flood the Track tab); the runner can rank + record top manual candidates later.
+- [x] **Real submit path + safety architecture** — done (2026-07-06, decision 035):
+      `safety.py` (`SafetyGate`: `profile/safety.yaml` `armed`+`max_submissions_per_run`,
+      `profile/KILL` kill file, checked immediately before every click);
+      `apply._attempt_submit` (pre-submit gate on unresolved REQUIRED fields → `blocked`
+      outcome, submit-button click, confirmation detection by text/URL, validation-rejection
+      detection, form-gone ⇒ `unconfirmed`-but-submitted so we never double-submit);
+      tracker rows become `applied`/method `auto` on real submission; `--dry-run` force-
+      disarm on both CLIs. **Verified on local HTML fixtures** (13 tests incl. E2E armed
+      submit + dry-run, zero tokens). *Remaining:* per-ATS validation of the submit click
+      on live Lever/Ashby/SmartRecruiters DOMs (patterns cover "Submit application").
+- [x] **Autonomous runner (first version)** — done (2026-07-06):
+      `python -m applicationbot.runner` loops EVERY Claude-cleared match (never keyword-
+      blind — closes the min_fit bypass), dry-run default, kill-file check between
+      applications, `--max` per-run limit + submission cap stop, per-application failure
+      isolation (a Claude-CLI failure stops the queue instead of burning it), outcomes
+      recorded to the tracker via the existing `run_apply` path. 6 loop tests (injected
+      apply_one, no browser). *Not yet run live end-to-end.*
+- [x] **Claude usage-cap / rate-limit resilience** — done (2026-07-06, subagent):
+      `backends.py` typed taxonomy (`ClaudeUnavailableError` ← `ClaudeAuthError` /
+      `ClaudeRateLimitError`, classified from CLI stderr markers; all subclass RuntimeError
+      so existing callers are untouched) + `runner.run_queue` pause-and-resume: a rate-limit
+      hit waits 15 min (kill-file-abortable, ≤3 waits/run) and retries the SAME match; an
+      auth failure stops the queue with the exact fix. 15 new tests (monkeypatched
+      subprocess — no CLI calls). *Remaining:* per-run call accounting (nice-to-have).
+- [x] **Multi-page form navigation** — done (2026-07-06): `apply._fill_all_pages` walks
+      Next/Continue wizards page-by-page (anchored patterns can never match a submit
+      control or "Continue with Google"), per-page fill + required-flagging (the
+      required-label scan is now visible-only so hidden wizard steps don't pollute it),
+      advance detection by form-signature change with frame re-location,
+      validation-rejected advance ⇒ recorded stop, résumé upload retried on later pages
+      (and flagged if NO page had an upload field). Pre-submit gate hardened: a live DOM
+      scan of visible required labels with EMPTY controls blocks an armed submit even when
+      the field was only captured as "no saved answer". Every dry-run also records
+      `submit_probe` — the submit control it WOULD click — so the armed path's selectors
+      get live-validated for free on ordinary dry-runs. Verified on 3-step wizard fixtures
+      (dry-run walk, armed submit from the final page, rejected-advance block);
+      single-page forms unchanged.
+- [ ] **Account-gated portals (Workday first)** — the "any site" end goal: account
+      creation + login + credential store (keyring, not plaintext YAML) +
+      email-verification handling + the multi-page wizard. Largest single item
+      (multi-week); starts once the submit path + runner are solid on the open ATSs.
+
+### Adopted from the ai-job-search survey (2026-07-09) — user-approved queue
+
+Ideas mined from [MadsLorentzen/ai-job-search](https://github.com/MadsLorentzen/ai-job-search)
+(17.7k-star Claude Code framework; strong on evaluation + document QA, has no Apply stage).
+Ranked by value ÷ effort:
+
+- [x] **ATS text-layer verification of generated PDFs** — done (2026-07-09, decision 043):
+      `ats_check.verify_pdf` (pypdf) checks the text layer after every export — readable
+      name/email/phone (catches latin-1 `?`-mangling), JD keyword coverage split *covered*
+      vs *dropped-by-tailoring*. Wired into `pipeline.run_testing_mode` (notes reach the
+      Discover tab) and `cli.py --out *.pdf`. 5 tests.
+- [x] **Per-application archive** — done (2026-07-09, decision 043): `archive.py` writes
+      `profile/applications/<company>-<role>-<urlhash>/` (posting.md + resume.pdf +
+      report.json), dry-runs overwrite, real submissions freeze a `submitted-<date>/` copy;
+      best-effort next to the tracker record in `run_apply`. 4 tests.
+- [x] **Multi-dimension fit rubric in the judge** — done (2026-07-09, decision 043): judge
+      returns skills/experience/seniority 0-100; `fit_score` computed in code via
+      `FIT_WEIGHTS` (.45/.35/.20, renormalized when a dimension is absent); dimensions on
+      `Match`, cache-safe, shown in CLI + Discover tab. Culture/career dimensions deferred
+      until the Configure preference schema exists. 6 tests.
+- [x] **Outcome → calibration loop** — done (2026-07-09, decision 043 + update):
+      statuses + `fit_score` column (auto-migrated) + `calibration_report()` +
+      `python -m applicationbot.tracker calibration`; Track tab gets a Fit column.
+      Follow-ups done same day: `recommended_min_fit` → `pipeline.effective_min_fit`
+      **auto-raises min_fit above a proven-dead band** on pipeline/runner/web runs (loud
+      note, `--min-fit` wins, `calibrate_min_fit` filter toggle to disable), and the
+      `follow_up_date` column + Track-tab "Follow up" column. 10 tests.
 
 ### Discover stage (decision 026) — the just-built focus
 
@@ -166,6 +255,27 @@ and free-form notes.
       `tracker.add_application(...)`; the loop/kill-switch is what remains.)*
 - [ ] Later: browser **extension** surface for sites that resist headless automation.
 
+### UI/UX & onboarding (audit 2026-07-06) — delegated to parallel agents (Cursor)
+
+Posted to the agent bus 2026-07-06; independent of the engine work above.
+
+- [ ] **First-run onboarding** — guided setup that creates `profile/resume.yaml`,
+      `application_profile.yaml`, and `discovery.yaml`; a real PDF/LinkedIn→YAML resume
+      import (the generator `profile/README.md` promises does not exist in code).
+- [ ] **Never edit the committed example** — a fresh clone's Profile tab currently
+      round-trips edits into `examples/sample_resume.yaml` (PII-into-git risk); create
+      `profile/resume.yaml` instead.
+- [ ] **Batch/queue UI** — browse all ranked matches, per-row "apply to this one",
+      approve-then-apply; natural home for the arm toggle + STOP (kill-switch) button.
+- [ ] **Blocked-work routing** — unanswered-required-question failures deep-link to the
+      Profile "Needs your answer" card (UI Principle #2).
+- [ ] **CSRF/origin guard** on state-changing POSTs; stop serving the plaintext
+      Greenhouse password via `GET /profile`.
+- [x] **Track lifecycle** — done (2026-07-09, decision 043 + update): interview / offer /
+      rejected / no-response statuses + `follow_up_date` column, live in the Track tab.
+- [ ] **Durable run state** — a server restart currently orphans the headed browser
+      mid-fill and loses the in-flight record.
+
 ### Other
 
 - [ ] Editor niceties — drag-to-reorder entries/bullets, and a live length/1-page meter.
@@ -197,13 +307,228 @@ and free-form notes.
 - [ ] Auto-fill + submit flow with the `dry_run` default and global kill switch.
 - [ ] Per-site adapters for common application portals.
 - [ ] Dashboard / status view over tracked applications (see UI Design Principles).
-- [ ] Rate limiting and site-terms compliance for the scraper.
-- [ ] Cover-letter generation.
+- [x] Rate limiting and site-terms compliance for the scraper — done (2026-07-06,
+      subagent): per-host 0.5s pacing in `fetch_json`/`resolve_redirect`; retry ×3 with
+      1s/3s backoff on 429/5xx/timeouts honoring `Retry-After` (capped 30s); 404s fail fast.
+- [ ] Cover-letter generation **+ upload** (forms that require one are unfillable today).
 - [ ] Onboarding flow for a freshly-cloned repo (get a new user configured quickly).
+- [ ] Drift-check hardening (audit 2026-07-06): rewritten bullets/summary/projects are
+      never validated against the base résumé — must gate an armed submit.
+- [~] Discovery robustness (audit 2026-07-06) — **mostly done (2026-07-06, subagent):**
+      `canonical_url` dedup (tracking-noise query params stripped, job-id params kept)
+      applied in `discover()` + the tracker skip-seen comparison; opt-in staleness gate
+      (`DiscoveryFilters.max_posting_age_days`, default off — missing dates pass, Lever
+      ms-epoch dates handled). *Remaining:* structured-pay coverage so `min_salary`
+      actually enforces.
+- [~] PDF (audit 2026-07-06): embed a Unicode TTF (latin-1 `?`-mangling of non-Western
+      names) — still open. ~~Enforce true page-fit by measured height~~ **done
+      (decision 042):** `pdf.fit_to_pages` measures the rendered PDF and trims until it fits.
+- [ ] Profile schema gaps (audit 2026-07-06): GPA/test scores, security clearance,
+      structured street address, phone country code, salary min/max, references.
+- [ ] Per-ATS fill validation for SmartRecruiters/Recruitee/Workable + unify the two
+      divergent `detect_ats` implementations (discovery vs apply).
 
 ---
 
 ## Recently added (this session, latest first)
+
+- 2026-07-09 — **Project links captured + used to answer "projects you're proud of".**
+  Added an optional `link` field to the résumé `Project` model, a "Link (optional)" input on
+  each project card in the Profile page (`projCard`), and its capture in the résumé save
+  collector. `generate_answer` already grounds Claude in the full base-résumé JSON, so the
+  link now flows into drafted answers for open-ended/textarea questions (e.g. "a personal
+  project you're proud of?") with no extra plumbing; unset links are omitted from the context.
+  Not printed on the résumé PDF (renderer ignores the new field) — capture + answer-grounding
+  only, matching the request's scope.
+
+- 2026-07-09 — **min_fit auto-calibration + follow-up date (decision 043 update).** The two
+  043 follow-ups: (1) `tracker.recommended_min_fit` turns the dead-band hint into a value
+  (a fit band with ≥5 resolved outcomes and 0 responses → raise to band-top+1; never lowers,
+  never past the top band) and `pipeline.effective_min_fit(filters)` applies it on pipeline
+  CLI, runner, and web test-runs with a loud "min_fit raised 50→75 by outcome calibration"
+  note — explicit `--min-fit` always wins, and a new **`calibrate_min_fit`** Discovery
+  setting (checkbox in the Discover tab, default on) disables it; any tracker error keeps
+  the configured value. `tracker calibration` prints the recommendation and whether it's
+  applied. (2) **`follow_up_date`** tracker column (same additive migration as `fit_score`)
+  + a "Follow up" Track-tab column. **Verified:** 6 new tests, suite **132/132**, JS clean,
+  real DB migrated live, `/track` fields + `/discovery` both serve the new fields.
+
+- 2026-07-09 — **Four adoptions from the ai-job-search survey (decision 043).** Surveyed
+  [MadsLorentzen/ai-job-search](https://github.com/MadsLorentzen/ai-job-search) (17.7k-star
+  Claude Code framework — strong evaluation/document QA, no Apply stage) and implemented the
+  four ideas worth taking, all zero-token at run time: (1) **ATS text-layer verification**
+  ([ats_check.py](applicationbot/ats_check.py), new dep `pypdf`) — every exported PDF is
+  read back the way an ATS parses it: name/email/phone must be literal text (catches the
+  known latin-1 `?`-mangling), and JD keyword coverage is split *covered* vs
+  *dropped-by-tailoring*; notes surface in the Discover tab + CLI. (2) **Per-application
+  archive** ([archive.py](applicationbot/archive.py)) — `profile/applications/<posting>/`
+  snapshots posting text + exact PDF + fill report; dry-runs overwrite, a real submission
+  freezes a `submitted-<date>/` copy forever ("what exactly did we send" insurance for the
+  autonomous runner). (3) **Multi-dimension fit rubric** — the judge now scores
+  skills/experience/seniority 0-100 and `fit_score` is **computed in code**
+  (`matching.weighted_fit`, weights .45/.35/.20) — auditable verdicts, dims shown in CLI +
+  Discover tab, old discovery caches load fine. (4) **Outcome calibration groundwork** —
+  tracker statuses gain interview/offer/rejected/no-response, a `fit_score` column is
+  stamped at apply time (additive migration ran on the real DB, 12 rows intact), and
+  `python -m applicationbot.tracker calibration` reports response rate by fit band with a
+  raise-`min_fit` hint once a band has ≥5 dead outcomes. **Not adopted:** reviewer-agent
+  tailoring pass (2× cost vs decision 034), LaTeX toolchain, LinkedIn scraping (Guideline
+  #4). **Verified:** 19 new tests, full suite **126/126**, served JS `node --check`-clean,
+  live CLI export prints ATS notes, `/track` serves the new statuses + Fit column.
+
+- 2026-07-09 — **Tailoring token diet + measured one-page guarantee (decision 042).**
+  (1) **Delta output:** the Claude tailor now returns a `TailorDelta` — entries referenced by
+  index with rewritten bullets/notes, reordered skills, summary — and
+  [backends._delta_to_tailored](applicationbot/backends.py) reconstructs the full
+  `TailoredResume` in Python, so orgs/roles/dates/education/certifications are **copied
+  verbatim** (structurally drift-proof, zero output tokens for them); the response schema
+  shrank 4.8k→1.5k chars. External `TailoredResume` shape unchanged — web/render/drift-check
+  untouched. (2) **Input diet:** compact résumé JSON (no indent, empties dropped) in the
+  tailor prompt and `generate_answer`; `job_description.trim_for_prompt` strips trailing
+  EEO/legal boilerplate (last-40%-only markers) and caps the JD at 8k chars (stored JD
+  untouched — pay-band parsing unaffected). (3) **One-page is now MEASURED, not estimated:**
+  [pdf.fit_to_pages](applicationbot/pdf.py) renders the real PDF, counts pages, and trims
+  least-relevant-first (bullets to a 2-bullet floor, then trailing entries, ≥1 experience
+  kept) until it truly fits, appending a note naming exactly what was dropped; wired into
+  `tailor_resume` so CLI/web/pipeline and both backends all emit guaranteed-fit content —
+  closes the audit gap "auto page-break silently spills to page 2". **Verified:** 8 new tests
+  ([tests/test_resume_fit.py](tests/test_resume_fit.py)), suite **107/107**, plus one live
+  tailor (real résumé × 10.3k-char JD, fast tier): valid delta first try, PDF measured at
+  exactly 1 page. *Still open from the audit:* unicode TTF embedding (latin-1 `?`-mangling).
+
+- 2026-07-09 — **Two-pass batched fill + live validation + fabricated-salary fix (decision 041).**
+  (1) **Two-pass fill:** [_fill_page](applicationbot/apply.py) runs each form page as
+  deterministic round 1 (defers unresolved decisions into `PendingDecisions` instead of
+  spawning Claude per field) → `_resolve_pending` makes **≤3 batched schema-constrained calls**
+  (`classify_questions` enum-array, `match_banked_questions` bank-sent-once index-array,
+  `pick_dropdown_options` index-array + per-item token guard, all in
+  [answer_bank.py](applicationbot/answer_bank.py)) → round 2 re-runs the same deterministic
+  loop over the injected results; leftovers are captured with **no per-field fallback calls**
+  (`semantic_done`/`picks_done`). Typeahead searches stay inline; generation-off is unchanged
+  single-pass. Verified: [tests/test_two_pass_fill.py](tests/test_two_pass_fill.py) on a new
+  fixture — classify + bank-match + pick fill in EXACTLY 3 stubbed calls; failure degrades to
+  captures. (2) **Consolidated live dry-run (AppLovin Greenhouse, headless, never submits):**
+  16 filled, 0 errors, all 12 react-selects `option:literal`, submit probe found — and the new
+  audit trail caught a real bug: with `desired_salary` unset the salary question was
+  **Claude-drafted to a fabricated figure** (and a prior run had banked "85000"). Fixed:
+  numeric-fact questions (salary/GPA/test scores) are never `is_open_ended` (never drafted);
+  the salary rule falls through to the bank instead of short-circuiting `resolve()`;
+  `prune_answer_bank` drops drafted numeric-fact entries (ran with `--apply` — the "85000" is
+  gone); corpus grew to 66 cases. Re-ran the same dry-run: salary cleanly captured, 0
+  AI-drafted, all other fields byte-identical. Full suite **99/99**. **User action: set
+  "Desired salary" in the Profile tab** (pipeline runs also get the decision-039 market
+  estimate; the standalone apply CLI does not).
+
+- 2026-07-09 — **Autofill determinism hardening (decision 040).** Four gaps closed so the same
+  form + profile always fills the same way and the learning loop can't corrupt itself:
+  (1) **Resolver regression corpus** — [fixtures/resolver_corpus.yaml](fixtures/resolver_corpus.yaml)
+  (65 cases: real labels from the SpaceX/Stripe/Robinhood/Instacart/GitLab/Discord sweeps, incl.
+  6 must-stay-null enumerated questions) + [tests/test_resolver_corpus.py](tests/test_resolver_corpus.py)
+  pin the exact `resolve()`/`option_hints()` output against a synthetic profile — a rule edit
+  that flips an answer now fails loudly instead of silently. (2) **Write-time gates** —
+  `answer_bank.valid_mapping` is enforced in `remember_answers` (an invalid Claude `maps_to`
+  is dropped at persist time, answer text kept), garbage-length questions are never banked,
+  the prune script reuses the same gate, and `learn_option` refuses generic boolean aliases
+  ("yes" → descriptive option would leak into every future Yes/No dropdown). (3) **The 3
+  fill-time Claude decision calls are `--json-schema`-constrained** (classify → enum of known
+  types; bank-match/dropdown-pick → integer index) — no more free-text reply parsing.
+  (4) **Claude never decides while a dropdown menu is open** — `_fill_combobox` reads options,
+  closes the menu, decides, then recommits by exact text (`_commit_option_text`); each combobox
+  fill records its matched tier (`option:literal/learned/hint/claude/substring`) on the report
+  as a determinism audit trail. **Verified offline, zero tokens:** 17 new tests incl. a
+  react-select-shaped fixture ([fixtures/apply_forms/combobox.html](fixtures/apply_forms/combobox.html))
+  asserting the menu is closed at decide time; full suite **93/93**. *Remaining:* fold the
+  closed-menu recommit check into the next consolidated live dry-run; two-pass batched fill
+  (scan → one Claude call → deterministic fill) deliberately deferred.
+
+- 2026-07-07 — **Dynamic salary estimate when no band is advertised (decision 039)** —
+  extends 038's fallback: instead of one static `desired_salary` for every no-band posting,
+  new [salary.py](applicationbot/salary.py) computes a market estimate for
+  (title, location, years) by cross-checking **Claude** (median range) and **Adzuna** (mean
+  advertised salary) — agree ≤20% → mean, else take the **lower** — cached per (title,
+  location) in git-ignored `profile/salary_cache.json` (30-day TTL, zero calls on a hit).
+  When a later posting for the same role *does* advertise a real band, `validate_against_band`
+  drops the cached estimate if it's >40% off, so real data self-corrects a stale guess.
+  Resolver precedence is now **band midpoint → market estimate → stored figure**; degrades to
+  Claude-only without Adzuna keys (reuses the existing `ADZUNA_APP_ID`/`ADZUNA_APP_KEY`), then
+  to `desired_salary`. Wired once in `run_testing_mode` → CLI, runner, and web all benefit.
+  Verified offline ([tests/test_salary.py](tests/test_salary.py), stubbed Claude + Adzuna, 9
+  cases) + full suite 76/76.
+
+- 2026-07-07 — **Salary expectation tracks the posting's pay band (decision 038)** — fixes
+  a dry-run under-ask: the bot filled the static `85000` for a posting advertising
+  *$124,000 – $186,000*, ~$40k below the floor. `AnswerResolver` now parses the advertised
+  band (`_posting_pay_range`, from the structured `Posting.compensation` string then the JD
+  body; `$X – $Y`/`to`, `K`-notation, hourly excluded via a ≥1000 floor) and fills its
+  **midpoint** via one `_salary_expectation()` helper used by both the keyword salary rule
+  and the classified `desired_salary` type; falls back to the stored `desired_salary` when
+  no band is advertised. `pay=p.compensation` wired in [pipeline.py](applicationbot/pipeline.py);
+  the standalone `apply` CLI (no posting) keeps the stored figure. Verified with 7 cases
+  ($124k–$186k JD body → 155000) + full suite 67/67.
+
+- 2026-07-07 — **Discovery snapshot cache (decision 037)** — repeated dry-runs no longer
+  re-search every board and re-judge the same postings. After a live discovery,
+  [discovery_cache.py](applicationbot/discovery_cache.py) saves the whole ranked result
+  (postings + Claude verdicts) to git-ignored `profile/discovery_cache.json`;
+  [discover_and_match](applicationbot/pipeline.py) reuses it — skipping the board search
+  **and** the Claude judge — when it's younger than `cache_ttl_hours` (new filter,
+  default 12h) and the résumé/boards/filters fingerprint matches. `skip_seen` is
+  re-applied on every hit against the current tracker, so a role applied to since the
+  snapshot still drops out. Wired once, so the pipeline CLI, runner, and web UI all
+  benefit; `python -m applicationbot.pipeline --fresh` / `runner --fresh` force a
+  re-search. The web Discover tab shows a "♻ Reused a saved search from Nm ago" note with
+  a one-click **Re-search fresh** button ([web.py](applicationbot/web.py), `/test-run`
+  accepts `{fresh:true}`). Verified offline ([tests/test_discovery_cache.py](tests/test_discovery_cache.py),
+  stubbed network + Claude): reuse skips the search, `--fresh`/TTL-0/résumé-change force a
+  re-search, skip_seen prunes a now-tracked role from a cache hit.
+
+- 2026-07-06 — **Multi-page wizards + Claude-cap resilience + discovery robustness (orchestrated
+  session: 2 subagents in parallel with the main agent).** (1) **Multi-page navigation** (main
+  agent, [apply.py](applicationbot/apply.py)): `_fill_all_pages` walks Next/Continue wizards —
+  per-page fill/required-flagging, signature-change advance detection with frame re-location,
+  validation-rejected advances recorded, late-page résumé upload, `_MAX_FORM_PAGES=8` backstop.
+  Hardened while testing: required-label scan is **visible-only** (hidden wizard steps were
+  polluting the blocked-reason), the pre-submit gate adds a **live DOM scan** for visible
+  required labels with empty controls (catches required fields captured as "no saved answer"),
+  `_upload_resume` no longer burns 30s on upload-less pages, and every dry-run records a
+  **`submit_probe`** (the submit control it WOULD click — free live validation of armed-path
+  selectors). (2) **Cap resilience** (subagent, backends.py+runner.py): typed
+  `ClaudeAuthError`/`ClaudeRateLimitError` classification; the runner waits 15 min
+  (kill-abortable, ≤3×/run) and retries the same match on a rate limit, stops with the exact
+  fix on auth failure. (3) **Discovery robustness** (subagent, discovery.py+filters.py):
+  per-host 0.5s pacing, retry×3/backoff honoring Retry-After, `canonical_url` dedup wired into
+  discover() + skip-seen, opt-in `max_posting_age_days` staleness gate. **Verified: 53 tests
+  green across 8 modules** (wizard fixtures, monkeypatched subprocess/urlopen — zero tokens,
+  zero live dry-runs, zero real postings). *Next:* one consolidated live dry-run (probe
+  validates submit selectors on real ATSs), then Workday accounts (multi-page prerequisite ✓).
+
+- 2026-07-06 — **The submit stage exists: safety switch + real submit path + autonomous runner
+  + fillability gate (decision 035).** Built from the full-system audit (also 2026-07-06; four
+  parallel deep-dives, findings folded into Now/Next/Later above; UI/UX queue delegated to the
+  Cursor agent via the bus). (1) **`safety.py`** — `SafetyGate`: arming lives in git-ignored
+  `profile/safety.yaml` (`armed: false` default, `max_submissions_per_run`), the global kill
+  switch is the `profile/KILL` file, and `may_submit()` re-checks everything immediately before
+  every click; an unreadable safety file can never arm. (2) **`apply._attempt_submit`** — the
+  armed path: pre-submit gate (any unresolved REQUIRED field ⇒ `blocked` outcome with the field
+  names, no human pause), submit-button click (`Submit application`/`Submit`/`input[type=submit]`;
+  a bare "Apply" is deliberately never matched), confirmation detection (page text/URL),
+  client-side validation-rejection detection (⇒ `blocked`), and form-gone-without-confirmation ⇒
+  `unconfirmed`-but-submitted so we never risk a double submission. New `ApplyReport.submit_state/
+  blockers/confirmation`; banner + review pause + tracker all submit-aware (a real submission
+  upgrades the row to `applied`, method `auto`, date stamped). Both CLIs take `--dry-run` to force
+  disarm and print a loud ARMED warning otherwise. (3) **`runner.py`** — the autonomous loop:
+  `python -m applicationbot.runner` applies to EVERY Claude-cleared match (refuses keyword-only
+  auto-apply, closing the `min_fit` bypass), headless dry-run by default, kill-file check between
+  applications, `--max` + cap stops, per-application failure isolation with a stop-the-queue rule
+  for Claude-CLI failures. (4) **Fillability gate** — `pipeline._is_fillable` keeps
+  workday/icims/unresolved-aggregator postings out of the matcher entirely (no judge tokens
+  wasted), exposed as `PipelineResult.non_fillable` + CLI count. **Verified with ZERO live
+  dry-runs and zero Claude tokens:** new `tests/` package (23 passing) driving local ATS-shaped
+  HTML fixtures (`fixtures/apply_forms/`) headless — including a true end-to-end armed run
+  (fill from the sample résumé → gate → click → confirmation detected → `submitted: True`) and
+  its dry-run twin. `profile/safety.yaml` + `profile/KILL` confirmed git-ignored. *Next:* Claude
+  usage-cap resilience, live per-ATS submit validation (one consolidated dry-run), multi-page
+  navigation, then Workday accounts.
 
 - 2026-07-06 — **Captured questions recreate their real form control (dropdown stays a dropdown).**
   An unanswered question was always shown as a free-text box, even when the form field was a dropdown
@@ -938,7 +1263,10 @@ and free-form notes.
 - Storage for profile, postings, resumes, and application history (files vs. database).
 - Config format for the user profile + filters — **partially resolved:** discovery filters
   built (decision 026, `profile/discovery.yaml`); full Configure-stage profile schema still open.
-- How the `dry_run` / armed state and global kill switch are represented and toggled.
+- ~~How the `dry_run` / armed state and global kill switch are represented and toggled~~ —
+  **resolved (decision 035):** `profile/safety.yaml` (`armed: false` default +
+  `max_submissions_per_run`) + `profile/KILL` kill file checked before every submit;
+  `--dry-run` CLI override forces disarm.
 
 Record each decision in [DECISIONS.md](DECISIONS.md) once the user chooses.
 
@@ -946,6 +1274,23 @@ Record each decision in [DECISIONS.md](DECISIONS.md) once the user chooses.
 
 ## Recently completed
 
+- 2026-07-09 — **Readiness closers + ITAR gates auto-answered** (decision 044): "Are you
+  up for it?" / "Are you ready?" / "Does this sound like you?" resolve to Yes (guarded
+  keyword rule + `role_commitment` classifiable type for rephrasings; logistical "ready
+  to start/relocate" phrasings excluded). ITAR/export-control gates and security-clearance
+  *eligibility* resolve to Yes only when `us_citizen` is True (`itar_us_person` type +
+  status-dropdown hints; "itar" whole-word matched — substring hit "mil-ITAR-y");
+  *holding* a clearance stays captured. 11 new corpus cases; suite 132/132.
+
+- 2026-07-07 — **Semantic answer-bank matching** (decision 036): a saved answer is now
+  reused for any *rewording* of its question, not only the exact phrasing it was banked
+  under. On a literal bank miss, Claude matches the question against the banked Q→A pairs
+  by answer-fitness (`answer_bank.match_banked_question`), wired into both
+  `resolve_semantic` and `freetext_answer` (short text fields previously got no semantic
+  fallback at all). A hit is cached as a bank alias, so repeats match literally with zero
+  Claude calls. Verified offline (`tests/test_bank_semantic.py`, all 9 test modules pass)
+  and live: "Years of React experience" fills from a banked "How many years of experience
+  do you have with React?"; unbanked questions still go to the needs-attention queue.
 - 2026-07-04 — Added a **structural repo map** for faster agent orientation
   (`applicationbot/repo_map.py`, `python -m applicationbot.repo_map`) — decision 019.
   Parses every first-party `.py` with stdlib `ast` (zero deps), emits a compact markdown/

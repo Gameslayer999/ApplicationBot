@@ -1,0 +1,241 @@
+# Resolver regression corpus — pins AnswerResolver.resolve() + option_hints() behavior.
+#
+# Labels collected from REAL application forms driven in live dry-run sweeps (SpaceX, Stripe,
+# Robinhood, Instacart, GitLab, Discord, Ramp, cin7 — see NEXT_STEPS.md session notes), resolved
+# against examples/sample_resume.yaml + the synthetic profile in tests/test_resolver_corpus.py.
+# No real applicant data (Guideline #12).
+#
+# Every entry is VERIFIED-CORRECT behavior, not merely observed output. If a resolver change
+# flips one of these answers, the change is wrong (or this file must be deliberately updated
+# in the same commit, with the reasoning in the commit message).
+#
+#   expect: null   means the resolver must leave the field for the user (captured), never guess.
+#   hints:         when present, option_hints(label) must return exactly this list.
+#   company:/pay:  optional resolver context (hiring company; advertised pay band).
+cases:
+- label: First Name
+  expect: Jordan
+- label: Last Name
+  expect: Avery
+- label: Full name
+  expect: Jordan Avery
+- label: What's the name you'd prefer us to use?
+  expect: Jordan
+- label: Preferred First Name
+  expect: Jordan
+- label: Email
+  expect: jordan.avery@example.com
+- label: Phone
+  expect: (555) 010-4477
+- label: LinkedIn Profile
+  expect: https://linkedin.com/in/jordanavery-example
+- label: GitHub URL
+  expect: https://github.com/jordanavery-example
+- label: Website
+  expect: https://jordanavery.example.com
+- label: Portfolio
+  expect: https://jordanavery.example.com
+- label: Are you legally authorized to work in the United States?
+  expect: 'Yes'
+  hints:
+  - authorized to work in the United States for any employer
+  - for any employer
+  - 'Yes'
+- label: Will you now or in the future require sponsorship for employment visa status?
+  expect: 'No'
+- label: Are you authorized to work in the location(s) you selected?
+  expect: 'Yes'
+- label: Are you legally authorized to work in Japan for our Company?
+  expect: 'No'
+- label: Do you require sponsorship to work in Japan?
+  expect: 'Yes'
+- label: Are you a U.S. citizen?
+  expect: 'Yes'
+- label: What is your citizenship status?
+  expect: 'Yes'
+  hints:
+  - U.S. citizen or national
+  - U.S. citizen
+  - US citizen
+  - citizen or national of the United States
+  - 'Yes'
+- label: Are you willing to relocate?
+  expect: 'No'
+- label: Are you open to working remotely?
+  expect: 'Yes'
+- label: Are you willing to work from our office 3 days per week?
+  expect: null
+- label: Have you ever worked for or interned at SpaceX?
+  company: SpaceX
+  expect: 'No'
+- label: Have you previously been employed by Stripe?
+  company: Stripe
+  expect: 'No'
+- label: Have you worked with React?
+  company: SpaceX
+  expect: null
+- label: Are you currently located in Japan?
+  expect: 'No'
+- label: Are you currently located in the United States?
+  expect: 'Yes'
+- label: Do you live in Texas?
+  expect: 'Yes'
+- label: Which state do you reside in?
+  expect: Texas
+  hints:
+  - Texas
+  - TX
+- label: State/Province
+  expect: Texas
+- label: Current location
+  expect: Austin, TX
+- label: City
+  expect: Austin, TX
+- label: Country
+  expect: United States
+  hints:
+  - United States
+  - United States of America
+  - United States (USA)
+  - USA
+  - US
+  - U.S.A.
+  - America
+- label: What country do you reside in?
+  expect: United States
+- label: What is your preferred office location?
+  expect: New York, NY
+  hints:
+  - New York, NY
+  - New York
+  - Remote
+  - Austin, TX
+  - Austin
+- label: What are your salary expectations?
+  expect: '120000'
+- label: What are your salary expectations?
+  pay: $124,000 - $186,000
+  id: salary-band
+  expect: '155000'
+- label: When can you start?
+  expect: '2026-08-01'
+- label: What is the earliest date you would want to start working?
+  expect: '2026-08-01'
+- label: How many years of experience do you have?
+  expect: '6'
+- label: Can you perform the essential functions of this role, with or without reasonable accommodation?
+  expect: 'Yes'
+- label: Gender
+  expect: Male
+  hints:
+  - Male
+  - Man
+- label: What gender pronouns do you prefer?
+  expect: He/Him
+  hints:
+  - He/Him
+  - He/Him/His
+  - He
+  - Him
+- label: Are you Hispanic or Latino?
+  expect: 'No'
+- label: Race/Ethnicity
+  expect: White (Not Hispanic or Latino)
+- label: Veteran Status
+  expect: I am not a protected veteran
+- label: What is your military status?
+  expect: I am not a protected veteran
+- label: Disability Status
+  expect: No, I don't have a disability
+- label: Current employer
+  expect: Northwind Commerce
+- label: Are you subject to any employment agreements with your current employer?
+  expect: null
+- label: Current title
+  expect: Senior Software Engineer
+- label: Highest degree obtained
+  expect: B.S. in Computer Science
+- label: Degree
+  expect: B.S. in Computer Science
+  hints:
+  - Bachelor's Degree
+  - Bachelor's
+  - Bachelors
+  - Bachelor
+  - Undergraduate Degree
+- label: School
+  expect: University of Texas at Austin
+- label: Discipline
+  expect: Computer Science
+- label: Field of study
+  expect: Computer Science
+- label: Graduation year
+  expect: '2019'
+- label: How did you hear about this job?
+  expect: I found this role through an online job search.
+  hints:
+  - job board
+  - online
+  - search
+  - company website
+  - website
+  - google
+  - linkedin
+  - indeed
+  - glassdoor
+  - other
+- label: Did you use AI to complete this application?
+  expect: 'Yes'
+- label: Are you willing to travel up to 25% of the time?
+  expect: 'Yes'
+- label: Do you have an active security clearance?
+  expect: null
+- label: What is your GPA?
+  expect: null
+- label: SAT Score
+  expect: null
+- label: Employment History
+  expect: null
+- label: Are you a current or former government official?
+  expect: null
+- label: Why do you want to work at SpaceX?
+  company: SpaceX
+  expect: null
+
+- label: Please provide your annual gross salary expectation (in local currency and numerical format without special characters)
+  expect: '120000'
+
+# Readiness/commitment closers → Yes (applying IS the commitment); logistical "ready"
+# questions must NOT be caught by the blanket Yes.
+- label: Are you up for it?
+  expect: 'Yes'
+- label: Are you ready?
+  expect: 'Yes'
+- label: This role is fast-paced with tight deadlines. Are you up for the challenge?
+  expect: 'Yes'
+- label: Does this sound like you?
+  expect: 'Yes'
+- label: Are you ready to take on this role?
+  expect: 'Yes'
+- label: Are you ready to relocate?
+  expect: 'No'
+- label: When are you ready to start?
+  expect: null
+
+# ITAR / export-control gates → Yes for a U.S. citizen (a citizen is a "U.S. person");
+# clearance ELIGIBILITY → Yes, but HAVING a clearance stays captured (pinned null above).
+- label: Are you a U.S. Person as defined by ITAR?
+  expect: 'Yes'
+  hints:
+  - U.S. citizen or national
+  - U.S. citizen
+  - US citizen
+  - U.S. Person
+  - US Person
+  - 'Yes'
+- label: 'ITAR REQUIREMENTS: To conform to U.S. Government export regulations, applicant must be a (i) U.S. citizen or national, (ii) U.S. lawful, permanent resident (aka green card holder), (iii) Refugee under 8 U.S.C. 1157, or (iv) Asylee under 8 U.S.C. 1158, or be eligible to obtain the required authorizations from the U.S. Department of State. Do you meet these requirements?'
+  expect: 'Yes'
+- label: Do you meet the ITAR requirements described above?
+  expect: 'Yes'
+- label: Are you eligible to obtain a U.S. government security clearance?
+  expect: 'Yes'

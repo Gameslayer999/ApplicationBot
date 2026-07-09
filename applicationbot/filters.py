@@ -24,6 +24,7 @@ future work; this is the seed the discovery loop needs today.
 from __future__ import annotations
 
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -121,7 +122,14 @@ class DiscoveryFilters(BaseModel):
     min_skills: int = 2  # keyword pre-filter floor (raise to cut common-word false positives)
     top_n: int = 20  # how many keyword-ranked survivors Claude judges (more = more chances to clear min_fit)
     min_fit: int = 50  # only follow through (dry-run/apply) on matches Claude scores ≥ this (0-100)
+    calibrate_min_fit: bool = True  # auto-raise min_fit above a fit band your recorded outcomes prove dead (decision 043)
     skip_seen: bool = True  # drop postings already in the tracker (don't re-apply to the same role)
+    cache_ttl_hours: float = 12  # reuse the last discovery snapshot (skip board search + Claude judge) if younger than this; 0 disables
+    max_posting_age_days: Optional[int] = Field(
+        default=None,
+        description="Drop postings whose updated_at is older than this many days. "
+        "None (default) = no age gate. Missing/unparseable dates pass.",
+    )
     adzuna: AdzunaConfig = Field(default_factory=AdzunaConfig)
     early_career: EarlyCareerConfig = Field(default_factory=EarlyCareerConfig)
 
@@ -223,13 +231,39 @@ def _annual_salary(comp: str) -> Optional[int]:
     return max(nums) if nums else None
 
 
+def _posting_datetime(raw) -> Optional[datetime]:
+    """Best-effort parse of a posting timestamp for the staleness gate: ISO-8601-ish strings
+    (trailing 'Z' or offset ok) and epoch-milliseconds ints/digit-strings (> 10^11 — Lever's
+    createdAt). Returns None when missing/unparseable (the gate then keeps the posting)."""
+    if raw is None or raw == "":
+        return None
+    if isinstance(raw, (int, float)) or (isinstance(raw, str) and raw.strip().isdigit()):
+        n = float(raw)
+        if n > 1e11:  # milliseconds since epoch
+            try:
+                return datetime.fromtimestamp(n / 1000, tz=timezone.utc)
+            except (OverflowError, OSError, ValueError):
+                return None
+        return None
+    s = str(raw).strip()
+    if s.endswith("Z"):
+        s = s[:-1]
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
 def apply_gates(postings, filters: DiscoveryFilters):
     """Cheap pre-matcher gates from the filter config: remote_only, title_exclude, a salary
-    floor when the posting states pay, and an experience-level gate (by title). Returns the
-    kept postings. Postings with no stated salary — or no detectable level — pass their gate
-    (we don't drop for missing data)."""
+    floor when the posting states pay, an experience-level gate (by title), and — when
+    max_posting_age_days is set — a staleness gate on updated_at. Returns the kept postings.
+    Postings with no stated salary, no detectable level, or a missing/unparseable
+    updated_at pass their gate (we don't drop for missing data)."""
     excl = [t.lower() for t in filters.title_exclude]
     want_levels = {_norm_level(l) for l in filters.experience_levels} & set(EXPERIENCE_LEVELS)
+    now = datetime.now(timezone.utc)
     kept = []
     for p in postings:
         if filters.remote_only and p.remote is False:
@@ -245,6 +279,10 @@ def apply_gates(postings, filters: DiscoveryFilters):
         if filters.min_salary:
             sal = _annual_salary(p.compensation)
             if sal is not None and sal < filters.min_salary:
+                continue
+        if filters.max_posting_age_days is not None:
+            dt = _posting_datetime(p.updated_at)
+            if dt is not None and (now - dt).days > filters.max_posting_age_days:
                 continue
         kept.append(p)
     return kept

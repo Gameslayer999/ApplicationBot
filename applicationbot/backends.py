@@ -27,10 +27,12 @@ import shutil
 import subprocess
 from typing import Optional, Protocol
 
+from pydantic import BaseModel, Field
+
 from . import relevance
-from .job_description import JobDescription
+from .job_description import JobDescription, trim_for_prompt
 from .length import LengthBudget
-from .models import Project, Resume, SkillCategory, TailoredResume
+from .models import Experience, Project, Resume, SkillCategory, TailoredResume
 
 CLAUDE_CLI = "claude"
 
@@ -49,27 +51,29 @@ DEFAULT_QUALITY = "balanced"
 SYSTEM_PROMPT = """\
 You are a resume-tailoring assistant. You are given a candidate's BASE RESUME (the \
 single source of truth for everything true about the candidate) and a JOB DESCRIPTION. \
-Produce a tailored version of the resume that maximizes relevance to the job while \
-staying faithful to the candidate's own resume format.
+Produce a TAILORING PLAN — a delta, not a full resume: which entries to keep (by index), \
+in what order, with rewritten bullets, reordered skills, and a rewritten summary. The \
+application reconstructs the final resume from your plan; organizations, roles, dates, \
+locations, project names/tech, education, and certifications are copied VERBATIM from \
+the base resume, so never restate them.
+
+Output shape (JSON):
+- `experience` / `projects` / `activities`: arrays of {"i": <0-based index of the entry \
+within that same section of the BASE RESUME>, "bullets": [...], "tailor_note": "..."}. \
+Array order = the order entries should appear (most job-relevant first). Omit an entry's \
+index entirely to drop it from the tailored resume.
+- `skills`: the SAME categories as the base resume; within each you may reorder and drop \
+items, but every item must appear in the base resume — never add one.
+- `summary`: rewritten for this job, ONLY if the base resume has a summary; else null.
 
 Hard rules — never break these:
 - Use ONLY facts present in the base resume. Never invent or embellish organizations, \
 roles, titles, dates, degrees, certifications, metrics, or skills the candidate does not \
 have.
-- Skills stay grouped under the SAME categories as the base resume. Within each category \
-you may reorder and drop items, but every item must appear in the base resume — never add \
-one.
-- Each experience and activity entry's organization, role, start, and end MUST match the \
-base resume exactly. You may reword, reorder, and omit bullets to emphasize relevance and \
-mirror the job's terminology where it is truthful, but you must not fabricate \
-achievements.
-- Projects' name and tech must match the base resume.
-- Only include a `summary` if the base resume has one; otherwise leave it null.
-- Do not omit relevant education.
-
-Preserve format:
-- Keep roughly the same set of sections and a similar overall length as the base resume. \
-This tailors the *content*; it should still look like the same person's resume.
+- Each entry's bullets must be truthful selections/rewordings of THAT entry's base \
+bullets. You may reword, reorder, and omit to emphasize relevance and mirror the job's \
+terminology where it is truthful, but you must not fabricate achievements or move a \
+bullet between entries.
 
 Bullet formatting (CRITICAL — measured by character count, which is reliable; word counts \
 are not):
@@ -111,14 +115,75 @@ shown to the user for review and is NEVER printed on the resume.
 """
 
 
+# --------------------------------------------------- tailoring delta (LLM I/O shape only)
+# The model returns a PLAN referencing base-resume entries by index; the full TailoredResume
+# is reconstructed in Python (decision 042). Structural fields (orgs, roles, dates, education,
+# certifications) are copied from the base resume, so they can never be mangled and are never
+# paid for as output tokens.
+
+
+class DeltaEntry(BaseModel):
+    i: int = Field(description="0-based index of the entry within its base-resume section.")
+    bullets: list[str] = Field(default_factory=list,
+                               description="The rewritten bullets for this entry, in order.")
+    tailor_note: str = Field(default="", description="One short sentence: why this entry is "
+                             "here and how it was tailored for THIS job (review-only).")
+
+
+class TailorDelta(BaseModel):
+    summary: Optional[str] = None
+    experience: list[DeltaEntry] = Field(default_factory=list)
+    projects: list[DeltaEntry] = Field(default_factory=list)
+    activities: list[DeltaEntry] = Field(default_factory=list)
+    skills: list[SkillCategory] = Field(default_factory=list)
+    relevance_notes: list[str] = Field(default_factory=list)
+
+
+def _delta_to_tailored(base: Resume, delta: TailorDelta) -> TailoredResume:
+    """Reconstruct the full TailoredResume from the model's plan. Out-of-range or duplicate
+    indices are ignored; empty bullets fall back to the entry's base bullets (the length
+    budget caps them afterwards). Education/certifications are copied verbatim."""
+    def pick(entries, picks, make):
+        out, seen = [], set()
+        for p in picks:
+            if not (0 <= p.i < len(entries)) or p.i in seen:
+                continue
+            seen.add(p.i)
+            out.append(make(entries[p.i], p))
+        return out
+
+    def exp(e: Experience, p: DeltaEntry) -> Experience:
+        return Experience(organization=e.organization, role=e.role, location=e.location,
+                          start=e.start, end=e.end, bullets=list(p.bullets) or list(e.bullets),
+                          tailor_note=p.tailor_note or None)
+
+    def proj(pr: Project, p: DeltaEntry) -> Project:
+        return Project(name=pr.name, tech=pr.tech, bullets=list(p.bullets) or list(pr.bullets),
+                       tailor_note=p.tailor_note or None)
+
+    return TailoredResume(
+        summary=(delta.summary if base.summary else None),  # summary only if the base has one
+        skills=delta.skills or [c.model_copy(deep=True) for c in base.skills],
+        experience=pick(base.experience, delta.experience, exp),
+        projects=pick(base.projects, delta.projects, proj),
+        activities=pick(base.activities, delta.activities, exp),
+        education=[e.model_copy(deep=True) for e in base.education],
+        certifications=list(base.certifications),
+        relevance_notes=list(delta.relevance_notes),
+    )
+
+
 def _user_message(resume: Resume, jd: JobDescription, budget: LengthBudget) -> str:
+    # Compact JSON (no indentation, null/empty fields dropped) — the résumé is the largest
+    # prompt component and indent=2 was ~12% whitespace. The JD is boilerplate-trimmed.
     return (
-        "BASE RESUME (source of truth, JSON):\n"
-        f"{resume.model_dump_json(indent=2)}\n\n"
+        "BASE RESUME (source of truth, JSON; reference entries by their 0-based index "
+        "within each section):\n"
+        f"{resume.model_dump_json(exclude_none=True, exclude_defaults=True)}\n\n"
         f"JOB DESCRIPTION — {jd.title} at {jd.company}:\n"
-        f"{jd.body}\n\n"
+        f"{trim_for_prompt(jd.body)}\n\n"
         f"{budget.prompt()}\n\n"
-        "Produce the tailored resume now."
+        "Produce the tailoring plan now."
     )
 
 
@@ -133,32 +198,98 @@ class TailorBackend(Protocol):
 # ------------------------------------------------------------------ Claude (subscription)
 
 
+class ClaudeUnavailableError(RuntimeError):
+    """A Claude Code CLI call could not complete (failed, timed out, or CLI missing).
+
+    Subclasses RuntimeError so existing callers that catch RuntimeError keep working."""
+
+
+class ClaudeAuthError(ClaudeUnavailableError):
+    """Claude Code CLI is not installed or not signed in."""
+
+
+class ClaudeRateLimitError(ClaudeUnavailableError):
+    """Subscription usage cap / rate limit / service overloaded — retryable after a wait."""
+
+
+_RATE_LIMIT_MARKERS = (
+    "rate limit", "usage limit", "usage cap", "hit your limit", "too many requests",
+    "429", "overloaded", "quota", "capacity", "limit will reset",
+    "out of extended usage",
+)
+_AUTH_MARKERS = (
+    "not logged in", "please run /login", "/login", "authentication", "unauthorized",
+    "401", "invalid api key", "expired",
+)
+
+
+def _classify_cli_failure(detail: str) -> type:
+    """Map a failed CLI call's combined stderr+stdout to the exception class to raise."""
+    low = detail.lower()
+    if any(m in low for m in _RATE_LIMIT_MARKERS):
+        return ClaudeRateLimitError
+    if any(m in low for m in _AUTH_MARKERS):
+        return ClaudeAuthError
+    return ClaudeUnavailableError
+
+
 def run_claude_cli(prompt: str, *, cli: str = CLAUDE_CLI,
                    model: Optional[str] = None, think: bool = True,
-                   timeout: int = 300) -> str:
+                   timeout: int = 300, system: Optional[str] = None,
+                   json_schema: Optional[dict] = None) -> str:
     """Run one prompt through the Claude Code CLI (subscription billing, not the API) and
-    return the model's text. Raises RuntimeError if the CLI is missing or fails.
+    return the model's text. Raises ClaudeAuthError (CLI missing / not signed in),
+    ClaudeRateLimitError (usage cap / rate limit), or ClaudeUnavailableError (anything
+    else, incl. timeout) — all RuntimeError subclasses.
 
     `think=False` disables extended thinking (MAX_THINKING_TOKENS=0). Thinking is the
-    dominant latency cost for a JSON-output task like tailoring — off is ~3-4x faster."""
+    dominant latency cost for a JSON-output task like tailoring — off is ~3-4x faster.
+
+    The session is stripped to the bare model: no Claude Code system prompt, no tools, no
+    MCP servers, no settings/CLAUDE.md. A default headless session carries ~40k tokens of
+    coding-agent context per call; stripped, the same call carries only the prompt itself
+    (~74x less overhead measured — see DECISIONS.md #034). `system` replaces the (empty)
+    system prompt; `json_schema` makes the CLI enforce schema-valid JSON output."""
     if shutil.which(cli) is None:
-        raise RuntimeError(
+        raise ClaudeAuthError(
             "Claude Code CLI ('claude') not found. Install it and sign in to your Claude "
             "subscription (https://claude.com/product/claude-code)."
         )
-    cmd = [cli, "--print", prompt, "--output-format", "json"]
+    cmd = [cli, "--print", prompt, "--output-format", "json",
+           "--tools", "", "--strict-mcp-config", "--setting-sources", "",
+           "--system-prompt", system or "You are a helpful assistant."]
+    if json_schema is not None:
+        cmd += ["--json-schema", json.dumps(json_schema)]
     if model:
         cmd += ["--model", model]
-    env = {**os.environ, "MAX_THINKING_TOKENS": "0"} if not think else None
+    # CLAUDESTATUS_IGNORE=1 tells the ClaudeStatus hook to ignore these headless,
+    # programmatic sessions so they don't clutter its per-session light. Scoped to this
+    # spawn only — interactive/human `claude` usage is unaffected.
+    env = {**os.environ, "CLAUDESTATUS_IGNORE": "1"}
+    if not think:
+        env["MAX_THINKING_TOKENS"] = "0"
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
     except subprocess.TimeoutExpired as e:
-        raise RuntimeError(f"Claude Code timed out ({timeout}s).") from e
+        raise ClaudeUnavailableError(f"Claude Code timed out ({timeout}s).") from e
     if proc.returncode != 0:
-        raise RuntimeError(
-            f"Claude Code failed (exit {proc.returncode}). Are you signed in? "
-            f"Run `claude` and /login if not. Detail: "
-            f"{(proc.stderr or proc.stdout).strip()[-400:]}"
+        detail = ((proc.stderr or "") + (proc.stdout or "")).strip()
+        tail = detail[-400:]
+        exc = _classify_cli_failure(detail)
+        if exc is ClaudeRateLimitError:
+            raise ClaudeRateLimitError(
+                f"Claude usage limit/rate limit hit (exit {proc.returncode}). The runner "
+                f"will wait and retry; or wait for your usage window to reset. "
+                f"Detail: {tail}"
+            )
+        if exc is ClaudeAuthError:
+            raise ClaudeAuthError(
+                f"Claude Code is not signed in (exit {proc.returncode}). "
+                f"Run `claude` and /login, then retry. Detail: {tail}"
+            )
+        raise ClaudeUnavailableError(
+            f"Claude Code failed (exit {proc.returncode}). Retry; if it persists, run "
+            f"`claude` interactively to check it works. Detail: {tail}"
         )
     try:
         env = json.loads(proc.stdout)
@@ -197,28 +328,27 @@ class ClaudeCodeBackend:
                 "'rules' engine."
             )
         base = (
-            SYSTEM_PROMPT
-            + "\n\n"
-            + _user_message(resume, jd, budget)
-            + "\n\nOutput format: respond with ONLY a single JSON object for the tailored "
-            "resume — no explanation, no markdown code fences. It must match this JSON "
-            "schema:\n"
-            + json.dumps(TailoredResume.model_json_schema())
+            _user_message(resume, jd, budget)
+            + "\n\nOutput format: respond with ONLY a single JSON object for the tailoring "
+            "plan — no explanation, no markdown code fences."
         )
         last_err: Optional[Exception] = None
         for attempt in range(2):
             prompt = base if attempt == 0 else (
-                base + "\n\nYour previous reply was not valid JSON. Return ONLY the JSON object."
+                base + "\n\nYour previous reply was not a valid tailoring plan. Return ONLY the JSON object."
             )
             raw = self._run(prompt)
             try:
-                return TailoredResume.model_validate_json(_extract_json(raw))
+                delta = TailorDelta.model_validate_json(_extract_json(raw))
+                return _delta_to_tailored(resume, delta)
             except Exception as e:  # includes pydantic + json errors
                 last_err = e
-        raise RuntimeError(f"Claude Code did not return a valid tailored resume: {last_err}")
+        raise RuntimeError(f"Claude Code did not return a valid tailoring plan: {last_err}")
 
     def _run(self, prompt: str) -> str:
-        return run_claude_cli(prompt, cli=self.cli, model=self.model, think=self.think)
+        return run_claude_cli(prompt, cli=self.cli, model=self.model, think=self.think,
+                              system=SYSTEM_PROMPT,
+                              json_schema=TailorDelta.model_json_schema())
 
 
 # --------------------------------------------------------------------------- Rules

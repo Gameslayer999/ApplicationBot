@@ -1,0 +1,12 @@
+# Submission safety switch (decision 035, Agent Guideline #3).
+# Copy to profile/safety.yaml (git-ignored). A missing file means DISARMED (dry-run).
+#
+# Kill switch: create the file profile/KILL to halt ALL submission immediately
+# (checked before every single submit); delete it to resume.
+
+# Real submission only happens when this is true. Dry-run fills everything but never
+# clicks submit.
+armed: false
+
+# Hard cap on real submissions in one run, even while armed.
+max_submissions_per_run: 10

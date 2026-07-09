@@ -5,4 +5,5 @@
 pydantic>=2
 PyYAML>=6
 fpdf2>=2.7   # pure-Python PDF export (no Chromium / system libraries)
+pypdf>=4     # pure-Python PDF text extraction — the ATS text-layer check (decision 043)
 playwright>=1.40   # Apply-stage form automation; run `playwright install chromium` once

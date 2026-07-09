@@ -83,9 +83,13 @@ def main(argv: list[str] | None = None) -> int:
     except Exception:
         pass
     if args.out and args.out.lower().endswith(".pdf"):
+        from .ats_check import verify_pdf
         from .pdf import render_pdf
-        Path(args.out).write_bytes(render_pdf(resume, result.tailored))
+        pdf_bytes = render_pdf(resume, result.tailored)
+        Path(args.out).write_bytes(pdf_bytes)
         print(f"Wrote {args.out}", file=sys.stderr)
+        for note in verify_pdf(pdf_bytes, resume, jd.body or None).notes():
+            print(f"  {note}", file=sys.stderr)
     elif args.out:
         Path(args.out).write_text(render_markdown(resume, result.tailored), encoding="utf-8")
         print(f"Wrote {args.out}", file=sys.stderr)

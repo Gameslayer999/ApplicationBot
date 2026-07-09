@@ -1,0 +1,41 @@
+<!doctype html>
+<html>
+<head><title>Software Engineer application — Fixture Co (strict wizard)</title></head>
+<body>
+<h1>Apply for this job</h1>
+
+<div id="step1" class="step">
+  <div><label for="first_name">First Name *</label>
+    <input id="first_name" name="first_name" type="text"></div>
+  <div><label for="employee_ref">Referring Employee ID *</label>
+    <input id="employee_ref" name="employee_ref" type="text"></div>
+  <button type="button" onclick="advance()">Next</button>
+</div>
+
+<div id="step2" class="step" style="display:none">
+  <div><label for="email">Email *</label>
+    <input id="email" name="email" type="email"></div>
+  <button type="button" onclick="finish()">Submit application</button>
+</div>
+
+<script>
+function advance() {
+  document.querySelector('.error')?.remove();
+  const ok = ['first_name', 'employee_ref']
+    .every(id => document.getElementById(id).value.trim());
+  if (!ok) {
+    const d = document.createElement('div');
+    d.className = 'error';
+    d.textContent = 'Referring Employee ID is required to continue.';
+    document.getElementById('step1').prepend(d);
+    return;
+  }
+  document.getElementById('step1').style.display = 'none';
+  document.getElementById('step2').style.display = '';
+}
+function finish() {
+  document.body.innerHTML = '<h1>Thank you for applying!</h1>';
+}
+</script>
+</body>
+</html>

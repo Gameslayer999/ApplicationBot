@@ -30,7 +30,9 @@ from __future__ import annotations
 import json
 import re
 import ssl
+import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from datetime import date
@@ -67,30 +69,106 @@ def _ssl_context() -> ssl.SSLContext:
 
 _SSL_CTX = _ssl_context()
 
+# --- Politeness pacing (Agent Guideline #4): min gap between requests to the same host. ---
+_MIN_REQUEST_INTERVAL_S = 0.5
+_last_request_at: dict[str, float] = {}  # host -> time.monotonic() of last request
+_sleep = time.sleep  # module-level so tests can monkeypatch sleeping away
+
+# Retry policy for transient HTTP failures (429/5xx/network): 2 retries with backoff.
+_RETRY_ATTEMPTS = 3
+_RETRY_BACKOFF_S = (1.0, 3.0)  # sleep before attempt 2, attempt 3
+_RETRY_AFTER_CAP_S = 30
+
+
+def _polite_wait(host: str) -> None:
+    """Sleep just enough that consecutive requests to `host` are >= _MIN_REQUEST_INTERVAL_S
+    apart. Per-host: different hosts never wait on each other."""
+    last = _last_request_at.get(host)
+    if last is not None:
+        wait = _MIN_REQUEST_INTERVAL_S - (time.monotonic() - last)
+        if wait > 0:
+            _sleep(wait)
+    _last_request_at[host] = time.monotonic()
+
+
+def _retry_delay(e: urllib.error.HTTPError, attempt: int) -> float:
+    """Backoff before the next attempt; for 429/503 honor an integer Retry-After header
+    (capped at _RETRY_AFTER_CAP_S)."""
+    delay = _RETRY_BACKOFF_S[attempt - 1]
+    if e.code in (429, 503):
+        ra = str((e.headers.get("Retry-After") if e.headers is not None else "") or "").strip()
+        if ra.isdigit():
+            delay = min(int(ra), _RETRY_AFTER_CAP_S)
+    return delay
+
 
 def fetch_json(url: str, *, method: str = "GET", body: Any = None) -> Any:
     """Fetch a URL and parse JSON. Defaults to GET; pass a `body` (dict) to POST it as JSON
-    (Workable's careers API is POST). Raises DiscoveryError with a precise message on failure
+    (Workable's careers API is POST). Rate-limited per host (_polite_wait) and retried on
+    transient failures (429/5xx/network, up to 3 attempts with backoff); other HTTP errors
+    fail immediately. Raises DiscoveryError with a precise message on failure
     (Agent Guideline #11) so a single bad source never crashes a whole discovery run."""
     headers = {"User-Agent": _UA, "Accept": "application/json"}
     data = None
     if body is not None:
         data = json.dumps(body).encode("utf-8")
         headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(url, data=data, method=method, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=_TIMEOUT, context=_SSL_CTX) as r:
-            raw = r.read().decode("utf-8", errors="replace")
-    except urllib.error.HTTPError as e:
-        raise DiscoveryError(f"HTTP {e.code} for {url}") from e
-    except urllib.error.URLError as e:
-        raise DiscoveryError(f"network error for {url}: {e.reason}") from e
-    except Exception as e:  # timeouts, ssl, etc.
-        raise DiscoveryError(f"request failed for {url}: {type(e).__name__}: {e}") from e
+    host = urllib.parse.urlsplit(url).netloc
+    exhausted = f" (after {_RETRY_ATTEMPTS} attempts)"
+    for attempt in range(1, _RETRY_ATTEMPTS + 1):
+        _polite_wait(host)
+        req = urllib.request.Request(url, data=data, method=method, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=_TIMEOUT, context=_SSL_CTX) as r:
+                raw = r.read().decode("utf-8", errors="replace")
+            break
+        except urllib.error.HTTPError as e:
+            if e.code != 429 and not 500 <= e.code < 600:  # non-transient: fail immediately
+                raise DiscoveryError(f"HTTP {e.code} for {url}") from e
+            if attempt < _RETRY_ATTEMPTS:
+                _sleep(_retry_delay(e, attempt))
+                continue
+            raise DiscoveryError(f"HTTP {e.code} for {url}{exhausted}") from e
+        except urllib.error.URLError as e:
+            if attempt < _RETRY_ATTEMPTS:
+                _sleep(_RETRY_BACKOFF_S[attempt - 1])
+                continue
+            raise DiscoveryError(f"network error for {url}: {e.reason}{exhausted}") from e
+        except Exception as e:  # timeouts, ssl, etc.
+            if attempt < _RETRY_ATTEMPTS:
+                _sleep(_RETRY_BACKOFF_S[attempt - 1])
+                continue
+            raise DiscoveryError(f"request failed for {url}: {type(e).__name__}: {e}{exhausted}") from e
     try:
         return json.loads(raw)
     except json.JSONDecodeError as e:
         raise DiscoveryError(f"non-JSON response from {url}: {e}") from e
+
+
+# Query keys that carry the job identity on some hosts (Greenhouse embeds, Lever, generic
+# career pages) — kept by canonical_url; everything else in the query is tracking noise.
+_QUERY_KEEP_SUBSTRINGS = ("gh_jid", "lever", "job", "id", "token")
+_QUERY_DROP_KEYS = {"source", "ref", "src"}
+
+
+def canonical_url(u: str) -> str:
+    """Canonical form of a posting URL for dedup: lowercase scheme+host, trailing slash
+    stripped from the path, fragment dropped, and the query reduced to job-identifying
+    params only (keys containing gh_jid/lever/job/id/token) — utm_*, source, ref, src and
+    all other tracking params are dropped. Two spellings of the same posting compare equal."""
+    if not u:
+        return u
+    parts = urllib.parse.urlsplit(u)
+    path = parts.path[:-1] if parts.path.endswith("/") else parts.path
+    kept = []
+    for k, v in urllib.parse.parse_qsl(parts.query, keep_blank_values=True):
+        kl = k.lower()
+        if kl.startswith("utm_") or kl in _QUERY_DROP_KEYS:
+            continue
+        if any(s in kl for s in _QUERY_KEEP_SUBSTRINGS):
+            kept.append((k, v))
+    query = urllib.parse.urlencode(kept)
+    return urllib.parse.urlunsplit((parts.scheme.lower(), parts.netloc.lower(), path, query, ""))
 
 
 class DiscoveryError(Exception):
@@ -813,7 +891,8 @@ def build_source(ats: str, token: str) -> Source:
 
 
 def discover(sources: list[Source]) -> tuple[list[Posting], list[str]]:
-    """Fan out across sources, collect postings, dedup by URL. Returns (postings, errors);
+    """Fan out across sources, collect postings, dedup by canonical URL (so the same job
+    reached via two URL spellings survives only once). Returns (postings, errors);
     a failing source is recorded as an error string, never aborting the run."""
     seen: set[str] = set()
     postings: list[Posting] = []
@@ -821,7 +900,7 @@ def discover(sources: list[Source]) -> tuple[list[Posting], list[str]]:
     for src in sources:
         try:
             for p in src.fetch():
-                key = p.url or f"{p.company}|{p.title}"
+                key = canonical_url(p.url) if p.url else f"{p.company}|{p.title}"
                 if key in seen:
                     continue
                 seen.add(key)
@@ -855,8 +934,10 @@ def resolve_redirect(url: str) -> str:
     the 30x chain — JS/meta-refresh interstitials (some Jooble pages) are not followed."""
     if not url:
         return url
+    host = urllib.parse.urlsplit(url).netloc
     for method in ("HEAD", "GET"):
         try:
+            _polite_wait(host)
             req = urllib.request.Request(url, method=method, headers={"User-Agent": _UA})
             with urllib.request.urlopen(req, timeout=_TIMEOUT, context=_SSL_CTX) as r:
                 return r.geturl()

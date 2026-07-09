@@ -15,10 +15,6 @@ from applicationbot.apply import AnswerResolver, _norm
 from applicationbot.apply_profile import DEFAULT_PATH, load_profile, save_profile
 from applicationbot.resume import load_resume
 
-# Question terms whose answers are enumerated/specific and must never map to a boolean profile field.
-_ENUMERATED = ("clearance", "employment history", "gpa", "sat score", "act score",
-               "gre score", "test score")
-
 
 def main(argv: list[str]) -> int:
     apply = "--apply" in argv
@@ -35,11 +31,15 @@ def main(argv: list[str]) -> int:
         if len(qn) < 4:  # garbage capture ("yes", "no", stray tokens)
             notes.append(f"DROP  (garbage) {qa.question!r}")
             continue
+        # Claude-DRAFTED answers to numeric-fact questions (salary, GPA) are fabrications —
+        # older runs banked them before is_open_ended refused these. User-entered ones stay.
+        if qa.generated and (qa.answer or "").strip() and not qa.maps_to \
+                and any(t in qn for t in answer_bank._NUMERIC_FACT):
+            notes.append(f"DROP  (drafted numeric fact) {qa.question[:60]!r} = {qa.answer!r}")
+            continue
         if qa.maps_to:
             invalid = (
-                any(t in qn for t in _ENUMERATED)
-                or answer_bank.is_demographic(qa.question)
-                or answer_bank.is_company_specific(qa.question)
+                not answer_bank.valid_mapping(qa.question, qa.maps_to)  # same gate as write time
                 or resolver.resolve(qa.question) is not None  # a structured rule now answers it
             )
             if invalid:

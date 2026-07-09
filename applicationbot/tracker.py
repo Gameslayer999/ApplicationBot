@@ -25,12 +25,20 @@ DEFAULT_DB = REPO_ROOT / "applications.db"
 
 # Lifecycle of an application, in order. `dry-run` = filled + recorded but not submitted
 # (the safety-switch default, Guideline #3); `applied` = actually submitted once armed.
-STATUSES = ["discovered", "tailored", "dry-run", "applied", "failed", "responded"]
+# Post-application outcomes (decision 043): `responded` = any non-rejection reply,
+# `interview`/`offer` = reached that stage, `rejected` = explicit no, `no-response` =
+# closed out after silence. These feed the calibration report below.
+STATUSES = ["discovered", "tailored", "dry-run", "applied", "responded",
+            "interview", "offer", "rejected", "no-response", "failed"]
 
 # Columns a caller may set/edit. `id`, `created_at`, `updated_at` are managed here.
+# `fit_score` is the judge's 0-100 verdict stamped at apply time (decision 043) — the
+# calibration report correlates it with outcomes. `follow_up_date` is a user-set ISO date
+# for chasing a silent application.
 EDITABLE = [
     "company", "role", "location", "remote", "pay", "portal", "method",
     "source_url", "date_discovered", "date_applied", "status", "resume_path", "notes",
+    "fit_score", "follow_up_date",
 ]
 
 _SCHEMA = """
@@ -49,6 +57,8 @@ CREATE TABLE IF NOT EXISTS applications (
     status          TEXT NOT NULL DEFAULT 'discovered',
     resume_path     TEXT NOT NULL DEFAULT '',       -- tailored résumé used (file path)
     notes           TEXT NOT NULL DEFAULT '',
+    fit_score       TEXT NOT NULL DEFAULT '',       -- judge's 0-100 fit at apply time
+    follow_up_date  TEXT NOT NULL DEFAULT '',       -- ISO date to chase a silent application
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL
 );
@@ -60,6 +70,11 @@ def _connect(path: str | Path = DEFAULT_DB) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")  # concurrent runner-writes + UI-reads
     conn.executescript(_SCHEMA)
+    # Migration for DBs created before decision 043 (CREATE IF NOT EXISTS won't add columns).
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(applications)")}
+    for missing in ("fit_score", "follow_up_date"):
+        if missing not in cols:
+            conn.execute(f"ALTER TABLE applications ADD COLUMN {missing} TEXT NOT NULL DEFAULT ''")
     return conn
 
 
@@ -204,6 +219,84 @@ def status_counts(*, path: str | Path = DEFAULT_DB) -> dict[str, int]:
     return counts
 
 
+# --------------------------------------------------- outcome calibration (decision 043)
+
+# Fit bands the calibration report groups by — aligned with the judge's 0-100 scale.
+FIT_BANDS = [(75, 100, "75-100"), (60, 74, "60-74"), (0, 59, "<60")]
+# Outcome classification: a positive is any signal a human read the application and
+# engaged; resolved = positive or closed-negative. `applied` rows are still pending.
+POSITIVE = {"responded", "interview", "offer"}
+CLOSED_NEGATIVE = {"rejected", "no-response"}
+_MIN_RESOLVED_FOR_HINT = 5  # don't suggest tuning min_fit off tiny samples
+
+
+def calibration_report(*, path: str | Path = DEFAULT_DB) -> dict:
+    """Response rate by fit band, from real submissions with a recorded fit score —
+    ground truth for tuning `min_fit` (adapted from ai-job-search's /outcome→/setup
+    calibration loop). Returns {"bands": [...], "hints": [...], "unscored": n}."""
+    submitted = {"applied"} | POSITIVE | CLOSED_NEGATIVE
+    rows = [r for r in list_applications(path=path) if r["status"] in submitted]
+    unscored = 0
+    bands = [{"band": label, "lo": lo, "hi": hi, "applications": 0,
+              "pending": 0, "positive": 0, "negative": 0} for lo, hi, label in FIT_BANDS]
+    for r in rows:
+        try:
+            fit = int(str(r.get("fit_score", "")).strip())
+        except ValueError:
+            unscored += 1
+            continue
+        for b in bands:
+            if b["lo"] <= fit <= b["hi"]:
+                b["applications"] += 1
+                if r["status"] in POSITIVE:
+                    b["positive"] += 1
+                elif r["status"] in CLOSED_NEGATIVE:
+                    b["negative"] += 1
+                else:
+                    b["pending"] += 1
+                break
+    hints = []
+    for b in bands:
+        resolved = b["positive"] + b["negative"]
+        b["resolved"] = resolved
+        b["response_rate"] = (b["positive"] / resolved) if resolved else None
+        if resolved >= _MIN_RESOLVED_FOR_HINT and b["positive"] == 0:
+            hints.append(
+                f"Fit band {b['band']}: 0 of {resolved} resolved applications got any "
+                f"response — consider raising min_fit above {b['hi']} in the Discover "
+                "settings.")
+    total_resolved = sum(b["resolved"] for b in bands)
+    if total_resolved < _MIN_RESOLVED_FOR_HINT:
+        hints.append(
+            f"Only {total_resolved} application(s) have a recorded outcome — set "
+            "interview/offer/rejected/no-response on the Track tab as replies arrive; "
+            f"calibration needs at least {_MIN_RESOLVED_FOR_HINT}.")
+    return {"bands": bands, "hints": hints, "unscored": unscored}
+
+
+def recommended_min_fit(current: int, *, path: str | Path = DEFAULT_DB) -> Optional[tuple[int, str]]:
+    """A higher `min_fit` justified by outcomes, or None to keep the configured value.
+
+    A band is *dead* when ≥ _MIN_RESOLVED_FOR_HINT of its applications resolved and NONE
+    got any response — applying into it is spending submissions (and tailoring tokens) on
+    silence. The recommendation is one above the highest dead band. It only ever RAISES:
+    lowering (or acting on thin/positive data) stays a human call. The top band is never
+    recommended past — if 75-100 is dead the strategy is failing, which no threshold fixes
+    (the calibration report already says so).
+    """
+    rep = calibration_report(path=path)
+    dead = [b for b in rep["bands"]
+            if b["hi"] < 100 and b["resolved"] >= _MIN_RESOLVED_FOR_HINT and b["positive"] == 0]
+    if not dead:
+        return None
+    worst = max(dead, key=lambda b: b["hi"])
+    if worst["hi"] + 1 <= current:
+        return None
+    reason = (f"fit band {worst['band']}: 0 of {worst['resolved']} resolved "
+              f"applications got any response")
+    return worst["hi"] + 1, reason
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     p = argparse.ArgumentParser(description="ApplicationBot tracking store (SQLite).")
     p.add_argument("--db", default=str(DEFAULT_DB), help="path to the SQLite DB")
@@ -215,6 +308,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     sub.add_parser("list", help="list applications")
     sub.add_parser("counts", help="status counts")
+    sub.add_parser("calibration", help="response rate by fit band (tune min_fit from outcomes)")
 
     d = sub.add_parser("delete", help="delete an application by id")
     d.add_argument("id", type=int)
@@ -236,6 +330,29 @@ def main(argv: Optional[list[str]] = None) -> int:
     elif args.cmd == "counts":
         for k, v in status_counts(path=db).items():
             print(f"{k:<12} {v}")
+    elif args.cmd == "calibration":
+        rep = calibration_report(path=db)
+        print(f"{'fit band':<10} {'applied':>8} {'pending':>8} {'positive':>9} "
+              f"{'negative':>9} {'response':>9}")
+        for b in rep["bands"]:
+            rate = f"{b['response_rate']:.0%}" if b["response_rate"] is not None else "—"
+            print(f"{b['band']:<10} {b['applications']:>8} {b['pending']:>8} "
+                  f"{b['positive']:>9} {b['negative']:>9} {rate:>9}")
+        if rep["unscored"]:
+            print(f"(+{rep['unscored']} submitted application(s) with no recorded fit score)")
+        for h in rep["hints"]:
+            print(f"→ {h}")
+        try:  # best-effort: filters may not exist on a fresh clone
+            from .filters import load_filters
+            f = load_filters()
+            rec = recommended_min_fit(f.min_fit, path=db)
+            if rec:
+                print(f"→ Recommended min_fit: {rec[0]} (configured {f.min_fit}; {rec[1]}) — "
+                      + ("applied automatically on pipeline/runner runs."
+                         if f.calibrate_min_fit else
+                         "NOT applied: auto-calibration is off in your Discovery settings."))
+        except Exception:
+            pass
     elif args.cmd == "delete":
         print("deleted" if delete_application(args.id, path=db) else "not found")
     return 0

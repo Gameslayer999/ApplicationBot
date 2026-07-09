@@ -14,10 +14,11 @@ Flow:
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Optional
 
-from . import catalogue
+from . import catalogue, pdf
 from .backends import DEFAULT_QUALITY, TailorBackend, select_backend
 from .job_description import JobDescription
 from .length import LengthBudget
@@ -69,6 +70,13 @@ def tailor_resume(
             f"Omitted {', '.join(omitted)} to fit {budget.pages:g} page(s) — "
             "the least job-relevant were dropped. Increase Length to include more.",
         ]
+
+    # The count caps above are heuristics; now GUARANTEE the page budget by measuring the
+    # actual rendered PDF and trimming until it fits (decision 042). Applied here so the web
+    # preview, CLI, and pipeline all see the same guaranteed-fit content.
+    tailored, fit_notes = pdf.fit_to_pages(resume, tailored, max(1, math.ceil(budget.pages)))
+    if fit_notes:
+        tailored.relevance_notes = [*tailored.relevance_notes, *fit_notes]
 
     return TailorResult(
         tailored=tailored,

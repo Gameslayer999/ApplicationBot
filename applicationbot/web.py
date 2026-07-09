@@ -53,6 +53,7 @@ def _test_reset() -> dict:
         "phase": "running", "step": "start",
         "message": "Starting…", "elapsed_note": "",
         "scanned": 0, "matched": 0, "judged": 0, "judged_total": 0,
+        "from_cache": False, "cache_age_min": None,
         "chosen": None, "report": None, "errors": [],
     }
 
@@ -62,8 +63,9 @@ def _set(**kw) -> None:
         _TEST_STATE.update(kw)
 
 
-def _test_worker() -> None:
-    """Run the full testing-mode pipeline in the background, updating _TEST_STATE."""
+def _test_worker(force_fresh: bool = False) -> None:
+    """Run the full testing-mode pipeline in the background, updating _TEST_STATE.
+    `force_fresh` bypasses the discovery snapshot cache and re-searches every board."""
     from . import backends, pipeline
     from .filters import load_filters
 
@@ -80,14 +82,19 @@ def _test_worker() -> None:
             return
 
         use_claude = backends.claude_code_available()
-        _set(step="discover", message="Discovering postings from your target boards…")
+        _set(step="discover", message=("Re-searching every board (ignoring cache)…" if force_fresh
+                                       else "Discovering postings from your target boards…"))
 
         def on_judge(done, total):
             _set(step="match", judged=done, judged_total=total,
                  message=f"Judging fit with Claude — {done}/{total} postings…")
 
         res = pipeline.discover_and_match(resume, filters, profile=profile,
-                                          use_claude=use_claude, on_progress=on_judge)
+                                          use_claude=use_claude, on_progress=on_judge,
+                                          force_fresh=force_fresh)
+        # Outcome calibration can raise min_fit above a proven-dead fit band (decision 043
+        # follow-up); the note is shown with the judged list so the cutoff is never a mystery.
+        min_fit, calib_note = pipeline.effective_min_fit(filters)
         # Surface every Claude-judged posting — accepted AND denied — so the user can see what
         # the searches return and why each is rejected (ranked best-first).
         judged = [{
@@ -95,11 +102,14 @@ def _test_worker() -> None:
             "location": m.posting.location, "compensation": m.posting.compensation,
             "url": m.posting.url, "ats": m.posting.ats,
             "fit_score": m.fit_score, "qualified": m.qualified,
+            "dimensions": m.dimensions or None,
             "why": m.why, "missing": (m.missing or [])[:3],
-            "cleared": (m.fit_score is not None and m.fit_score >= filters.min_fit),
+            "cleared": (m.fit_score is not None and m.fit_score >= min_fit),
         } for m in res.matches if m.fit_score is not None]
+        cache_age_min = int((res.cache_age_seconds or 0) // 60) if res.from_cache else None
         _set(scanned=res.discovered, matched=len(res.matches), errors=res.errors,
-             skipped_seen=res.skipped_seen, judged=judged, min_fit=filters.min_fit)
+             skipped_seen=res.skipped_seen, judged=judged, min_fit=min_fit,
+             calib_note=calib_note, from_cache=res.from_cache, cache_age_min=cache_age_min)
         if not res.matches:
             extra = ["No new postings matched your qualifications."]
             if res.skipped_seen:
@@ -107,12 +117,12 @@ def _test_worker() -> None:
             _set(phase="error", errors=(res.errors or []) + extra)
             return
 
-        top = pipeline.pick_top(res.matches, min_fit=filters.min_fit)
+        top = pipeline.pick_top(res.matches, min_fit=min_fit)
         if top is None:
             best = max((m.fit_score for m in res.matches if m.fit_score is not None), default=None)
             best_txt = f" Best fit this run was {best}/100." if best is not None else ""
             _set(phase="error", errors=[
-                f"No match reached your minimum fit of {filters.min_fit}/100, so nothing was "
+                f"No match reached your minimum fit of {min_fit}/100, so nothing was "
                 f"applied to.{best_txt} See the judged postings below for why. To find a match: "
                 "lower “Minimum fit score”, raise “How many top matches Claude judges”, set "
                 "“Experience levels” to your level (so senior roles are filtered out before "
@@ -123,6 +133,7 @@ def _test_worker() -> None:
             "company": p.company, "title": p.title, "location": p.location,
             "compensation": p.compensation, "url": p.url, "ats": p.ats,
             "fit_score": top.fit_score, "qualified": top.qualified,
+            "dimensions": top.dimensions or None,
             "why": top.why, "missing": top.missing,
             "judged_by": top.judged_by,
         }
@@ -151,13 +162,13 @@ def _test_worker() -> None:
         _set(phase="error", errors=[f"{type(e).__name__}: {e}"])
 
 
-def start_test_run() -> dict:
+def start_test_run(force_fresh: bool = False) -> dict:
     with _TEST_LOCK:
         if _TEST_STATE.get("phase") == "running":
             return {"ok": False, "error": "A test run is already in progress."}
         _TEST_STATE.clear()
         _TEST_STATE.update(_test_reset())
-    threading.Thread(target=_test_worker, daemon=True).start()
+    threading.Thread(target=_test_worker, kwargs={"force_fresh": force_fresh}, daemon=True).start()
     return {"ok": True}
 
 
@@ -397,7 +408,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, render_pdf(base, tailored), "application/pdf",
                            {"Content-Disposition": 'attachment; filename="tailored_resume.pdf"'})
             elif path == "/test-run":
-                self._json(200, start_test_run())
+                self._json(200, start_test_run(bool(json.loads(raw or b"{}").get("fresh"))))
             elif path == "/test-run/close":
                 _TEST_HOLD.set()  # release the review hold so the browser closes
                 self._json(200, {"ok": True})
@@ -599,6 +610,10 @@ INDEX_HTML = """<!doctype html>
   .tstep.done { color:#2a9d5b; }
   .tmsg { margin-top:8px; font-size:14px; color:var(--ink); }
   .tmeta { margin-top:6px; font-size:12px; color:var(--muted); }
+  .tmeta.cache { color:var(--ink); }
+  .linklike { background:none; border:none; padding:0; margin-left:8px; color:var(--accent);
+              font:inherit; text-decoration:underline; cursor:pointer; }
+  .linklike:disabled { color:var(--muted); text-decoration:none; cursor:default; }
   .tbar { margin-top:8px; height:7px; background:var(--line); border-radius:4px; overflow:hidden; }
   .tbarfill { height:100%; background:var(--accent); transition:width .3s; }
   .testchosen { margin-top:14px; padding:14px; border:1px solid var(--accent); border-radius:8px; background:#f7f9ff; }
@@ -976,6 +991,7 @@ function projCard(p) {
   p = p || {};
   return entryCard([
     row2(fld("Project name","name",p.name), fld("Tech — e.g. Python, SQL","tech",p.tech)),
+    fld("Link (optional) — repo, demo, or write-up","link",p.link),
     area("Bullets (one per line)","bullets",(p.bullets||[]).join("\\n")),
   ], c => cardData(c).name);
 }
@@ -1019,7 +1035,7 @@ function collect() {
     skills: cardsIn("sec-skills").map(c => { const d = cardData(c); return { category:(d.category||"").trim(), items:(d.items||"").split(",").map(s=>s.trim()).filter(Boolean) }; }).filter(s => s.category),
     experience: cardsIn("sec-experience").map(expData).filter(e => e.organization || e.role),
     activities: cardsIn("sec-activities").map(expData).filter(e => e.organization || e.role),
-    projects: cardsIn("sec-projects").map(c => { const d = cardData(c); return { name:(d.name||"").trim(), tech:orNull(d.tech), bullets:linesOf(d.bullets) }; }).filter(p => p.name),
+    projects: cardsIn("sec-projects").map(c => { const d = cardData(c); return { name:(d.name||"").trim(), tech:orNull(d.tech), link:orNull(d.link), bullets:linesOf(d.bullets) }; }).filter(p => p.name),
     education: cardsIn("sec-education").map(c => { const d = cardData(c); return { school:(d.school||"").trim(), degree:(d.degree||"").trim(), location:orNull(d.location), graduation:orNull(d.graduation), details:linesOf(d.details) }; }).filter(e => e.school),
   };
 }
@@ -1040,17 +1056,19 @@ $("resume").addEventListener("change", () => { if (!$("view-profile").classList.
 
 // ---- Discover: run one full dry-run test ------------------------------------
 let TEST_TIMER = null, TEST_T0 = null;
-$("test-run").addEventListener("click", async () => {
+async function startTestRun(fresh) {
   const btn = $("test-run"), msg = $("test-msg");
   msg.className = "msg"; msg.textContent = "";
-  btnBusy(btn, "Starting…");
+  btnBusy(btn, fresh ? "Re-searching…" : "Starting…");
   try {
-    const r = await (await fetch("/test-run", {method:"POST", headers:{"Content-Type":"application/json"}, body:"{}"})).json();
+    const r = await (await fetch("/test-run", {method:"POST", headers:{"Content-Type":"application/json"},
+                                               body: JSON.stringify({fresh: !!fresh})})).json();
     if (!r.ok) { msg.className = "msg err"; msg.textContent = r.error || "Could not start."; btnDone(btn); return; }
     TEST_T0 = Date.now();
     pollTest();
   } catch (e) { msg.className = "msg err"; msg.textContent = String(e.message || e); btnDone(btn); }
-});
+}
+$("test-run").addEventListener("click", () => startTestRun(false));
 
 function testStepList(s) {
   const steps = [["discover","Discovering postings"],["match","Judging fit"],
@@ -1073,6 +1091,8 @@ function renderChosen(s) {
   let html = `<div class="tclabel">Following through on this one posting:</div>`;
   html += `<div class="tctitle">${escapeHtml(c.company)} — ${escapeHtml(c.title)} ${fit}</div>`;
   if (meta) html += `<div class="tcmeta">${meta}</div>`;
+  if (c.dimensions) html += `<div class="tcmeta">${["skills","experience","seniority"]
+    .filter(k => c.dimensions[k] != null).map(k => `${k} ${c.dimensions[k]}`).join(" · ")}</div>`;
   if (c.why) html += `<div class="tcwhy"><b>Why:</b> ${escapeHtml(c.why)}</div>`;
   if (c.missing && c.missing.length) html += `<div class="tcwhy"><b>Missing:</b> ${c.missing.slice(0,3).map(escapeHtml).join("; ")}</div>`;
   html += `<div class="tcmeta"><a href="${escapeHtml(c.url)}" target="_blank" rel="noopener">${escapeHtml(c.url)}</a></div>`;
@@ -1085,6 +1105,7 @@ function renderJudged(s) {
   const minFit = (s.min_fit != null) ? s.min_fit : 50;
   let html = `<div class="tjhead">Postings Claude judged this run — ${rows.length} scored, `
     + `${cleared} cleared your ${minFit}/100 cutoff. Denied ones are shown so you can see what the searches return.</div>`;
+  if (s.calib_note) html += `<div class="tjhead">→ ${escapeHtml(s.calib_note)}</div>`;
   for (const r of rows) {
     const cls = r.cleared ? "tjrow ok" : "tjrow no";
     const badge = r.cleared ? `✓ ${r.fit_score}` : `✗ ${r.fit_score}`;
@@ -1093,6 +1114,8 @@ function renderJudged(s) {
       + `<div class="tjtop"><span class="tjscore">${badge}</span>`
       + `<span class="tjname">${escapeHtml(r.company)} — ${escapeHtml(r.title)}</span></div>`;
     if (meta) html += `<div class="tjmeta">${meta}</div>`;
+    if (r.dimensions) html += `<div class="tjmeta">${["skills","experience","seniority"]
+      .filter(k => r.dimensions[k] != null).map(k => `${k} ${r.dimensions[k]}`).join(" · ")}</div>`;
     if (r.why) html += `<div class="tjwhy">${escapeHtml(r.why)}</div>`;
     if (r.missing && r.missing.length) html += `<div class="tjmiss"><b>Missing:</b> ${r.missing.map(escapeHtml).join("; ")}</div>`;
     html += `<div class="tjmeta"><a href="${escapeHtml(r.url)}" target="_blank" rel="noopener">${escapeHtml(r.url)}</a></div></div>`;
@@ -1115,9 +1138,17 @@ async function pollTest() {
     body += `<div class="tbar"><div class="tbarfill" style="width:${pct}%"></div></div>`;
   }
   if (s.scanned) body += `<div class="tmeta">Scanned ${s.scanned} postings · ${s.matched} matched your skills${s.skipped_seen ? ` · ${s.skipped_seen} already in tracker skipped` : ""}</div>`;
+  if (s.from_cache) {
+    const m = s.cache_age_min || 0;
+    const age = m < 90 ? `${m} min ago` : `${Math.round(m/60)}h ago`;
+    body += `<div class="tmeta cache">♻ Reused a saved search from ${age} — no boards searched, no Claude judging.`
+          + `<button id="test-fresh" type="button" class="linklike"${running ? " disabled" : ""}>Re-search fresh</button></div>`;
+  }
   const el = TEST_T0 ? Math.round((Date.now()-TEST_T0)/1000) : null;
   if ((running || filled) && el!=null) body += `<div class="tmeta">${el}s elapsed</div>`;
   prog.innerHTML = body;
+  const fresh = $("test-fresh");
+  if (fresh) fresh.addEventListener("click", () => startTestRun(true));
 
   if (s.chosen) { chosen.classList.remove("hidden"); chosen.innerHTML = renderChosen(s); }
 
@@ -1150,10 +1181,10 @@ async function pollTest() {
 // columns are individually resizable (drag the right edge) and can overflow into a horizontal
 // scroll, like a spreadsheet. Per-user width/hidden overrides persist in localStorage.
 const TRACK_COLS = [
-  ["status","Status",120], ["company","Company",140], ["role","Role",180], ["location","Location",140],
+  ["status","Status",120], ["fit_score","Fit",60], ["company","Company",140], ["role","Role",180], ["location","Location",140],
   ["remote","Remote",80], ["pay","Pay",100], ["portal","Portal",110], ["method","Method",90],
   ["source_url","Source URL",220], ["date_discovered","Discovered",120], ["date_applied","Applied",120],
-  ["resume_path","Résumé used",160], ["notes","Notes",240],
+  ["follow_up_date","Follow up",110], ["resume_path","Résumé used",160], ["notes","Notes",240],
 ];
 let TRACK_STATE = { status:null, search:"", statuses:[] };
 
@@ -1757,6 +1788,7 @@ function renderDiscForm(f, levels) {
     numFld("Min skill matches to keep a posting (keyword floor)", "min_skills", f.min_skills),
     numFld("How many top matches Claude judges for fit", "top_n", f.top_n),
     numFld("Minimum fit score to apply — 0-100 (dry-run/apply only follow through at or above this)", "min_fit", f.min_fit),
+    chkRow("Auto-raise minimum fit above a score band your recorded outcomes prove gets no responses", "calibrate_min_fit", f.calibrate_min_fit),
     chkRow("Skip postings already in my tracker (don't re-surface)", "skip_seen", f.skip_seen),
     area("Aggregator search keywords (one per line; empty = derive from your résumé)", "keywords", (f.keywords||[]).join("\\n")),
   ]));
@@ -1806,6 +1838,7 @@ function collectDisc() {
     min_skills: discInt("min_skills", 2),
     top_n: discInt("top_n", 10),
     min_fit: discInt("min_fit", 50),
+    calibrate_min_fit: discChk("calibrate_min_fit"),
     skip_seen: discChk("skip_seen"),
     adzuna: {
       app_id: discVal("adz_app_id").trim(),

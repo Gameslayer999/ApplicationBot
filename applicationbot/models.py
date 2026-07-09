@@ -56,6 +56,11 @@ class Project(BaseModel):
     tech: Optional[str] = Field(
         default=None, description="Tech-stack line, e.g. 'Retool, JavaScript, SQL'"
     )
+    link: Optional[str] = Field(
+        default=None,
+        description="Optional URL for the project (repo, demo, or write-up). Grounds answers "
+        "to questions like 'a personal project you're proud of?' — never fabricated.",
+    )
     bullets: list[str] = Field(default_factory=list)
     tailor_note: Optional[str] = Field(
         default=None,

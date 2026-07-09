@@ -42,6 +42,38 @@ class PipelineResult:
     errors: list[str]
     skipped_seen: int = 0  # postings dropped because they're already in the tracker
     bridged: int = 0  # aggregator hits resolved to a fillable ATS (decision 032)
+    non_fillable: list = None  # postings on portals Apply can't fill (decision 035 gate)
+    from_cache: bool = False  # matches came from the discovery snapshot, not a live search (decision 037)
+    cache_age_seconds: float | None = None  # age of the reused snapshot, when from_cache
+
+    def __post_init__(self):
+        if self.non_fillable is None:
+            self.non_fillable = []
+
+
+def _is_fillable(p) -> bool:
+    """Can the Apply stage drive this posting's form? True for the six public-API ATSs
+    (and for aggregator hits not yet bridge-resolved, which redirect to one of them or get
+    marked auto_applyable=False by the bridge). Workday/iCIMS/unresolved links are not."""
+    from .discovery import _AGGREGATOR_ATS, ATS_SOURCES
+    if p.extra.get("auto_applyable") is False:
+        return False
+    return p.ats in ATS_SOURCES or p.ats in _AGGREGATOR_ATS
+
+
+def _seen_canonical_urls(filters: DiscoveryFilters) -> set:
+    """Canonicalized URLs of postings already in the tracker (empty when skip_seen is off or
+    the tracker can't be read). Re-computed on every run — including cache hits — so a role
+    applied to since a snapshot was saved never re-surfaces from stale cache."""
+    if not filters.skip_seen:
+        return set()
+    from . import tracker
+    from .discovery import canonical_url
+    try:
+        seen = tracker.seen_source_urls()  # tracker stores raw URLs
+    except Exception:
+        return set()
+    return {canonical_url(u) for u in seen}
 
 
 def discover_and_match(
@@ -52,15 +84,56 @@ def discover_and_match(
     extra_sources: list[Source] | None = None,
     use_claude: bool = True,
     bridge: bool = True,
+    cache: bool = True,
+    force_fresh: bool = False,
     on_progress=None,
 ) -> PipelineResult:
     """The reusable core: discover → gate → skip-already-seen → bridge → qualification-match.
-    No side effects. `on_progress(done, total)` reports Claude-judging progress for a UI.
-    `bridge` resolves aggregator (Adzuna/Jooble) redirect links to their real ATS so those
-    hits become auto-applyable (a no-op when no aggregator postings are present)."""
+    `on_progress(done, total)` reports Claude-judging progress for a UI. `bridge` resolves
+    aggregator (Adzuna/Jooble) redirect links to their real ATS so those hits become
+    auto-applyable (a no-op when no aggregator postings are present).
+
+    Caching (decision 037): unless `force_fresh` or `cache=False`, a discovery snapshot
+    younger than `filters.cache_ttl_hours` (and matching the résumé/boards/filters
+    fingerprint) is reused verbatim — skipping the board search AND the Claude judge. The
+    only per-run work on a cache hit is re-applying `skip_seen`, so a role you've since
+    applied to still drops out. A live run saves its result as the next snapshot."""
+    from . import backends
+    from . import discovery_cache
+
     sources = build_sources(filters, resume, profile) + list(extra_sources or [])
     if not sources:
         return PipelineResult([], 0, 0, ["No sources configured. Add boards to profile/discovery.yaml."])
+
+    # `match()` only judges when the CLI is actually present; fold that into the fingerprint
+    # so a keyword-only snapshot (Claude absent) is never reused once Claude is available.
+    effective_claude = use_claude and backends.claude_code_available()
+    fp = discovery_cache.fingerprint(
+        resume, filters, [s.name for s in sources], use_claude=effective_claude, bridge=bridge,
+    )
+
+    if cache and not force_fresh and filters.cache_ttl_hours and not extra_sources:
+        snap = discovery_cache.load(fp, ttl_hours=filters.cache_ttl_hours)
+        if snap is not None:
+            from .discovery import canonical_url
+            seen_canon = _seen_canonical_urls(filters)
+            matches = snap.matches
+            skipped = 0
+            if seen_canon:
+                before = len(matches)
+                matches = [m for m in matches if canonical_url(m.posting.url) not in seen_canon]
+                skipped = before - len(matches)
+            return PipelineResult(
+                matches=matches,
+                discovered=snap.discovered,
+                after_gates=snap.after_gates,
+                errors=[],
+                skipped_seen=skipped,
+                bridged=snap.bridged,
+                non_fillable=list(snap.non_fillable),
+                from_cache=True,
+                cache_age_seconds=snap.age_seconds,
+            )
 
     postings, errors = discover(sources)
     discovered = len(postings)
@@ -69,16 +142,12 @@ def discover_and_match(
     # Skip postings already in the tracker so we don't keep re-surfacing/re-applying to the
     # same roles (keyed on the posting URL, which is what the Apply stage records).
     skipped_seen = 0
-    if filters.skip_seen:
-        from . import tracker
-        try:
-            seen = tracker.seen_source_urls()
-        except Exception:
-            seen = set()
-        if seen:
-            before = len(postings)
-            postings = [p for p in postings if p.url not in seen]
-            skipped_seen = before - len(postings)
+    seen_canon = _seen_canonical_urls(filters)
+    if seen_canon:
+        from .discovery import canonical_url
+        before = len(postings)
+        postings = [p for p in postings if canonical_url(p.url) not in seen_canon]
+        skipped_seen = before - len(postings)
 
     # Bridge aggregator hits (Adzuna/Jooble) to their real ATS before matching, so the matcher
     # ranks them on the full JD and Apply lands on the fillable form (decision 032). No-op when
@@ -88,10 +157,28 @@ def discover_and_match(
         from .discovery import bridge_aggregator_postings
         postings, bridged = bridge_aggregator_postings(postings)
 
+    # Fillability gate (decision 035): postings on portals Apply can't drive (Workday/iCIMS/
+    # unresolved aggregator links) never reach the matcher — no Claude judge tokens spent on
+    # them, no dead apply runs. They're returned separately for a future manual queue.
+    non_fillable = [p for p in postings if not _is_fillable(p)]
+    if non_fillable:
+        postings = [p for p in postings if _is_fillable(p)]
+
     matches, match_errors = match(
         resume, postings, top_n=filters.top_n, use_claude=use_claude,
         min_skills=filters.min_skills, on_progress=on_progress,
     )
+
+    # Save this live result as the next run's snapshot (decision 037). Only cache the coarse
+    # after-gates count and the ranked matches — enough to replay the run without touching the
+    # network or Claude. Skipped when `extra_sources` are injected (the fingerprint doesn't
+    # capture ad-hoc sources, so caching them could serve a mismatched result).
+    if cache and filters.cache_ttl_hours and not extra_sources:
+        discovery_cache.save(
+            fp, matches, non_fillable,
+            discovered=discovered, after_gates=len(postings), bridged=bridged,
+        )
+
     return PipelineResult(
         matches=matches,
         discovered=discovered,
@@ -99,6 +186,7 @@ def discover_and_match(
         errors=errors + match_errors,
         skipped_seen=skipped_seen,
         bridged=bridged,
+        non_fillable=non_fillable,
     )
 
 
@@ -113,12 +201,37 @@ def _fmt_match(i: int, m: Match) -> str:
     out = [line]
     if meta:
         out.append(f"       {meta}")
+    if m.dimensions:
+        out.append("       " + " · ".join(f"{k} {v}" for k, v in m.dimensions.items()))
     if m.why:
         out.append(f"       why: {m.why}")
     if m.missing:
         out.append(f"       missing: {'; '.join(m.missing[:3])}")
     out.append(f"       {p.url}")
     return "\n".join(out)
+
+
+def effective_min_fit(filters: DiscoveryFilters) -> tuple[int, str | None]:
+    """The min_fit to actually use: the configured value, auto-RAISED when recorded
+    outcomes prove a band below it is dead (decision 043 follow-up). Returns
+    (value, user-facing note when raised — callers must surface it, silence would read as
+    the config being ignored). The user stays in control: the `calibrate_min_fit` filter
+    turns this off, and an explicit --min-fit override wins at the call site. Best-effort:
+    any tracker problem keeps the configured value."""
+    if not filters.calibrate_min_fit:
+        return filters.min_fit, None
+    from . import tracker
+    try:
+        rec = tracker.recommended_min_fit(filters.min_fit)
+    except Exception:
+        return filters.min_fit, None
+    if rec is None:
+        return filters.min_fit, None
+    value, reason = rec
+    return value, (f"min_fit raised {filters.min_fit}→{value} by outcome calibration "
+                   f"({reason}). Set min_fit ≥ {value} in the Discover settings to make "
+                   "this permanent, or turn off its calibration toggle to keep "
+                   f"{filters.min_fit}.")
 
 
 def pick_top(matches: list[Match], *, min_fit: int) -> Match | None:
@@ -148,11 +261,13 @@ def run_testing_mode(
     status_cb=None,
     hold=None,
     on_filled=None,
+    gate=None,
 ):
-    """Tailor → PDF → dry-run apply for ONE posting, watched live. Never submits. Returns the
-    ApplyReport. `status_cb(step, message)` receives progress (in addition to printing) so a UI
-    can surface it; `hold` (a threading.Event) replaces the terminal review pause for web runs;
-    `on_filled(report)` fires the moment filling finishes, before the hold."""
+    """Tailor → PDF → apply for ONE posting, watched live. Dry-run (never submits) unless an
+    armed SafetyGate is passed (decision 035). Returns the ApplyReport. `status_cb(step,
+    message)` receives progress (in addition to printing) so a UI can surface it; `hold` (a
+    threading.Event) replaces the terminal review pause for web runs; `on_filled(report)`
+    fires the moment filling finishes, before the hold."""
     from .apply import AnswerResolver, run_apply
     from .pdf import render_pdf
     from .tailor import tailor_resume
@@ -178,18 +293,45 @@ def run_testing_mode(
     # none, so the submitted PDF carries them (they're stored once, in the apply profile).
     profile = load_profile(profile_path)
     pdf_resume = resume_with_profile_links(resume, profile)
-    pdf_path = resume_store.write_pdf(render_pdf(pdf_resume, result.tailored), p.company, p.title, p.url)
+    pdf_bytes = render_pdf(pdf_resume, result.tailored)
+    pdf_path = resume_store.write_pdf(pdf_bytes, p.company, p.title, p.url)
     print(f"  résumé PDF → {pdf_path}")
+
+    # ATS text-layer check (decision 043): what an ATS parser would actually see in this
+    # PDF — readability of name/email/phone + which JD-requested skills survived tailoring.
+    from .ats_check import verify_pdf
+    for note in verify_pdf(pdf_bytes, pdf_resume, jd.body or None).notes():
+        say("pdf", f"  {note}")
 
     apply_url = p.apply_url or p.url
     say("apply", f"▶ DRY-RUN apply (watch it fill; never submits): {apply_url}")
     generate = backends.claude_code_available()
+    # Salary-expectation fallback (decision 039): if the posting advertises a band, the resolver
+    # fills its midpoint (decision 038) and we opportunistically re-validate any cached estimate
+    # for this role against that real band; otherwise pre-compute the dynamic market estimate
+    # (Claude + Adzuna, cached) so the resolver never falls back to the static desired_salary.
+    from . import salary
+    band = salary.advertised_band(p.compensation or None, jd.body or None)
+    market = None
+    if band:
+        salary.validate_against_band(p.title, p.location, band)
+    else:
+        say("apply", "  no pay band advertised — resolving market salary estimate…")
+        market = salary.estimate(
+            p.title, p.location, profile.years_experience,
+            app_id=os.environ.get("ADZUNA_APP_ID", ""),
+            app_key=os.environ.get("ADZUNA_APP_KEY", ""),
+        )
+        say("apply", f"  salary expectation → {market:,} (market estimate)" if market is not None
+            else f"  salary expectation → {profile.desired_salary or 'unset'} (stored; no estimate available)")
     resolver = AnswerResolver(
         resume=load_resume(resume_yaml),
         profile=profile,
         enable_generation=generate,
         company=p.company or None,
         jd=jd.body or None,
+        pay=p.compensation or None,
+        market_salary=str(market) if market is not None else None,
     )
     # Basic info for the Track record comes from the discovered posting (reliable), keyed on
     # the posting URL for dedup — not scraped from the ATS form page.
@@ -197,11 +339,17 @@ def run_testing_mode(
         "company": p.company, "role": p.title, "location": p.location,
         "remote": ("remote" if p.remote else ("on-site" if p.remote is False else "")),
         "pay": p.compensation, "source_url": p.url,
+        # The judge's verdict at apply time — the calibration report correlates it
+        # with outcomes (decision 043).
+        "fit_score": match_obj.fit_score,
+        # Not a tracker column: the posting text, snapshotted by the per-application
+        # archive (decision 043) so a dead posting stays reconstructable.
+        "jd_body": jd.body or "",
     }
     return run_apply(
         apply_url, pdf_path, resolver,
         headed=headed, pause=pause, slow_mo=slow_mo,
-        profile_path=profile_path, hold=hold, on_filled=on_filled, meta=meta,
+        profile_path=profile_path, hold=hold, on_filled=on_filled, meta=meta, gate=gate,
     )
 
 
@@ -229,6 +377,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--headless", action="store_true", help="Testing mode: no visible browser.")
     parser.add_argument("--no-pause", action="store_true",
                         help="Testing mode: don't leave the browser open for review at the end.")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Force dry-run even if profile/safety.yaml is armed.")
+    parser.add_argument("--fresh", action="store_true",
+                        help="Ignore the cached discovery snapshot and re-search every board "
+                        "(re-judges with Claude). Default reuses a snapshot younger than "
+                        "cache_ttl_hours in your filters.")
     args = parser.parse_args(argv)
 
     resume = load_resume(args.resume)
@@ -248,11 +402,22 @@ def main(argv: list[str] | None = None) -> int:
     if use_claude and not backends.claude_code_available():
         print("Note: Claude Code CLI not found — ranking by keyword only. Sign in with `claude` to judge fit.\n")
 
-    print(f"Discovering from {len(filters.boards)} board(s)…")
-    res = discover_and_match(resume, filters, profile=profile, use_claude=use_claude)
+    if args.fresh:
+        print(f"Discovering fresh from {len(filters.boards)} board(s)…")
+    else:
+        print(f"Discovering from {len(filters.boards)} board(s) (reusing a fresh cache if present)…")
+    res = discover_and_match(resume, filters, profile=profile, use_claude=use_claude,
+                             force_fresh=args.fresh)
     seen_note = f" (skipped {res.skipped_seen} already in tracker)" if res.skipped_seen else ""
     bridge_note = f" (bridged {res.bridged} aggregator hit(s) to a fillable ATS)" if res.bridged else ""
-    print(f"Discovered {res.discovered} postings → {res.after_gates} after gates{seen_note}{bridge_note} → "
+    manual_note = (f" (set aside {len(res.non_fillable)} on portals ApplicationBot can't fill yet"
+                   " — e.g. Workday/iCIMS)" if res.non_fillable else "")
+    if res.from_cache:
+        mins = int((res.cache_age_seconds or 0) // 60)
+        age = f"{mins} min ago" if mins < 90 else f"{mins // 60}h ago"
+        print(f"→ Reused cached discovery (saved {age}; no board search, no Claude judging — "
+              "pass --fresh to re-search).")
+    print(f"Discovered {res.discovered} postings → {res.after_gates} after gates{seen_note}{bridge_note}{manual_note} → "
           f"{len(res.matches)} matched ≥{filters.min_skills} skill(s).")
     for e in res.errors:
         print(f"  ! {e}")
@@ -266,14 +431,29 @@ def main(argv: list[str] | None = None) -> int:
             print("\n(Run again with --apply-first to watch the top match go end-to-end in dry-run.)")
         return 0
 
-    min_fit = args.min_fit if args.min_fit is not None else filters.min_fit
+    if args.min_fit is not None:
+        min_fit = args.min_fit  # explicit override — calibration never second-guesses it
+    else:
+        min_fit, calib_note = effective_min_fit(filters)
+        if calib_note:
+            print(f"\n→ {calib_note}")
     top = pick_top(res.matches, min_fit=min_fit)
     if top is None:
         print(f"\nNo match met min-fit {min_fit}; nothing to apply to.")
         return 1
+
+    # Safety switch (decision 035): armed state comes from profile/safety.yaml; the KILL
+    # file halts submission; --dry-run overrides both to disarmed.
+    from .safety import load_gate
+    gate = None if args.dry_run else load_gate()
+    if gate is not None and gate.armed:
+        print("\n⚠ ARMED (profile/safety.yaml) — this run WILL SUBMIT if all required fields "
+              "resolve. Create profile/KILL or pass --dry-run to stop.")
+
     run_testing_mode(
         resume, top, args.resume, args.profile,
         backend=args.backend, headed=not args.headless, pause=not args.no_pause,
+        gate=gate,
     )
     return 0
 

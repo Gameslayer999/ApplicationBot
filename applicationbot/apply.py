@@ -4,9 +4,11 @@ Split into two layers:
   * AnswerResolver — pure, fully testable: given a form field's label, returns the value
     from the résumé contact + apply profile + saved answer bank (or None = "can't answer",
     a logged exception rather than a blocking prompt — decision 016).
-  * run_greenhouse — a thin, defensive Playwright driver. DRY-RUN by default: it fills the
-    form, uploads the PDF, screenshots it, and PAUSES for review — it never clicks submit
-    (Guideline #3: never submit against a real posting in development).
+  * run_apply — a thin, defensive Playwright driver. DRY-RUN by default: it fills the
+    form, uploads the PDF, screenshots it, and PAUSES for review — it clicks submit ONLY
+    when passed an armed SafetyGate (profile/safety.yaml + no KILL file, decision 035)
+    and every REQUIRED field resolved (Guideline #3: never submit against a real posting
+    in development).
 
 The Playwright browser (Chromium) is a separate one-time install: `playwright install
 chromium`. The resolver needs no browser.
@@ -18,7 +20,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Optional
 
-from . import answer_bank
+from . import answer_bank, salary
 from .apply_profile import QA, ApplicationProfile, load_profile
 from .models import Resume
 
@@ -31,7 +33,9 @@ class FilledField:
     label: str
     value: str
     control: str = "text"  # text | select | combobox | radio | file
-    source: str = "resolver"  # resolver | native (ATS autofill) | generated (Claude draft)
+    source: str = "resolver"  # resolver | native (ATS autofill) | generated (Claude draft) |
+    #                           option:<tier> (combobox: literal/learned/hint/claude/substring —
+    #                           how the option matched, the determinism audit trail)
 
 
 @dataclass
@@ -45,12 +49,29 @@ class ApplyReport:
     errors: list[str] = field(default_factory=list)
     screenshot: Optional[str] = None
     submitted: bool = False
+    # Armed-run outcome (decision 035): dry-run (never attempted) | blocked (armed but
+    # withheld — see `blockers`) | submitted (confirmation seen) | unconfirmed (form gone
+    # after the click but no explicit confirmation — treat as submitted, verify manually).
+    submit_state: str = "dry-run"
+    blockers: list[str] = field(default_factory=list)
+    confirmation: str = ""  # the evidence a submission went through (url / page text)
+    pages: int = 1  # form pages walked (1 = single-page form)
+    submit_probe: str = ""  # dry-run only: the submit control we WOULD click (live selector check)
     native_autofill: Optional[str] = None  # which native autofill ran (e.g. "greenhouse: MyGreenhouse")
 
     def summary(self) -> str:
         native = sum(1 for f in self.filled if f.source == "native")
         generated = sum(1 for f in self.filled if f.source == "generated")
-        lines = [f"Apply report — {self.ats} — {self.url}", f"  submitted: {self.submitted}"]
+        state = f" ({self.submit_state})" if self.submit_state != "dry-run" else ""
+        lines = [f"Apply report — {self.ats} — {self.url}", f"  submitted: {self.submitted}{state}"]
+        if self.confirmation:
+            lines.append(f"  confirmation: {self.confirmation}")
+        if self.blockers:
+            lines.append(f"  blocked: {'; '.join(self.blockers)}")
+        if self.pages > 1:
+            lines.append(f"  form pages walked: {self.pages}")
+        if self.submit_probe:
+            lines.append(f"  submit control (not clicked): {self.submit_probe}")
         if self.native_autofill:
             lines.append(f"  native autofill: {self.native_autofill} — {native} field(s) prefilled")
         breakdown = f"{native} native, {generated} AI-drafted, {len(self.filled) - native - generated} banked/direct"
@@ -123,6 +144,36 @@ def _degree_hints(degree_text: str) -> Optional[list[str]]:
 
 
 @dataclass
+class PendingDecisions:
+    """Unresolved decisions collected during round 1 of a page fill (the deterministic pass).
+    Between rounds they are adjudicated by at most 3 BATCHED Claude calls (classify,
+    bank-match, dropdown picks) instead of one CLI spawn per field; round 2 is the same
+    deterministic loop, now resolving from the injected results."""
+    questions: dict = field(default_factory=dict)  # label -> {"kind": str, "options": [str]}
+    picks: dict = field(default_factory=dict)      # label -> (value, [option texts shown])
+
+    def defer_question(self, label: str) -> None:
+        self.questions.setdefault(label, {"kind": "", "options": []})
+
+    def enrich(self, label: str, kind: str, options: Optional[list] = None) -> None:
+        """Attach the control's kind/options to a deferred question — a classified dropdown
+        whose answer doesn't literally match its options can then join the pick batch."""
+        q = self.questions.get(label)
+        if q is not None:
+            q["kind"] = q["kind"] or kind
+            q["options"] = q["options"] or [o for o in (options or []) if o]
+
+    def defer_pick(self, label: str, value: str, options: list) -> None:
+        self.picks.setdefault(label, (value, [o for o in options if o]))
+
+    def has(self, label: str) -> bool:
+        return label in self.questions or label in self.picks
+
+    def __bool__(self) -> bool:
+        return bool(self.questions or self.picks)
+
+
+@dataclass
 class AnswerResolver:
     resume: Resume
     profile: ApplicationProfile
@@ -130,9 +181,17 @@ class AnswerResolver:
     enable_generation: bool = False
     company: Optional[str] = None
     jd: Optional[str] = None
+    pay: Optional[str] = None  # the posting's advertised compensation string, if any
+    market_salary: Optional[str] = None  # dynamic estimate used when no band is advertised (decision 039)
     model: Optional[str] = None
     learned: list = field(default_factory=list)  # generated Q&A to persist after the run
     learned_options: dict = field(default_factory=dict)  # value -> [option texts] learned this run
+    # Two-pass batching state (decision 041). `pending` is set only during round 1 of a page
+    # fill: semantic/pick decisions are DEFERRED into it instead of spawning Claude per field.
+    pending: Optional[PendingDecisions] = None
+    semantic_done: set = field(default_factory=set)  # labels the batch already adjudicated
+    picks_done: set = field(default_factory=set)     # dropdown labels the batch already adjudicated
+    decided_options: dict = field(default_factory=dict)  # label -> batch-picked option text
 
     def learned_option_hints(self, value: Optional[str]) -> list[str]:
         """Dropdown options this value has matched before (learned across runs), so a repeat
@@ -143,10 +202,16 @@ class AnswerResolver:
         return list(self.profile.dropdown_aliases.get(key, [])) + list(self.learned_options.get(key, []))
 
     def learn_option(self, value: Optional[str], chosen: str) -> None:
-        """Record that `value` matched dropdown option `chosen` (persisted after the run)."""
+        """Record that `value` matched dropdown option `chosen` (persisted after the run).
+        Generic boolean values are NEVER learned: aliases are keyed by value alone, so a
+        "yes" → "I am authorized to work … for any employer" mapping learned on one question
+        would become a match candidate for EVERY future Yes/No dropdown. Descriptive boolean
+        dropdowns are covered per-question by option_hints instead."""
         if not (value and chosen):
             return
         key = " ".join(value.lower().split())
+        if key in ("yes", "no", "true", "false"):
+            return
         opts = self.learned_options.setdefault(key, [])
         if chosen not in opts:
             opts.append(chosen)
@@ -176,6 +241,17 @@ class AnswerResolver:
             return None
         m = re.search(r"\bin\s+(.+)", edu.degree or "", re.I)
         return (m.group(1).split(",")[0].strip() or None) if m else None
+
+    def _salary_expectation(self) -> Optional[str]:
+        """Salary-expectation answer, most-grounded source first:
+          1. the posting's advertised pay band → its midpoint (decision 038);
+          2. else the pre-computed market estimate for this posting (decision 039), injected
+             by the pipeline when the posting advertises nothing;
+          3. else the profile's stored desired_salary."""
+        band = salary.advertised_band(self.pay, self.jd)
+        if band:
+            return str((band[0] + band[1]) // 2)
+        return self.market_salary or self.profile.desired_salary or None
 
     def _place_matches_applicant(self, place: str) -> bool:
         """True if `place` (a country/region named in a Yes/No "are you located in X?" question)
@@ -335,6 +411,22 @@ class AnswerResolver:
             if p.requires_sponsorship is False and self._named_foreign_country(n):
                 return "Yes"
             return _yn(p.requires_sponsorship)
+        # ITAR / export-control gates — a U.S. citizen is a "U.S. person" under ITAR, so the
+        # gate is met. Checked BEFORE the citizen rule so the long blurb form ("applicant must
+        # be a (i) U.S. citizen or national, (ii) …green card holder…") resolves as ITAR. A
+        # non-citizen falls THROUGH (not return None) so a banked answer can still apply —
+        # a green-card holder also qualifies, which the profile can't derive. NB: "itar" must
+        # be a whole word — as a substring it hits "mil-ITAR-y status".
+        if (re.search(r"\bitar\b", n)
+                or _has(n, "export control", "export regulation", "us person", "u s person")) \
+                and p.us_citizen is True:
+            return "Yes"
+        # Security-clearance ELIGIBILITY (citizens are eligible to apply) — distinct from
+        # HAVING a clearance, which stays captured for the user (pinned null in the corpus).
+        if "clearance" in n and _has(n, "eligible", "eligibility", "ability to obtain",
+                                     "able to obtain", "can you obtain", "willing to obtain") \
+                and p.us_citizen is True:
+            return "Yes"
         # Citizenship — also answers "confirm you are a US citizen located in the US" gates,
         # since those are Yes/No and citizenship is the binding requirement.
         if _has(n, "citizen"):
@@ -398,7 +490,13 @@ class AnswerResolver:
 
         # Logistics
         if _has(n, "salary", "compensation expectation", "desired pay", "expected compensation"):
-            return p.desired_salary or None
+            # No advertised band, no market estimate, no stored figure → fall THROUGH (don't
+            # return None) so a user-entered banked answer below can still answer it. A live
+            # AppLovin dry-run hit this: the early return skipped the bank and the field fell
+            # to the drafting path, which fabricated a salary.
+            sal = self._salary_expectation()
+            if sal is not None:
+                return sal
         if _has(n, "start date", "available to start", "notice period", "when can you start",
                 "earliest", "start working", "want to start", "like to start", "when would you start",
                 "when could you start", "availability to start", "available start"):
@@ -409,6 +507,17 @@ class AnswerResolver:
         # accommodation?" — answered Yes (the applicant can do the job); a standard required Yes/No.
         if _has(n, "essential functions", "perform the essential", "essential function",
                 "perform the duties of", "perform the job duties"):
+            return "Yes"
+        # Readiness/commitment closers — "Are you up for it?", "Are you ready?", "Does this
+        # sound like you?" — ask for a commitment to the described role, not a fact; applying
+        # IS that commitment, so answer Yes. Guarded so logistical "ready" questions (start
+        # date, relocation, remote/onsite, travel) still resolve from their profile rules
+        # above or are captured for the user, never blanket-answered Yes.
+        if _has(n, "are you up for", "up for it", "up for the challenge", "up to the challenge",
+                "ready for the challenge", "ready to take on", "sound like you",
+                "are you ready") \
+                and not _has(n, "start", "relocate", "remote", "onsite", "on site", "travel",
+                             "commute", "when"):
             return "Yes"
 
         # Voluntary EEO
@@ -490,9 +599,11 @@ class AnswerResolver:
             "us_citizen": _yn(p.us_citizen),
             "willing_to_relocate": _yn(p.willing_to_relocate),
             "open_to_remote": _yn(p.open_to_remote),
-            "desired_salary": p.desired_salary or None,
+            "desired_salary": self._salary_expectation(),
             "earliest_start_date": p.earliest_start_date or None,
             "years_experience": p.years_experience or None,
+            "itar_us_person": "Yes" if p.us_citizen is True else None,
+            "role_commitment": "Yes",
             "how_heard": p.how_heard or None,
             "location": p.location or c.location or None,
             "country": p.country or None,
@@ -509,13 +620,42 @@ class AnswerResolver:
             return value
         if not self.enable_generation:
             return None
-        key = answer_bank.classify_question(label, model=self.model)
-        if not key:
+        if self.pending is not None:  # round 1 of a two-pass fill — defer to the batch
+            if label not in self.semantic_done:
+                self.pending.defer_question(label)
             return None
-        ans = self.answer_for_type(key)
-        if ans is None:
-            return None  # matched a type but the profile field is unset — leave for the user
-        self.learned.append(QA(question=label, answer="", maps_to=key, generated=True))
+        if label in self.semantic_done:
+            return None  # the batch already adjudicated this label — never re-ask per-field
+        key = answer_bank.classify_question(label, model=self.model)
+        if key:
+            ans = self.answer_for_type(key)
+            if ans is not None:
+                self.learned.append(QA(question=label, answer="", maps_to=key, generated=True))
+                return ans
+        # Not a structured type (or its profile field is unset) — the question may still be a
+        # REPHRASING of a custom question already answered in the bank.
+        return self._bank_semantic(label)
+
+    def _bank_semantic(self, label: str) -> Optional[str]:
+        """On a literal bank miss, Claude-match `label` against the banked Q&A — a saved answer
+        should be reused for any rewording of its question, not only the exact phrasing it was
+        saved under. On a hit, the answer is returned and the new phrasing is cached as a bank
+        alias so the next encounter matches literally (no Claude call)."""
+        cands: list[tuple[QA, str]] = []
+        for qa in self.profile.custom_answers:
+            mt = getattr(qa, "maps_to", "")
+            ans = self.answer_for_type(mt) if mt else (qa.answer or "").strip()
+            if (qa.question or "").strip() and ans:
+                cands.append((qa, ans))
+        if not cands:
+            return None
+        idx = answer_bank.match_banked_question(
+            label, [(qa.question, ans) for qa, ans in cands], model=self.model)
+        if idx is None:
+            return None
+        qa, ans = cands[idx]
+        self.learned.append(QA(question=label, answer="" if qa.maps_to else qa.answer,
+                               maps_to=qa.maps_to, generated=True))
         return ans
 
     def option_hints(self, label: str) -> Optional[list[str]]:
@@ -544,6 +684,14 @@ class AnswerResolver:
                          "for any employer", "Yes"])
             if self.profile.work_authorized is False:
                 return ["I am not authorized to work", "not authorized to work", "No"]
+        # ITAR/export-control dropdowns list the qualifying statuses — a citizen picks the
+        # citizen/national option. Before the citizen hints so ITAR blurbs naming several
+        # statuses get these; same hint texts, plus the "U.S. person" phrasing ITAR forms use.
+        if (re.search(r"\bitar\b", n)
+                or _has(n, "export control", "export regulation", "us person", "u s person")) \
+                and self.profile.us_citizen is True:
+            return ["U.S. citizen or national", "U.S. citizen", "US citizen", "U.S. Person",
+                    "US Person", "Yes"]
         # Citizenship-status dropdowns list statuses ("(a) U.S. citizen or national…"), not Yes/No.
         if _has(n, "citizen"):
             if self.profile.us_citizen is True:
@@ -600,7 +748,19 @@ class AnswerResolver:
         value = self.resolve(label)
         if value is not None:
             return value, "resolver"
-        if not self.enable_generation or not answer_bank.is_open_ended(label, is_textarea):
+        if not self.enable_generation:
+            return None, ""
+        if self.pending is not None and label not in self.semantic_done:
+            # Round 1 of a two-pass fill — classify/bank-match (and any drafting) wait for
+            # round 2; "pending" tells the caller not to capture/skip the field yet.
+            self.pending.defer_question(label)
+            return None, "pending"
+        # A reworded banked question beats drafting a fresh answer (and covers short text
+        # fields, which never reach resolve_semantic). Skipped when the batch already checked.
+        banked = None if label in self.semantic_done else self._bank_semantic(label)
+        if banked is not None:
+            return banked, "resolver"
+        if not answer_bank.is_open_ended(label, is_textarea):
             return None, ""
         company_specific = answer_bank.is_company_specific(label)
         if company_specific and not (self.company or self.jd):
@@ -669,6 +829,8 @@ _REQUIRED_LABELS_JS = r"""(scope) => {
   const clean = s => (s || '').replace(/\s+/g, ' ').replace(/\*/g, '').trim();
   const out = [];
   document.querySelectorAll(scope + 'label, ' + scope + 'legend').forEach(l => {
+    const r = l.getBoundingClientRect();
+    if (!(r.width && r.height)) return;  // hidden (e.g. a wizard's other steps) don't count
     if ((l.innerText || '').includes('*')) {
       const c = clean(l.innerText);
       if (c && !out.includes(c)) out.push(c);
@@ -915,8 +1077,12 @@ def _upload_resume(frame, resume_pdf: str, report: "ApplyReport") -> None:
         except Exception:
             continue
     try:  # classic/older forms expose a direct file input
-        frame.locator('input[type="file"]').first.set_input_files(resume_pdf)
-        report.filled.append(FilledField("Resume", resume_pdf, "file"))
+        fi = frame.locator('input[type="file"]')
+        if fi.count():
+            fi.first.set_input_files(resume_pdf)
+            report.filled.append(FilledField("Resume", resume_pdf, "file"))
+        # No upload control on this page: a wizard may expose it on a later step — the
+        # page walker retries there, and flags it if the whole walk ends without one.
     except Exception as e:
         report.errors.append(f"resume upload: {type(e).__name__}: {e}")
 
@@ -1117,20 +1283,35 @@ def _field_options(page, loc, tag: str, role: str) -> list[str]:
     return []
 
 
-def _claude_pick_click(page, opts, texts, label, value, resolver) -> Optional[str]:
-    """Ask Claude to pick the best option from `texts` and click it by index, learning the
-    mapping. Returns the chosen text or None. `opts`/`texts` must come from the SAME open."""
-    if not texts:
-        return None
-    chosen = answer_bank.pick_dropdown_option(label, value, texts, model=resolver.model)
-    if not chosen:
-        return None
+def _commit_option_text(page, loc, chosen: str, query: Optional[str] = None) -> bool:
+    """Reopen the combobox (retyping `query` first for a searchable list) and click the option
+    whose text is exactly `chosen`. Deciding an option (a Claude call can take tens of seconds)
+    happens with the menu CLOSED — holding a react-select popup open across a subprocess call
+    is a staleness race (the menu re-renders, indexes shift, options detach). This re-derives
+    the same option list and commits deterministically by exact text."""
+    if not _open_combobox(page, loc):
+        return False
+    if query is not None:
+        try:
+            loc.fill(query, timeout=4000)
+        except Exception:
+            return False
+        page.wait_for_timeout(900)
+    else:
+        page.wait_for_timeout(250)
+    opts, texts = _open_options_and_texts(page)
     for i, t in enumerate(texts):
         if t == chosen:
-            opts.nth(i).click(timeout=4000)
-            resolver.learn_option(value, chosen)
-            return chosen
-    return None
+            try:
+                opts.nth(i).click(timeout=4000)
+                return True
+            except Exception:
+                return False
+    try:
+        loc.press("Escape")  # option no longer offered — close cleanly, caller falls through
+    except Exception:
+        pass
+    return False
 
 
 def _search_queries(value: str) -> list[str]:
@@ -1163,44 +1344,67 @@ def _search_queries(value: str) -> list[str]:
 
 
 def _fill_combobox(page, loc, value: Optional[str], hints: Optional[list[str]] = None,
-                   resolver=None, label: str = "") -> Optional[str]:
+                   resolver=None, label: str = "") -> Optional[tuple[str, str]]:
     """react-select combobox: commit the option matching the answer (or a ranked hint). Returns
-    the committed option text, or None. Never leaves uncommitted typed text (which would look
-    filled but submit as an invalid/empty selection) — clears the field if nothing selected.
+    (committed option text, matched tier) — tier ∈ literal | learned | hint | claude | substring,
+    recorded on the fill report so every dropdown fill is auditable — or None. Never leaves
+    uncommitted typed text (which would look filled but submit as an invalid/empty selection) —
+    clears the field if nothing selected.
 
     (1) On the FIRST open, literal-match any candidate (answer + hints + LEARNED aliases). If no
-    match and it's a static list (options already shown), let Claude pick from those FRESH
-    options and LEARN it — done here, before any typing pollutes the react-select filter.
+    match and it's a static list (options already shown), CLOSE the menu, let Claude pick from
+    those options, then recommit by exact text (a Claude call takes seconds-to-minutes — deciding
+    never happens with the menu open) and LEARN it.
     (2) Otherwise type each candidate to filter a searchable list; if a typed filter yields
-    options but none literally match, let Claude pick from them and learn. Learned mappings make
-    the same value match instantly next time without another Claude call (decision 033)."""
+    options but none literally match, same closed-menu Claude pick over them. Learned mappings
+    make the same value match instantly next time without another Claude call (decision 033)."""
     learned = resolver.learned_option_hints(value) if resolver is not None else []
-    candidates = [w for w in ([value] if value else []) + (hints or []) + learned if w]
-    use_claude = resolver is not None and getattr(resolver, "enable_generation", False) and bool(value)
+    # A batch-decided pick for THIS label leads the candidates: committed by exact text in
+    # round 2 of a two-pass fill, reported as tier "claude" (Claude decided it, batched).
+    decided = resolver.decided_options.get(label) if resolver is not None else None
+    pending = resolver.pending if resolver is not None else None
+    picks_done = resolver.picks_done if resolver is not None else set()
+    candidates = ([(decided, "claude")] if decided else []) \
+        + ([(value, "literal")] if value else []) \
+        + [(h, "hint") for h in (hints or []) if h] \
+        + [(l, "learned") for l in learned if l]
+    use_claude = resolver is not None and getattr(resolver, "enable_generation", False) \
+        and bool(value) and label not in picks_done
 
     # Phase 1 — literal match on the options shown on open; then Claude-pick for static lists.
     if _open_combobox(page, loc):
         page.wait_for_timeout(250)
         opts, texts = _open_options_and_texts(page)
-        for want in candidates:
+        for want, tier in candidates:
             for i, t in enumerate(texts):
                 if _matches(t, want):
                     opts.nth(i).click(timeout=4000)
-                    return t
-        if use_claude and len(texts) >= 3:  # static list fully shown — pick now, before pollution
-            chosen = _claude_pick_click(page, opts, texts, label, value, resolver)
-            if chosen:
-                return chosen
+                    if tier == "claude":
+                        resolver.learn_option(value, t)  # a committed batch pick is learned too
+                    return t, tier
         try:
-            loc.press("Escape")  # close so Phase 2 reopens/types cleanly
+            loc.press("Escape")  # close before any Claude call / Phase 2 typing
         except Exception:
             pass
+        if use_claude and len(texts) >= 3:  # static list fully shown — pick before pollution
+            if pending is not None:
+                # Round 1 of a two-pass fill: the pick joins ONE batched call between rounds;
+                # round 2 recommits the decided text. Skip the remaining phases — filling by
+                # substring now would preempt the vetted batch decision.
+                pending.defer_pick(label, value, texts)
+                return None
+            chosen = answer_bank.pick_dropdown_option(label, value, texts, model=resolver.model)
+            if chosen and _commit_option_text(page, loc, chosen):
+                resolver.learn_option(value, chosen)
+                return chosen, "claude"
 
     # Phase 2 — type each candidate to filter a searchable list (literal match).
-    for want in candidates:
+    for want, tier in candidates:
         chosen = _combo_try(page, loc, want)
         if chosen:
-            return chosen
+            if tier == "claude" and resolver is not None:
+                resolver.learn_option(value, chosen)
+            return chosen, tier
 
     # Phase 2b — searchable list, no literal match on the full value: type progressively-shorter,
     # article-stripped queries (a school picker indexes "The Pennsylvania State University" under
@@ -1217,10 +1421,16 @@ def _fill_combobox(page, loc, value: Optional[str], hints: Optional[list[str]] =
             except Exception:
                 continue
             page.wait_for_timeout(900)
-            opts, texts = _open_options_and_texts(page)
-            chosen = _claude_pick_click(page, opts, texts, label, value, resolver)
-            if chosen:
-                return chosen
+            _, texts = _open_options_and_texts(page)
+            try:
+                loc.press("Escape")  # decide with the menu closed; recommit retypes the query
+            except Exception:
+                pass
+            chosen = answer_bank.pick_dropdown_option(label, value, texts, model=resolver.model) \
+                if texts else None
+            if chosen and _commit_option_text(page, loc, chosen, query=q):
+                resolver.learn_option(value, chosen)
+                return chosen, "claude"
 
     # Phase 2c — no Claude (or it declined): best-effort substring match on the shortened queries
     # for a comma-free name value (e.g. a school), so the field still fills when generation is off.
@@ -1230,7 +1440,7 @@ def _fill_combobox(page, loc, value: Optional[str], hints: Optional[list[str]] =
         for q in _search_queries(value)[1:]:  # [0] == value, already tried in Phase 2
             chosen = _combo_try(page, loc, q)
             if chosen:
-                return chosen
+                return chosen, "substring"
 
     try:
         loc.fill("", timeout=2000)  # discard any typed-but-uncommitted text
@@ -1309,6 +1519,11 @@ def _fill_all_fields(page, resolver: AnswerResolver, report: "ApplyReport", done
             value = resolver.resolve_semantic(label)
         if value is None and not hints and not is_free:
             kind = "select" if tag == "select" else ("dropdown" if role == "combobox" else "text")
+            if resolver.pending is not None and resolver.pending.has(label):
+                # Deferred to the batched decision step — round 2 revisits it. Record the
+                # control's kind/options so a classified dropdown can join the pick batch.
+                resolver.pending.enrich(label, kind, _field_options(page, loc, tag, role))
+                continue
             _record_capture(report, label, kind, _field_options(page, loc, tag, role))
             report.skipped.append(f"{label} — no saved answer")
             done.add(label)
@@ -1317,9 +1532,15 @@ def _fill_all_fields(page, resolver: AnswerResolver, report: "ApplyReport", done
             # Same question can be a dropdown or a text box depending on the company —
             # dispatch on the control type discovered live.
             if role == "combobox":
-                chosen = _fill_combobox(page, loc, value, hints, resolver=resolver, label=label)
-                if chosen:
-                    report.filled.append(FilledField(label, chosen, "combobox"))
+                got = _fill_combobox(page, loc, value, hints, resolver=resolver, label=label)
+                if got:
+                    text, tier = got
+                    # source records HOW the option matched (option:literal | option:learned |
+                    # option:hint | option:claude | option:substring) — the determinism audit
+                    # trail: anything but option:claude was resolved without a model call.
+                    report.filled.append(FilledField(label, text, "combobox", source=f"option:{tier}"))
+                elif resolver.pending is not None and resolver.pending.has(label):
+                    continue  # pick deferred to the batch — round 2 recommits by exact text
                 else:
                     report.skipped.append(f"{label} — no dropdown option matched {value!r}")
             elif tag == "select":
@@ -1327,6 +1548,8 @@ def _fill_all_fields(page, resolver: AnswerResolver, report: "ApplyReport", done
             elif is_free:
                 # Banked/structured answer, else a grounded Claude draft for open-ended questions.
                 ans, source = resolver.freetext_answer(label, is_textarea=(tag == "textarea"))
+                if source == "pending":
+                    continue  # deferred to the batch — round 2 revisits
                 if ans is None:
                     _record_capture(report, label, "textarea" if tag == "textarea" else "text")
                     report.skipped.append(f"{label} — no saved answer")
@@ -1361,7 +1584,7 @@ def _fill_radio_groups(page, resolver: AnswerResolver, report: "ApplyReport", do
         if not q or q in done:
             continue
         value = resolver.resolve(q)
-        if value is None:  # semantic classify onto a known type (Claude, cached) on a miss
+        if value is None:  # semantic classify onto a known type (batched/cached) on a miss
             value = resolver.resolve_semantic(q)
         if value is None:
             labels = []
@@ -1372,6 +1595,9 @@ def _fill_radio_groups(page, resolver: AnswerResolver, report: "ApplyReport", do
                     lb = ""
                 if lb:
                     labels.append(lb)
+            if resolver.pending is not None and resolver.pending.has(q):
+                resolver.pending.enrich(q, "radio", labels)
+                continue  # deferred to the batched decision step — round 2 revisits
             _record_capture(report, q, "radio", labels)
             report.skipped.append(f"{q} — no saved answer")
             done.add(q)
@@ -1462,6 +1688,9 @@ def _fill_checkboxes(page, resolver: AnswerResolver, report: "ApplyReport", done
         # Also consult option_hints — e.g. a "US" checkbox vs our "United States" value (Stripe's
         # country list uses abbreviations UAE/UK/US), matched via the country aliases.
         candidates = [c for c in ([value] if value else []) + (resolver.option_hints(q) or []) if c]
+        if not candidates and resolver.pending is not None and resolver.pending.has(q):
+            resolver.pending.enrich(q, "checkbox", [info[i]["lbl"] for i in idxs])
+            continue  # deferred to the batched decision step — round 2 revisits
         done.add(q)
         if not candidates:
             _record_capture(report, q, "checkbox", [info[i]["lbl"] for i in idxs])
@@ -1517,6 +1746,380 @@ def _flag_missing_required(page, report: "ApplyReport", done: set) -> None:
         report.skipped.append(f"{r} — REQUIRED, not filled (no matching answer or unsupported field)")
 
 
+# ------------------------------------------------------------- multi-page navigation
+
+# Buttons that advance a multi-step wizard (Workday-style). Anchored so they can NEVER
+# match a submit control ("Submit application") or an auth control ("Continue with
+# Google") — advancing pages is fill work, not submission, so it is dry-run-safe.
+_NEXT_PATTERNS = (r"^next$", r"^next step$", r"^continue$", r"^save (?:and|&) continue$")
+
+_MAX_FORM_PAGES = 8  # runaway-wizard backstop
+
+
+def _find_next_button(frame):
+    for pat in _NEXT_PATTERNS:
+        try:
+            btn = frame.get_by_role("button", name=re.compile(pat, re.I)).first
+            if btn.count() and btn.is_visible():
+                return btn
+        except Exception:
+            continue
+    return None
+
+
+def _page_signature(frame) -> str:
+    """Cheap fingerprint of the VISIBLE form controls, used to detect that a wizard
+    actually advanced (name/id sets differ between steps; hidden steps don't count)."""
+    return frame.evaluate(
+        """() => {
+          const els = Array.from(document.querySelectorAll(
+            'input:not([type=hidden]), textarea, select, [role=combobox]'
+          )).filter(e => { const r = e.getBoundingClientRect(); return r.width && r.height; });
+          return els.length + ':' + els.slice(0, 40).map(e => e.name || e.id || '').join(',');
+        }"""
+    )
+
+
+def _advance_page(page, frame, nxt, report: "ApplyReport"):
+    """Click a next/continue control and wait for the form to actually change. Returns
+    (advanced, frame) — the frame is re-located because a step change can remount or
+    navigate it. No change = the wizard rejected the advance (client-side validation);
+    that's recorded and the caller stops walking."""
+    import time
+
+    try:
+        before = _page_signature(frame)
+    except Exception:
+        before = ""
+    try:
+        nxt.click(timeout=4000)
+    except Exception as e:
+        report.errors.append(f"next-step click failed: {type(e).__name__}: {e}")
+        return False, frame
+
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        page.wait_for_timeout(400)
+        try:
+            cur, n = _find_form_frame(page)
+            sig = _page_signature(cur) if n else ""
+        except Exception:
+            continue  # frame detached mid-navigation — keep polling
+        if sig and sig != before:
+            page.wait_for_timeout(400)  # settle the newly-mounted step
+            return True, cur
+
+    try:
+        errs = [t for t in frame.evaluate(_VALIDATION_JS) if t]
+    except Exception:
+        errs = []
+    report.errors.append(
+        "could not advance to the next form page — "
+        + ("validation: " + "; ".join(errs[:5]) if errs
+           else "no change after clicking next (fields on later pages were not reached)")
+    )
+    return False, frame
+
+
+def _resolve_pending(resolver: AnswerResolver, pending: PendingDecisions) -> None:
+    """Adjudicate round 1's deferred decisions with at most 3 BATCHED Claude calls, then inject
+    the results so round 2 (the same deterministic loop) fills without any per-field call:
+      1. classify — novel questions → structured types, answered live from the profile;
+      2. bank-match — the rest → a reworded saved answer;
+         both injected as in-memory bank entries (resolve() hits them in round 2; persistence
+         still goes through remember_answers' valid_mapping gate);
+      3. dropdown picks — the deferred static-list picks, plus any just-classified dropdown
+         whose new answer doesn't literally match its recorded options → decided_options,
+         recommitted by exact text in round 2.
+    Every deferred label is marked adjudicated regardless of outcome, so round 2 captures the
+    leftovers for the user instead of falling back to per-field Claude calls."""
+    labels = list(pending.questions)
+    types = answer_bank.classify_questions(labels, model=resolver.model) if labels else {}
+    unresolved = []
+    for label in labels:
+        key = types.get(label)
+        ans = resolver.answer_for_type(key) if key else None
+        if key and ans is not None:
+            qa = QA(question=label, answer="", maps_to=key, generated=True)
+            resolver.learned.append(qa)
+            resolver.profile.custom_answers.append(qa)
+        else:
+            unresolved.append(label)
+    if unresolved:
+        cands = []
+        for qa in resolver.profile.custom_answers:
+            mt = getattr(qa, "maps_to", "")
+            ans = resolver.answer_for_type(mt) if mt else (qa.answer or "").strip()
+            if (qa.question or "").strip() and ans:
+                cands.append((qa, ans))
+        if cands:
+            matches = answer_bank.match_banked_questions(
+                unresolved, [(qa.question, ans) for qa, ans in cands], model=resolver.model)
+            for label in unresolved:
+                idx = matches.get(label)
+                if idx is None:
+                    continue
+                qa, _ = cands[idx]
+                alias = QA(question=label, answer="" if qa.maps_to else qa.answer,
+                           maps_to=qa.maps_to, generated=True)
+                resolver.learned.append(alias)
+                resolver.profile.custom_answers.append(alias)
+    resolver.semantic_done.update(labels)
+
+    items = [(label, value, opts) for label, (value, opts) in pending.picks.items()]
+    for label, meta in pending.questions.items():
+        if meta.get("kind") != "dropdown" or len(meta.get("options") or []) < 3:
+            continue
+        value = resolver.resolve(label)  # the just-injected answer, if any
+        if not value:
+            continue
+        wants = [value] + (resolver.option_hints(label) or []) + resolver.learned_option_hints(value)
+        if any(_matches(o, w) for w in wants for o in meta["options"]):
+            continue  # round 2 matches it deterministically — no pick needed
+        items.append((label, value, meta["options"]))
+    if items:
+        for (label, value, _), chosen in zip(items, answer_bank.pick_dropdown_options(
+                items, model=resolver.model)):
+            if chosen:
+                resolver.decided_options[label] = chosen
+    resolver.picks_done.update(label for label, _, _ in items)
+
+
+def _fill_page(frame, resolver: AnswerResolver, report: "ApplyReport", done: set) -> None:
+    """Fill one form page in two deterministic passes with ONE batched decision step between
+    them (decision 041). Round 1 fills everything the rules/bank/hints/aliases resolve and
+    DEFERS the unresolved decisions; ≤3 batched Claude calls adjudicate them all; round 2
+    re-runs the same loop, which now fills from the injected results. Claude cost is per PAGE,
+    not per field — and no model call ever runs while a menu is open (decision 040). Typeahead
+    searches stay inline (their options only exist as you type). With generation disabled the
+    first pass is the only pass, exactly as before."""
+    resolver.pending = PendingDecisions() if resolver.enable_generation else None
+    try:
+        _fill_all_fields(frame, resolver, report, done, only_empty=True)
+        _fill_radio_groups(frame, resolver, report, done)
+        _fill_checkboxes(frame, resolver, report, done)
+    finally:
+        pending, resolver.pending = resolver.pending, None
+    if pending:
+        _resolve_pending(resolver, pending)
+        _fill_all_fields(frame, resolver, report, done, only_empty=True)
+        _fill_radio_groups(frame, resolver, report, done)
+        _fill_checkboxes(frame, resolver, report, done)
+
+
+def _fill_all_pages(page, frame, resolver: AnswerResolver, report: "ApplyReport", done: set,
+                    resume_pdf: str = ""):
+    """Fill EVERY page of the form: fill the current page's fields, flag its unmet REQUIRED
+    fields (they're invisible once we advance), then walk Next/Continue until the final
+    page. Single-page forms take one pass and find no next button — behaviour unchanged.
+    Returns the frame holding the FINAL page (where the submit control lives)."""
+    for step in range(1, _MAX_FORM_PAGES + 1):
+        # A wizard may put the résumé upload on a later step — attach once, wherever it is.
+        if step > 1 and resume_pdf and not any(f.control == "file" for f in report.filled):
+            try:
+                if frame.locator('input[type="file"]').count():
+                    _upload_resume(frame, resume_pdf, report)
+            except Exception:
+                pass
+        _fill_page(frame, resolver, report, done)
+        _flag_missing_required(frame, report, done)
+
+        nxt = _find_next_button(frame)
+        advanced = False
+        if nxt is not None:
+            advanced, frame = _advance_page(page, frame, nxt, report)
+        if not advanced:
+            report.pages = step
+            break
+    else:
+        report.errors.append(f"stopped after {_MAX_FORM_PAGES} form pages — wizard longer than expected")
+        report.pages = _MAX_FORM_PAGES
+
+    if resume_pdf and not any(f.control == "file" for f in report.filled):
+        report.skipped.append("Resume upload — no upload field found on any form page")
+    return frame
+
+
+# ------------------------------------------------------------------ submit (armed only)
+
+# Submit-control names, most specific first. GH/Lever/Ashby all label theirs
+# "Submit application"; a bare "apply" button is deliberately NOT matched — that's the
+# control that *opens* a form, not the one that sends it.
+_SUBMIT_PATTERNS = (r"^submit\s+(?:your\s+)?application$", r"^submit$", r"^send\s+application$")
+
+_CONFIRMATION_RX = re.compile(
+    r"thank you for applying|thanks for applying|application (?:has been |was )?(?:submitted|received)"
+    r"|we(?:'|’)?ve received your application|successfully submitted"
+    r"|your application has been received",
+    re.I,
+)
+
+# Visible required labels whose control is still EMPTY in the DOM (label→control via
+# for=/descendant/fieldset; value read like _VALUE_JS incl. react-select's single-value).
+_UNMET_REQUIRED_JS = r"""(scope) => {
+  const clean = s => (s || '').replace(/\s+/g, ' ').replace(/\*/g, '').trim();
+  const out = [];
+  document.querySelectorAll(scope + 'label, ' + scope + 'legend').forEach(l => {
+    const r = l.getBoundingClientRect();
+    if (!(r.width && r.height)) return;
+    if (!(l.innerText || '').includes('*')) return;
+    const name = clean(l.innerText);
+    if (!name) return;
+    let filled = null;  // null = couldn't tie the label to a control
+    if (l.tagName === 'LEGEND') {
+      const fs = l.closest('fieldset');
+      if (fs) filled = !!(fs.querySelector('input:checked')
+        || Array.from(fs.querySelectorAll('input, textarea, select'))
+             .some(e => (e.value || '').trim()));
+    } else {
+      let el = null;
+      const forId = l.getAttribute('for');
+      if (forId) el = document.getElementById(forId);
+      if (!el) el = l.querySelector('input, textarea, select');
+      if (el) {
+        if (el.type === 'checkbox' || el.type === 'radio') {
+          filled = el.checked || !!(el.name && document.querySelector(
+            'input[name="' + el.name.replace(/"/g, '\\"') + '"]:checked'));
+        } else {
+          let v = (el.value || '').trim();
+          if (!v) {
+            const ctl = el.closest('[class*="control"]');
+            const sv = ctl && ctl.querySelector('[class*="single-value"], [class*="multi-value__label"]');
+            if (sv) v = (sv.innerText || '').trim();
+          }
+          filled = !!v;
+        }
+      }
+    }
+    if (filled === true) return;
+    if (!out.includes(name)) out.push(name);
+  });
+  return out;
+}"""
+
+# Visible client-side validation messages after a rejected submit.
+_VALIDATION_JS = """() => Array.from(document.querySelectorAll(
+    '[class*="error" i]:not(input):not(textarea), [role="alert"]'))
+    .map(e => (e.innerText || '').replace(/\\s+/g, ' ').trim())
+    .filter(t => t && t.length < 200).slice(0, 10)"""
+
+
+def _find_submit_button(frame):
+    for pat in _SUBMIT_PATTERNS:
+        try:
+            btn = frame.get_by_role("button", name=re.compile(pat, re.I)).first
+            if btn.count() and btn.is_visible():
+                return btn
+        except Exception:
+            continue
+    try:  # classic forms: <input type=submit>
+        btn = frame.locator('input[type="submit"], button[type="submit"]').first
+        if btn.count() and btn.is_visible():
+            return btn
+    except Exception:
+        pass
+    return None
+
+
+def _confirmation_evidence(page, frame) -> str:
+    """Non-empty evidence string when the page shows a submission confirmation."""
+    try:
+        u = page.url or ""
+        if re.search(r"confirmation|/thank", u, re.I):
+            return f"url: {u}"
+    except Exception:
+        pass
+    for fr in (frame, page.main_frame):  # the form frame may have navigated/detached
+        try:
+            text = fr.evaluate("() => document.body ? document.body.innerText : ''") or ""
+            m = _CONFIRMATION_RX.search(text)
+            if m:
+                return f"page text: {m.group(0)!r}"
+        except Exception:
+            continue
+    return ""
+
+
+def _attempt_submit(page, frame, report: "ApplyReport", gate) -> None:
+    """The armed submit path (decision 035). Pre-submit gate: every REQUIRED field must be
+    filled AND the SafetyGate must allow it (armed + no profile/KILL file + under the
+    per-run cap, re-checked immediately before the click). On any doubt the application is
+    left UNSUBMITTED with the reason in `report.blockers` — a blocked outcome to record,
+    never a prompt (decision 016's exception-queue model)."""
+    import time
+
+    missing = [s.split(" — ")[0] for s in report.skipped if "REQUIRED" in s]
+    if frame is not None:
+        # Belt and braces: live-scan the visible required labels whose controls are still
+        # EMPTY in the DOM — catches a required field that was captured as "no saved
+        # answer" (never REQUIRED-tagged) before we click anything. A label we filled by
+        # record (report.filled) is trusted even if its widget hides the committed value.
+        try:
+            filled = {f.label for f in report.filled}
+            for r in frame.evaluate(_UNMET_REQUIRED_JS, _scope_prefix(frame)):
+                if r not in missing and not any(r == f or r in f for f in filled):
+                    missing.append(r)
+        except Exception:
+            pass
+    if missing:
+        report.submit_state = "blocked"
+        report.blockers = ["unresolved required field(s): " + "; ".join(missing)]
+        return
+    ok, reason = gate.may_submit()  # kill switch / cap checked at the last possible moment
+    if not ok:
+        report.submit_state = "blocked"
+        report.blockers = [reason]
+        return
+    btn = _find_submit_button(frame)
+    if btn is None:
+        report.submit_state = "blocked"
+        report.blockers = ["no submit button found on the form"]
+        return
+    try:
+        btn.click(timeout=5000)
+    except Exception as e:
+        report.submit_state = "blocked"
+        report.blockers = [f"submit click failed: {type(e).__name__}: {e}"]
+        return
+    gate.record_submission()  # count the click, not the confirmation — conservative vs. the cap
+
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        evidence = _confirmation_evidence(page, frame)
+        if evidence:
+            report.submitted = True
+            report.submit_state = "submitted"
+            report.confirmation = evidence
+            return
+        try:
+            errs = [t for t in frame.evaluate(_VALIDATION_JS) if t]
+        except Exception:
+            errs = []
+        if errs:
+            report.submit_state = "blocked"
+            report.blockers = ["form rejected the submit: " + "; ".join(errs[:5])]
+            return
+        page.wait_for_timeout(500)
+
+    # No confirmation text and no rejection. If the form is gone (or its frame detached on a
+    # navigation), the submit almost certainly went through — mark it submitted-but-unconfirmed
+    # so we NEVER risk a double submission. A form still sitting there means the click had no
+    # observable effect: treat as not submitted.
+    try:
+        still_there = _count_fields(frame) >= 2
+    except Exception:
+        still_there = False
+    if still_there:
+        report.submit_state = "blocked"
+        report.blockers = ["submit clicked but the form is still showing with no confirmation — "
+                          "treated as NOT submitted; verify manually"]
+    else:
+        report.submitted = True
+        report.submit_state = "unconfirmed"
+        report.confirmation = ("form disappeared after the submit click; no explicit confirmation "
+                               "text found — verify via the confirmation email")
+
+
 def _show_done_banner(page, report: "ApplyReport", ok: bool = True) -> None:
     """Inject a fixed overlay so the watching user gets a clear, visible signal — green when
     fields were filled, red when the form didn't load or nothing filled (with the reason)."""
@@ -1526,6 +2129,14 @@ def _show_done_banner(page, report: "ApplyReport", ok: bool = True) -> None:
         reason = report.errors[0] if report.errors else "No fillable fields were found on the page."
         mark, color = "⚠", "#b21f2d"
         msg = f"ApplicationBot could not fill this application. {reason} DRY RUN — nothing submitted."
+    elif report.submitted:
+        mark, color = "✓", "#0b7a3b"
+        msg = (f"ApplicationBot SUBMITTED this application ({report.submit_state}). "
+               f"{report.confirmation}")
+    elif report.submit_state == "blocked":
+        mark, color = "⚠", "#a05a00"
+        msg = ("Armed, but NOT submitted — "
+               + (report.blockers[0] if report.blockers else "blocked") )
     else:
         mark, color = "✓", "#0b7a3b"
         msg = (f"ApplicationBot finished filling — {len(report.filled)} field(s) filled"
@@ -1593,16 +2204,36 @@ def _title_role_company(title: str) -> tuple[str, str]:
     return m.group(1).strip(), m.group(2).strip()
 
 
-def _record_dry_run(report: ApplyReport, resume_pdf: str, role: str, company: str,
-                    meta: Optional[dict] = None) -> tuple[int, str]:
-    """Record this dry-run in the tracker (decision 024) — the Track stage's 'record what it
-    WOULD submit'. Basic info (company, role, location, remote, pay, source URL) comes from the
-    discovered posting via `meta` when available — the reliable source — falling back to the
-    page-title-derived role/company for a bare CLI run against a URL. Upserts by source URL so
-    re-running a posting updates its row instead of duplicating it, and never clobbers
-    user-owned fields (status/notes) on a re-run. Returns (id, 'recorded' | 'updated')."""
+def _report_snapshot(report: ApplyReport) -> dict:
+    """The fill outcome as plain data, for the per-application archive (decision 043)."""
+    from datetime import datetime
+    return {
+        "when": datetime.now().isoformat(timespec="seconds"),
+        "url": report.url, "ats": report.ats,
+        "submitted": report.submitted, "submit_state": report.submit_state,
+        "confirmation": report.confirmation, "blockers": report.blockers,
+        "pages": report.pages,
+        "filled": [{"label": f.label, "value": f.value, "source": f.source}
+                   for f in report.filled],
+        "skipped": report.skipped,
+        "errors": report.errors,
+    }
+
+
+def _record_run(report: ApplyReport, resume_pdf: str, role: str, company: str,
+                meta: Optional[dict] = None) -> tuple[int, str]:
+    """Record this run in the tracker (decision 024): a real submission becomes an `applied`
+    row (method `auto`; tracker stamps date_applied), everything else stays the Track stage's
+    'record what it WOULD submit' `dry-run` row. Basic info (company, role, location, remote,
+    pay, source URL) comes from the discovered posting via `meta` when available — the reliable
+    source — falling back to the page-title-derived role/company for a bare CLI run against a
+    URL. Upserts by source URL so re-running a posting updates its row instead of duplicating
+    it, and never clobbers user-owned fields (status/notes) on a re-run — except upgrading
+    status to `applied` when we really submitted. Returns (id, 'recorded' | 'updated')."""
     from . import tracker  # lazy — keep apply.py importable without touching the DB
 
+    status = "applied" if report.submitted else "dry-run"
+    method = "auto" if report.submitted else "dry-run"
     m = meta or {}
     company = (m.get("company") or company or "").strip()
     role = (m.get("role") or role or "").strip()
@@ -1615,8 +2246,13 @@ def _record_dry_run(report: ApplyReport, resume_pdf: str, role: str, company: st
     existing = tracker.find_by_source_url(source_url)
     if existing:
         # Runner-owned refresh; fill any basic-info field only if it was never set (don't
-        # clobber user edits).
-        changes: dict = {"resume_path": resume_pdf, "portal": report.ats, "method": "dry-run"}
+        # clobber user edits). A real submission DOES upgrade the status — that's runner-owned
+        # truth, not a user edit (tracker stamps date_applied on the flip).
+        changes: dict = {"resume_path": resume_pdf, "portal": report.ats, "method": method}
+        if m.get("fit_score") is not None:
+            changes["fit_score"] = m["fit_score"]  # runner-owned: this run's judge verdict
+        if report.submitted:
+            changes["status"] = "applied"
         for col, val in (("company", company), ("role", role), ("location", location),
                          ("remote", remote), ("pay", pay)):
             if val and not existing.get(col):
@@ -1626,12 +2262,16 @@ def _record_dry_run(report: ApplyReport, resume_pdf: str, role: str, company: st
 
     native = sum(1 for f in report.filled if f.source == "native")
     drafted = sum(1 for f in report.filled if f.source == "generated")
+    what = "Submitted" if report.submitted else "Dry-run"
+    blocked = f" BLOCKED: {report.blockers[0]}" if report.blockers else ""
     app_id = tracker.add_application({
         "company": company, "role": role, "location": location, "remote": remote, "pay": pay,
-        "portal": report.ats, "method": "dry-run", "status": "dry-run",
+        "portal": report.ats, "method": method, "status": status,
+        "fit_score": m.get("fit_score"),
         "source_url": source_url, "resume_path": resume_pdf,
-        "notes": f"[auto] Dry-run: {len(report.filled)} field(s) filled "
-                 f"({native} native, {drafted} AI-drafted); {len(report.skipped)} need attention.",
+        "notes": f"[auto] {what}: {len(report.filled)} field(s) filled "
+                 f"({native} native, {drafted} AI-drafted); {len(report.skipped)} need attention."
+                 + blocked,
     })
     return app_id, "recorded"
 
@@ -1653,8 +2293,14 @@ def run_apply(
     hold: "object | None" = None,
     on_filled: "object | None" = None,
     meta: Optional[dict] = None,
+    gate: "object | None" = None,
 ) -> ApplyReport:
-    """DRY-RUN fill an application form. Never submits.
+    """Fill an application form; DRY-RUN unless an armed SafetyGate is passed.
+
+    `gate` (applicationbot.safety.SafetyGate, decision 035) is the ONLY path to a real
+    submission: when armed and allowed (no kill file, under the per-run cap) and every
+    REQUIRED field resolved, the driver clicks submit and verifies the confirmation.
+    Without a gate — or armed-but-blocked — behaviour is the dry-run below.
 
     Native-first: uploads the résumé, triggers the ATS's own autofill (MyGreenhouse with stored
     credentials; resume-parse on Lever/Ashby/Workday), then our resolver fills only the fields
@@ -1714,14 +2360,29 @@ def run_apply(
                 _trigger_native_autofill(frame, ats, report)  # resume-parse button (Workday etc.)
                 page.wait_for_timeout(1500)  # let any parse-on-upload settle
 
-                # ---- our resolver fills only what's still empty, in the form's frame ----
-                _fill_all_fields(frame, resolver, report, done, only_empty=True)
-                _fill_radio_groups(frame, resolver, report, done)
-                _fill_checkboxes(frame, resolver, report, done)
-                _flag_missing_required(frame, report, done)
+                # ---- our resolver fills only what's still empty, page by page, in the
+                # form's frame — walks Next/Continue wizards to the final page ----
+                frame = _fill_all_pages(page, frame, resolver, report, done, resume_pdf)
             # else: report carries an actionable "form did not load" error; skip filling.
 
-            report.submitted = False  # DRY-RUN — never submit in dev (Guideline #3)
+            if form_loaded and gate is not None and getattr(gate, "armed", False):
+                # ARMED (decision 035): pre-submit gate + kill-switch check + submit +
+                # confirmation detection. Any doubt leaves report.submitted False with the
+                # reason in report.blockers.
+                _attempt_submit(page, frame, report, gate)
+            else:
+                report.submitted = False  # DRY-RUN — the default (Guideline #3)
+                if form_loaded:
+                    # Probe (never click) the submit control so every dry-run live-validates
+                    # the armed path's selectors for free — no tokens, no risk.
+                    try:
+                        btn = _find_submit_button(frame)
+                        report.submit_probe = (
+                            "found: " + repr((btn.evaluate("el => el.innerText || el.value || ''")
+                                              or "").strip()) if btn is not None
+                            else "NOT FOUND — an armed run could not submit this form")
+                    except Exception:
+                        pass
             _show_done_banner(page, report, ok=form_loaded)  # visible signal in the browser
 
             try:
@@ -1739,11 +2400,25 @@ def run_apply(
             # a tracker failure must not break the fill run.
             if record:
                 try:
-                    rid, action = _record_dry_run(report, resume_pdf, role, company, meta)
-                    print(f"Tracked: {action} application #{rid} (dry-run) — open the Track tab to view/edit.")
+                    rid, action = _record_run(report, resume_pdf, role, company, meta)
+                    kind = "applied" if report.submitted else "dry-run"
+                    print(f"Tracked: {action} application #{rid} ({kind}) — open the Track tab to view/edit.")
                 except Exception as e:
                     report.errors.append(f"tracker: {type(e).__name__}: {e}")
                     print(f"Note: could not record to tracker ({type(e).__name__}: {e}).")
+                # Archive the run (decision 043): posting text + exact PDF + fill outcome,
+                # frozen on a real submission. Best-effort, like the tracker.
+                try:
+                    from . import archive
+                    m = meta or {}
+                    path = archive.archive_run(
+                        m.get("company") or company, m.get("role") or role, m,
+                        jd_text=m.get("jd_body", ""), pdf_path=resume_pdf,
+                        report_data=_report_snapshot(report), submitted=report.submitted)
+                    print(f"Archived: {path}")
+                except Exception as e:
+                    report.errors.append(f"archive: {type(e).__name__}: {e}")
+                    print(f"Note: could not archive the run ({type(e).__name__}: {e}).")
 
             # Show the result in the terminal the moment filling finishes, before the pause.
             print("\n" + report.summary())
@@ -1759,8 +2434,10 @@ def run_apply(
                     # instead of blocking on terminal input which has no TTY in a server.
                     hold.wait()
                 else:
+                    done_note = ("SUBMITTED" if report.submitted
+                                 else "DRY RUN — not submitted")
                     try:
-                        input("\n✓ Done filling (DRY RUN — not submitted). Review the browser, "
+                        input(f"\n✓ Done ({done_note}). Review the browser, "
                               "then press Enter to close… ")
                     except EOFError:
                         pass
@@ -1802,10 +2479,20 @@ def main(argv: list[str] | None = None) -> int:
                         help="Don't save new answers/questions to the answer bank.")
     parser.add_argument("--no-record", action="store_true",
                         help="Don't record this dry-run in the tracker (applications.db).")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Force dry-run even if profile/safety.yaml is armed.")
     args = parser.parse_args(argv)
 
     ats = detect_ats(args.url)
     print(f"ATS: {ats}" + ("" if ats != "generic" else " (unrecognized — using generic autofill)"))
+
+    # Safety switch (decision 035): armed state comes from profile/safety.yaml; the KILL
+    # file halts submission; --dry-run overrides both to disarmed.
+    from .safety import load_gate
+    gate = None if args.dry_run else load_gate()
+    if gate is not None and gate.armed:
+        print("⚠ ARMED (profile/safety.yaml) — this run WILL SUBMIT if all required fields "
+              "resolve. Create profile/KILL or pass --dry-run to stop.")
 
     from . import backends
     generate = not args.no_generate and backends.claude_code_available()
@@ -1824,6 +2511,7 @@ def main(argv: list[str] | None = None) -> int:
         headed=not args.headless, pause=not args.no_pause,
         slow_mo=args.slow_mo, screenshot=args.screenshot, debug=args.debug,
         profile_path=profile_path, learn=not args.no_learn, record=not args.no_record,
+        gate=gate,
     )
     return 0
 

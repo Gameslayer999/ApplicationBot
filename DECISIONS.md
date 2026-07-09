@@ -44,6 +44,17 @@
 | 031 | 2026-07-05 | Early-career discovery: SimplifyJobs new-grad/intern JSON feeds → rank by title-relevance → resolve full JD for top-K via linked ATS; curated postings judged first | Accepted |
 | 032 | 2026-07-05 | Workable source + aggregator→ATS bridge (resolve redirect → detect ATS → rewrite apply_url + upgrade snippet to full JD); partner APIs (SEEK/Indeed/LinkedIn) out | Accepted |
 | 033 | 2026-07-05 | Self-improving dropdown resolver: Claude picks the option (guarded) when literal/hint match fails, and the value→option mapping is learned + reused without another Claude call | Accepted |
+| 034 | 2026-07-06 | Strip the headless Claude session (74x less overhead/call), batch fit judging (5 postings/call on Sonnet), schema-enforced JSON output for tailor + judge | Accepted |
+| 035 | 2026-07-06 | Submit stage: safety = `profile/safety.yaml` (`armed` default false + per-run cap) + `profile/KILL` kill-switch file; submit-first build order; verify on local HTML fixtures, not live dry-runs | Accepted |
+| 036 | 2026-07-07 | Semantic answer-bank matching: on a literal bank miss, Claude matches the question against banked Q→A pairs (answer-fitness, not topic); hit reused + cached as an alias | Accepted |
+| 037 | 2026-07-07 | Discovery snapshot cache: save the whole ranked result to git-ignored `profile/discovery_cache.json`; reuse it (skip board search + Claude judge) when younger than `cache_ttl_hours` (12h) and the résumé/boards/filters fingerprint matches; skip_seen re-applied on hit; `--fresh` forces re-search | Accepted |
+| 038 | 2026-07-07 | Salary-expectation: when a posting advertises a pay band, fill its **midpoint** instead of the static profile figure (which undersold below-band postings); parse the band from the structured compensation string then the JD body; fall back to `desired_salary` when no band is advertised | Accepted |
+| 039 | 2026-07-07 | Dynamic salary fallback when **no** band is advertised: a market estimate for (title, location, seniority) that Claude + Adzuna cross-check (agree≤20% → mean; else take the **lower**), cached per (title, location) in git-ignored `profile/salary_cache.json` (30-day TTL) and invalidated when a real advertised band later shows it's >40% off; degrades to Claude-only without Adzuna keys, then to the stored `desired_salary` | Accepted |
+| 040 | 2026-07-09 | Autofill determinism hardening: a 65-case resolver regression corpus pins `resolve()`/`option_hints()`; `valid_mapping` gates every learned `maps_to` at write time (and generic boolean dropdown aliases are never learned); the 3 fill-time Claude decision calls are `--json-schema`-constrained (enum/index, no free-text parsing); Claude never decides while a dropdown menu is open (read → close → decide → recommit by exact text), and every combobox fill records its matched tier (`option:literal/learned/hint/claude/substring`) | Accepted |
+| 041 | 2026-07-09 | Two-pass page fill: round 1 fills deterministically and DEFERS unresolved decisions; ≤3 batched schema-constrained Claude calls (classify / bank-match / dropdown-picks) adjudicate them; round 2 is the same deterministic loop over the injected results — Claude cost per PAGE, not per field. Live AppLovin dry-run exposed + fixed fabricated-salary drafting: numeric-fact questions are never drafted, the salary rule falls through to the bank, drafted numeric answers pruned | Accepted |
+| 042 | 2026-07-09 | Tailoring token diet + one-page guarantee: the Claude backend returns a **TailorDelta** (entries by index + rewritten bullets; schema 4.8k→1.5k chars) reconstructed in Python so orgs/dates/education/certs are copied verbatim — never mangled, never paid as output; résumé JSON compacted + JD trailing-boilerplate trim (8k cap) on the input side; and `pdf.fit_to_pages` renders → measures → trims (least-relevant first, floors, user-facing note) until the PDF **actually** fits the page budget — wired into `tailor_resume` for all backends and surfaces | Accepted |
+| 043 | 2026-07-09 | Four adoptions from the ai-job-search survey (all zero-token at run time): `ats_check.py` verifies every exported PDF's text layer (readable name/email/phone, JD keyword coverage split covered vs dropped-by-tailoring); `archive.py` snapshots each application (posting text + exact PDF + fill report) under git-ignored `profile/applications/`, freezing a dated copy on real submission; the fit judge returns **skills/experience/seniority** dimensions and `fit_score` is computed in code via `FIT_WEIGHTS` (.45/.35/.20); tracker gains interview/offer/rejected/no-response statuses + a `fit_score` column (migrated) + `calibration_report()` — response rate by fit band to tune `min_fit` from real outcomes. NOT adopted: reviewer-agent tailoring pass (2× cost vs 034), LaTeX, LinkedIn scraping (Guideline #4) | Accepted |
+| 044 | 2026-07-09 | Readiness/commitment closers ("Are you up for it?", "Are you ready?", "Does this sound like you?") auto-answer **Yes** — applying IS the commitment — via a guarded keyword rule (start/relocate/remote/travel/when phrasings excluded) + a `role_commitment` classifiable type for rephrasings. ITAR/export-control gates and security-clearance *eligibility* auto-answer **Yes** only when `us_citizen` is True (a citizen is a "U.S. person"); non-citizens fall through to the bank/capture (green-card holders also qualify — the profile can't derive it), and *holding* a clearance stays captured. "itar" matched as a whole word (substring hits "mil-ITAR-y") | Accepted |
 
 ---
 
@@ -1287,3 +1298,530 @@ unit tests: "The Pennsylvania State University" → "…-Main Campus", "Rutgers 
 "…-New Brunswick", and Penn-State-vs-Harvard/MIT/Stanford → none (guard). See
 [[018-self-improving-answer-bank]], [[028-semantic-question-classification]] (the learning
 pattern this extends), [[016-apply-stage]] (the filler), [[011-claude-code-cli-subscription]].
+
+## 034 — Strip the headless Claude session; batch fit judging; schema-enforced JSON
+
+**Date:** 2026-07-06
+**Status:** Accepted
+
+**Context:** Tailoring and fit judging were burning through subscription credits and running
+slowly. Measured root cause: every `run_claude_cli` call spawned a **full default Claude Code
+session** — the coding-agent system prompt, all tool schemas, MCP servers, skills, settings, and
+this project's 16KB CLAUDE.md. A trivial "reply ok" call carried ~40,000 tokens of context
+(3,432 input + 11,804 cache-write + 24,787 cache-read; $0.089 cost-equivalent). Fit judging
+multiplied this by N: `match()` judged the top 10 postings serially, one spawn each (~400k tokens
+of pure overhead per discovery run), and `judge_fit` passed no `--model`, silently inheriting the
+CLI's default model (typically Opus) for a one-sentence JSON verdict.
+
+**Options considered:**
+| Option | Verdict |
+|---|---|
+| **Strip the session (`--system-prompt`, `--tools ""`, `--strict-mcp-config`, `--setting-sources ""`)** | **Chosen** — same prompt text reaches the model minus irrelevant coding-agent context; measured 184 tokens vs ~40,000 per call (74x, $0.0012 vs $0.089), and ~1s faster |
+| Switch to the `anthropic` API SDK | Rejected — bills the metered API; subscription-only usage is a standing constraint (#011) |
+| Keep per-posting judge calls, parallelize with threads | Rejected — fixes latency only; still pays N spawns of overhead |
+| **Batch fit judging: one call per 5 postings, JSON array back** | **Chosen** — résumé sent once per chunk; 10 postings = 2 spawns instead of 10; chunking keeps failure blast-radius at 5 postings (degrade to keyword-only, never abort — Guideline #11) |
+| **Pin the judge to Sonnet (`JUDGE_MODEL = "sonnet"`)** | **Chosen** — a strict 0-100 JSON verdict is a classification task; previously the model was undefined (CLI default) |
+| **`--json-schema` structured output for tailor + judge** | **Chosen** — CLI guarantees schema-valid JSON; removes the tailor's retry-on-bad-JSON loop double-spend risk and the 4.8k-char schema dump from the prompt |
+
+**Decision:** `run_claude_cli` now always runs a stripped headless session and accepts `system`
+(replaces the system prompt) and `json_schema` (CLI-enforced output shape). The tailor backend
+passes `SYSTEM_PROMPT` and the `TailoredResume` schema through those flags instead of embedding
+them in the prompt. `matching.judge_fit_batch` judges up to `JUDGE_BATCH_SIZE=5` postings per
+call on `JUDGE_MODEL="sonnet"`; `match()` chunks the top-N through it, mapping verdicts back by
+index — a failed call or skipped verdict leaves those postings keyword-only with a recorded
+error. `judge_fit` (single posting) remains as a thin wrapper. The answer bank benefits from the
+stripped session automatically. Quality tiers (fast/balanced/max) are unchanged.
+
+**Reasoning:** Prompts, judge instructions, and tier semantics are byte-for-byte preserved where
+they matter — the only removed context was Claude Code scaffolding irrelevant (arguably
+distracting) to tailoring/judging. Verified end-to-end with a synthetic résumé: batched judge
+returned correct verdicts for a match (88, qualified) and a deliberate non-match (2, unqualified)
+in one 7.1s call; tailor via `--json-schema` produced a valid drift-free résumé in 13.9s on the
+fast tier (previously ~30s). Net effect for a 10-posting discovery run: ~400k+ overhead tokens →
+~15k, judging wall-clock from minutes to well under a minute. See [[011-claude-code-cli-subscription]],
+[[013-catalogue-preselection]], [[025-hybrid-qualification-matching]].
+
+## 035 — Submit stage: safety architecture, build order, and fixture-based verification
+
+**Date:** 2026-07-06
+**Status:** Accepted (user-approved)
+
+**Context:** A full-system audit (2026-07-06, four parallel deep-dives) found the submit
+half of the product unbuilt: `apply.py` hardcodes `submitted = False`, there is no armed
+mode, no kill switch, no loop beyond one application per run, and no support for
+account-gated portals (Workday ≈32% / iCIMS ≈10% of US enterprise postings). The user
+directed: fold findings into NEXT_STEPS.md, delegate UI/UX to parallel agents, focus on
+the heaviest engine work, minimize token-heavy live dry-runs, and build toward
+"fill AND submit any application format/site."
+
+**Options considered (safety switch representation):**
+
+| Option | Pros | Cons |
+|--------|------|------|
+| **`profile/safety.yaml` + `profile/KILL` file (chosen)** | Works identically for CLI, web UI, and a future scheduled runner; state inspectable on disk; kill switch checked before every submit; git-ignored under `profile/` | A config file a user could leave armed |
+| CLI flag only (`--arm`) | Explicit per-run intent | No standing kill switch; web/scheduled runs can't arm without plumbing the flag everywhere |
+| Config AND flag (double gate) | Maximum deliberateness | More friction/plumbing than the product's "arm once, then autonomous" intent |
+
+**Options considered (build order):**
+
+| Option | Pros | Cons |
+|--------|------|------|
+| **Submit-first (chosen)** | Fillability gate (hours) → submit path + safety on Greenhouse → runner + Claude-cap resilience → multi-page → Workday; each step verifiable offline | Scale (runner) lands second |
+| Runner-first | Scale earlier | Every run ends in a no-op until submit exists |
+| Workday-first | Attacks the largest market gap | Multi-week with nothing shippable; submit/runner still missing on ATSs we already fill |
+
+**Decision:** (1) Arming lives in git-ignored `profile/safety.yaml` — `armed: false` by
+default plus `max_submissions_per_run`; a real submit additionally requires the absence of
+`profile/KILL`, which is checked immediately before every submission and halts the whole
+queue when present (the future web STOP button just creates it). (2) Build order:
+fillability gate → Greenhouse submit path with a pre-submit gate (any unresolved REQUIRED
+field aborts and records a blocked outcome instead of pausing for a human) → autonomous
+runner + usage-cap resilience → multi-page navigation → account-gated portals (Workday).
+(3) Verification policy: submit logic is developed and tested against **local HTML form
+fixtures** driven by Playwright (zero tokens, zero real postings — Guideline #3); one
+consolidated live dry-run per milestone at most.
+
+**Reasoning:** The safety file + kill file is the only representation that serves all
+three entry points (CLI, web, scheduled runner) without new plumbing, and it makes
+Guideline #3's "deliberate arming" a visible artifact rather than a transient flag.
+Submit-first converts the existing, verified fill engine into the actual product on the
+~35-40% of postings we can already reach, before spending multi-week effort on Workday.
+See [[016-apply-per-ats-playwright]], [[026-discover-qualification-driven]].
+
+## 036 — Semantic answer-bank matching (reuse a saved answer for any rewording)
+
+**Date:** 2026-07-07
+
+**Context:** Banked custom answers were only reused when a new form's question matched the
+saved phrasing exactly or as a substring (`apply.py` resolver). The Claude fallback
+(decision 028) only classified questions onto the 11 structured profile fields, never
+against the user's own answer bank — and free-text inputs skipped it entirely. Result:
+questions the user had already answered ("How many years of experience do you have with
+React?" → "3") were skipped and re-captured whenever a form reworded them ("Years of React
+experience"), defeating the answer bank's answer-once purpose.
+
+**Options considered:**
+
+| Option | Pros | Cons |
+|--------|------|------|
+| **Claude matches the question against banked Q→A pairs (chosen)** | Handles arbitrary rewording; judges the *answer's* fitness, not just question similarity (a saved "Yes" to "travel up to 25%?" is correctly refused for "what percentage of travel?"); same pattern as decisions 028/033; match learned as an alias so repeats cost no Claude call | One extra Claude call the first time a reworded question is seen |
+| Fuzzy string matching (token overlap / edit distance) | No Claude call; deterministic | Misses true paraphrases and false-matches near-strings with opposite meaning ("willing to relocate?" vs "willing to travel?") — confident-wrong answers on an outward-facing form |
+| Embeddings + similarity threshold | Fast at scale | New dependency + index to maintain for a bank of tens of entries; topical similarity ≠ functional equivalence |
+
+**Decision:** On a literal bank miss (and after the decision-028 structured classify),
+`answer_bank.match_banked_question` sends the new question plus the banked (question,
+answer-preview) pairs to Claude, which returns the pair whose *saved answer correctly
+answers the new question* — functional equivalence, else `none`. Wired into both
+`resolve_semantic` (selects/radios/checkboxes/comboboxes) and `freetext_answer` (before
+drafting, covering short text fields too). A hit is cached to the bank as an alias — the
+new phrasing with the same answer (or the same `maps_to`, keeping mapped entries live from
+the profile) — so the next encounter matches literally with zero Claude calls.
+Company-specific and demographic questions are never bank-matched (unchanged handling).
+
+**Reasoning:** The bank's contract is "answer once, reuse everywhere"; exact-phrasing reuse
+silently broke it for every reworded repeat. Claude-judged functional equivalence is the
+only option that both catches paraphrases and refuses same-topic-different-question traps,
+and the learned alias keeps steady-state cost identical to the old literal match. Verified
+offline (`tests/test_bank_semantic.py`, mocked CLI) and live: reworded banked questions
+resolve, unbanked ones stay captured for the user.
+See [[018-answer-bank]], [[028-semantic-question-classification]], [[033-dropdown-resolver]].
+
+## 037 — Discovery snapshot cache (skip the re-search on repeated dry-runs)
+
+**Date:** 2026-07-07
+
+**Context:** Every run of `discover_and_match` re-fetched all configured boards over the
+network and re-ran the Claude fit judge on the top-N postings — *every time*. Postings
+the user applied to are recorded in the tracker and dropped next run (`skip_seen`), but
+every posting that was discovered and judged yet **not** applied to (everything below the
+top match, or beyond a run/submission cap) got rediscovered and rejudged from scratch on
+the next dry-run. Repeated dry-runs — the normal way you iterate before arming the
+runner — therefore paid the full network + Claude cost each time to surface the same
+postings before the autofill even started. The user asked to save those un-used postings
+so future dry-runs don't search every time.
+
+**Options considered:**
+
+| Option | Pros | Cons |
+|--------|------|------|
+| **Snapshot cache, skip search if fresh (chosen)** | Reuses the *whole ranked list + Claude verdicts*; a fresh dry-run does zero network + zero Claude; simplest data model (one JSON file) | Won't see brand-new postings until the freshness window expires or `--fresh` is passed |
+| Always search, reuse cached verdicts | Still finds new postings each run; only re-judges the new ones | Doesn't remove the board-search latency the user complained about; needs per-posting verdict store keyed by résumé |
+| Cache leftovers, merge into each run | Closest to "save the ones not used" literally | Still hits every board each run; merge/dedup complexity; smallest speed win |
+
+**Decision:** After a live discovery, `discovery_cache.save` writes the full ranked result
+(postings + Claude verdicts + coarse counts) to git-ignored
+`profile/discovery_cache.json`. On the next call, unless `force_fresh` (CLI `--fresh`) or
+`cache_ttl_hours=0`, `discovery_cache.load` returns that snapshot **iff** it is younger
+than `cache_ttl_hours` (default 12h) **and** a fingerprint over the résumé, the exact
+source set (board tokens / aggregator config / curated kinds, via source names), the
+gate/matcher filters, and the effective Claude-availability flag all match — otherwise a
+clean miss falls through to a real search. A cache hit skips the board fetch **and** the
+Claude judge entirely; the only per-run work is re-applying `skip_seen` against the
+*current* tracker, so a role applied to since the snapshot was saved still drops out.
+Wired once in `discover_and_match`, so the pipeline CLI, autonomous runner, and web UI
+all benefit; both CLIs gained `--fresh`. Caching is disabled when `extra_sources` are
+injected (the fingerprint can't capture ad-hoc sources). The effective-Claude flag is in
+the fingerprint so a keyword-only snapshot (CLI absent) is never served once Claude is
+available.
+
+**Reasoning:** The user's iteration loop is repeated dry-runs, and the dominant cost —
+board latency + Claude tokens — was being paid to re-derive an identical ranked list.
+The snapshot is résumé/filters-fingerprinted so a real change invalidates it (never
+serving verdicts judged against a stale résumé), TTL-bounded so postings don't go stale
+silently, and `--fresh` is always available for an on-demand re-search. The tracker
+remains the source of truth for "already applied," re-applied on every hit, so the cache
+can only ever *save* work, never re-surface a used role. It holds discovered postings and
+match notes (PII), so it lives under git-ignored `profile/` (Agent Guideline #12).
+Verified offline (`tests/test_discovery_cache.py`, stubbed network + Claude): a second
+run reuses without a search, `--fresh`/TTL-0/résumé-change all force a re-search, and
+skip_seen prunes a now-tracked role from a cache hit.
+See [[026-discover-qualification-driven]], [[035-submit-stage-safety-switch]].
+
+---
+
+## 038 — Salary expectation follows the posting's advertised pay band (midpoint)
+
+**Date:** 2026-07-07 · **Status:** Accepted
+
+**Context:** In a dry-run the bot filled `85000` for a posting whose JD stated a *CA Base
+Pay Range of $124,000 – $186,000* — ~$40k below the floor. The salary rule returned the
+static profile figure (`desired_salary`) verbatim, blind to the posting, so any posting
+whose band sits above the stored number was actively under-asked.
+
+**Options considered:**
+
+| Option | Pros | Cons |
+|--------|------|------|
+| Top of band | Never undersells; standard negotiation advice | Can read as inflexible; overshoots when the band is wide |
+| **Midpoint of band (chosen)** | In-band by construction; neither undersells nor caps at the ceiling; a defensible neutral ask | Not the maximum obtainable figure |
+| Bump stored figure up to the floor | Preserves the user's number when already in-band | A below-band stored figure still lands at the very bottom |
+| Keep static figure | No new parsing | The reported bug — undersells every above-band posting |
+
+**Decision (user choice):** When the posting advertises a pay band, fill its **midpoint**;
+otherwise fall back to `desired_salary`. The band is parsed by `AnswerResolver`
+(`_posting_pay_range`) from a specific `$X – $Y` pattern (dash or "to"; `K` notation
+handled) — from the structured `Posting.compensation` string first, then the JD body.
+Bands are accepted only when both figures are ≥ 1000, which excludes hourly rates
+("$40 – $60"). The resolver gained a `pay` field, wired from `p.compensation` in the
+pipeline. Both the keyword salary rule and the classified `desired_salary` type route
+through one `_salary_expectation()` helper so live and cached answers agree. The
+standalone `apply` CLI (no posting metadata) passes no band and keeps the stored figure.
+
+**Reasoning:** Under-asking is a silent, per-application loss with no signal to the user,
+so it must be fixed in the autonomous path, not left for review. The midpoint keeps the
+answer inside whatever the employer already published — grounded, never fabricated — and
+degrades safely to the user's own figure when nothing is advertised. Parsing prefers the
+reliable structured field and only falls back to prose with a tight two-`$`-figure
+pattern, avoiding stray numbers in the JD. Verified with seven cases (JD-body band,
+compensation-string band, `K` notation, "to" separator, no-band fallback, hourly excluded,
+and `resolve()`/`answer_for_type` routing); full suite 67/67 green.
+See [[016-apply-stage-automation]], [[028-semantic-question-classification]].
+
+---
+
+## 039 — Dynamic salary fallback when a posting advertises no pay band
+
+**Date:** 2026-07-07 · **Status:** Accepted
+
+**Context:** Decision 038 fixed the under-ask *when a posting publishes a band* (the resolver
+fills its midpoint). When a posting publishes **nothing**, it still fell back to the single
+static `desired_salary` — the same figure for a junior role in a low-cost metro and a senior
+role in SF. The user asked for that fallback to be dynamic: "a saved number based on location
+and position … generated by looking at average salaries in areas," with two sources that
+"agree on a number, saved until it looks extremely wrong."
+
+**Options considered:**
+
+| Axis | Options | Choice |
+|------|---------|--------|
+| Data source | Claude estimate · external API · static location×role table | **Mix:** Claude + Adzuna cross-check |
+| External API | Adzuna (role+location salary averages, free key) · BLS OES (no key, coarse SOC codes) · Claude-only-first | **Adzuna** (already integrated for discovery — reuses the same keys) |
+| On disagreement (>20%) | take lower · trust API · average anyway | **Take the lower** (never over-ask on a shaky estimate) |
+
+**Decision:** New `applicationbot/salary.py`. When a posting advertises no band, the pipeline
+pre-computes a market estimate for (title, location, `years_experience`) and injects it into
+the resolver as `market_salary`; the resolver's precedence is **advertised band midpoint →
+market estimate → stored `desired_salary`**. The estimate is the cross-check of two sources
+(`reconcile`): Claude's median range estimate and Adzuna's mean advertised salary for the
+query. Both within 20% → their mean; wider → the **lower**, with the divergence recorded.
+Results are cached per (title, location) in git-ignored `profile/salary_cache.json` (mirrors
+decision 037's cache location) with a 30-day TTL — a cache hit makes **zero** network/Claude
+calls. When a *later* posting for the same (title, location) *does* advertise a real band,
+`validate_against_band` opportunistically checks the cached estimate against it and drops the
+entry if it sits >40% outside the band ("extremely wrong"), so real market data corrects a
+stale guess over time. Band parsing (`advertised_band`, the `$X–$Y` regex from decision 038)
+moved into `salary.py` so the resolver and pipeline parse bands identically. Wired once in
+`run_testing_mode`, so the pipeline CLI, autonomous runner, and web UI all benefit.
+
+**Reasoning:** A location/role-aware number beats one static figure for the postings that
+publish nothing (still common outside pay-transparency states). Two independent sources guard
+against either being wrong, and taking the lower on disagreement keeps an uncertain estimate
+conservative — the applicant can always negotiate up, but a too-high number can screen them
+out. Everything is best-effort and degrades cleanly: no Adzuna keys → Claude-only; no Claude →
+Adzuna-only; neither → the stored `desired_salary` (never worse than before 039). Adzuna reuses
+the exact `ADZUNA_APP_ID`/`ADZUNA_APP_KEY` the discovery source already reads, so no new
+onboarding. The cache holds only role/location→number pairs (no PII) but lives under
+git-ignored `profile/` anyway (Agent Guideline #12). Verified offline
+(`tests/test_salary.py`, stubbed Claude + Adzuna, 9 cases): reconcile policy, cache
+reuse/TTL-recompute/no-source-None, band-validation invalidate-vs-keep, and resolver
+precedence; full suite 76/76 green.
+See [[038-salary-expectation-advertised-band]], [[037-discovery-snapshot-cache]], [[026-discover-qualification-driven]].
+
+## 040 — Autofill determinism hardening (corpus pin, write-time gates, schema-constrained decisions, no mid-DOM Claude)
+
+**Date:** 2026-07-09 · **Status:** Accepted
+
+**Context:** The user asked to make autofill "as deterministic as possible." The answering
+layer was already rule-first with learn-once Claude fallbacks (decisions 018/033/036), but four
+non-determinism gaps remained: (1) nothing pinned the keyword resolver — its rules are order-
+and substring-sensitive, so an edit could silently flip an answer on a form we already fill
+correctly; (2) learned mappings were persisted **unvalidated** — the polluted-answer-bank
+incident (a wrong Claude `maps_to` banked, then overriding the corrected rules) was only
+repairable after the fact via `scripts/prune_answer_bank.py`; (3) the three fill-time decision
+calls parsed free-text replies (`.strip().lower()` + regex), leaving room for reasoning
+preambles and mis-reads; (4) `_fill_combobox` called Claude (a 5–60s subprocess) **while the
+react-select menu was open** — a staleness race (menus re-render, indexes shift) and the main
+timing-dependent behavior in the driver.
+
+**Options considered:** full package vs. safety-net-only (corpus + write gate) vs. also
+restructuring to a batched two-pass fill (scan → one Claude call → deterministic fill). User
+chose the full package minus two-pass; two-pass batching stays a candidate follow-up (it can't
+cover async typeaheads anyway, so the closed-menu restructure was needed regardless).
+
+**Decision:**
+1. **Regression corpus** — `fixtures/resolver_corpus.yaml` (65 cases: real labels from the
+   SpaceX/Stripe/Robinhood/Instacart/GitLab/Discord/Ramp/cin7 live sweeps, incl. per-country
+   work-auth overrides, pay-band midpoint, and 6 must-stay-null enumerated questions) +
+   `tests/test_resolver_corpus.py` (synthetic Jordan Avery profile, zero PII) assert the exact
+   `resolve()` answer, and `option_hints()` where pinned. A flipped case = a wrong change, or
+   a deliberate corpus update in the same commit.
+2. **Write-time gates** — `answer_bank.valid_mapping(question, key)` (known key; not
+   demographic/company-specific/enumerated; non-garbage question) is enforced in
+   `apply_profile.remember_answers` before any `maps_to` is banked (invalid mapping dropped,
+   answer text kept); `capture_questions` refuses garbage-length questions; the prune script
+   now reuses the same gate for old data. `AnswerResolver.learn_option` never learns aliases
+   for generic booleans (yes/no/true/false) — aliases are keyed by value alone, so a "yes" →
+   descriptive-option alias learned on one question would leak into every future Yes/No dropdown.
+3. **Schema-constrained decisions** — `classify_question` replies `{"type": <enum of
+   CLASSIFIABLE_TYPES + none>}`, `match_banked_question` `{"match": <int>}`,
+   `pick_dropdown_option` `{"choice": <int>}` via the CLI's `--json-schema` (the decision-034
+   mechanism); the token-overlap guard on dropdown picks stays.
+4. **No mid-DOM Claude** — `_fill_combobox` reads the options, **closes the menu**, decides,
+   then `_commit_option_text` reopens (retyping the search query if any) and clicks by exact
+   text. Every combobox fill now records HOW it matched — `FilledField.source =
+   option:literal|learned|hint|claude|substring` — the per-field determinism audit trail.
+
+**Reasoning:** Determinism per effort. The corpus makes regressions loud instead of silent (the
+enforcement mechanism for everything else); write-time gates make bank pollution impossible
+instead of repairable; schema enforcement moves output validation from our regexes into the CLI;
+the closed-menu commit removes the one place where model latency could interact with live DOM
+state. Repeat encounters were already deterministic via learning — these changes make the
+learning itself safe and the first encounter auditable. **Verified offline, zero tokens:** new
+`tests/test_determinism_gates.py` (10), `tests/test_resolver_corpus.py` (3, 65 cases),
+`tests/test_combobox_fill.py` (4, driving `_fill_combobox` against a new react-select-shaped
+fixture `fixtures/apply_forms/combobox.html` — asserts the menu is CLOSED at decide time, exact
+recommit, boolean-alias refusal, and no typed-text residue); full suite 93/93. *Remaining:* one
+consolidated live dry-run to confirm the closed-menu recommit on real Greenhouse/Ashby
+react-selects.
+See [[033-self-improving-dropdown-resolver]], [[036-semantic-answer-bank-matching]], [[034-claude-cli-cost-latency]], [[018-answer-bank]].
+
+## 041 — Two-pass page fill: batch all fill-time Claude decisions (≤3 calls per page)
+
+**Date:** 2026-07-09 · **Status:** Accepted
+
+**Context:** After decision 040, each *novel* field still cost its own CLI spawn mid-fill
+(classify, bank-match, dropdown pick — ~184-token overhead and 5–15s latency each), and a slow
+decision sat between DOM interactions. The user asked to proceed with the deferred two-pass
+batching.
+
+**Decision:** `_fill_page` runs each form page twice around ONE batched decision step.
+Round 1 is the existing deterministic loop, but with `AnswerResolver.pending` set it DEFERS
+unresolved decisions (novel questions with their control kind/options; static-list dropdown
+picks with their read options) instead of spawning Claude per field. `_resolve_pending` then
+makes at most 3 batched, schema-constrained calls — `classify_questions` (enum array),
+`match_banked_questions` (bank sent once, index array), `pick_dropdown_options` (index array +
+the per-item token guard) — and injects the results (in-memory bank entries;
+`decided_options[label]`). Round 2 is the SAME deterministic loop: injected answers resolve
+via the normal bank path, batch-picked options commit by exact text (tier `option:claude`),
+and anything unadjudicated is captured for the user — `semantic_done`/`picks_done` guarantee
+no per-field fallback calls. Typeahead searches stay inline (their options only exist as you
+type); generation-off remains a single pass, byte-identical to before. Batch failure degrades
+to plain captures.
+
+**Reasoning:** Claude cost becomes per PAGE, not per field, and no model call ever runs
+between dependent DOM interactions — the fill sequence itself is fully deterministic given the
+decided answers. **Verified:** `tests/test_two_pass_fill.py` against a new fixture
+(`fixtures/apply_forms/two_pass.html`): classify + bank-match + pick all fill in EXACTLY 3
+stubbed calls; generation-off = zero calls; failed batch = captures. Full suite 99/99.
+
+**Live dry-run (consolidated, AppLovin Greenhouse):** 17→16 filled, 0 errors, submit probe
+found, all 12 react-selects committed `option:literal` (deterministic). The audit trail
+exposed a REAL bug: with `desired_salary` unset, the salary question fell to the drafting path
+and Claude **fabricated a figure** ("80000 USD"; a prior run had likewise banked "85000").
+Fixed three layers deep: numeric-fact questions (salary/GPA/test scores) are never
+`is_open_ended` (never drafted, even as textareas); the salary rule falls THROUGH to the bank
+on no-data instead of short-circuiting `resolve()`; `prune_answer_bank` drops previously
+drafted numeric-fact answers (ran it: the banked "85000" is gone). Re-ran the same dry-run:
+salary now cleanly captured ("needs attention"), 0 AI-drafted, all other fields identical —
+a deterministic repeat. *User action:* set **desired salary** in the Profile tab (or let the
+decision-039 market estimate cover pipeline runs).
+See [[040-autofill-determinism-hardening]], [[034-claude-cli-cost-latency]], [[039-dynamic-salary-fallback]].
+
+## 042 — Tailoring token diet (delta output) + measured one-page guarantee
+
+**Date:** 2026-07-09 · **Status:** Accepted
+
+**Context:** The user asked to tighten résumé generation: optimize token usage and make
+résumés always one page. Measured: the tailor call sent the résumé JSON with `indent=2` and
+null/empty fields (~12% waste; the real résumé is ~17.6k chars), the full JD including
+trailing EEO/benefits boilerplate (2–10k chars), and a 4.8k-char TailoredResume schema — and
+the model **echoed the entire TailoredResume back** (education, skills, orgs, dates, certs
+verbatim), the largest single spend. One-page was only a count heuristic (`LengthBudget`:
+3 entries / 4 bullets) with `auto_page_break=True` — overflow silently spilled to page 2
+(a known audit gap).
+
+**Decision:**
+1. **Delta output (user-approved):** the Claude backend now returns a `TailorDelta` — entries
+   referenced by 0-based index with rewritten bullets + `tailor_note`, reordered skills,
+   summary, notes — and `_delta_to_tailored` reconstructs the full `TailoredResume` in Python.
+   Orgs/roles/dates/locations/project tech/education/certifications are copied VERBATIM from
+   the base résumé: never mangled (structural drift-proofing) and never paid for as output
+   tokens. Bad indices ignored, duplicates deduped, empty bullets fall back to the entry's
+   base bullets, summary gated on the base having one. Schema shrank 4.8k→1.5k chars.
+   `TailoredResume` stays the external shape — web/render/drift-check untouched.
+2. **Input diet:** résumé JSON compact (`exclude_none/exclude_defaults`, no indent) in the
+   tailor prompt AND `generate_answer`; new `job_description.trim_for_prompt` strips trailing
+   legal/EEO boilerplate (markers searched only in the last 40% so requirements are never cut)
+   and caps at 8k chars on a paragraph boundary. Stored JD untouched (pay-band parsing and the
+   fit judge read the full body).
+3. **Measured one-page guarantee:** `pdf.page_count` renders and counts; `pdf.fit_to_pages`
+   loops render→measure→trim until the PDF actually fits — one bullet at a time from the last
+   (least-relevant) entry of activities→projects→experience down to a 2-bullet floor, then
+   whole trailing entries (≥1 experience always kept) — zero tokens, deterministic, with a
+   user-facing note naming exactly what was dropped (UI Principle #5). Wired at the end of
+   `tailor_resume`, so web preview, CLI, pipeline, and both backends all emit guaranteed-fit
+   content.
+
+**Reasoning:** Output tokens were the dominant cost and structural echo carried zero
+information — reconstruction makes it free and safer at once. Page fit must be measured, not
+estimated: only the renderer knows where lines wrap. **Verified:** 8 new tests
+(`tests/test_resume_fit.py`: fit no-op/overflow/end-to-end, delta fidelity/bad-index/summary
+gate, stubbed backend parse, JD trim safety + cap), full suite 107/107 — plus one LIVE tailor
+(real résumé × 10.3k-char JD, fast tier): valid delta first try, sensible tailoring notes,
+PDF measured at exactly 1 page. *Open (pre-existing):* unicode TTF embedding (latin-1
+`?`-mangling of non-Western names).
+See [[040-autofill-determinism-hardening]], [[034-claude-cli-cost-latency]], [[013-resume-length-budget]], [[002-structured-resume]].
+
+## 043 — Adoptions from the ai-job-search survey: ATS PDF verify, per-application archive, dimension rubric, outcome calibration
+
+**Date:** 2026-07-09 · **Status:** Accepted
+
+**Context:** The user asked for a review of [MadsLorentzen/ai-job-search](https://github.com/MadsLorentzen/ai-job-search)
+(17.7k-star Claude Code job-application framework). It has no Apply stage (human submits
+manually) and its LaTeX/Danish-portal stack doesn't fit us, but four of its quality
+mechanisms do. Options considered per idea are in the survey summary (session 2026-07-09);
+the reviewer-agent tailoring pass was deliberately NOT adopted (doubles tailor cost against
+decision 034; its cheap subset — keyword coverage — comes free with the ATS check), nor were
+LaTeX/moderncv, manual submission, or the ToS-flagged LinkedIn scraper (Guideline #4).
+
+**Decision (four adoptions, all zero-token/deterministic at run time):**
+1. **ATS text-layer verification** (`ats_check.py`, new dep `pypdf`): after every PDF
+   export, extract the text layer and verify what an ATS parser sees — readable text,
+   name/email/phone literal (catches the known latin-1 `?`-mangling), and JD keyword
+   coverage split *covered* vs *dropped-by-tailoring* (in the base résumé but cut from the
+   PDF; genuine gaps stay the judge's `missing` list). Wired after PDF export in
+   `pipeline.run_testing_mode` (notes flow to the Discover tab via status_cb) and `cli.py
+   --out *.pdf`.
+2. **Per-application archive** (`archive.py`): git-ignored
+   `profile/applications/<company>-<role>-<urlhash>/` (same key as `resume_store`) holding
+   `posting.md` (JD as fetched), `resume.pdf` (exact bytes), `report.json` (fill outcome).
+   Dry-runs overwrite the dir root; a REAL submission freezes a `submitted-<date>/` copy
+   never touched again. Best-effort call next to the tracker record in `run_apply`
+   (`jd_body` threaded via meta from the pipeline).
+3. **Multi-dimension fit rubric** (`matching.py`): the judge returns 0-100 **skills /
+   experience / seniority** per posting; the overall `fit_score` is now computed in code —
+   `weighted_fit` over `FIT_WEIGHTS` {skills .45, experience .35, seniority .20},
+   renormalized over present dimensions — not model-reported. Dimensions ride `Match`,
+   the discovery cache (pre-043 snapshots load with `{}`), the pipeline CLI listing, and
+   the Discover tab (judged rows + chosen match). ai-job-search's culture/career
+   dimensions are deferred until the Configure preference schema exists.
+4. **Outcome calibration groundwork** (`tracker.py`): statuses gain the post-application
+   lifecycle **interview / offer / rejected / no-response** (absorbing the queued "Track
+   lifecycle" statuses; follow-up date still open), a `fit_score` column (stamped from the
+   judge at apply time; additive `ALTER TABLE` migration for pre-043 DBs) and
+   `calibration_report()` + `python -m applicationbot.tracker calibration` — response rate
+   by fit band (75-100 / 60-74 / <60), with a hint to raise `min_fit` when a band has ≥5
+   resolved outcomes and zero responses. Track tab shows a Fit column; status dropdowns
+   pick the new statuses up automatically from `tracker.STATUSES`.
+
+**Reasoning:** These four give the autonomous pipeline the feedback loops the manual
+framework relies on a human for: verify what the ATS will actually parse before submitting,
+keep evidence of what was submitted, make fit verdicts auditable, and let real outcomes tune
+the threshold. **Verified:** 19 new tests (`test_ats_check`, `test_archive`,
+`test_matching_dimensions`, `test_calibration` — incl. pre-043 DB migration and
+mangled-name detection), full suite **126/126**; served JS `node --check`-clean; live: CLI
+PDF export prints the ATS notes, real `applications.db` migrated in place (12 rows intact),
+`/track` serves the new statuses + `fit_score`.
+See [[034-claude-cli-cost-latency]], [[024-tracking-store]], [[025-hybrid-matching]], [[035-submit-safety]].
+
+### Update (2026-07-09): min_fit auto-calibration + follow-up date (043 follow-ups)
+
+The two items 043 left open, user-approved: (1) **`tracker.recommended_min_fit(current)`**
+turns the dead-band hint into a value — a band with ≥5 resolved outcomes and zero responses
+recommends `hi+1`; it only ever raises, never acts on thin/positive data, and never
+recommends past the top band (a dead 75-100 band means the strategy is failing, which no
+threshold fixes). **`pipeline.effective_min_fit(filters)`** applies it wherever the CONFIG
+default is used — pipeline CLI, runner, web test-run — each surfacing a loud note
+("min_fit raised 50→75 by outcome calibration (…)"); an explicit `--min-fit` always wins,
+and a new **`DiscoveryFilters.calibrate_min_fit`** toggle (default on, editable in the
+Discover settings) turns the behaviour off — the user stays in control of their filters.
+Any tracker error keeps the configured value (a broken DB must never change matching).
+`tracker calibration` also prints the recommendation + whether it's being applied.
+(2) **`follow_up_date`** tracker column (ISO date, same additive migration path as
+`fit_score`) + a "Follow up" Track-tab column — closes the queued "Track lifecycle" item.
+**Verified:** 6 new tests (recommendation floors/never-lowers/positive-band/top-band,
+effective wiring + kill switch + error fallback, follow-up roundtrip), suite **132/132**,
+served JS clean, live: real DB migrated (follow_up_date in `/track` fields),
+`calibrate_min_fit` served to the Discover settings editor.
+## 044 — Auto-answer readiness/commitment closers and ITAR/export-control gates
+
+**Date:** 2026-07-09 · **Status:** Accepted
+
+**Context:** Live forms end with commitment closers — "Are you up for it?", "Are you
+ready?", "Does this sound like you?" — that matched no keyword rule and no classifiable
+type, so they always fell to the needs-attention queue. The user also flagged ITAR gates
+(the standard "(i) U.S. citizen or national, (ii) green card holder…" blurb): as a U.S.
+citizen he qualifies as an ITAR "U.S. person" and is eligible to apply for a secret
+clearance, so these should never block an autonomous run.
+
+**Decision:**
+1. **Readiness closers → "Yes"** (`apply.py resolve()`): a keyword rule ("are you up
+   for", "up for the challenge", "ready to take on", "sound like you", "are you ready", …)
+   answers Yes — applying IS the commitment, same honesty rationale as the existing ADA
+   essential-functions rule. Guarded against logistical "ready" phrasings (start,
+   relocate, remote/onsite, travel, commute, when), which keep resolving from their
+   profile fields or stay captured. Plus a **`role_commitment`** entry in
+   `CLASSIFIABLE_TYPES` (answered live as "Yes") so the batched classifier catches
+   rephrasings the keywords miss.
+2. **ITAR / export-control gates → "Yes" iff `us_citizen` is True** (rule ordered before
+   the citizen rule so the multi-status blurb resolves as ITAR): a citizen is a "U.S.
+   person", so the gate is met. A non-citizen falls THROUGH — not `return None` — so a
+   banked answer still applies (green-card holders/refugees/asylees also qualify, which
+   the profile can't derive; the salary rule's skipped-bank lesson, decision 041).
+   Matching pitfall fixed en route: "itar" must match as a whole word — as a substring it
+   hit "mil-ITAR-y status" and flipped the veteran-status corpus case. Option hints map
+   status-style ITAR dropdowns to the citizen/national / "U.S. Person" option. Plus an
+   **`itar_us_person`** classifiable type (Yes iff citizen, else None → capture).
+3. **Clearance eligibility vs possession:** "eligible/able/willing to obtain a
+   clearance" → Yes for a citizen; "do you HAVE an active clearance" stays captured
+   (pinned null in the corpus, and "clearance" remains in `_ENUMERATED` so no
+   classification/banking path can map it onto a blanket Yes).
+
+**Reasoning:** Both families are gates whose truthful answer is derivable (commitment from
+the act of applying; ITAR from citizenship) — leaving them to the needs-attention queue
+stalled otherwise-autonomous runs. All deterministic at run time; the two new types cost
+nothing extra (they ride the existing batched classify call). **Verified:** 11 new corpus
+cases (closers, guards like "When are you ready to start?" → null and "Are you ready to
+relocate?" → No, the verbatim ITAR blurb, clearance eligibility vs possession), full suite
+**132/132**.
+See [[041-two-pass-page-fill]], [[040-autofill-determinism-hardening]], [[018-answer-bank]].

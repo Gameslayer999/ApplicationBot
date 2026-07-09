@@ -175,16 +175,25 @@ def remember_dropdown_aliases(new: dict[str, list[str]], path: str | Path = DEFA
 def remember_answers(new: list[QA], path: str | Path = DEFAULT_PATH) -> int:
     """Append newly-learned Q&A to the on-disk answer bank so future autofill reuses them.
     Reloads from disk first (the run may have started from an in-memory copy), skips questions
-    already banked (case/space-insensitive) and blank answers. Returns how many were added."""
+    already banked (case/space-insensitive) and blank answers. A `maps_to` mapping is only
+    persisted if `answer_bank.valid_mapping` allows it — a banked mapping overrides the
+    structured rules forever after, so an invalid one must be refused at write time, not
+    repaired later (the polluted-answer-bank incident). Returns how many were added."""
+    from . import answer_bank  # lazy: keep profile I/O importable without the bank machinery
+
     profile = load_profile(path)
     have = {_norm_q(qa.question) for qa in profile.custom_answers}
     added = 0
     for qa in new:
         key = _norm_q(qa.question)
+        maps_to = getattr(qa, "maps_to", "")
+        if maps_to and not answer_bank.valid_mapping(qa.question, maps_to):
+            qa = qa.model_copy(update={"maps_to": ""})  # keep any answer text, drop the mapping
+            maps_to = ""
         # Keep entries that carry either a written answer OR a structured mapping (maps_to);
         # a mapped entry answers live from the profile, so its `answer` is intentionally blank.
-        has_content = bool((qa.answer or "").strip()) or bool(getattr(qa, "maps_to", ""))
-        if not key or not has_content or key in have:
+        has_content = bool((qa.answer or "").strip()) or bool(maps_to)
+        if not key or len(key) < 4 or not has_content or key in have:
             continue
         profile.custom_answers.append(qa)
         have.add(key)
@@ -208,7 +217,7 @@ def capture_questions(questions: list[str], path: str | Path = DEFAULT_PATH,
     touched = False
     for q in questions:
         key = _norm_q(q)
-        if not key:
+        if not key or len(key) < 4:  # garbage capture ("yes", stray tokens) — never bank it
             continue
         m = meta.get(q) or {}
         kind, options = (m.get("kind") or ""), list(m.get("options") or [])
