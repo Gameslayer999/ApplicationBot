@@ -1,0 +1,49 @@
+<!doctype html>
+<!-- Workday-shaped account gate for tests/test_workday.py (headless, no tokens): a sign-in form
+     shown by default and a create-account form revealed by the "Create Account" toggle. Both
+     carry the same data-automation-id="email"/"password" — only the VISIBLE one is targeted, as
+     on real Workday. Submit buttons set window flags so tests confirm the click without a server. -->
+<html>
+<head><meta charset="utf-8"><title>Sign In</title><style>.hidden{display:none}</style></head>
+<body>
+
+  <div id="signin" data-automation-id="signInContent">
+    <h1>Sign In</h1>
+    <input data-automation-id="email" type="email" aria-label="Email Address">
+    <input data-automation-id="password" type="password" aria-label="Password">
+    <button data-automation-id="signInSubmitButton" type="button">Sign In</button>
+    <button data-automation-id="createAccountLink" type="button">Create Account</button>
+  </div>
+
+  <div id="create" class="hidden" data-automation-id="createAccountContent">
+    <h1>Create Account</h1>
+    <input data-automation-id="email" type="email" aria-label="Email Address">
+    <input data-automation-id="password" type="password" aria-label="Password">
+    <input data-automation-id="verifyPassword" type="password" aria-label="Verify New Password">
+    <div data-automation-id="createAccountCheckbox">
+      <input type="checkbox"><label>I agree to the Terms</label>
+    </div>
+    <button data-automation-id="createAccountSubmitButton" type="button">Create Account</button>
+  </div>
+
+  <script>
+    const signin = document.getElementById('signin');
+    const create = document.getElementById('create');
+    document.querySelector('[data-automation-id=createAccountLink]')
+      .addEventListener('click', () => { signin.classList.add('hidden'); create.classList.remove('hidden'); });
+
+    window.__signedIn = false;
+    window.__created = false;
+    const q = id => document.querySelector(`#${id} [data-automation-id=email]`).value;
+
+    document.querySelector('[data-automation-id=signInSubmitButton]')
+      .addEventListener('click', () => { window.__signedIn = q('signin').length > 0; });
+
+    document.querySelector('[data-automation-id=createAccountSubmitButton]')
+      .addEventListener('click', () => {
+        const checked = document.querySelector('#create [data-automation-id=createAccountCheckbox] input').checked;
+        window.__created = q('create').length > 0 && checked;
+      });
+  </script>
+</body>
+</html>

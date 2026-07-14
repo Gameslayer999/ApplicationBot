@@ -41,6 +41,7 @@ class PipelineResult:
     after_gates: int
     errors: list[str]
     skipped_seen: int = 0  # postings dropped because they're already in the tracker
+    skipped_shown: int = 0  # postings hidden because a previous preview already showed them (decision 053)
     bridged: int = 0  # aggregator hits resolved to a fillable ATS (decision 032)
     non_fillable: list = None  # postings on portals Apply can't fill (decision 035 gate)
     from_cache: bool = False  # matches came from the discovery snapshot, not a live search (decision 037)
@@ -52,13 +53,14 @@ class PipelineResult:
 
 
 def _is_fillable(p) -> bool:
-    """Can the Apply stage drive this posting's form? True for the six public-API ATSs
-    (and for aggregator hits not yet bridge-resolved, which redirect to one of them or get
-    marked auto_applyable=False by the bridge). Workday/iCIMS/unresolved links are not."""
+    """Can the Apply stage drive this posting's form? True for the six public-API ATSs, for
+    **Workday** (the deterministic adapter, decision 059 — M1 dry-run), and for aggregator hits
+    not yet bridge-resolved (which redirect to one of them or get marked auto_applyable=False by
+    the bridge). iCIMS / unresolved links are not."""
     from .discovery import _AGGREGATOR_ATS, ATS_SOURCES
     if p.extra.get("auto_applyable") is False:
         return False
-    return p.ats in ATS_SOURCES or p.ats in _AGGREGATOR_ATS
+    return p.ats in ATS_SOURCES or p.ats in _AGGREGATOR_ATS or p.ats == "workday"
 
 
 def _seen_canonical_urls(filters: DiscoveryFilters) -> set:
@@ -76,6 +78,25 @@ def _seen_canonical_urls(filters: DiscoveryFilters) -> set:
     return {canonical_url(u) for u in seen}
 
 
+def _hide_already_shown(matches: list[Match], only_new: bool) -> tuple[list[Match], int]:
+    """The seen-openings ledger (decision 053): when `only_new`, drop matches a previous
+    preview already surfaced, then record the survivors so the NEXT preview hides them too.
+    Returns (matches_to_show, n_hidden). A no-op (and never records) when `only_new` is False,
+    so the runner and other non-preview callers keep their exact current behaviour."""
+    if not only_new:
+        return matches, 0
+    from . import discovery_seen
+    from .discovery import canonical_url
+    seen = discovery_seen.seen_urls()
+    hidden = 0
+    if seen:
+        before = len(matches)
+        matches = [m for m in matches if canonical_url(m.posting.url) not in seen]
+        hidden = before - len(matches)
+    discovery_seen.record(m.posting.url for m in matches)
+    return matches, hidden
+
+
 def discover_and_match(
     resume: Resume,
     filters: DiscoveryFilters,
@@ -86,6 +107,7 @@ def discover_and_match(
     bridge: bool = True,
     cache: bool = True,
     force_fresh: bool = False,
+    only_new: bool = False,
     on_progress=None,
 ) -> PipelineResult:
     """The reusable core: discover → gate → skip-already-seen → bridge → qualification-match.
@@ -97,7 +119,12 @@ def discover_and_match(
     younger than `filters.cache_ttl_hours` (and matching the résumé/boards/filters
     fingerprint) is reused verbatim — skipping the board search AND the Claude judge. The
     only per-run work on a cache hit is re-applying `skip_seen`, so a role you've since
-    applied to still drops out. A live run saves its result as the next snapshot."""
+    applied to still drops out. A live run saves its result as the next snapshot.
+
+    `only_new` (decision 053): for preview/list runs, hide openings a previous preview already
+    showed (the seen-openings ledger) and record what's surfaced, so each run shows only NEW
+    postings. Layered on top of the cache (which still holds the full ranked result) and
+    `skip_seen`; off by default so the autonomous runner is unaffected."""
     from . import backends
     from . import discovery_cache
 
@@ -123,12 +150,14 @@ def discover_and_match(
                 before = len(matches)
                 matches = [m for m in matches if canonical_url(m.posting.url) not in seen_canon]
                 skipped = before - len(matches)
+            matches, skipped_shown = _hide_already_shown(matches, only_new)
             return PipelineResult(
                 matches=matches,
                 discovered=snap.discovered,
                 after_gates=snap.after_gates,
                 errors=[],
                 skipped_seen=skipped,
+                skipped_shown=skipped_shown,
                 bridged=snap.bridged,
                 non_fillable=list(snap.non_fillable),
                 from_cache=True,
@@ -164,10 +193,22 @@ def discover_and_match(
     if non_fillable:
         postings = [p for p in postings if _is_fillable(p)]
 
+    # Steer which top_n postings the judge scores toward past winners (decision 046). Built
+    # from the accumulated fit history; a no-op until enough postings have been judged.
+    from . import fit_learning
+    predictor = fit_learning.predictor()
+
     matches, match_errors = match(
         resume, postings, top_n=filters.top_n, use_claude=use_claude,
-        min_skills=filters.min_skills, on_progress=on_progress,
+        min_skills=filters.min_skills, on_progress=on_progress, predictor=predictor,
     )
+
+    # Record this run's judged verdicts so the next run's predictor learns from them
+    # (decision 046). Best-effort; judged-only (keyword-only matches carry no fit signal).
+    fit_learning.append(m for m in matches if m.fit_score is not None)
+    # Also log a one-line run summary for the UI's improvement trend (best/mean fit, how many
+    # cleared). Uses the configured min_fit so "cleared" means the same across runs.
+    fit_learning.record_run(matches, min_fit=filters.min_fit)
 
     # Save this live result as the next run's snapshot (decision 037). Only cache the coarse
     # after-gates count and the ranked matches — enough to replay the run without touching the
@@ -179,12 +220,17 @@ def discover_and_match(
             discovered=discovered, after_gates=len(postings), bridged=bridged,
         )
 
+    # Hide openings a previous preview already showed, AFTER caching the full result above so
+    # the snapshot keeps everything (decision 053). No-op unless only_new.
+    matches, skipped_shown = _hide_already_shown(matches, only_new)
+
     return PipelineResult(
         matches=matches,
         discovered=discovered,
         after_gates=len(postings),
         errors=errors + match_errors,
         skipped_seen=skipped_seen,
+        skipped_shown=skipped_shown,
         bridged=bridged,
         non_fillable=non_fillable,
     )
@@ -232,6 +278,27 @@ def effective_min_fit(filters: DiscoveryFilters) -> tuple[int, str | None]:
                    f"({reason}). Set min_fit ≥ {value} in the Discover settings to make "
                    "this permanent, or turn off its calibration toggle to keep "
                    f"{filters.min_fit}.")
+
+
+def _print_diagnosis(filters: DiscoveryFilters) -> None:
+    """Print the fit-learning diagnosis + recommendations (decision 046), best-effort."""
+    from . import fit_learning
+    try:
+        a = fit_learning.analysis(min_fit=filters.min_fit,
+                                   current_levels=filters.experience_levels)
+    except Exception:
+        return
+    if a.n_judged == 0:
+        return
+    print("\nWhat past runs have taught the search:")
+    for line in a.lines():
+        print("  " + line)
+    hist = fit_learning.runs(limit=10)
+    if len(hist) >= 2:
+        first, last = hist[0]["best_fit"], hist[-1]["best_fit"]
+        trend = "▲ improving" if last > first else ("▼ down" if last < first else "▬ flat")
+        spark = " → ".join(str(r["best_fit"]) for r in hist)
+        print(f"  trend: best fit {first}→{last} over {len(hist)} runs ({trend}); {spark}")
 
 
 def pick_top(matches: list[Match], *, min_fit: int) -> Match | None:
@@ -383,7 +450,18 @@ def main(argv: list[str] | None = None) -> int:
                         help="Ignore the cached discovery snapshot and re-search every board "
                         "(re-judges with Claude). Default reuses a snapshot younger than "
                         "cache_ttl_hours in your filters.")
+    parser.add_argument("--all", dest="show_all", action="store_true",
+                        help="Show every match, including openings a previous run already showed "
+                        "you. Default lists only NEW openings since your last run (decision 053).")
+    parser.add_argument("--reset-seen", action="store_true",
+                        help="Forget which openings were already shown, then run — every match "
+                        "counts as new again.")
     args = parser.parse_args(argv)
+
+    if args.reset_seen:
+        from . import discovery_seen
+        print("Reset seen-openings ledger." if discovery_seen.clear()
+              else "Seen-openings ledger was already empty.")
 
     resume = load_resume(args.resume)
     filters = load_filters(args.filters)
@@ -407,8 +485,10 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print(f"Discovering from {len(filters.boards)} board(s) (reusing a fresh cache if present)…")
     res = discover_and_match(resume, filters, profile=profile, use_claude=use_claude,
-                             force_fresh=args.fresh)
+                             force_fresh=args.fresh, only_new=not args.show_all)
     seen_note = f" (skipped {res.skipped_seen} already in tracker)" if res.skipped_seen else ""
+    shown_note = (f" (hid {res.skipped_shown} already shown — pass --all to see them)"
+                  if res.skipped_shown else "")
     bridge_note = f" (bridged {res.bridged} aggregator hit(s) to a fillable ATS)" if res.bridged else ""
     manual_note = (f" (set aside {len(res.non_fillable)} on portals ApplicationBot can't fill yet"
                    " — e.g. Workday/iCIMS)" if res.non_fillable else "")
@@ -418,13 +498,20 @@ def main(argv: list[str] | None = None) -> int:
         print(f"→ Reused cached discovery (saved {age}; no board search, no Claude judging — "
               "pass --fresh to re-search).")
     print(f"Discovered {res.discovered} postings → {res.after_gates} after gates{seen_note}{bridge_note}{manual_note} → "
-          f"{len(res.matches)} matched ≥{filters.min_skills} skill(s).")
+          f"{len(res.matches)} matched ≥{filters.min_skills} skill(s){shown_note}.")
     for e in res.errors:
         print(f"  ! {e}")
+
+    if not res.matches and res.skipped_shown:
+        print("\nEvery match this run was already shown to you. Pass --all to see them again, "
+              "or --reset-seen to start over.")
 
     print(f"\nTop {min(args.limit, len(res.matches))} qualification matches:\n")
     for i, m in enumerate(res.matches[:args.limit], 1):
         print(_fmt_match(i, m))
+
+    # What the feedback loop has learned so far, and what it recommends (decision 046).
+    _print_diagnosis(filters)
 
     if not args.apply_first:
         if res.matches:

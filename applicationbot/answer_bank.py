@@ -23,6 +23,11 @@ from typing import Optional
 
 from .models import Resume
 
+# Free-text answers are drafted with a deliberately WEAK/cheap Claude model (a grounded,
+# résumé-only paragraph doesn't need a frontier model). Alias, not a pinned snapshot, so the
+# CLI resolves the latest Haiku — consistent with the tier aliases in backends.py.
+DRAFT_MODEL = "haiku"
+
 # Phrases whose answer depends on the specific company/role — never cache these.
 _COMPANY_SPECIFIC = (
     "why do you want to work", "why do you want to join", "why are you interested",
@@ -89,6 +94,20 @@ def is_open_ended(question: str, is_textarea: bool = False) -> bool:
     if is_textarea:
         return True
     return len(n) > 25 and any(t in n for t in _OPEN_ENDED)
+
+
+def is_draftable_required(question: str) -> bool:
+    """True if a REQUIRED free-text field with no mapped/banked answer may be drafted by Claude.
+    Broader than is_open_ended — a required field must be filled to submit, whatever its phrasing —
+    but still refuses questions we must never fabricate: numeric facts the applicant must own
+    (salary, GPA, test scores) and demographic/EEO self-identification. Those stay unfilled so the
+    pre-submit gate parks them for the user instead of inventing an answer."""
+    n = _norm(question)
+    if not n:
+        return False
+    if any(t in n for t in _NUMERIC_FACT):
+        return False
+    return not is_demographic(question)
 
 
 _SYSTEM = """\
@@ -398,6 +417,61 @@ def _plausible_pick(value: str, chosen: str) -> bool:
     return not vtok or bool(vtok & otok)
 
 
+def choose_required_option(
+    question: str,
+    options: list[str],
+    resume: Resume,
+    *,
+    company: Optional[str] = None,
+    jd: Optional[str] = None,
+    model: Optional[str] = None,
+) -> Optional[str]:
+    """Choose the best-fitting OFFERED option for a REQUIRED dropdown/select we have NO mapped
+    answer for, grounded strictly in the résumé (+ company/JD). Returns an option VERBATIM from
+    `options`, or None. Distinct from `pick_dropdown_option` (which maps a KNOWN value onto an
+    option): this answers from scratch when the resolver, semantic classify, and hints all missed,
+    so a required box doesn't block the submit. It NEVER invents an option — only picks among those
+    offered — and refuses questions we must not guess at: demographic/EEO self-identification and
+    facts the applicant must own (clearance, citizenship, GPA, scores, salary). Those stay for the
+    user. Uses the weak DRAFT_MODEL. Best-effort: None if the CLI is unavailable or nothing fits."""
+    n = _norm(question)
+    if not (n and is_draftable_required(question)) or any(t in n for t in _ENUMERATED):
+        return None
+    opts = [o for o in options if (o or "").strip()][:60]
+    if not opts:
+        return None
+    from . import backends  # lazy
+
+    context = ("RÉSUMÉ (JSON — the only source of truth about the applicant):\n"
+               f"{resume.model_dump_json(exclude_none=True, exclude_defaults=True)}\n")
+    if company:
+        context += f"COMPANY: {company}\n"
+    if jd:
+        context += f"JOB DESCRIPTION:\n{jd[:1500]}\n"
+    numbered = "\n".join(f"{i}. {o}" for i, o in enumerate(opts))
+    prompt = (
+        context
+        + f"\nA REQUIRED job-application dropdown labelled {question!r} must be answered.\n"
+        f"OPTIONS:\n{numbered}\n\n"
+        "Choose the option that is TRUE for this applicant per the résumé, or — when the question "
+        "is a preference with no résumé fact — the most reasonable, honest choice. Use ONLY the "
+        "résumé; NEVER guess a fact the applicant must own (citizenship, work authorization, a "
+        "security clearance, a demographic). If no option can be honestly chosen, decline.\n"
+        'Reply with JSON: {"choice": <number of the best option, or -1 if none fits>}.'
+    )
+    schema = {"type": "object", "properties": {"choice": {"type": "integer"}},
+              "required": ["choice"], "additionalProperties": False}
+    try:
+        out = backends.run_claude_cli(prompt, model=model or DRAFT_MODEL, think=False,
+                                      timeout=60, json_schema=schema)
+    except Exception:
+        return None
+    idx = _json_reply(out, "choice")
+    if isinstance(idx, int) and 0 <= idx < len(opts):
+        return opts[idx]
+    return None
+
+
 _PICK_RULES = (
     "An option MATCHES if it refers to the same institution/organization/value as the "
     "answer — i.e. it shares the answer's core name, possibly with an extra qualifier (a "
@@ -462,8 +536,11 @@ def generate_answer(
     max_chars: int = 700,
     model: Optional[str] = None,
 ) -> Optional[str]:
-    """Draft a grounded answer via the Claude subscription. Returns None if unavailable/failed."""
+    """Draft a grounded answer via the Claude subscription, using a weak/cheap model by default
+    (DRAFT_MODEL) — an override is honored. Returns None if unavailable/failed."""
     from . import backends  # lazy: avoids importing the CLI plumbing unless we generate
+
+    model = model or DRAFT_MODEL
 
     context = ("RÉSUMÉ (source of truth, JSON):\n"
                f"{resume.model_dump_json(exclude_none=True, exclude_defaults=True)}\n\n")

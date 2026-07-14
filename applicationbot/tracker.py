@@ -28,7 +28,11 @@ DEFAULT_DB = REPO_ROOT / "applications.db"
 # Post-application outcomes (decision 043): `responded` = any non-rejection reply,
 # `interview`/`offer` = reached that stage, `rejected` = explicit no, `no-response` =
 # closed out after silence. These feed the calibration report below.
-STATUSES = ["discovered", "tailored", "dry-run", "applied", "responded",
+# `blocked` = an armed run that filled the form but withheld the submit because something
+# the user must resolve stood in the way (a required question with no answer, a login wall,
+# a CAPTCHA). It carries `blocked_kind`/`blocked_detail` and is surfaced as a parked
+# application the user can resolve then resume (see parking.py).
+STATUSES = ["discovered", "tailored", "dry-run", "blocked", "applied", "responded",
             "interview", "offer", "rejected", "no-response", "failed"]
 
 # Columns a caller may set/edit. `id`, `created_at`, `updated_at` are managed here.
@@ -38,7 +42,7 @@ STATUSES = ["discovered", "tailored", "dry-run", "applied", "responded",
 EDITABLE = [
     "company", "role", "location", "remote", "pay", "portal", "method",
     "source_url", "date_discovered", "date_applied", "status", "resume_path", "notes",
-    "fit_score", "follow_up_date",
+    "fit_score", "follow_up_date", "blocked_kind", "blocked_detail",
 ]
 
 _SCHEMA = """
@@ -59,6 +63,8 @@ CREATE TABLE IF NOT EXISTS applications (
     notes           TEXT NOT NULL DEFAULT '',
     fit_score       TEXT NOT NULL DEFAULT '',       -- judge's 0-100 fit at apply time
     follow_up_date  TEXT NOT NULL DEFAULT '',       -- ISO date to chase a silent application
+    blocked_kind    TEXT NOT NULL DEFAULT '',       -- parking.py kind if parked (needs_answer / login / …)
+    blocked_detail  TEXT NOT NULL DEFAULT '',       -- specifics for the Resolve card (field names, error)
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL
 );
@@ -72,7 +78,7 @@ def _connect(path: str | Path = DEFAULT_DB) -> sqlite3.Connection:
     conn.executescript(_SCHEMA)
     # Migration for DBs created before decision 043 (CREATE IF NOT EXISTS won't add columns).
     cols = {r[1] for r in conn.execute("PRAGMA table_info(applications)")}
-    for missing in ("fit_score", "follow_up_date"):
+    for missing in ("fit_score", "follow_up_date", "blocked_kind", "blocked_detail"):
         if missing not in cols:
             conn.execute(f"ALTER TABLE applications ADD COLUMN {missing} TEXT NOT NULL DEFAULT ''")
     return conn
@@ -187,6 +193,19 @@ def seen_source_urls(*, statuses: Optional[list[str]] = None, path: str | Path =
         return {r["source_url"] for r in cur.fetchall()}
 
 
+# Statuses at which a parked block is still worth surfacing to the user. Once a row reaches
+# `applied` (submitted) or a post-application outcome, its block is moot and it drops out.
+_PARKED_OPEN = {"discovered", "tailored", "dry-run", "blocked"}
+
+
+def parked_applications(*, path: str | Path = DEFAULT_DB) -> list[dict[str, Any]]:
+    """Applications parked on a user-resolvable block (parking.py) that are still open —
+    newest first. These feed the UI's "Resolve" cards: each carries `blocked_kind` /
+    `blocked_detail` describing what to fix before re-running Apply on the posting."""
+    return [r for r in list_applications(path=path)
+            if r.get("blocked_kind") and r["status"] in _PARKED_OPEN]
+
+
 def list_applications(
     *, status: Optional[str] = None, search: Optional[str] = None, path: str | Path = DEFAULT_DB
 ) -> list[dict[str, Any]]:
@@ -217,6 +236,36 @@ def status_counts(*, path: str | Path = DEFAULT_DB) -> dict[str, int]:
             counts[r["status"]] = counts.get(r["status"], 0) + r["n"]
     counts["total"] = sum(counts[s] for s in STATUSES)
     return counts
+
+
+# The application journey as a shrinking funnel (AutoApply-AI survey #4). Each stage's set is a
+# SUPERSET of the next, so counting rows whose current status falls in each set yields a monotone
+# funnel — "reached this stage or beyond" — even though a row stores only its latest status. A
+# rejection still counts as having *responded* (a human replied); `no-response` counts as applied
+# but not responded. `discovered`/`tailored`/`failed` sit before the form and only feed the top.
+_SUBMITTED = {"applied", "responded", "interview", "offer", "rejected", "no-response"}
+_FUNNEL_STAGES = [
+    ("Discovered", set(STATUSES)),                              # everything in the tracker
+    ("Filled", _SUBMITTED | {"dry-run", "blocked"}),           # reached + filled the form
+    ("Applied", _SUBMITTED),                                    # actually submitted (armed)
+    ("Responded", {"responded", "interview", "offer", "rejected"}),  # a human replied (incl. a no)
+    ("Interview", {"interview", "offer"}),
+    ("Offer", {"offer"}),
+]
+
+
+def funnel_report(*, path: str | Path = DEFAULT_DB) -> list[dict[str, Any]]:
+    """The discovery→offer funnel: for each stage, how many applications reached it and the
+    conversion from the previous stage. Drives the Track-tab funnel view (survey #4)."""
+    counts = status_counts(path=path)
+    out: list[dict[str, Any]] = []
+    prev: Optional[int] = None
+    for label, statuses in _FUNNEL_STAGES:
+        n = sum(counts.get(s, 0) for s in statuses)
+        conv = None if prev is None else (n / prev if prev else 0.0)
+        out.append({"stage": label, "count": n, "conversion_from_prev": conv})
+        prev = n
+    return out
 
 
 # --------------------------------------------------- outcome calibration (decision 043)
@@ -308,6 +357,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     sub.add_parser("list", help="list applications")
     sub.add_parser("counts", help="status counts")
+    sub.add_parser("funnel", help="discovery→offer conversion funnel")
     sub.add_parser("calibration", help="response rate by fit band (tune min_fit from outcomes)")
 
     d = sub.add_parser("delete", help="delete an application by id")
@@ -330,6 +380,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     elif args.cmd == "counts":
         for k, v in status_counts(path=db).items():
             print(f"{k:<12} {v}")
+    elif args.cmd == "funnel":
+        for s in funnel_report(path=db):
+            conv = f"  ({s['conversion_from_prev']:.0%} of prev)" if s["conversion_from_prev"] is not None else ""
+            print(f"{s['stage']:<12} {s['count']:>4}{conv}")
     elif args.cmd == "calibration":
         rep = calibration_report(path=db)
         print(f"{'fit band':<10} {'applied':>8} {'pending':>8} {'positive':>9} "

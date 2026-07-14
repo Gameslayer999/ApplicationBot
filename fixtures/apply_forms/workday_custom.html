@@ -1,0 +1,29 @@
+<!doctype html>
+<!-- A Workday page with a tenant's CUSTOM "Application Questions" (unknown data-automation-ids)
+     alongside a standard field and an already-filled one — for tests/test_workday.py to exercise
+     unrecognized_fields() + replay_recipe() (M2, decision 060). Headless, no tokens. -->
+<html>
+<head><meta charset="utf-8"><title>Application Questions</title></head>
+<body>
+  <h2>Application Questions</h2>
+
+  <!-- standard (known) field — must NOT be reported as unrecognized -->
+  <div data-automation-id="legalNameSection_firstName"><label>First Name</label><input type="text"></div>
+
+  <!-- custom, unknown, empty, resolvable -->
+  <div data-automation-id="customGithub"><label>GitHub profile URL</label><input type="text"></div>
+
+  <!-- custom, unknown, empty, open-ended (not resolvable without generation) -->
+  <div data-automation-id="customWhy"><label>Why do you want to work here?</label><textarea></textarea></div>
+
+  <!-- custom dropdown, unknown, empty -->
+  <div class="wd-dropdown" data-automation-id="referralSource">
+    <label>How did you hear about us?</label>
+    <button type="button" aria-haspopup="listbox">Select One</button>
+    <ul role="listbox" style="display:none"><li role="option">Online job search</li><li role="option">Referral</li></ul>
+  </div>
+
+  <!-- custom but already FILLED — must NOT be reported (nothing to do) -->
+  <div data-automation-id="customPrefilled"><label>Pronouns</label><input type="text" value="she/her"></div>
+</body>
+</html>

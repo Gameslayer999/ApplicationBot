@@ -102,13 +102,14 @@ def _retry_delay(e: urllib.error.HTTPError, attempt: int) -> float:
     return delay
 
 
-def fetch_json(url: str, *, method: str = "GET", body: Any = None) -> Any:
-    """Fetch a URL and parse JSON. Defaults to GET; pass a `body` (dict) to POST it as JSON
-    (Workable's careers API is POST). Rate-limited per host (_polite_wait) and retried on
-    transient failures (429/5xx/network, up to 3 attempts with backoff); other HTTP errors
-    fail immediately. Raises DiscoveryError with a precise message on failure
-    (Agent Guideline #11) so a single bad source never crashes a whole discovery run."""
-    headers = {"User-Agent": _UA, "Accept": "application/json"}
+def fetch_text(url: str, *, method: str = "GET", body: Any = None,
+               accept: str = "application/json") -> str:
+    """Fetch a URL and return the decoded response body. Defaults to GET; pass a `body`
+    (dict) to POST it as JSON (Workable's careers API is POST). Rate-limited per host
+    (_polite_wait) and retried on transient failures (429/5xx/network, up to 3 attempts
+    with backoff); other HTTP errors fail immediately. Raises DiscoveryError with a precise
+    message on failure (Agent Guideline #11) so a single bad source never crashes a run."""
+    headers = {"User-Agent": _UA, "Accept": accept}
     data = None
     if body is not None:
         data = json.dumps(body).encode("utf-8")
@@ -120,8 +121,7 @@ def fetch_json(url: str, *, method: str = "GET", body: Any = None) -> Any:
         req = urllib.request.Request(url, data=data, method=method, headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=_TIMEOUT, context=_SSL_CTX) as r:
-                raw = r.read().decode("utf-8", errors="replace")
-            break
+                return r.read().decode("utf-8", errors="replace")
         except urllib.error.HTTPError as e:
             if e.code != 429 and not 500 <= e.code < 600:  # non-transient: fail immediately
                 raise DiscoveryError(f"HTTP {e.code} for {url}") from e
@@ -139,6 +139,13 @@ def fetch_json(url: str, *, method: str = "GET", body: Any = None) -> Any:
                 _sleep(_RETRY_BACKOFF_S[attempt - 1])
                 continue
             raise DiscoveryError(f"request failed for {url}: {type(e).__name__}: {e}{exhausted}") from e
+    raise DiscoveryError(f"request failed for {url}{exhausted}")  # unreachable (loop returns/raises)
+
+
+def fetch_json(url: str, *, method: str = "GET", body: Any = None) -> Any:
+    """Fetch a URL and parse JSON (fetch semantics per `fetch_text`). Raises DiscoveryError
+    on a non-JSON response so a single bad source never crashes a whole discovery run."""
+    raw = fetch_text(url, method=method, body=body, accept="application/json")
     try:
         return json.loads(raw)
     except json.JSONDecodeError as e:
@@ -653,6 +660,60 @@ class WorkableSource(Source):
         )
 
 
+class CareerSiteSource(Source):
+    """Discover from career pages that publish schema.org `JobPosting` structured data —
+    the enrichment cascade (DECISIONS.md #047, adapted from ApplyPilot): JSON-LD first, then
+    CSS/DOM, then an optional Claude fallback. Give it career/posting URLs; each page is
+    fetched once and every JobPosting on it becomes a Posting (a listing page may yield
+    several; a single posting page yields one). Reads only published structured data
+    (Agent Guideline #4). No link-crawling in v1 — point it at posting pages or listing pages
+    that embed JobPosting JSON-LD. `llm` (optional) turns on the tier-3 Claude fallback for
+    pages with neither JSON-LD nor a recognizable description block; off by default (free,
+    offline). `stats` counts which tier resolved each page for a "% saved" log line."""
+
+    def __init__(self, urls: list[str], *, llm=None) -> None:
+        self.urls = [u.strip() for u in urls if u and u.strip()]
+        self.llm = llm
+        self.name = f"career-sites:{len(self.urls)}"
+        self.stats: dict[str, int] = {"json-ld": 0, "css": 0, "llm": 0, "empty": 0}
+
+    def fetch(self) -> list[Posting]:
+        from . import enrich
+
+        out: list[Posting] = []
+        for url in self.urls:
+            try:
+                html = fetch_text(url, accept="text/html,application/xhtml+xml,*/*")
+            except DiscoveryError:
+                self.stats["empty"] += 1
+                continue
+            results = [enrich.jobposting_to_result(n) for n in enrich.extract_jobpostings_from_jsonld(html)]
+            results = [r for r in results if r.ok]
+            if not results:  # no JSON-LD JobPosting → single-result CSS/LLM cascade for the page
+                single = enrich.enrich_from_html(html, url=url, llm=self.llm)
+                results = [single] if single.ok else []
+            if not results:
+                self.stats["empty"] += 1
+                continue
+            for r in results:
+                self.stats[r.tier] = self.stats.get(r.tier, 0) + 1
+                apply_url = r.apply_url or url
+                out.append(Posting(
+                    company=r.company,
+                    title=r.title,
+                    body=r.description,
+                    url=apply_url,
+                    ats=detect_ats_from_url(apply_url),
+                    location=r.location,
+                    compensation=r.compensation,
+                    remote=r.remote,
+                    apply_url=apply_url,
+                    updated_at=r.date_posted,
+                    extra={"enriched": r.tier},
+                ))
+        return out
+
+
 # --------------------------------------------------------------------------- curated feeds
 #
 # Community-maintained, daily-updated JSON lists of EARLY-CAREER roles (new-grad + internships)
@@ -962,7 +1023,9 @@ def bridge_aggregator_postings(postings, *, limit: int = _BRIDGE_MAX, upgrade_jd
         ats = detect_ats_from_url(final)
         if ats not in ("other", ""):
             p.extra["bridged_from"] = p.ats
-            p.extra["auto_applyable"] = ats in ATS_SOURCES  # do we have a dedicated adapter?
+            # Do we have a dedicated Apply adapter? The six public-API ATSs, plus Workday
+            # (deterministic adapter, decision 059 — M1 dry-run).
+            p.extra["auto_applyable"] = ats in ATS_SOURCES or ats == "workday"
             p.ats = ats
             p.apply_url = final
             if upgrade_jd:

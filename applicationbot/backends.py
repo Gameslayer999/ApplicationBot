@@ -92,6 +92,10 @@ What you SHOULD do:
 only).
 - Reorder and select experience, bullets, projects, activities, and skills so the most \
 relevant material comes first.
+- Each project may carry an `impact` score (1–5, technical impressiveness). Relevance to \
+this job is the primary signal, but among comparably-relevant projects prefer higher-\
+impact ones, and when the length budget forces you to drop projects, drop the \
+lowest-impact, least-relevant ones first.
 - Mirror the job description's vocabulary where the candidate genuinely has that \
 experience (e.g. if the base resume says "built REST services" and the job says \
 "microservices", you may say "built REST microservices" only if that is accurate).
@@ -402,7 +406,8 @@ class RulesBackend:
                 (score(" ".join([p.name, p.tech or "", *p.bullets])), i, p)
                 for i, p in enumerate(projects)
             ]
-            scored.sort(key=lambda t: (-t[0], t[1]))
+            # Relevance first; break ties toward the more technically impressive project.
+            scored.sort(key=lambda t: (-t[0], -(t[2].impact or 0), t[1]))
             return [
                 p.model_copy(update={"tailor_note": _note(" ".join([p.name, p.tech or "", *p.bullets]))})
                 for _, _, p in scored

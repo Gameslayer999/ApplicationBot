@@ -54,6 +54,7 @@ def _match_to_dict(m: Match) -> dict:
         "posting": _posting_to_dict(m.posting),
         "keyword_score": m.keyword_score,
         "matched_skills": m.matched_skills,
+        "ats_score": m.ats_score,
         "qualified": m.qualified,
         "fit_score": m.fit_score,
         "why": m.why,
@@ -68,6 +69,7 @@ def _match_from_dict(d: dict) -> Match:
         posting=_posting_from_dict(d["posting"]),
         keyword_score=d.get("keyword_score", 0),
         matched_skills=d.get("matched_skills") or [],
+        ats_score=d.get("ats_score", 0),  # absent in pre-052 snapshots
         qualified=d.get("qualified"),
         fit_score=d.get("fit_score"),
         why=d.get("why", ""),

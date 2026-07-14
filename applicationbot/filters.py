@@ -34,7 +34,7 @@ from pydantic import BaseModel, Field
 import os
 
 from .apply_profile import ApplicationProfile
-from .discovery import AdzunaSource, CuratedListSource, Source, build_source
+from .discovery import AdzunaSource, CareerSiteSource, CuratedListSource, Source, build_source
 from .models import Resume
 
 DEFAULT_PATH = "profile/discovery.yaml"
@@ -101,6 +101,12 @@ def detect_levels(title: str) -> set[str]:
 
 class DiscoveryFilters(BaseModel):
     boards: list[Board] = Field(default_factory=list)
+    career_sites: list[str] = Field(
+        default_factory=list,
+        description="Career/posting page URLs to discover from via schema.org JobPosting "
+        "(JSON-LD) structured data, with a CSS/DOM fallback — full JD, no scraping grey "
+        "area. Point at posting pages or listing pages that embed JobPosting JSON-LD.",
+    )
     remote_only: bool = False
     min_salary: int = 0  # annual, in the profile's currency; 0 = no floor
     title_exclude: list[str] = Field(
@@ -156,6 +162,8 @@ def build_sources(
     (per-company, full JD) plus the broad aggregator when it's configured and we have a
     résumé to derive search keywords from. The aggregator gracefully self-skips if no key."""
     sources: list[Source] = [build_source(b.ats, b.token) for b in filters.boards]
+    if filters.career_sites:
+        sources.append(CareerSiteSource(filters.career_sites))
     agg = build_aggregator(filters, resume, profile)
     if agg is not None:
         sources.append(agg)

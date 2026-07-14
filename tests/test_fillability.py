@@ -18,9 +18,13 @@ def test_public_api_atss_are_fillable():
         assert _is_fillable(_p(ats)) is True, ats
 
 
-def test_account_gated_portals_are_not():
-    for ats in ("workday", "icims"):
-        assert _is_fillable(_p(ats)) is False, ats
+def test_workday_is_now_fillable():
+    # The Workday deterministic adapter (decision 059) makes Workday fillable (M1 dry-run).
+    assert _is_fillable(_p("workday")) is True
+
+
+def test_remaining_account_gated_portals_are_not():
+    assert _is_fillable(_p("icims")) is False
 
 
 def test_unbridged_aggregator_passes_through():

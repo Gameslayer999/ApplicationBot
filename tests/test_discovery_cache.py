@@ -51,6 +51,7 @@ class _Env:
 
     def __enter__(self):
         import applicationbot.backends as backends
+        import applicationbot.fit_learning as fit_learning
 
         def fake_discover(sources):
             self.searches += 1
@@ -66,11 +67,18 @@ class _Env:
         self._orig["match"] = pipeline.match
         self._orig["avail"] = backends.claude_code_available
         self._orig["path"] = discovery_cache.DEFAULT_PATH
+        self._orig["fit_path"] = fit_learning.DEFAULT_PATH
+        self._orig["runs_path"] = fit_learning.RUNS_PATH
         pipeline.discover = fake_discover
         pipeline.match = fake_match
         backends.claude_code_available = lambda: True
         discovery_cache.DEFAULT_PATH = self.tmp / "discovery_cache.json"
+        # discover_and_match reads/writes the fit-learning history (decision 046) — keep it in
+        # the temp dir so the suite never touches the real profile/fit_history.jsonl.
+        fit_learning.DEFAULT_PATH = self.tmp / "fit_history.jsonl"
+        fit_learning.RUNS_PATH = self.tmp / "fit_runs.jsonl"
         self._backends = backends
+        self._fit_learning = fit_learning
         return self
 
     def __exit__(self, *a):
@@ -78,6 +86,8 @@ class _Env:
         pipeline.match = self._orig["match"]
         self._backends.claude_code_available = self._orig["avail"]
         discovery_cache.DEFAULT_PATH = self._orig["path"]
+        self._fit_learning.DEFAULT_PATH = self._orig["fit_path"]
+        self._fit_learning.RUNS_PATH = self._orig["runs_path"]
 
 
 def _run(resume, filters, **kw):

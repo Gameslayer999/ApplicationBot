@@ -24,11 +24,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from . import apply_profile, auth, catalogue, filters, linkedin, tracker
+from . import apply_profile, auth, catalogue, filters, impact, linkedin, tracker
 from .job_description import JobDescription, load_job_description
 from .backends import DEFAULT_QUALITY
 from .length import LengthBudget
-from .models import TailoredResume
+from .models import Resume, TailoredResume
 from .pdf import render_pdf
 from .render import render_html, render_markdown
 from .resume import load_resume
@@ -53,7 +53,7 @@ def _test_reset() -> dict:
         "phase": "running", "step": "start",
         "message": "Starting…", "elapsed_note": "",
         "scanned": 0, "matched": 0, "judged": 0, "judged_total": 0,
-        "from_cache": False, "cache_age_min": None,
+        "from_cache": False, "cache_age_min": None, "can_research": False,
         "chosen": None, "report": None, "errors": [],
     }
 
@@ -89,9 +89,12 @@ def _test_worker(force_fresh: bool = False) -> None:
             _set(step="match", judged=done, judged_total=total,
                  message=f"Judging fit with Claude — {done}/{total} postings…")
 
+        # Show only openings not surfaced by a previous run (decision 053), so re-running
+        # doesn't keep listing the same postings. "Re-search fresh" (force_fresh) shows
+        # everything again — the user explicitly asked to see the full board result.
         res = pipeline.discover_and_match(resume, filters, profile=profile,
                                           use_claude=use_claude, on_progress=on_judge,
-                                          force_fresh=force_fresh)
+                                          force_fresh=force_fresh, only_new=not force_fresh)
         # Outcome calibration can raise min_fit above a proven-dead fit band (decision 043
         # follow-up); the note is shown with the judged list so the cutoff is never a mystery.
         min_fit, calib_note = pipeline.effective_min_fit(filters)
@@ -108,25 +111,30 @@ def _test_worker(force_fresh: bool = False) -> None:
         } for m in res.matches if m.fit_score is not None]
         cache_age_min = int((res.cache_age_seconds or 0) // 60) if res.from_cache else None
         _set(scanned=res.discovered, matched=len(res.matches), errors=res.errors,
-             skipped_seen=res.skipped_seen, judged=judged, min_fit=min_fit,
-             calib_note=calib_note, from_cache=res.from_cache, cache_age_min=cache_age_min)
+             skipped_seen=res.skipped_seen, skipped_shown=res.skipped_shown, judged=judged,
+             min_fit=min_fit, calib_note=calib_note, from_cache=res.from_cache,
+             cache_age_min=cache_age_min)
         if not res.matches:
             extra = ["No new postings matched your qualifications."]
+            if res.skipped_shown:
+                extra.append(f"({res.skipped_shown} opening(s) already shown in an earlier run "
+                             "were hidden — use “Re-search fresh” to see them all again.)")
             if res.skipped_seen:
                 extra.append(f"({res.skipped_seen} already in your tracker were skipped.)")
-            _set(phase="error", errors=(res.errors or []) + extra)
+            _set(phase="error", errors=(res.errors or []) + extra, can_research=True)
             return
 
         top = pipeline.pick_top(res.matches, min_fit=min_fit)
         if top is None:
             best = max((m.fit_score for m in res.matches if m.fit_score is not None), default=None)
             best_txt = f" Best fit this run was {best}/100." if best is not None else ""
-            _set(phase="error", errors=[
+            _set(phase="error", can_research=True, errors=[
                 f"No match reached your minimum fit of {min_fit}/100, so nothing was "
                 f"applied to.{best_txt} See the judged postings below for why. To find a match: "
-                "lower “Minimum fit score”, raise “How many top matches Claude judges”, set "
-                "“Experience levels” to your level (so senior roles are filtered out before "
-                "judging), or add boards that better fit your résumé — all in Discovery settings."])
+                "re-search fresh below, lower “Minimum fit score”, raise “How many top matches "
+                "Claude judges”, set “Experience levels” to your level (so senior roles are "
+                "filtered out before judging), or add boards that better fit your résumé — the "
+                "last four in Discovery settings."])
             return
         p = top.posting
         chosen = {
@@ -172,21 +180,120 @@ def start_test_run(force_fresh: bool = False) -> dict:
     return {"ok": True}
 
 
+def _reapply_gate(arm: bool):
+    """The SafetyGate a re-apply runs under. `arm=True` → a per-click armed gate (decision 058):
+    armed for exactly ONE submission, independent of profile/safety.yaml, but the global KILL file
+    still halts it (checked in `may_submit`). `arm=False` → None, so run_apply stays a dry-run."""
+    if not arm:
+        return None
+    from .safety import DEFAULT_KILL, SafetyGate
+    return SafetyGate(armed=True, max_submissions_per_run=1, kill_file=DEFAULT_KILL)
+
+
+def _reapply_worker(app_id: int, *, arm: bool = False) -> None:
+    """Resume a parked application (decision 049): re-drive the DETERMINISTIC fill on the same
+    posting URL with the stored tailored PDF, now that the user has resolved the block (answered
+    the question, stored the login). No re-discovery, no re-tailoring — the answer/profile change
+    is all that's new, so the same form fills further.
+
+    `arm=False` (default) → DRY-RUN: fills, records, never submits. `arm=True` (decision 058) →
+    a per-click armed submit: a one-shot `SafetyGate(armed=True, cap 1)` is passed to run_apply so
+    THIS one application is really submitted — independent of profile/safety.yaml (the user
+    confirmed this specific submit in the UI). The KILL file still halts it, and run_apply's
+    pre-submit gate still blocks a submit while any REQUIRED field is unresolved, so an unresolved
+    block records `blocked` instead of submitting."""
+    from . import backends
+    from .apply import AnswerResolver, run_apply
+
+    try:
+        app = tracker.get_application(app_id)
+        if not app:
+            _set(phase="error", errors=["That application is no longer in the tracker."])
+            return
+        url = (app.get("source_url") or "").strip()
+        pdf = (app.get("resume_path") or "").strip()
+        if not url:
+            _set(phase="error", errors=[
+                "This application has no source URL to re-apply to. Run a fresh dry-run instead."])
+            return
+        if not pdf or not Path(pdf).is_file():
+            _set(phase="error", errors=[
+                "The tailored résumé PDF for this application is gone — run a fresh dry-run for "
+                "this posting from Discovery settings instead of re-applying."])
+            return
+
+        company, role = app.get("company", ""), app.get("role", "")
+        verb = "Submitting" if arm else "Re-applying"
+        _set(step="apply", message=f"{verb} to {company} — {role}…".strip(" —"),
+             chosen={"company": company, "title": role, "url": url})
+
+        resolver = AnswerResolver(
+            resume=load_resume("profile/resume.yaml"),
+            profile=apply_profile.load_profile(),
+            enable_generation=backends.claude_code_available(),
+        )
+        gate = _reapply_gate(arm)
+
+        def on_filled(report):
+            _set(phase="filled", step="review",
+                 message=("Filled — submitting…" if arm else
+                          "Re-filled — review the browser window. Nothing was submitted."),
+                 report={"summary": report.summary(), "submitted": report.submitted,
+                         "url": report.url, "screenshot": report.screenshot})
+
+        _TEST_HOLD.clear()
+        report = run_apply(
+            url, pdf, resolver, headed=True, pause=True,
+            meta={"company": company, "role": role, "source_url": url,
+                  "fit_score": app.get("fit_score") or None},
+            hold=_TEST_HOLD, on_filled=on_filled, gate=gate,
+        )
+        from . import parking
+        still = parking.classify(report)
+        if report.submitted and report.submit_state == "submitted":
+            done_msg = f"Submitted to {company} — {report.confirmation or 'confirmation seen'}.".strip()
+        elif arm and report.submit_state in ("unconfirmed", "blocked"):
+            done_msg = (f"Not submitted — {report.submit_state}: "
+                        + (report.confirmation or "; ".join(report.blockers) or "see the browser"))
+        elif still and still.resumable:
+            done_msg = f"Re-filled — still blocked: {still.summary}"
+        elif still:
+            done_msg = f"Re-filled — {still.summary}"
+        else:
+            done_msg = "Re-filled cleanly — the block is cleared. It's ready for the runner to submit."
+        _set(phase="done", step="done", message=done_msg,
+             report={"summary": report.summary(), "submitted": report.submitted,
+                     "url": report.url, "screenshot": report.screenshot})
+    except Exception as e:
+        _set(phase="error", errors=[f"{type(e).__name__}: {e}"])
+
+
+def start_reapply(app_id: int, *, arm: bool = False) -> dict:
+    with _TEST_LOCK:
+        if _TEST_STATE.get("phase") == "running":
+            return {"ok": False, "error": "A run is already in progress — let it finish first."}
+        _TEST_STATE.clear()
+        _TEST_STATE.update(_test_reset())
+    threading.Thread(target=_reapply_worker, kwargs={"app_id": app_id, "arm": arm},
+                     daemon=True).start()
+    return {"ok": True}
+
+
 def list_resumes() -> list[dict[str, str]]:
     # The apply profile and discovery filters live alongside résumés in profile/ but are not
     # résumés — exclude them so they never show up as a selectable resume (they fail to load
     # as a Resume, which broke the Profile page). Keep this in sync with the config modules.
-    from . import filters
-
-    exclude = {
-        Path(apply_profile.DEFAULT_PATH).name,  # application_profile.yaml
-        Path(filters.DEFAULT_PATH).name,        # discovery.yaml
-        "discovery.example.yaml",               # the committed example template (examples/)
-    }
+    # Include only files that actually validate as a Resume. Config files (application_profile,
+    # discovery filters, mailbox link, safety) live alongside résumés but are not résumés;
+    # loading one as a Resume crashes the Profile page with a pydantic ValidationError. An earlier
+    # name-based blacklist drifted out of sync as new config files were added — validating instead
+    # skips any non-résumé file automatically.
     out = []
     for folder in ("profile", "examples"):
         for p in sorted((REPO_ROOT / folder).glob("*.yaml")):
-            if p.name in exclude:
+            try:
+                load_resume(p)
+            except Exception:
                 continue
             out.append({"path": str(p.relative_to(REPO_ROOT)), "label": f"{folder}/{p.name}"})
     return out
@@ -206,6 +313,27 @@ def _allowlisted(rel_path: str, allowed: list[dict[str, str]]) -> Path:
     if rel_path not in {a["path"] for a in allowed}:
         raise ValueError(f"Not an allowed path: {rel_path!r}")
     return REPO_ROOT / rel_path
+
+
+def _same_origin(handler) -> bool:
+    """True if a state-changing request looks same-origin (the localhost UI). The `do_POST`
+    origin guard (decision 062) uses it to reject a drive-by cross-site POST — a page on another
+    site the user has open must not drive this server. A missing Origin/Referer (many same-origin
+    fetches omit it; non-browser clients send none) passes. A present Origin passes if it is a
+    loopback host, or if its host matches the `Host` the client addressed — so the guard is
+    correct whatever the server is bound to (`--host` LAN IP or name), not just 127.0.0.1. A
+    browser sets Origin itself, so a remote attacker page cannot forge it to a loopback value."""
+    origin = handler.headers.get("Origin") or handler.headers.get("Referer") or ""
+    if not origin:
+        return True
+    try:
+        origin_host = (urlparse(origin).hostname or "").lower()
+    except Exception:
+        return False
+    if origin_host in ("127.0.0.1", "localhost", "::1"):
+        return True
+    host_header = (handler.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]").lower()
+    return bool(origin_host) and origin_host == host_header
 
 
 def do_tailor(payload: dict) -> dict:
@@ -278,12 +406,46 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(400, {"error": f"{type(e).__name__}: {e}"})
             return
         if path == "/profile":
-            self._json(200, {"profile": apply_profile.load_profile().model_dump()})
+            # Never serve the MyGreenhouse password to the browser (decision 060) — it lives in
+            # the OS keychain. Send a boolean link status instead; the password input is write-only.
+            prof = apply_profile.load_profile()
+            d = prof.model_dump()
+            d.pop("greenhouse_password", None)
+            d["greenhouse_linked"] = apply_profile.greenhouse_linked(prof)
+            self._json(200, {"profile": d})
+            return
+        if path == "/mailbox":
+            # Bot-email link status for the Profile panel (decisions 057, 065). Never returns any
+            # secret — the password / OAuth token live in the OS keychain. `client_id` is non-secret
+            # and returned so a Gmail reconnect can pre-fill it (one click).
+            from . import mailbox
+            self._json(200, {**mailbox.link_status(), "client_id": mailbox.gmail_client_id()})
             return
         if path == "/discovery":
             self._json(200, {
                 "filters": filters.load_filters().model_dump(),
                 "levels": filters.EXPERIENCE_LEVELS,
+            })
+            return
+        if path == "/fit-insights":
+            # What the discovery feedback loop has learned + recommends (decision 046).
+            from . import fit_learning
+            f = filters.load_filters()
+            recs = fit_learning.load()
+            a = fit_learning.analyze(recs, min_fit=f.min_fit, current_levels=f.experience_levels)
+            self._json(200, {
+                "n_judged": a.n_judged,
+                "lines": a.lines() if a.n_judged else [],
+                "recommendations": [
+                    {"kind": r.kind, "message": r.message, "field": r.field, "value": r.value}
+                    for r in a.recommendations
+                ],
+                # How well the deterministic pre-score tracks real fit for this résumé (decision
+                # 052/055) — bands + a one-line read.
+                "prescore": fit_learning.prescore_insight(recs),
+                # Per-run trend so the UI can chart results improving over time (decision 046).
+                # Return the full lifetime; the UI defaults to showing all and can window it down.
+                "runs": fit_learning.runs(),
             })
             return
         if path == "/sources":
@@ -322,9 +484,24 @@ class Handler(BaseHTTPRequestHandler):
                     search=(q.get("search", [""])[0] or None),
                 ),
                 "counts": tracker.status_counts(),
+                "funnel": tracker.funnel_report(),
                 "statuses": tracker.STATUSES,
                 "fields": tracker.EDITABLE,
             })
+            return
+        if path == "/parked":
+            # Applications parked on a user-resolvable block (parking.py) + display metadata
+            # for the Resolve cards (headline, action verb, deep-link target, resumable).
+            from . import parking
+            out = []
+            for a in tracker.parked_applications():
+                d = parking.describe(a.get("blocked_kind", ""), a.get("blocked_detail", ""))
+                out.append({
+                    "id": a["id"], "company": a["company"], "role": a["role"],
+                    "portal": a["portal"], "source_url": a["source_url"],
+                    "status": a["status"], **d,
+                })
+            self._json(200, {"parked": out})
             return
         if path == "/track/resume":
             # Stream the tailored PDF a Track row used, so the Track tab can link to it
@@ -364,6 +541,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         path = self.path.split("?")[0]
+        # CSRF/origin guard (decision 062): every POST here is state-changing (saves, submits,
+        # launches a browser), so reject a cross-origin request — a page on another site the user
+        # has open must not be able to drive this localhost server. A same-origin fetch (loopback
+        # Origin, or none) passes; non-browser clients (curl/CLI/tests) send no Origin and pass,
+        # which is fine — CSRF is a browser-only attack.
+        if not _same_origin(self):
+            self._json(403, {"ok": False, "error":
+                "Cross-origin request blocked. Use the ApplicationBot UI on this machine."})
+            return
         try:
             length = int(self.headers.get("Content-Length", "0"))
             raw = self.rfile.read(length) if length else b"{}"
@@ -374,6 +560,17 @@ class Handler(BaseHTTPRequestHandler):
                 rp = _allowlisted(p["resume"], list_resumes())
                 catalogue.replace_resume(rp, p["data"])
                 self._json(200, {"ok": True})
+            elif path == "/resume/rank-projects":
+                # Score the current (posted) projects by technical impressiveness via Claude,
+                # persist the scores into resume.yaml, and return the re-scored résumé so the
+                # UI can reorder. Saves the posted edits as a side effect (like Save).
+                p = json.loads(raw or b"{}")
+                rp = _allowlisted(p["resume"], list_resumes())
+                result = impact.score_projects(Resume.model_validate(p["data"]))
+                catalogue.save_resume(rp, result.resume)
+                self._json(200, {"ok": True,
+                                 "resume": result.resume.model_dump(exclude_none=True),
+                                 "ranked": [list(t) for t in result.ranked]})
             elif path == "/resume/import-linkedin":
                 p = json.loads(raw or b"{}")
                 rp = _allowlisted(p["resume"], list_resumes())
@@ -382,12 +579,83 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, {"ok": True, **result})
             elif path == "/profile/update":
                 p = json.loads(raw or b"{}")
-                apply_profile.replace_profile(p["data"])
+                data = p.get("data") or {}
+                # Route the MyGreenhouse password to the keychain (write-only), never the YAML
+                # (decision 060). A blank value means "leave the stored password unchanged" — so an
+                # ordinary profile save never wipes it; clearing is the explicit unlink below.
+                if "greenhouse_password" in data:
+                    pw = (data.pop("greenhouse_password") or "").strip()
+                    if pw:
+                        apply_profile.set_greenhouse_password(pw)
+                apply_profile.replace_profile(data)
                 self._json(200, {"ok": True})
+            elif path == "/profile/greenhouse/unlink":
+                apply_profile.set_greenhouse_password("")  # clear the keychain entry
+                self._json(200, {"ok": True})
+            elif path == "/mailbox/link":
+                # Link the bot inbox (decision 057): test the IMAP connection, and only save on
+                # success so we never store credentials that don't work. Password → OS keychain.
+                from . import mailbox
+                p = json.loads(raw or b"{}")
+                email = (p.get("email") or "").strip()
+                host = (p.get("host") or "").strip() or mailbox.suggest_host(email)
+                password = p.get("password") or ""
+                try:
+                    port = int(p.get("port") or 993)
+                except (TypeError, ValueError):
+                    port = 993
+                if not (email and host and password):
+                    self._json(400, {"ok": False,
+                                     "message": "Enter the email, IMAP host, and app password "
+                                     "(host is guessed from common providers if left blank)."})
+                else:
+                    ok, msg = mailbox.test_connection(
+                        mailbox.MailboxConfig(host=host, email=email, password=password, port=port))
+                    if ok:
+                        mailbox.save_link(host, email, password, port)
+                    self._json(200, {"ok": ok, "message": msg, "status": mailbox.link_status()})
+            elif path == "/mailbox/gmail/connect":
+                # One-click Gmail connect (decision 065): run the OAuth loopback flow, which opens
+                # the consent screen in the local browser and blocks this (threaded) request until
+                # the user approves. Nothing is stored unless a reusable token comes back AND a test
+                # read succeeds. Slow by nature — the UI shows a "waiting for Google" state.
+                from . import mailbox
+                p = json.loads(raw or b"{}")
+                client_id = (p.get("client_id") or "").strip()
+                client_secret = (p.get("client_secret") or "").strip()
+                if not (client_id and client_secret):
+                    self._json(400, {"ok": False, "message":
+                                     "Paste your Google Cloud OAuth client ID and secret first — "
+                                     "the one-time setup steps are linked above the button."})
+                else:
+                    ok, msg = mailbox.connect_gmail(client_id, client_secret)
+                    self._json(200, {"ok": ok, "message": msg,
+                                     "status": {**mailbox.link_status(),
+                                                "client_id": mailbox.gmail_client_id()}})
+            elif path == "/mailbox/unlink":
+                from . import mailbox
+                existed = mailbox.clear_link()
+                self._json(200, {"ok": True, "existed": existed,
+                                 "status": {**mailbox.link_status(),
+                                            "client_id": mailbox.gmail_client_id()}})
             elif path == "/discovery/update":
                 p = json.loads(raw or b"{}")
                 filters.save_filters(filters.DiscoveryFilters.model_validate(p["data"]))
                 self._json(200, {"ok": True})
+            elif path == "/fit-insights/apply":
+                # One-click accept of a learned recommendation (decision 046): merge one
+                # {field: value} into discovery.yaml. Only fields the analyzer proposes
+                # (experience_levels / min_fit) are accepted, and the merged config is
+                # re-validated so a bad value can never corrupt the filters.
+                p = json.loads(raw or b"{}")
+                fld, val = p.get("field"), p.get("value")
+                if fld not in ("experience_levels", "min_fit"):
+                    self._json(400, {"error": f"not an applyable recommendation field: {fld}"})
+                else:
+                    data = filters.load_filters().model_dump()
+                    data[fld] = val
+                    filters.save_filters(filters.DiscoveryFilters.model_validate(data))
+                    self._json(200, {"ok": True, "field": fld, "value": val})
             elif path == "/track/add":
                 p = json.loads(raw or b"{}")
                 app_id = tracker.add_application(p.get("data", {}))
@@ -407,6 +675,11 @@ class Handler(BaseHTTPRequestHandler):
                 tailored = TailoredResume.model_validate(p["tailored"])
                 self._send(200, render_pdf(base, tailored), "application/pdf",
                            {"Content-Disposition": 'attachment; filename="tailored_resume.pdf"'})
+            elif path == "/parked/reapply":
+                # Cross-origin already rejected by the do_POST origin guard (decision 062); an
+                # armed submit is doubly safe there.
+                p = json.loads(raw or b"{}")
+                self._json(200, start_reapply(int(p["id"]), arm=bool(p.get("arm"))))
             elif path == "/test-run":
                 self._json(200, start_test_run(bool(json.loads(raw or b"{}").get("fresh"))))
             elif path == "/test-run/close":
@@ -444,7 +717,7 @@ INDEX_HTML = """<!doctype html>
   .account .on { background:#2a9d5b; } .account .off { background:#c0392b; }
   .account button { margin-top:8px; background:#111; }
   .account .hint { color:var(--muted); font-size:12px; margin-top:6px; line-height:1.4; }
-  main { padding:28px; overflow:auto; }
+  main { padding:28px; overflow:auto; height:100vh; }
   .tabs { display:flex; gap:8px; margin-bottom:18px; }
   .tab { width:auto; margin:0; padding:8px 16px; background:#eef1fb; color:var(--accent); }
   .tab.active { background:var(--accent); color:#fff; }
@@ -462,6 +735,15 @@ INDEX_HTML = """<!doctype html>
   .tcounts .pill { font-size:12px; font-weight:600; padding:6px 12px; border-radius:99px; background:#fff; border:1px solid var(--line); cursor:pointer; }
   .tcounts .pill.active { background:var(--accent); color:#fff; border-color:var(--accent); }
   .tcounts .pill .n { font-variant-numeric:tabular-nums; }
+  .funnel { display:flex; flex-direction:column; gap:5px; margin:0 0 16px; max-width:560px; }
+  .funnel .fn-row { display:grid; grid-template-columns:78px 1fr 92px; align-items:center; gap:10px; }
+  .funnel .fn-label { font-size:12px; font-weight:600; color:#444; text-align:right; }
+  .funnel .fn-track { background:#f0f1f4; border-radius:5px; height:22px; overflow:hidden; }
+  .funnel .fn-bar { height:100%; background:var(--accent); border-radius:5px; min-width:2px; transition:width .3s; }
+  .funnel .fn-meta { font-size:11.5px; color:#666; font-variant-numeric:tabular-nums; }
+  .funnel .fn-meta b { color:#222; }
+  .funnel .fn-conv { color:#0b7a3b; }
+  .funnel-empty { font-size:12.5px; color:#888; margin:0 0 14px; }
   .trackbar { display:flex; gap:8px; align-items:center; margin-bottom:12px; flex-wrap:wrap; }
   .trackbar input { flex:1; min-width:200px; margin:0; }
   .trackbar select { width:auto; margin:0; }
@@ -492,6 +774,8 @@ INDEX_HTML = """<!doctype html>
   .ttable .st-responded { color:#2a9d5b; } .ttable .st-failed { color:#c0392b; }
   .ttable .st-discovered, .ttable .st-tailored { color:var(--muted); }
   .ttable .delrow { width:auto; margin:0; padding:4px 8px; background:#fff; color:#c0392b; border:1px solid var(--line); font-size:12px; }
+  .ttable .rerun { width:auto; margin:0; padding:4px 8px; background:#fff; color:var(--accent); border:1px solid var(--line); font-size:12px; white-space:nowrap; }
+  .ttable .rerun:disabled { opacity:.6; cursor:default; }
   .ttable .rowsaved { color:#2a9d5b; font-size:12px; }
   .ttable .reslink { color:var(--accent); text-decoration:none; font-size:12px; white-space:nowrap; padding:5px 6px; display:inline-block; }
   .ttable .reslink:hover { text-decoration:underline; }
@@ -526,7 +810,7 @@ INDEX_HTML = """<!doctype html>
   .saverow { position:sticky; bottom:0; background:var(--bg); padding:12px 0 4px; display:flex; align-items:center; gap:12px; }
   .saverow button { width:auto; margin:0; }
   /* profile section-jump nav */
-  .pnav { position:sticky; top:0; z-index:5; display:flex; flex-wrap:wrap; gap:6px; background:var(--bg); padding:2px 0 12px; margin-bottom:4px; }
+  .pnav { position:sticky; top:0; z-index:5; display:flex; flex-wrap:wrap; gap:6px; background:var(--bg); padding:10px 0; margin-bottom:4px; border-bottom:1px solid var(--line); }
   .pnav a { font-size:12px; font-weight:600; color:var(--accent); background:#eef1fb; padding:5px 10px; border-radius:99px; text-decoration:none; }
   .pnav a:hover { background:#dfe6fb; }
   .subhint { color:var(--muted); font-size:12px; margin:0 0 8px; line-height:1.45; }
@@ -589,6 +873,27 @@ INDEX_HTML = """<!doctype html>
   .resume .skillrow { font-size:13.5px; margin:1px 0; line-height:1.34; }
   .resume p { font-size:13.5px; margin:2px 0; line-height:1.36; }
   .empty { color:var(--muted); text-align:center; margin-top:60px; }
+  /* Fit-insights panel (decision 046) */
+  .fit-head { font-weight:600; margin-bottom:4px; }
+  .fit-line { color:var(--muted); font-size:13px; margin:2px 0; }
+  .fit-rec { display:flex; flex-direction:column; align-items:flex-start; gap:8px;
+             background:var(--card, #f6f7f9); border:1px solid var(--line, #e3e5e9);
+             border-radius:6px; padding:8px 10px; margin:6px 0; font-size:13px; }
+  .fit-rec button { flex:0 0 auto; align-self:flex-start; }
+  .fit-trend { margin:2px 0 12px; padding-bottom:10px; border-bottom:1px solid var(--line, #e3e5e9); }
+  .fit-trend svg { display:block; margin:4px 0; }
+  .fit-legend { color:var(--muted); font-size:11px; }
+  .fit-window-bar { display:flex; justify-content:flex-end; align-items:center; gap:6px;
+                    color:var(--muted); font-size:12px; margin-bottom:2px; }
+  .fit-window { font-size:12px; padding:1px 4px; }
+  .ps-grid { display:flex; align-items:flex-end; gap:12px; height:110px; margin:8px 0 2px; padding:0 2px; }
+  .ps-col { display:flex; flex-direction:column; align-items:center; gap:3px; width:52px; }
+  .ps-fit { font-size:11.5px; font-weight:700; color:#222; font-variant-numeric:tabular-nums; }
+  .ps-bar-wrap { width:26px; height:72px; display:flex; align-items:flex-end;
+                 background:#f0f1f4; border-radius:4px; overflow:hidden; }
+  .ps-bar { width:100%; background:var(--accent); border-radius:4px 4px 0 0; min-height:3px; transition:height .3s; }
+  .ps-band { font-size:11px; color:#555; font-variant-numeric:tabular-nums; }
+  .ps-n { font-size:10.5px; color:#999; }
   /* Review pane: résumé + "why was this tailored this way" side panel */
   .reviewwrap { display:flex; gap:20px; align-items:flex-start; }
   .reviewwrap > #result { flex:1; min-width:0; }
@@ -636,6 +941,17 @@ INDEX_HTML = """<!doctype html>
   .tjmeta { font-size:12px; color:var(--muted); margin-top:3px; word-break:break-all; }
   .tjwhy { font-size:12.5px; margin-top:4px; line-height:1.45; }
   .tjmiss { font-size:12px; color:#8a5a00; margin-top:3px; }
+  #parked-panel { border-left:4px solid #e0a400; }
+  .pkcard { border:1px solid var(--line); border-radius:6px; padding:10px 12px; margin-bottom:8px; background:#fffdf6; }
+  .pk-head { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+  .pk-title { font-weight:700; font-size:14px; }
+  .pk-tag { font-size:11.5px; font-weight:700; color:#8a5a00; background:#fbeecb; border-radius:10px; padding:2px 9px; }
+  .pk-detail { font-size:12.5px; color:#555; margin:6px 0 8px; line-height:1.4; }
+  .pk-actions { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  .pk-fix { width:auto; margin:0; }
+  .pk-submit { background:#b3261e; border-color:#b3261e; color:#fff; }
+  .pk-submit:hover { background:#8f1e18; border-color:#8f1e18; }
+  .pk-note { font-size:12.5px; color:#666; }
 </style>
 </head>
 <body>
@@ -699,12 +1015,26 @@ INDEX_HTML = """<!doctype html>
     </div>
 
     <div id="view-discover" class="hidden">
+      <div class="editor" id="parked-panel" style="display:none">
+        <h3 style="margin-top:0">Applications waiting on you</h3>
+        <p class="editing">These were filled but couldn't finish on their own — each needs one
+          thing from you before it can go through. Click to go straight to the fix.</p>
+        <div id="parked-body"></div>
+      </div>
       <div class="editor" id="sources-overview">
         <h3 style="margin-top:0">Where your postings come from</h3>
         <p class="editing">The live view of every source feeding discovery — target boards by
           ATS, the optional aggregator, early-career feeds, and the aggregator→ATS bridge.
           Configure them in <b>Discovery settings</b> below.</p>
         <div id="sources-body">Loading…</div>
+      </div>
+      <div class="editor" id="fit-insights" style="display:none">
+        <h3 style="margin-top:0">What past runs taught the search</h3>
+        <p class="editing">Every posting Claude judges is remembered. The search now steers each
+          run's scarce judge slots toward the kinds of postings that scored highest for you before,
+          so new runs should surface more matches above your bar. Below is what it has learned and
+          what it recommends changing.</p>
+        <div id="fit-insights-body">Loading…</div>
       </div>
       <div class="editor">
         <h3 style="margin-top:0">Discovery settings</h3>
@@ -783,6 +1113,7 @@ INDEX_HTML = """<!doctype html>
           as you go. <b>Drag a column's right edge to resize it</b>, and use <b>Columns</b>
           to hide any you don't need — your layout is remembered on this browser.</p>
         <div id="track-counts" class="tcounts"></div>
+        <div id="track-funnel" class="funnel"></div>
         <div class="trackbar">
           <input id="track-search" type="text" placeholder="Search company, role, location, notes…">
           <div class="colmenu">
@@ -989,11 +1320,14 @@ function expCard(e) {
 }
 function projCard(p) {
   p = p || {};
+  // Hidden `impact` carries Claude's technical-impressiveness score (1–5) through the save
+  // round-trip; the collapsed header shows it as a ★ badge so ranking is visible at a glance.
   return entryCard([
+    el("input", {type:"hidden", "data-k":"impact", value:(p.impact==null?"":String(p.impact))}),
     row2(fld("Project name","name",p.name), fld("Tech — e.g. Python, SQL","tech",p.tech)),
     fld("Link (optional) — repo, demo, or write-up","link",p.link),
     area("Bullets (one per line)","bullets",(p.bullets||[]).join("\\n")),
-  ], c => cardData(c).name);
+  ], c => { const d = cardData(c); return (d.impact ? "★"+d.impact+"  " : "") + (d.name||""); });
 }
 function eduCard(e) {
   e = e || {};
@@ -1035,7 +1369,7 @@ function collect() {
     skills: cardsIn("sec-skills").map(c => { const d = cardData(c); return { category:(d.category||"").trim(), items:(d.items||"").split(",").map(s=>s.trim()).filter(Boolean) }; }).filter(s => s.category),
     experience: cardsIn("sec-experience").map(expData).filter(e => e.organization || e.role),
     activities: cardsIn("sec-activities").map(expData).filter(e => e.organization || e.role),
-    projects: cardsIn("sec-projects").map(c => { const d = cardData(c); return { name:(d.name||"").trim(), tech:orNull(d.tech), link:orNull(d.link), bullets:linesOf(d.bullets) }; }).filter(p => p.name),
+    projects: cardsIn("sec-projects").map(c => { const d = cardData(c); const im = parseInt(d.impact,10); return { name:(d.name||"").trim(), tech:orNull(d.tech), link:orNull(d.link), impact:(im>=1 && im<=5)?im:null, bullets:linesOf(d.bullets) }; }).filter(p => p.name),
     education: cardsIn("sec-education").map(c => { const d = cardData(c); return { school:(d.school||"").trim(), degree:(d.degree||"").trim(), location:orNull(d.location), graduation:orNull(d.graduation), details:linesOf(d.details) }; }).filter(e => e.school),
   };
 }
@@ -1050,7 +1384,7 @@ document.querySelectorAll(".tab").forEach(t => t.addEventListener("click", () =>
   $("view-track").classList.toggle("hidden", v !== "track");
   if (v === "profile") loadProfile();
   if (v === "track") loadTrack();
-  if (v === "discover") { loadSources(); loadDisc(); pollTest(); }
+  if (v === "discover") { loadParked(); loadSources(); loadFitInsights(); loadDisc(); pollTest(); }
 }));
 $("resume").addEventListener("change", () => { if (!$("view-profile").classList.contains("hidden")) loadProfile(); });
 
@@ -1141,8 +1475,11 @@ async function pollTest() {
   if (s.from_cache) {
     const m = s.cache_age_min || 0;
     const age = m < 90 ? `${m} min ago` : `${Math.round(m/60)}h ago`;
-    body += `<div class="tmeta cache">♻ Reused a saved search from ${age} — no boards searched, no Claude judging.`
+    body += `<div class="tmeta cache">♻ Reused a saved search from ${age} — same results as before, so this run added no point to the fit chart and taught the search nothing. Re-search fresh to judge live, add a chart point, and train.`
           + `<button id="test-fresh" type="button" class="linklike"${running ? " disabled" : ""}>Re-search fresh</button></div>`;
+  } else if (s.phase === "error" && s.can_research) {
+    body += `<div class="tmeta cache">Nothing cleared your fit cutoff this run. Re-search fresh to pull new postings and judge them live.`
+          + `<button id="test-fresh" type="button" class="linklike">Re-search fresh</button></div>`;
   }
   const el = TEST_T0 ? Math.round((Date.now()-TEST_T0)/1000) : null;
   if ((running || filled) && el!=null) body += `<div class="tmeta">${el}s elapsed</div>`;
@@ -1168,11 +1505,105 @@ async function pollTest() {
   if (s.errors && s.errors.length && (s.phase==="error")) {
     msg.className = "msg err"; msg.textContent = s.errors.join(" · ");
   }
-  if (s.phase === "done") { btnDone(btn); msg.className = "msg ok"; msg.textContent = "Done — recorded a dry-run row in Track."; }
-  if (s.phase === "error") { btnDone(btn); }
+  if (s.phase === "done") { btnDone(btn); msg.className = "msg ok"; msg.textContent = s.message || "Done — recorded a dry-run row in Track."; loadFitInsights(); loadParked(); }
+  if (s.phase === "error") { btnDone(btn); loadFitInsights(); loadParked(); }
 
   if (running || filled) { clearTimeout(TEST_TIMER); TEST_TIMER = setTimeout(pollTest, 1200); }
   else { btnDone(btn); }
+}
+
+// ---- Discover: applications parked on a user-resolvable block (park & resume) ----
+async function loadParked() {
+  const panel = $("parked-panel"), body = $("parked-body");
+  let d;
+  try { d = await (await fetch("/parked")).json(); }
+  catch (e) { panel.style.display = "none"; return; }
+  const parked = (d && d.parked) || [];
+  if (!parked.length) { panel.style.display = "none"; return; }
+  panel.style.display = "";
+  body.innerHTML = "";
+  parked.forEach(p => body.appendChild(parkedCard(p)));
+}
+
+function parkedCard(p) {
+  const title = (p.company || "—") + (p.role ? " — " + p.role : "");
+  const head = el("div", {class:"pk-head"}, [
+    el("span", {class:"pk-title", text:title}),
+    el("span", {class:"pk-tag", text:p.label || "Blocked"})]);
+  const actions = el("div", {class:"pk-actions"});
+  if (p.resolve === "profile-answers")
+    actions.append(el("button", {class:"pk-fix", type:"button", text:(p.action || "Resolve") + " →",
+      on:{click:()=>goToProfileAnswers()}}));
+  else if (p.resolve === "credentials")
+    actions.append(el("span", {class:"pk-note", text:(p.action || "Store the login") + ", then re-apply this posting."}));
+  else if (p.kind === "captcha")
+    actions.append(el("span", {class:"pk-note", text:"Re-apply this posting and solve the CAPTCHA in the browser window that opens."}));
+  else
+    actions.append(el("span", {class:"pk-note", text:"This is a site error, not something you can answer — skip it or try again later."}));
+  if (p.resumable) {
+    actions.append(el("button", {class:"pk-fix pk-reapply", type:"button", text:"Re-apply (dry-run) ▶",
+      title:"Re-fill this posting with your updated answers — never submits",
+      on:{click:(ev)=>reapplyParked(p.id, ev.target, false)}}));
+    // Per-click armed submit (decision 058): really submits THIS one application, with a confirm.
+    // Independent of profile/safety.yaml; the KILL file + the pre-submit required-field gate still apply.
+    actions.append(el("button", {class:"pk-fix pk-submit", type:"button", text:"Submit for real ▶",
+      title:"Actually submit this application (irreversible) — confirms first",
+      on:{click:(ev)=>reapplyParked(p.id, ev.target, true, title)}}));
+  }
+  const kids = [head];
+  if (p.detail) kids.push(el("div", {class:"pk-detail", text:p.detail}));
+  kids.push(actions);
+  return el("div", {class:"pkcard"}, kids);
+}
+
+// Resume a parked application: re-drive the deterministic fill on the same posting. `arm=false`
+// is a dry-run (never submits); `arm=true` really submits THIS one application after an explicit
+// confirm (decision 058). Reuses the run-progress panel + Finish button lower in the Discover tab.
+async function reapplyParked(id, btn, arm, who) {
+  const label = btn ? btn.textContent : "";
+  if (arm) {
+    const ok = confirm("Really SUBMIT this application" + (who ? " to " + who : "") + "?\\n\\n"
+      + "This is a real, irreversible submission. Make sure the block is resolved. "
+      + "It fills the form and clicks Submit; the pre-submit check still stops it if a required "
+      + "field is unanswered.");
+    if (!ok) return;
+  }
+  const msg = $("test-msg");
+  if (btn) { btn.disabled = true; btn.textContent = arm ? "Submitting…" : "Starting…"; }
+  if (msg) { msg.className = "msg"; msg.textContent = ""; }
+  try {
+    const r = await (await fetch("/parked/reapply", {method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ id, arm: !!arm })})).json();
+    if (!r.ok) {
+      if (msg) { msg.className = "msg err"; msg.textContent = r.error || "Could not start."; }
+      if (btn) { btn.disabled = false; btn.textContent = label; }
+      return;
+    }
+    TEST_T0 = Date.now();
+    const prog = $("test-progress"); if (prog) prog.scrollIntoView({behavior:"smooth", block:"start"});
+    pollTest();
+  } catch (e) {
+    if (msg) { msg.className = "msg err"; msg.textContent = String(e.message || e); }
+    if (btn) { btn.disabled = false; btn.textContent = label; }
+  }
+}
+
+// Deep-link to the Profile tab's "Needs your answer" list (UI Principle #2: one click to the fix).
+function goToProfileAnswers() {
+  const tab = document.querySelector('.tab[data-view="profile"]');
+  if (tab) tab.click();  // triggers loadProfile() (async render)
+  let tries = 0;
+  const tick = () => {
+    const t = document.getElementById("sec-qa");
+    if (t) {
+      t.scrollIntoView({behavior:"smooth", block:"start"});
+      const first = document.querySelector("#qa-need textarea.qa-a, #qa-need input.qa-q");
+      if (first) first.focus();
+      return;
+    }
+    if (tries++ < 30) setTimeout(tick, 100);  // wait for the profile render, up to ~3s
+  };
+  setTimeout(tick, 100);
 }
 
 // ---- Track tab: the local application store (applications.db) ----
@@ -1208,6 +1639,7 @@ async function loadTrack() {
     const d = await (await fetch("/track?" + q.toString())).json();
     TRACK_STATE.statuses = d.statuses;
     renderCounts(d.counts);
+    renderFunnel(d.funnel);
     renderTrack(d.applications);
   } catch (e) {
     body.innerHTML = ""; body.append(el("div", {class:"msg err", text:"Couldn't load applications: " + (e.message||e)}));
@@ -1224,6 +1656,33 @@ function renderCounts(counts) {
   for (const s of TRACK_STATE.statuses) c.append(mk(s, s, counts[s] || 0));
 }
 
+// The discovery→offer funnel (survey #4): one bar per stage, width relative to Discovered,
+// with the count and the conversion from the previous stage.
+function renderFunnel(funnel) {
+  const box = $("track-funnel"); if (!box) return;
+  box.innerHTML = "";
+  const top = (funnel && funnel[0] && funnel[0].count) || 0;
+  if (!top) {
+    box.className = "funnel-empty";
+    box.textContent = "The funnel fills in as the pipeline discovers, fills, and (once armed) submits applications.";
+    return;
+  }
+  box.className = "funnel";
+  for (const s of funnel) {
+    const pct = Math.round(100 * s.count / top);
+    const conv = (s.conversion_from_prev != null)
+      ? el("span", {class:"fn-conv", text:" · " + Math.round(100 * s.conversion_from_prev) + "%"})
+      : null;
+    const meta = el("span", {class:"fn-meta"}, [el("b", {text:String(s.count)}), " " + pct + "%"]);
+    if (conv) meta.append(conv);
+    box.append(el("div", {class:"fn-row"}, [
+      el("span", {class:"fn-label", text:s.stage}),
+      el("div", {class:"fn-track"}, [el("div", {class:"fn-bar", style:"width:" + pct + "%"})]),
+      meta,
+    ]));
+  }
+}
+
 function statusCell(app) {
   const sel = el("select", {class:"st-" + app.status.replace("-","")});
   for (const s of TRACK_STATE.statuses) {
@@ -1231,6 +1690,16 @@ function statusCell(app) {
   }
   sel.addEventListener("change", () => { sel.className = "st-" + sel.value.replace("-",""); saveCell(app.id, "status", sel.value); });
   return sel;
+}
+
+// Re-run a previous dry-run from the tracker: re-drive the same deterministic fill on the same
+// posting URL with the stored tailored PDF (never submits — reuses reapplyParked with arm=false).
+// Switch to the Discover tab first so the fill reports into the one shared run-progress panel +
+// Finish button, instead of a second progress UI.
+function rerunDry(app, btn) {
+  const tab = document.querySelector('.tab[data-view="discover"]');
+  if (tab) tab.click();
+  reapplyParked(app.id, btn, false);
 }
 
 function renderTrack(apps) {
@@ -1246,7 +1715,7 @@ function renderTrack(apps) {
   const vis = visibleCols();
   const colEls = {};
   const cols = vis.map(([key,,def]) => { const c = el("col", {style:"width:"+colWidth(key,def)+"px"}); colEls[key] = c; return c; })
-    .concat([el("col", {style:"width:96px"})]);
+    .concat([el("col", {style:"width:200px"})]);
   const ths = vis.map(([key,label,def]) => {
     const rz = el("div", {class:"rz", title:"Drag to resize"});
     const th = el("th", {}, [el("span", {class:"lbl", text:label}), rz]);
@@ -1271,7 +1740,14 @@ function renderTrack(apps) {
     const saved = el("span", {class:"rowsaved"});
     const del = el("button", {class:"delrow", type:"button", text:"Delete",
       on:{click:()=>delApp(app.id)}});
-    tds.push(el("td", {}, [el("div", {style:"display:flex;gap:6px;align-items:center"}, [del, saved])]));
+    // Re-run: only for rows that were dry-runs and still have a posting URL to re-fill.
+    const acts = [];
+    if (app.status === "dry-run" && app.source_url)
+      acts.push(el("button", {class:"rerun", type:"button", text:"Re-run ▶",
+        title:"Re-fill this posting in a browser to check it — never submits",
+        on:{click:(ev)=>rerunDry(app, ev.target)}}));
+    acts.push(del, saved);
+    tds.push(el("td", {}, [el("div", {style:"display:flex;gap:6px;align-items:center"}, acts)]));
     const tr = el("tr", {}, tds); tr._saved = saved; tr.dataset.id = app.id;
     return tr;
   });
@@ -1603,7 +2079,7 @@ function acctRow(name, ok, text) {
   ]);
 }
 function nativeAccountsPanel() {
-  const ghOK = !!((P.greenhouse_email||"").trim() && (P.greenhouse_password||"").trim());
+  const ghOK = !!P.greenhouse_linked;  // password lives in the keychain, not P (decision 060)
   const card = el("div", {class:"card"}, [
     el("p", {class:"hint", text:"Which native autofills the Apply stage can use. Greenhouse uses your MyGreenhouse login (set below); Lever/Ashby/Workday parse your uploaded résumé and need no account."}),
     acctRow("MyGreenhouse", ghOK, ghOK ? ("Connected · " + P.greenhouse_email) : "Not set up — add credentials below"),
@@ -1612,6 +2088,135 @@ function nativeAccountsPanel() {
     acctRow("Workday", true, "No login needed — résumé-parse autofill"),
   ]);
   return el("div", {class:"sec"}, [el("h3", {text:"Autofill accounts"}), card]);
+}
+// Bot email link panel — its own secure store (password → OS keychain), not the profile YAML.
+function mailboxPanel() {
+  // Primary path: paste email + a Gmail app password. Google blocked normal-password IMAP login in
+  // 2022, so an app password (a 16-char code you generate once) is the closest paste-and-go option.
+  const emailIn = el("input", {class:"f", id:"mb-email", placeholder:"you@gmail.com"});
+  const passIn  = el("input", {class:"f", id:"mb-pass", type:"password", placeholder:"16-character app password"});
+  const hostIn  = el("input", {class:"f", id:"mb-host", placeholder:"auto-detected from your email address"});
+  const portIn  = el("input", {class:"f", id:"mb-port", value:"993"});
+  const linkBtn = el("button", {id:"mb-link", class:"addbtn", type:"button", text:"Connect"});
+  const twofaLink = el("a", {href:"https://myaccount.google.com/security", target:"_blank", rel:"noopener", text:"2-Step Verification"});
+  const appPwLink = el("a", {href:"https://myaccount.google.com/apppasswords", target:"_blank", rel:"noopener", text:"App passwords"});
+  const setup = el("details", {open:""}, [
+    el("summary", {class:"subhint", text:"How to get an app password — ~1 min (Google no longer allows your normal password here)", style:"cursor:pointer;font-weight:600"}),
+    el("ol", {class:"subhint", style:"margin:6px 0 0 18px;line-height:1.6"}, [
+      el("li", {}, [document.createTextNode("Turn on "), twofaLink, document.createTextNode(" for your Google account (app passwords only appear once it’s on).")]),
+      el("li", {}, [document.createTextNode("Open "), appPwLink, document.createTextNode(", type a name like “ApplicationBot”, and click Create — Google shows a 16-character code.")]),
+      el("li", {text:"Paste your Gmail address and that 16-character code below, then click Connect."}),
+    ]),
+  ]);
+  const emailFld = el("div", {class:"fld"}, [el("label", {text:"Gmail address"}), emailIn]);
+  const passFld = el("div", {class:"fld"}, [
+    el("label", {text:"App password"}),
+    passIn,
+    el("div", {class:"subhint", text:"The 16-character code from Google above — not your normal Gmail password. Stored in your OS keychain, never in a file."}),
+  ]);
+  const serverDetails = el("details", {}, [
+    el("summary", {class:"subhint", text:"Not Gmail? Set your mail server", style:"cursor:pointer"}),
+    el("p", {class:"subhint", text:"Left blank, the server is auto-detected for Gmail, Outlook, Yahoo, iCloud, and Fastmail."}),
+    row2(el("div", {class:"fld"}, [el("label", {text:"IMAP host"}), hostIn]),
+         el("div", {class:"fld"}, [el("label", {text:"Port"}), portIn])),
+  ]);
+
+  // Alternative: one-click OAuth (read-only). Kept for anyone who prefers not to use an app password.
+  const cidIn  = el("input", {class:"f", id:"mb-cid", placeholder:"e.g. 8391027-xq3z.apps.googleusercontent.com"});
+  const csecIn = el("input", {class:"f", id:"mb-csec", type:"password", placeholder:"e.g. GOCSPX-aB1cD2eF3gH4"});
+  const gmailBtn = el("button", {id:"mb-gmail", class:"addbtn", type:"button", text:"Connect with Google (read-only)"});
+  const oauthLink = el("a", {href:"https://console.cloud.google.com/auth/clients", target:"_blank", rel:"noopener", text:"Google Cloud → Clients"});
+  const oauth = el("details", {}, [
+    el("summary", {class:"subhint", text:"Prefer read-only access? Connect with a Google app instead (more setup)", style:"cursor:pointer"}),
+    el("p", {class:"subhint", text:"An app password grants full mailbox access; this OAuth path grants read-only. The trade-off is more one-time setup: you register a free Google “app” and paste its two keys (the app’s keys — not your Gmail login)."}),
+    el("ol", {class:"subhint", style:"margin:6px 0 0 18px;line-height:1.6"}, [
+      el("li", {}, [document.createTextNode("In "), oauthLink, document.createTextNode(", Create client → application type "), el("b",{text:"Desktop app"}), document.createTextNode(".")]),
+      el("li", {text:"On the consent screen, add your Gmail as a test user and set the app to “In production” (else access expires after 7 days)."}),
+      el("li", {}, [document.createTextNode("Copy the "), el("b",{text:"Client ID"}), document.createTextNode(" and "), el("b",{text:"Client secret"}), document.createTextNode(" into the boxes, then click Connect with Google.")]),
+    ]),
+    el("div", {class:"fld"}, [el("label", {text:"Client ID"}), cidIn, el("div", {class:"subhint", text:"Ends in .apps.googleusercontent.com — not your email."})]),
+    el("div", {class:"fld"}, [el("label", {text:"Client secret"}), csecIn]),
+    el("div", {style:"margin-top:6px"}, [gmailBtn]),
+  ]);
+
+  const status  = el("div", {id:"mb-status", class:"subhint", text:"Loading…"});
+  const msg     = el("div", {id:"mb-msg", class:"subhint"});
+  const unlinkBtn = el("button", {id:"mb-unlink", class:"addbtn", type:"button", text:"Disconnect", style:"display:none"});
+  linkBtn.addEventListener("click", () => linkMailbox(linkBtn));
+  gmailBtn.addEventListener("click", () => connectGmail(gmailBtn));
+  unlinkBtn.addEventListener("click", () => unlinkMailbox(unlinkBtn));
+
+  const card = el("div", {class:"card"}, [
+    el("p", {class:"hint", text:"Optional — only for account-gated portals (Workday). When the bot creates a Workday account for you, Workday emails a verification link; connecting your inbox lets the bot read that one email and click it."}),
+    status,
+    setup,
+    emailFld,
+    passFld,
+    serverDetails,
+    el("div", {style:"display:flex;gap:8px;align-items:center;margin-top:6px"}, [linkBtn, unlinkBtn]),
+    msg,
+    oauth,
+  ]);
+  return el("div", {class:"sec"}, [el("h3", {text:"Bot email — for Workday verification (optional)"}), card]);
+}
+async function loadMailbox() {
+  try {
+    const s = await (await fetch("/mailbox")).json();
+    const st = $("mb-status"), un = $("mb-unlink");
+    if (s.linked) {
+      const how = s.auth === "oauth" ? "Gmail, read-only" : (s.host + ":" + s.port);
+      st.textContent = "✓ Connected: " + s.email + " (" + how + ") · " + s.source;
+      st.style.color = "#0b7a3b";
+      if (un) un.style.display = "";
+      if (s.client_id && $("mb-cid") && !$("mb-cid").value) $("mb-cid").value = s.client_id;
+      if ($("mb-email") && !$("mb-email").value) $("mb-email").value = s.email;
+      if ($("mb-host")  && !$("mb-host").value)  $("mb-host").value  = s.host;
+      if ($("mb-port")) $("mb-port").value = s.port;
+    } else {
+      st.textContent = "Not connected — add your Gmail address + app password below to auto-verify Workday accounts.";
+      st.style.color = "";
+      if (un) un.style.display = "none";
+    }
+  } catch (e) { const st = $("mb-status"); if (st) st.textContent = "Could not load connection status."; }
+}
+async function connectGmail(btn) {
+  const client_id = $("mb-cid").value.trim(), client_secret = $("mb-csec").value.trim();
+  const msg = $("mb-msg"); msg.textContent = ""; msg.style.color = "";
+  if (!client_id || !client_secret) { msg.textContent = "Paste the Google OAuth client ID and secret (see the setup steps above)."; msg.style.color = "#b21f2d"; return; }
+  const t0 = Date.now();
+  btnBusy(btn, "Waiting for Google…");
+  msg.style.color = "";
+  const tick = setInterval(() => { msg.textContent = "A Google sign-in tab should have opened — approve read-only access. (" + Math.round((Date.now()-t0)/1000) + "s)"; }, 1000);
+  try {
+    const r = await (await fetch("/mailbox/gmail/connect", {method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({client_id, client_secret})})).json();
+    clearInterval(tick);
+    msg.textContent = (r.ok ? "✓ " : "⚠ ") + (r.message || "");
+    msg.style.color = r.ok ? "#0b7a3b" : "#b21f2d";
+    if (r.ok) { $("mb-csec").value = ""; await loadMailbox(); }
+  } catch (e) { clearInterval(tick); msg.textContent = "Failed: " + e.message; msg.style.color = "#b21f2d"; }
+  finally { btnDone(btn); }
+}
+async function linkMailbox(btn) {
+  const email = $("mb-email").value.trim(), host = $("mb-host").value.trim();
+  const port = $("mb-port").value.trim() || "993", password = $("mb-pass").value;
+  const msg = $("mb-msg"); msg.textContent = ""; msg.style.color = "";
+  if (!email || !password) { msg.textContent = "Enter the email and app password."; msg.style.color = "#b21f2d"; return; }
+  btnBusy(btn, "Linking & testing…");
+  try {
+    const r = await (await fetch("/mailbox/link", {method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({email, host, port, password})})).json();
+    msg.textContent = (r.ok ? "✓ " : "⚠ ") + (r.message || "");
+    msg.style.color = r.ok ? "#0b7a3b" : "#b21f2d";
+    if (r.ok) { $("mb-pass").value = ""; await loadMailbox(); }
+  } catch (e) { msg.textContent = "Failed: " + e.message; msg.style.color = "#b21f2d"; }
+  finally { btnDone(btn); }
+}
+async function unlinkMailbox(btn) {
+  btnBusy(btn, "Unlinking…");
+  try { await fetch("/mailbox/unlink", {method:"POST"}); $("mb-msg").textContent = "Unlinked."; $("mb-msg").style.color = ""; await loadMailbox(); }
+  catch (e) { $("mb-msg").textContent = "Failed: " + e.message; }
+  finally { btnDone(btn); }
 }
 // One unified Profile screen: applicant details + résumé content + screening answers + logins.
 function renderProfileForm() {
@@ -1650,7 +2255,15 @@ function renderProfileForm() {
   // Résumé content (source of truth for tailoring) — collapsible entries.
   put("s-experience", section("Experience","sec-experience",(R.experience||[]).map(expCard),"+ Add experience",()=>expCard()));
   put("s-activities", section("Leadership & activities","sec-activities",(R.activities||[]).map(expCard),"+ Add activity",()=>expCard()));
-  put("s-projects", section("Projects","sec-projects",(R.projects||[]).map(projCard),"+ Add project",()=>projCard()));
+  // Projects are ordered most→least impressive (Claude's ★ score); unscored sort last.
+  const projSorted = (R.projects||[]).slice().sort((a,b) => (b.impact||0) - (a.impact||0));
+  const projSec = section("Projects","sec-projects",projSorted.map(projCard),"+ Add project",()=>projCard());
+  const rankBtn = el("button", {id:"rank-proj", class:"addbtn", type:"button", text:"★ Rank by impressiveness"});
+  const rankMsg = el("div", {id:"rank-msg", class:"msg"});
+  rankBtn.addEventListener("click", rankProjects);
+  projSec.insertBefore(el("p", {class:"subhint", text:"Claude scores each project 1–5 on technical depth and difficulty, then orders them so your résumé leads with your strongest work. Saves your current edits."}), projSec.querySelector(".cards"));
+  projSec.append(rankBtn, rankMsg);
+  put("s-projects", projSec);
   put("s-education", section("Education","sec-education",(R.education||[]).map(eduCard),"+ Add education",()=>eduCard()));
   put("s-skills", section("Skills","sec-skills",(R.skills||[]).map(skillCard),"+ Add skill category",()=>skillCard()));
 
@@ -1674,17 +2287,40 @@ function renderProfileForm() {
   // Autofill accounts status + native logins (apply profile).
   put("s-accounts", nativeAccountsPanel());
   const creds = el("div", {id:"creds-card", class:"card"});
+  const linked = !!P.greenhouse_linked;
+  // The password is write-only: never sent to the browser (it's in the OS keychain). Leave blank
+  // to keep the saved one; type a new one to replace it; Disconnect to remove it.
+  const passWrap = el("div", {class:"fld"}, [
+    el("label", {text:"MyGreenhouse password"}),
+    el("input", {class:"f", "data-k":"greenhouse_password", type:"password",
+                 placeholder: linked ? "•••••••• saved — leave blank to keep" : "app password"})]);
+  const ghControls = el("div", {class:"subhint", style:"margin-top:6px"}, [
+    el("span", {text: linked ? "🔒 Password saved in your OS keychain." : "🔓 No password saved yet."})]);
+  if (linked) {
+    const dc = el("button", {class:"linklike", type:"button", text:"Disconnect", style:"margin-left:8px",
+      on:{click: async ()=>{
+        dc.disabled = true; dc.textContent = "Disconnecting…";
+        await fetch("/profile/greenhouse/unlink", {method:"POST", headers:{"Content-Type":"application/json"}, body:"{}"});
+        loadProfile();
+      }}});
+    ghControls.append(dc);
+  }
   creds.append(
-    el("p", {class:"hint", text:"Optional. If set, the Apply stage logs into Greenhouse's own MyGreenhouse account and uses its autofill first, then fills the rest. Stored locally in your git-ignored profile."}),
-    row2(fld("MyGreenhouse email","greenhouse_email",P.greenhouse_email), fld("MyGreenhouse password","greenhouse_password",P.greenhouse_password)));
+    el("p", {class:"hint", text:"Optional. If set, the Apply stage logs into Greenhouse's own MyGreenhouse account and uses its autofill first, then fills the rest. Email is stored in your git-ignored profile; the password is stored in your OS keychain, never in a file."}),
+    row2(fld("MyGreenhouse email","greenhouse_email",P.greenhouse_email), passWrap),
+    ghControls);
   put("s-logins", el("div", {class:"sec"}, [el("h3", {text:"Native autofill logins (optional)"}), creds]));
+
+  // Bot email for account-gated portals (Workday) — its own secure store (keychain), not the profile YAML.
+  put("s-botemail", mailboxPanel());
 
   // Section-jump nav (s-linkedin is the static import block below the form).
   const jump = [
     ["s-applicant","Applicant details"], ["s-experience","Experience"], ["s-activities","Activities"],
     ["s-projects","Projects"], ["s-education","Education"], ["s-skills","Skills"],
     ["s-resume-header","Résumé header"], ["s-screening","Screening answers"],
-    ["s-accounts","Autofill accounts"], ["s-logins","Logins"], ["s-linkedin","LinkedIn import"],
+    ["s-accounts","Autofill accounts"], ["s-logins","Logins"], ["s-botemail","Bot email"],
+    ["s-linkedin","LinkedIn import"],
   ];
   const nav = el("div", {class:"pnav"}, jump.map(([id,label]) =>
     el("a", {href:"#", text:label, on:{click:(ev)=>{ ev.preventDefault(); const t = $(id); if (t) t.scrollIntoView({behavior:"smooth", block:"start"}); }}})));
@@ -1722,8 +2358,30 @@ async function loadProfile() {
     ]);
     if (rd.error) throw new Error(rd.error);
     if (pd.error) throw new Error(pd.error);
-    R = rd.resume; P = pd.profile; renderProfileForm();
+    R = rd.resume; P = pd.profile; renderProfileForm(); loadMailbox();
   } catch (e) { $("profile-form").innerHTML = ""; $("profile-form").appendChild(el("div", {class:"msg err", text:String(e.message || e)})); }
+}
+async function rankProjects() {
+  const btn = $("rank-proj");
+  btnBusy(btn, "Ranking…");
+  const stop = busyInto($("rank-msg"), "Saving, then Claude is scoring your projects by technical impressiveness…", true);
+  try {
+    // Persist profile edits first (the rank endpoint saves the résumé itself), so the
+    // reload below can't drop any unsaved screening/applicant changes on the same page.
+    const rp = await (await fetch("/profile/update", { method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ data: collectProfile() }) })).json();
+    if (!rp.ok) throw new Error(rp.error || "profile save failed");
+    const r = await (await fetch("/resume/rank-projects", { method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ resume: currentResume(), data: collect() }) })).json();
+    stop();
+    if (!r.ok) throw new Error(r.error || "ranking failed");
+    await loadProfile();   // reload résumé (now scored + reordered) and profile, then re-render
+    const m = $("rank-msg"); m.className = "msg ok";
+    m.textContent = "Ranked ✓  " + r.ranked.map(x => x[0] + " (★" + x[1] + ")").join("  ·  ");
+  } catch (e) {
+    stop(); btnDone(btn);
+    const m = $("rank-msg"); m.className = "msg err"; m.textContent = String(e.message || e);
+  }
 }
 async function saveProfile() {
   const btn = $("save-profile"), msg = $("profile-msg");
@@ -1900,6 +2558,117 @@ async function loadSources(){
       "on — aggregator hits are resolved to their real ATS and upgraded to the full job description"));
     box.appendChild(el("div", {class:"editing", text:"Forms we can auto-fill: " + (s.fillable_ats || []).join(", ") + "."}));
   } catch(e){ box.innerHTML = ""; box.appendChild(el("div", {class:"msg err", text:String(e.message || e)})); }
+}
+
+// ---- Discover: chart how fit improves run over run (decision 046) -----------
+// Wrap the chart with a window toggle. Default is Lifetime (all runs); the user can
+// narrow to the most recent N when the history gets long.
+function renderFitTrend(box, allRuns){
+  if (!allRuns.length) return;
+  const wrap = el("div", {class:"fit-trend"});
+  const inner = el("div");
+  const WINDOWS = [["Lifetime", 0], ["Last 30", 30], ["Last 10", 10]];
+  const opts = WINDOWS.filter(([, n]) => n === 0 || allRuns.length > n);
+  const draw = n => { inner.innerHTML = ""; drawFitChart(inner, n ? allRuns.slice(-n) : allRuns); };
+  if (opts.length > 1) {
+    const sel = el("select", {class:"fit-window"});
+    opts.forEach(([label, n]) => sel.appendChild(el("option", {value:String(n), text:label})));
+    sel.addEventListener("change", () => draw(parseInt(sel.value, 10) || 0));
+    wrap.appendChild(el("div", {class:"fit-window-bar"},
+      [el("label", {text:"Show"}), sel]));
+  }
+  wrap.appendChild(inner);
+  box.appendChild(wrap);
+  draw(0);   // default: lifetime
+}
+
+function drawFitChart(box, runs){
+  if (!runs.length) return;
+  const W = Math.max(160, runs.length * 26), H = 60, PAD = 4;
+  const x = i => PAD + (runs.length === 1 ? W/2 : i * (W - 2*PAD) / (runs.length - 1));
+  const y = v => H - PAD - (Math.max(0, Math.min(100, v)) / 100) * (H - 2*PAD);
+  const best = runs.map((r, i) => x(i) + "," + y(r.best_fit)).join(" ");
+  const mean = runs.map((r, i) => x(i) + "," + y(r.mean_fit)).join(" ");
+  const mf = runs[runs.length - 1].min_fit;                     // current bar line
+  const dots = runs.map((r, i) =>
+    `<circle cx="${x(i).toFixed(1)}" cy="${y(r.best_fit).toFixed(1)}" r="2.5" fill="#2563eb"><title>run ${i+1}: best ${r.best_fit}, mean ${r.mean_fit}, ${r.cleared}/${r.n_judged} cleared</title></circle>`
+  ).join("");
+  const first = runs[0].best_fit, last = runs[runs.length - 1].best_fit;
+  const arrow = last > first ? "▲ improving" : (last < first ? "▼ down" : "▬ flat");
+  const clearedNow = runs[runs.length - 1].cleared;
+  const svg =
+    `<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" style="max-width:100%">
+       <line x1="${PAD}" y1="${y(mf).toFixed(1)}" x2="${W-PAD}" y2="${y(mf).toFixed(1)}"
+             stroke="#c026d3" stroke-width="1" stroke-dasharray="3 3"/>
+       <polyline points="${mean}" fill="none" stroke="#9ca3af" stroke-width="1.5"/>
+       <polyline points="${best}" fill="none" stroke="#2563eb" stroke-width="2"/>
+       ${dots}
+     </svg>`;
+  box.appendChild(el("div", {class:"fit-head",
+    text:`Results over ${runs.length} run${runs.length>1?"s":""}: best fit ${first} → ${last} (${arrow}); ${clearedNow} above your bar this run`}));
+  const chart = el("div"); chart.innerHTML = svg; box.appendChild(chart);
+  box.appendChild(el("div", {class:"fit-legend",
+    text:`— best fit  ·  — mean fit  ·  ┈ your bar (min_fit ${mf}).  Hover a point for that run's numbers.`}));
+}
+
+// ---- Discover: what past runs taught the search (decision 046) --------------
+async function loadFitInsights(){
+  const panel = $("fit-insights"), box = $("fit-insights-body");
+  try {
+    const a = await (await fetch("/fit-insights")).json();
+    if (a.error) throw new Error(a.error);
+    if (!a.n_judged) { panel.style.display = "none"; return; }  // nothing learned yet
+    panel.style.display = "";
+    box.innerHTML = "";
+    renderFitTrend(box, a.runs || []);   // improvement over time, run by run
+    (a.lines || []).forEach((line, i) => box.appendChild(
+      el("div", {class: i === 0 ? "fit-head" : "fit-line", text: line})));
+    const recs = (a.recommendations || []);
+    if (recs.length) {
+      box.appendChild(el("div", {class:"editing", text:"Recommendations:", style:"margin-top:10px;font-weight:600"}));
+      recs.forEach(r => {
+        const row = el("div", {class:"fit-rec"});
+        row.appendChild(el("span", {text: r.message}));
+        if (r.field) {  // one-click applyable (experience_levels / min_fit)
+          const b = el("button", {type:"button", text:"Apply"});
+          b.addEventListener("click", async () => {
+            b.disabled = true; b.textContent = "Applying…";
+            const res = await (await fetch("/fit-insights/apply", {method:"POST",
+              headers:{"Content-Type":"application/json"},
+              body: JSON.stringify({field: r.field, value: r.value})})).json();
+            if (res.ok) { b.textContent = "Applied ✓"; loadDisc(); setTimeout(loadFitInsights, 600); }
+            else { b.disabled = false; b.textContent = "Apply"; alert(res.error || "Failed"); }
+          });
+          row.appendChild(b);
+        }
+        box.appendChild(row);
+      });
+    }
+    renderPrescore(box, a.prescore);
+  } catch(e){ panel.style.display = ""; box.innerHTML = ""; box.appendChild(el("div", {class:"msg err", text:String(e.message || e)})); }
+}
+
+// How well the zero-token pre-score tracks Claude's actual verdict for this résumé (decision
+// 052/055): one bar per pre-score band, its height = mean actual fit, plus a one-line read.
+function renderPrescore(box, ps) {
+  const bands = (ps && ps.bands) || [];
+  if (!bands.length) return;  // no pre-score history yet (pre-053 runs)
+  box.appendChild(el("div", {class:"editing", style:"margin-top:12px;font-weight:600",
+    text:"How well the quick pre-score predicts fit"}));
+  const grid = el("div", {class:"ps-grid"});
+  for (const b of bands) {
+    const h = Math.max(4, Math.round(b.mean_fit));  // bar height ∝ mean actual fit (0-100)
+    grid.append(el("div", {class:"ps-col"}, [
+      el("div", {class:"ps-fit", text:String(Math.round(b.mean_fit))}),
+      el("div", {class:"ps-bar-wrap"}, [el("div", {class:"ps-bar", style:"height:" + h + "%"})]),
+      el("div", {class:"ps-band", text:b.band}),
+      el("div", {class:"ps-n", text:"n=" + b.n}),
+    ]));
+  }
+  box.appendChild(grid);
+  box.appendChild(el("div", {class:"editing", style:"margin-top:4px",
+    text:"quick pre-score band (x) → average actual fit Claude gave (bar)"}));
+  if (ps.note) box.appendChild(el("div", {class:"fit-line", style:"margin-top:6px", text:ps.note}));
 }
 
 function escapeHtml(s){ const d=document.createElement("div"); d.textContent=s; return d.innerHTML; }

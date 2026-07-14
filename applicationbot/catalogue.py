@@ -69,18 +69,22 @@ def select_relevant(resume: Resume, jd: JobDescription, budget: LengthBudget) ->
     jd_tokens = relevance.tokens(jd.body)
     terms = relevance.skill_terms(resume)
 
-    def top(entries, k, textfn):
+    def top(entries, k, textfn, tiebreak=lambda e: 0):
         if len(entries) <= k:
             return list(entries)
+        # Relevance is primary; `tiebreak` (e.g. project impact) decides among equally-
+        # relevant entries; original order is the final tiebreak. All negated → higher wins.
         scored = sorted(
             enumerate(entries),
-            key=lambda it: (-relevance.text_score(textfn(it[1]), terms, jd_lower, jd_tokens), it[0]),
+            key=lambda it: (-relevance.text_score(textfn(it[1]), terms, jd_lower, jd_tokens),
+                            tiebreak(it[1]), it[0]),
         )
         keep = sorted(i for i, _ in scored[:k])  # preserve original order among kept
         return [entries[i] for i in keep]
 
     trimmed = resume.model_copy(deep=True)
     trimmed.experience = top(resume.experience, keep_exp, lambda e: " ".join([e.role, e.organization, *e.bullets]))
-    trimmed.projects = top(resume.projects, keep_proj, lambda p: " ".join([p.name, p.tech or "", *p.bullets]))
+    trimmed.projects = top(resume.projects, keep_proj, lambda p: " ".join([p.name, p.tech or "", *p.bullets]),
+                           tiebreak=lambda p: -(p.impact or 0))
     trimmed.activities = top(resume.activities, keep_act, lambda a: " ".join([a.role, a.organization, *a.bullets]))
     return trimmed

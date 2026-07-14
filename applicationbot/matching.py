@@ -20,7 +20,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Optional
 
-from . import relevance
+from . import ats_score, relevance
 from .backends import _extract_json, claude_code_available, run_claude_cli
 from .discovery import Posting
 from .models import Resume
@@ -33,6 +33,7 @@ class Match:
     posting: Posting
     keyword_score: int
     matched_skills: list[str]
+    ats_score: int = 0  # 0-100 deterministic pre-score (ats_score.py) — orders the judge queue
     qualified: Optional[bool] = None  # None until Claude judges it
     fit_score: Optional[int] = None  # 0-100, computed from `dimensions` via FIT_WEIGHTS
     why: str = ""
@@ -58,12 +59,17 @@ def keyword_rank(resume: Resume, postings: list[Posting], *, min_skills: int = 1
     for p in postings:
         score, matched = relevance.qualification_score(resume, f"{p.title}\n{p.body}")
         if score >= min_skills:
-            matches.append(Match(posting=p, keyword_score=score, matched_skills=matched))
+            # Deterministic multi-factor pre-score (decision 052): richer than the raw overlap
+            # count — folds in experience/education/title fit so the judge queue isn't led by
+            # verbose senior JDs. Reuses this pass's matched count (no re-scan).
+            ats = ats_score.ats_prescore(resume, p.title, f"{p.title}\n{p.body}", matched_count=score)
+            matches.append(Match(posting=p, keyword_score=score, matched_skills=matched, ats_score=ats))
     # Curated early-career postings (already pre-vetted to the user's level) rank ABOVE raw board
-    # postings — otherwise a verbose senior JD's larger skill overlap crowds them out of the
-    # judged top-N, defeating the point of enabling early-career feeds. Within each group, rank
-    # by skill overlap.
-    matches.sort(key=lambda m: (bool(m.posting.extra.get("curated")), m.keyword_score), reverse=True)
+    # postings — otherwise a verbose senior JD crowds them out of the judged top-N, defeating the
+    # point of enabling early-career feeds. Within each group, rank by the deterministic pre-score
+    # (keyword overlap as the tiebreak).
+    matches.sort(key=lambda m: (bool(m.posting.extra.get("curated")), m.ats_score, m.keyword_score),
+                 reverse=True)
     return matches
 
 
@@ -212,14 +218,33 @@ def match(
     use_claude: bool = True,
     min_skills: int = 1,
     on_progress=None,
+    predictor=None,
 ) -> tuple[list[Match], list[str]]:
     """Rank postings against the user's qualifications. Keyword-ranks all of them, then (if
     enabled and the Claude CLI is present) has Claude judge the top `top_n`. Returns
     (matches sorted best-first, errors). A Claude failure on one posting is recorded and
     leaves that posting keyword-only — it never aborts the run (Agent Guideline #11).
-    `on_progress(done, total)` is called after each judged posting (for a UI progress bar)."""
+    `on_progress(done, total)` is called after each judged posting (for a UI progress bar).
+
+    `predictor` (a `fit_learning.Predictor`), when active, decides WHICH `top_n` postings the
+    judge spends its slots on: survivors are re-ordered by predicted fit learned from past
+    runs (decision 046) so the judge sees the postings most like past winners, not the ones a
+    raw keyword count floats up. It never changes the final best-first ordering (that is still
+    the judge's fit_score) — only which postings get judged."""
     ranked = keyword_rank(resume, postings, min_skills=min_skills)
     errors: list[str] = []
+
+    # Steer the scarce judge slots toward postings history predicts will clear the bar. Keep
+    # curated early-career feeds first (as keyword_rank does), then predicted fit, then the
+    # keyword score as a tiebreak. Only reorders which top_n get judged; a no-op when the
+    # predictor is inactive (thin history) or absent (keeps today's keyword ordering).
+    if predictor is not None and getattr(predictor, "active", False):
+        ranked.sort(
+            key=lambda m: (bool(m.posting.extra.get("curated")),
+                           predictor.predict(m.posting, ats_score=m.ats_score),
+                           m.ats_score, m.keyword_score),
+            reverse=True,
+        )
 
     if use_claude and claude_code_available():
         survivors = ranked[:top_n]

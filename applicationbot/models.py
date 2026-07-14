@@ -61,6 +61,15 @@ class Project(BaseModel):
         description="Optional URL for the project (repo, demo, or write-up). Grounds answers "
         "to questions like 'a personal project you're proud of?' — never fabricated.",
     )
+    impact: Optional[int] = Field(
+        default=None,
+        ge=1,
+        le=5,
+        description="Technical-impressiveness score, 1 (routine) – 5 (very impressive), "
+        "auto-scored by Claude (see impact.py). Orders projects in the Profile UI and, when "
+        "the résumé's length budget can't fit every project, breaks ties in favour of the "
+        "more impressive ones (relevance to the job stays the primary signal). Null = unscored.",
+    )
     bullets: list[str] = Field(default_factory=list)
     tailor_note: Optional[str] = Field(
         default=None,

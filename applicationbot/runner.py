@@ -11,6 +11,7 @@ Run:
     python -m applicationbot.runner              # dry-run the whole cleared queue, headless
     python -m applicationbot.runner --max 5      # bound this run to 5 applications
     python -m applicationbot.runner --headed     # watch it work
+    python -m applicationbot.runner --continuous # poll forever: cycle, wait --interval min, repeat
 """
 
 from __future__ import annotations
@@ -175,6 +176,46 @@ def run_queue(
     return out
 
 
+def _report_parked(say=print) -> None:
+    """After a cycle, name the applications parked on a user-resolvable block (decision 049)
+    so a blocked fill is a one-step fix, not a lost run. Best-effort: a tracker/DB hiccup
+    never breaks the run."""
+    try:
+        from . import parking, tracker
+        parked = tracker.parked_applications()
+    except Exception:
+        return
+    if not parked:
+        return
+    say(f"\n{len(parked)} application(s) waiting on you — resolve in the Discover tab, then re-apply:")
+    for a in parked[:10]:
+        d = parking.describe(a.get("blocked_kind", ""), a.get("blocked_detail", ""))
+        who = f"{a['company']} — {a['role']}".strip(" —") or a.get("source_url", "?")
+        say(f"  - {who}: {d['label']}" + (f" ({d['detail']})" if d["detail"] else ""))
+    if len(parked) > 10:
+        say(f"  … and {len(parked) - 10} more.")
+
+
+def continuous_loop(run_cycle, gate: SafetyGate, *, interval_s: int,
+                    say=None, _sleep=time.sleep) -> str:
+    """Poll forever: run one cycle, wait `interval_s` (kill-file-abortable), repeat. `run_cycle()`
+    returns 'ok'|'empty'|'stop'; a 'stop' (fatal, e.g. Claude sign-in) ends the loop immediately —
+    waiting won't fix it. Returns why it ended: 'stop' or 'kill'. Injected `run_cycle`/`_sleep`
+    keep it testable without network, browser, or real waiting."""
+    say = say or (lambda msg: print(msg))
+    cycle = 0
+    while not gate.kill_file.exists():
+        cycle += 1
+        say(f"\n=== Cycle {cycle} ===")
+        if run_cycle() == "stop":
+            return "stop"
+        say(f"Cycle {cycle} done — waiting {max(1, round(interval_s / 60))} min. "
+            f"Create {gate.kill_file} to stop.")
+        if not _wait_for_reset(interval_s, gate, _sleep):
+            return "kill"
+    return "kill"
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     import argparse
 
@@ -201,6 +242,13 @@ def main(argv: Optional[list[str]] = None) -> int:
                         help="Force dry-run even if profile/safety.yaml is armed.")
     parser.add_argument("--fresh", action="store_true",
                         help="Ignore the cached discovery snapshot and re-search every board.")
+    parser.add_argument("--continuous", action="store_true",
+                        help="Keep polling for new matching postings: run a cycle, wait "
+                        "--interval minutes, repeat. Stop with Ctrl-C or by creating profile/KILL.")
+    parser.add_argument("--interval", type=int, default=30,
+                        help="Minutes to wait between cycles in --continuous mode (default 30). "
+                        "Pair with --fresh to re-search boards every cycle; otherwise cycles "
+                        "reuse the discovery cache until its TTL expires.")
     args = parser.parse_args(argv)
 
     if not backends.claude_code_available():
@@ -224,36 +272,6 @@ def main(argv: Optional[list[str]] = None) -> int:
           if gate.armed else "Dry-run — filling and recording, never submitting "
           "(arm in profile/safety.yaml).")
 
-    print(f"Discovering from {len(filters.boards)} board(s)"
-          + ("…" if args.fresh else " (reusing a fresh cache if present)…"))
-    res = discover_and_match(resume, filters, profile=profile, use_claude=True,
-                             force_fresh=args.fresh)
-    if res.from_cache:
-        mins = int((res.cache_age_seconds or 0) // 60)
-        age = f"{mins} min ago" if mins < 90 else f"{mins // 60}h ago"
-        print(f"→ Reused cached discovery (saved {age}; no board search, no Claude judging — "
-              "pass --fresh to re-search).")
-    for e in res.errors:
-        print(f"  ! {e}")
-
-    if args.min_fit is not None:
-        min_fit = args.min_fit  # explicit override — calibration never second-guesses it
-    else:
-        from .pipeline import effective_min_fit
-        min_fit, calib_note = effective_min_fit(filters)
-        if calib_note:
-            print(f"→ {calib_note}")
-    queue = cleared_queue(res.matches, min_fit)
-    manual = f" ({len(res.non_fillable)} set aside on non-fillable portals)" if res.non_fillable else ""
-    print(f"{res.discovered} discovered → {len(res.matches)} matched{manual} → "
-          f"{len(queue)} cleared min-fit {min_fit}.")
-    if not queue:
-        best = max((m.fit_score for m in res.matches if m.fit_score is not None), default=None)
-        print("Nothing cleared the bar."
-              + (f" Best fit this run: {best}." if best is not None else "")
-              + f" Lower min_fit (now {min_fit}) or broaden boards in {args.filters}.")
-        return 1
-
     def apply_one(m: Match):
         return run_testing_mode(
             resume, m, args.resume, args.profile,
@@ -261,10 +279,61 @@ def main(argv: Optional[list[str]] = None) -> int:
             slow_mo=350 if args.headed else 0, pause=False, gate=gate,
         )
 
-    result = run_queue(queue, apply_one, gate, max_applications=args.max)
-    print("\n" + result.summary())
-    for o in result.outcomes:
-        print(f"  - {o.result:11} {o.company} — {o.role} (fit {o.fit}) {o.detail}")
+    def run_cycle() -> str:
+        """One discover → judge → apply pass. Returns 'ok' (applied to the cleared queue),
+        'empty' (nothing cleared the bar), or 'stop' (fatal — Claude sign-in required, which
+        won't fix itself by waiting)."""
+        print(f"Discovering from {len(filters.boards)} board(s)"
+              + ("…" if args.fresh else " (reusing a fresh cache if present)…"))
+        res = discover_and_match(resume, filters, profile=profile, use_claude=True,
+                                 force_fresh=args.fresh)
+        if res.from_cache:
+            mins = int((res.cache_age_seconds or 0) // 60)
+            age = f"{mins} min ago" if mins < 90 else f"{mins // 60}h ago"
+            print(f"→ Reused cached discovery (saved {age}; no board search, no Claude judging — "
+                  "pass --fresh to re-search).")
+        for e in res.errors:
+            print(f"  ! {e}")
+
+        if args.min_fit is not None:
+            min_fit = args.min_fit  # explicit override — calibration never second-guesses it
+        else:
+            from .pipeline import effective_min_fit
+            min_fit, calib_note = effective_min_fit(filters)
+            if calib_note:
+                print(f"→ {calib_note}")
+        queue = cleared_queue(res.matches, min_fit)
+        manual = f" ({len(res.non_fillable)} set aside on non-fillable portals)" if res.non_fillable else ""
+        print(f"{res.discovered} discovered → {len(res.matches)} matched{manual} → "
+              f"{len(queue)} cleared min-fit {min_fit}.")
+        if not queue:
+            best = max((m.fit_score for m in res.matches if m.fit_score is not None), default=None)
+            print("Nothing cleared the bar."
+                  + (f" Best fit this run: {best}." if best is not None else "")
+                  + f" Lower min_fit (now {min_fit}) or broaden boards in {args.filters}.")
+            return "empty"
+
+        result = run_queue(queue, apply_one, gate, max_applications=args.max)
+        print("\n" + result.summary())
+        for o in result.outcomes:
+            print(f"  - {o.result:11} {o.company} — {o.role} (fit {o.fit}) {o.detail}")
+        _report_parked()
+        return "stop" if "sign-in required" in result.stopped_reason.lower() else "ok"
+
+    if not args.continuous:
+        return 1 if run_cycle() == "empty" else 0
+
+    print(f"Continuous mode — a cycle then a {args.interval} min wait, repeating. "
+          f"Create {gate.kill_file} or press Ctrl-C to stop.")
+    try:
+        ended = continuous_loop(run_cycle, gate, interval_s=args.interval * 60)
+    except KeyboardInterrupt:
+        print("\nStopped (Ctrl-C).")
+        return 0
+    if ended == "stop":
+        print("Stopping continuous run — fix the above, then rerun.")
+        return 1
+    print(f"Kill switch — {gate.kill_file} exists; stopping continuous run.")
     return 0
 
 

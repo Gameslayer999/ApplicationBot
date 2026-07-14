@@ -55,6 +55,29 @@
 | 042 | 2026-07-09 | Tailoring token diet + one-page guarantee: the Claude backend returns a **TailorDelta** (entries by index + rewritten bullets; schema 4.8k→1.5k chars) reconstructed in Python so orgs/dates/education/certs are copied verbatim — never mangled, never paid as output; résumé JSON compacted + JD trailing-boilerplate trim (8k cap) on the input side; and `pdf.fit_to_pages` renders → measures → trims (least-relevant first, floors, user-facing note) until the PDF **actually** fits the page budget — wired into `tailor_resume` for all backends and surfaces | Accepted |
 | 043 | 2026-07-09 | Four adoptions from the ai-job-search survey (all zero-token at run time): `ats_check.py` verifies every exported PDF's text layer (readable name/email/phone, JD keyword coverage split covered vs dropped-by-tailoring); `archive.py` snapshots each application (posting text + exact PDF + fill report) under git-ignored `profile/applications/`, freezing a dated copy on real submission; the fit judge returns **skills/experience/seniority** dimensions and `fit_score` is computed in code via `FIT_WEIGHTS` (.45/.35/.20); tracker gains interview/offer/rejected/no-response statuses + a `fit_score` column (migrated) + `calibration_report()` — response rate by fit band to tune `min_fit` from real outcomes. NOT adopted: reviewer-agent tailoring pass (2× cost vs 034), LaTeX, LinkedIn scraping (Guideline #4) | Accepted |
 | 044 | 2026-07-09 | Readiness/commitment closers ("Are you up for it?", "Are you ready?", "Does this sound like you?") auto-answer **Yes** — applying IS the commitment — via a guarded keyword rule (start/relocate/remote/travel/when phrasings excluded) + a `role_commitment` classifiable type for rephrasings. ITAR/export-control gates and security-clearance *eligibility* auto-answer **Yes** only when `us_citizen` is True (a citizen is a "U.S. person"); non-citizens fall through to the bank/capture (green-card holders also qualify — the profile can't derive it), and *holding* a clearance stays captured. "itar" matched as a whole word (substring hits "mil-ITAR-y") | Accepted |
+| 045 | 2026-07-09 | Project impressiveness ranking: Claude auto-scores each résumé project 1–5 on technical depth/difficulty (`impact.py`, one subscription-CLI pass, cached in `Project.impact` in resume.yaml); the Profile UI orders projects by that score, shows a ★ badge, and adds a "Rank by impressiveness" button. Selection stays **relevance-first** — impact only breaks ties in `catalogue.select_relevant`, the rules engine, and the tailoring prompt — so the résumé leads with the strongest work without forcing off-topic projects on | Accepted |
+| 046 | 2026-07-09 | Discovery feedback loop (`fit_learning.py`): every judged posting is appended to git-ignored `profile/fit_history.jsonl` (fit + per-dimension scores + detected level + board). Before each run a `Predictor` (shrinkage-blended level/board means, inactive below 5 rows) **re-ranks the free keyword pre-filter by predicted fit**, so the judge's scarce `top_n` slots go to postings most like past winners instead of the verbose senior JDs a raw keyword count floats up — zero extra Claude tokens. `analyze()` diagnoses why postings clear or don't (dimension breakdown, per-level/board segments, recurring missing = résumé gaps) and recommends auditable edits: narrow `experience_levels` to winning bands, lower `min_fit` to best-achievable when nothing cleared, drop dead boards. Surfaced in the CLI + a Discover-tab panel with one-click apply for `experience_levels`/`min_fit`. Complements 043's `recommended_min_fit` (which only ever RAISES the bar) by steering the *supply* of high-fit postings | Accepted |
+| 047 | 2026-07-09 | JSON-LD → CSS → LLM enrichment cascade (`enrich.py`) adopted from the ApplyPilot survey: `fetch_full_jd`/`enrich_from_html` read a full JD off any posting page — tier 1 parses `<script type=ld+json>` `JobPosting` structured data (ToS-clean, the data Google for Jobs indexes), tier 2 a stdlib-`HTMLParser` description/apply-link scraper, tier 3 an **opt-in** Claude extractor (off by default, 30k-capped, schema-constrained). Reusable module, not a one-off source: new `discovery.CareerSiteSource(career_sites)` consumes it (ATS auto-detected from the apply URL so a JSON-LD link routes into the right Apply adapter), and it can later backfill JD wherever an ATS resolver comes up empty. `fetch_json` refactored onto a shared `fetch_text` (same politeness/retry); no new dependency. Live-verified on a real Lever page (5,099-char JD), SPA degrades to empty | Accepted |
+| 048 | 2026-07-09 | ApplyPilot adoptions #3/#4: `python -m applicationbot.doctor` runs six read-only readiness checks (Claude CLI signed in · Playwright Chromium installed · résumé loads · applicant profile loads · discovery has ≥1 source · submit-safety state) and prints each with ✓/✗/⚠ plus a one-line actionable fix on failure; exit 0 iff every *required* check passes (missing profile = optional ⚠). Runner gains `--continuous [--interval MIN]` (default 30): the per-cycle discover→judge→apply work is a `run_cycle()` closure, driven by an injectable module-level `continuous_loop(run_cycle, gate, interval_s, _sleep)` that repeats until the KILL file / Ctrl-C / a fatal Claude-sign-in `stop`, waiting via the existing kill-abortable `_wait_for_reset`. Cycles reuse the discovery cache unless `--fresh`; `skip_seen` keeps applied roles out; dry-run/safety unchanged | Accepted |
+| 049 | 2026-07-09 | CAPTCHA auto-solving (`captcha.py`, CapSolver) — **user-directed over my survey rec to reject** (Guideline #4: solving a CAPTCHA to submit circumvents an anti-bot control / may breach site ToS); built **fenced** so it can't run silently. `apply._attempt_submit` calls a gated hook only after `may_submit()` (armed-only ⇒ dry-run never solves). Five gates: off by default (`captcha.enabled` in safety.yaml), per-site opt-in (`captcha.sites` host-suffix allowlist), armed-only, key from env `CAPSOLVER_API_KEY` (never YAML), every attempt logged. Any unmet gate ⇒ **blocked** outcome with the fix, never a silent bypass. Detects reCAPTCHA-v2/hCaptcha/Turnstile, solves via CapSolver createTask/getTaskResult (urllib, no new dep), injects the response token. ApplyPilot's README claims CapSolver but its code has none (detect+fail) — from-scratch build. `doctor` reports the state; `_attempt_submit` back-compat via `solve_captcha=None` | Accepted |
+| 050 | 2026-07-09 | Workday hybrid (Option C, approved): deterministic `data-automation-id` adapter first, agentic worker only for unrecognized pages (distilled to replayable recipes), final submit always behind the Python `SafetyGate` — inverts ApplyPilot's all-agentic, prompt-only-safety approach. Enabling fact: Workday automation ids are stable across every tenant. M1 (login + standard fields, dry-run only) started: brick 1 `credentials.py` (per-tenant passwords in the OS keychain via **keyring** [new dep], never YAML; git-ignored tenant→email index for listing; CLI list/get/delete); brick 2 `workday.py` `fill_standard_fields` maps stable ids (legalName/city/email/phone) to profile-first-then-résumé values, dry-run, verified on a local Workday-shaped fixture headless. Settled: bot-owned email for account creation but all tenant passwords stored; shared committed recipe library; custom questions reuse `AnswerResolver`. Unwired (`_is_fillable` still drops Workday) until brick 5 — no current flow changes. Remaining M1: wizard nav + dropdowns, account-create/sign-in + IMAP, apply dispatch | Accepted |
+| 051 | 2026-07-09 | AutoApply-AI survey + adoption #1 (park & resume blocked applications), M1+M2. Survey of Rayyan9477/AutoApply-AI (full-stack FastAPI+React+Redis on browser-use): adopted #1 (park/resume), #3 (deterministic ATS pre-score), #4 (funnel analytics); **rejected #2 (Exa AI semantic discovery — paid API, overlaps `enrich.py`)** and the whole FastAPI/React/Redis/Postgres/Prometheus/LiteLLM stack (heft; conflicts with simplicity-first + Claude-only decision 004). **M1:** pure `parking.classify(report)→ParkReason` maps a stalled fill to a user-actionable kind (needs_answer / login / captcha / form_rejected / site_error) + UI deep-link target + resumable flag; tracker gains a `blocked` status + `blocked_kind`/`blocked_detail` columns (additive migration) + `parked_applications()`; `_record_run` parks an armed-blocked (or required-unanswered) fill as a `blocked` row carrying the reason instead of a silent `dry-run`, and a resolved re-run clears it → `applied`. **M2:** `GET /parked` + a Discover-tab "Applications waiting on you" panel of Resolve cards deep-linking to the fix (Profile "Needs your answer" for needs_answer); `runner._report_parked` names parked apps after each cycle; a "Re-apply (dry-run)" button POSTs `/parked/reapply` → `_reapply_worker` re-drives the deterministic fill on the same URL with the stored PDF + a fresh resolver (reusing the test-run progress panel), **always dry-run** (armed runner stays the only submit path, Guideline #3). Dependency-free resume — NOT AutoApply-AI's Redis BLPOP/RPUSH. Remaining: armed one-click resume + a credentials UI for the login target | Accepted |
+| 052 | 2026-07-09 | AutoApply-AI adoption #3: deterministic multi-factor pre-score (`ats_score.py`, zero tokens) orders the Claude judge queue. `ats_prescore(resume, title, jd_text)` → 0-100 from skills (matched-count saturated at 6) + experience (candidate career-span years ÷ the JD's floor "N years" bar) + education (candidate degree rank ÷ the JD's floor degree, HS=1…PhD=5) + title-keyword overlap, weighted .40/.30/.20/.10, renormalized over the factors the JD actually states (missing requirement ≠ zero, same as `weighted_fit`). `matching.keyword_rank` computes it (reusing the keyword pass's matched count — no re-scan), stores it on `Match.ats_score`, and ranks survivors by it instead of the raw overlap count; the predictor-active path uses it as the tiebreak below predicted fit. **Claude stays the final judge — unchanged**; this only changes WHICH `top_n` get judged, fixing decision 046's failure where a verbose senior JD's larger keyword overlap crowds early-career-fit roles out of the judged set (the experience factor now sinks the over-bar role cheaply). Rejected the surveyed scorer's required-vs-preferred skill split (not extractable from raw JD text) in favour of a saturated overlap count; cache-safe (`ats_score` defaults 0 on pre-052 snapshots). Live drive: a 7-yr full-stack résumé now leads with the Full-Stack role (ats 87) over a Staff role with higher keyword overlap (6 vs 4, ats 86), nurse posting gate-dropped | Accepted |
+| 053 | 2026-07-09 | Workday M1 brick 4 (account create/sign-in + email verification). `mailbox.py`: IMAP reader for a dedicated bot inbox — `extract_verification` (pure) pulls a portal-looking verification link or a 6–8 digit code; `fetch_verification`/`wait_for_verification` (injected `_connect`/`_sleep`, tested against a fake IMAP) get the newest matching-sender message; creds from env `MAILBOX_IMAP_HOST/EMAIL/PASSWORD` (secrets, never YAML). `workday.py`: `sign_in`/`create_account` (`:visible`-scoped, reveal-create-form + tick-terms) + `generate_password` (secrets, complexity-meeting); `ensure_account` orchestrates stored⇒sign-in else create-on-**bot-email**⇒**persist immediately** (never lose a password)⇒verify via mailbox. Unwired until brick 5 — no current flow changes. 16 offline tests (fake IMAP + `workday_account.html` fixture); live step flagged (real inbox + tenant). Full suite 237/237 | Accepted |
+| 054 | 2026-07-09 | AutoApply-AI adoption #4: discovery→offer funnel on the Track tab. `tracker.funnel_report()` counts applications reaching each stage of a shrinking funnel — Discovered ⊇ Filled (dry-run/blocked/submitted) ⊇ Applied (submitted) ⊇ Responded (a human replied, incl. a rejection; `no-response` excluded) ⊇ Interview ⊇ Offer — from each row's current status (sets nested so it's monotone despite storing only the latest status), with the conversion from the previous stage. Served in `/track`, rendered as labeled bars above the Track table, and a `tracker funnel` CLI command. Read-only over existing data; no schema change | Accepted |
+| 055 | 2026-07-09 | Feed the deterministic pre-score (decision 052) into the fit-learning `Predictor` (decision 046). Each judged posting's `ats_score` is now stored in `fit_history.jsonl`; the predictor learns a third shrunk bucket — the pre-score band (width 20 → five bands) — averaged with the level + board estimates, and `matching.match` passes `m.ats_score` to `predict`. This **calibrates** the heuristic against real Claude verdicts: a pre-score band that historically judged low is tempered rather than trusted. Fully back-compatible — pre-053 history lacks `ats_score`, so `_prescore` is empty and `predict` falls back to the exact level+board average; the `ats_score` arg is optional so existing callers/tests are unchanged. Verified: high vs low band separation, misleading-band tempering (ats 90→pred 43 < ats 40→pred 52), old-history no-op. Full suite 244/244 | Accepted |
+| 056 | 2026-07-09 | Seen-openings ledger (`discovery_seen.py`) so a dry-run/list preview shows only NEW openings on a re-run. Root cause of the "same openings every time" report: the snapshot cache (037) returns the identical result within its window AND even a `--fresh` search finds the same board postings, while `skip_seen` drops only postings in the *tracker* — which a preview never writes to. New git-ignored `profile/discovery_seen.json` records the canonical URL of every posting a preview surfaces; `discover_and_match(only_new=True)` hides already-shown matches then records the survivors, layered on top of the cache (which still holds the FULL ranked result) and `skip_seen`, re-applied fresh each run. Kept SEPARATE from the tracker (ledger entry = "shown once", tracker row = "acted on") so previewing never pollutes application history/calibration. On by default for the CLI list path (`--all` shows everything, `--reset-seen` / `python -m applicationbot.discovery_seen clear` forgets) and the web testing worker (normal run = new-only; "Re-search fresh" = show all). **Off by default so the autonomous runner is unaffected** (it relies on tracker `skip_seen` from real applies). 6 new tests; full suite 250/250 | Accepted |
+| 057 | 2026-07-09 | Link the bot email inbox (secure store + Profile-tab UI + CLI + doctor). Password → OS keychain (`keyring`, service `applicationbot-mailbox`); host/email/port → git-ignored `profile/mailbox.yaml`. `mailbox.save_link/load_link/clear_link/link_status`; `load_config` prefers a stored link then falls back to env (`MAILBOX_*`); `test_connection` does a real IMAP login + INBOX-select returning an actionable (ok, msg); `suggest_host` guesses from the email domain. Web: a "Bot email (Workday verification)" Profile panel (`GET /mailbox`, `POST /mailbox/link|unlink`) whose Link & test **tests before it saves — bad creds never stored**; CLI `python -m applicationbot.mailbox link|status|test|unlink`; `doctor` reports linked/unlinked. Mirrors the keychain-for-secret pattern (050), avoids the plaintext-YAML anti-pattern. Back-compat: env-only path unchanged. 8 tests; served JS node-clean; endpoints driven live; `profile/mailbox.yaml` git-ignored. Full suite 257/257. Unblocks brick 5 | Accepted |
+| 058 | 2026-07-09 | Per-click armed resume for parked applications (park & resume M3, extends 051). A "Submit for real ▶" button on each resumable parked card really submits THAT one application — a **second, per-application arming path** the user approved, independent of `profile/safety.yaml`'s global `armed` flag (green-light one reviewed application without arming the whole autonomous runner). `_reapply_gate(arm)` builds a one-shot `SafetyGate(armed=True, max_submissions_per_run=1)`; `_reapply_worker(arm=True)` passes it to the existing `run_apply` armed path (pre-submit required-field gate + confirmation detection + tracker `applied`, decision 035). Safety: the global `profile/KILL` still halts it (`may_submit`); a client `confirm()` names the company; and since a POST now fires an irreversible submit, the armed branch of `/parked/reapply` requires a same-origin request (`_same_origin`) to block a drive-by cross-site submit. Dry-run re-apply (arm=false) unchanged. 6 tests (gate armed/cap/kill, same-origin matrix, route cross-origin 403 before any run); full suite 260/260; drove KILL-halts-armed-gate live | Accepted |
+| 059 | 2026-07-09 | Workday M1 brick 5 (end-to-end wire-in, dry-run) — **M1 complete**. `workday.apply_workday` orchestrates start_application (Apply → Apply Manually) → `ensure_account` (053) → résumé upload → `fill_wizard` (bricks 2–3), and **never submits** (no armed/submit branch in the Workday path). `run_apply` routes `ats == "workday"` to it instead of `_open_application_form`/`_fill_all_pages`; the non-Workday path is byte-identical under `else`. `pipeline._is_fillable` now allows Workday and the aggregator bridge marks resolved Workday `auto_applyable=True`, so Workday postings reach the matcher + adapter instead of being dropped; tracker logs a `dry-run` row unchanged. Verified end-to-end on new `workday_full.html` (job→Apply→Apply Manually→account create→3-page wizard→Review) headless: account created+stored, fields+dropdowns+résumé filled across 3 pages, Submit NEVER clicked; + dispatch + `_is_fillable` tests; updated the 035 fillability test. Full suite 264/264. Live step flagged (real tenant). Next: M2 agentic fallback, M3 armed submit | Accepted |
+| 060 | 2026-07-09 | MyGreenhouse password moved from plaintext YAML → OS keychain (closes an audit item; Guideline #12). Was: `ApplicationProfile.greenhouse_password` stored plaintext in `profile/application_profile.yaml` AND sent to the browser on every `GET /profile`. Now: `apply_profile.set/get_greenhouse_password` store it in the keychain (`keyring`, service `applicationbot-greenhouse`) mirroring credentials.py/mailbox.py (050/057); the email stays in the YAML (non-secret). `save_profile` never writes the password; `GET /profile` strips it and returns `greenhouse_linked: bool`; `/profile/update` routes a typed password to the keychain (blank = keep existing) and `/profile/greenhouse/unlink` clears it; the Profile field is write-only + a Disconnect button; `apply.greenhouse_credentials` reads the keychain (legacy-plaintext fallback). One-time auto-migration in `load_profile` moves any existing plaintext into the keychain and scrubs the YAML (idempotent, best-effort). 6 tests (fake keyring) + full suite 270/270; drove GET/migration/unlink live (password never in the payload, YAML scrubbed, keychain holds it). No new dependency (keyring already in); `profile/*` already git-ignored | Accepted |
+| 061 | 2026-07-09 | Workday M2 part 1: recipe backbone + agentic-fallback distillation (offline core; live agentic call built + flagged, pipeline wire-in is M2 part 2). `workday_recipes.py` = a **shared, committed, PII-free** library (`workday_recipes.json`, `{signature: [{automation_id, control, question}]}` — selectors + labels only, **never answer values**; answers re-resolved per user at replay). `workday.unrecognized_fields` finds visible+empty+unknown-id custom controls; `replay_recipe` re-fills a learned page deterministically via `AnswerResolver` (source `workday-recipe`, no Claude); `run_agent_fill` hands unrecognized fields to a Claude-Code+Playwright-MCP worker over CDP (`agent_prompt` = fields + facts + HARD RULES: never navigate/fabricate) and **distills the recipe by DIFFING which fields went empty→filled** — no dependence on parsing opaque MCP element refs. `_spawn` injectable → fake-agent tests, no Claude/CDP. 8 tests incl. PII-free store + the full learn-once→replay-no-agent loop; full suite 278/278. Unwired until part 2 (fill_wizard/apply_workday integration + CDP browser launch + gating) | Accepted |
+| 062 | 2026-07-09 | General CSRF/origin guard on ALL state-changing POSTs (closes the audit item; extends 058). A single choke point at the top of `web.Handler.do_POST` rejects any cross-origin request (403) before dispatch — a page on another site the user has open can't drive the loopback server (saves, submits, browser launches). `_same_origin` generalized: a missing Origin/Referer passes (same-origin fetches often omit it; non-browser clients send none — not the CSRF threat), a loopback Origin passes, and otherwise the Origin host must equal the `Host` header the client addressed — so it's correct under `--host` LAN/name binds, not just 127.0.0.1 (a browser sets Origin itself, so a remote page can't forge a loopback value). The per-endpoint armed-`/parked/reapply` check (058) is now redundant and removed. GETs stay unguarded (read-only). 6 tests (`test_web_csrf.py` cross-origin blocked before the handler + loopback/no-Origin/GET allowed; `_same_origin` matrix incl. LAN-bind); full suite 280/280; drove a real cross-origin POST → 403 with the handler never called | Accepted |
+| 063 | 2026-07-09 | Workday M2 part 2: agentic fallback + recipe replay wired into the pipeline (extends 061). `_resolve_unrecognized` runs per wizard page after the deterministic fill — replay a learned recipe first (free), then only if custom fields remain AND armed does `run_agent_fill` fill+learn+persist. `fill_wizard`/`apply_workday` gained optional `resolver`/`agentic`/`cdp_port`/`store_path`/`_agent_spawn` (no resolver ⇒ pure M1). `run_apply` opens a CDP endpoint (`--remote-debugging-port=<free port>`) only for armed-agentic Workday runs so the Playwright-MCP worker attaches to the same page; threads resolver+agentic+port to the adapter. `workday.agentic_enabled` reads `workday_agentic` from safety.yaml, **off by default** (replay always on/free; only Claude-learning of a NEW page is gated, mirroring 049). 4 tests incl. learn-once(on)→replay(off) agent-runs-exactly-once + a live `run_apply` drive confirming the real CDP launch + param threading. Full suite 283/283. **M2 complete** but for the flagged live Claude-over-MCP run on a real tenant. Next: M3 armed submit | Accepted |
+| 064 | 2026-07-09 | Workday M3: armed submit gated by the SafetyGate (extends 035/059). `_attempt_workday_submit` — reached only from `apply_workday` when `gate.armed`, after `fill_wizard` reaches Review. Order: Review-page check (Submit control present) → `_workday_unmet_required` scan (empty aria-required/placeholder-dropdown → **blocked before any click**) → `gate.may_submit()` (armed + no KILL + under cap, last-moment) → click `pageFooterSubmitButton` + `record_submission` → confirmation via `_confirmation_evidence` (submitted) / Workday error alert (blocked) / Submit-gone (unconfirmed-but-submitted, no double-submit). `apply_workday` gained `gate`; `run_apply` passes it into the Workday branch (Workday owns its submit; generic `_attempt_submit` skipped). No gate/unarmed ⇒ M1/M2 dry-run unchanged. 5 tests (armed happy path submits + cap=1; empty-required blocks pre-click; KILL blocks; unarmed blocks; full armed Apply→create→wizard→Review→Submit). Full suite 289/289. **Workday M1+M2+M3 code-complete**; sole remaining item is the flagged live run on a real tenant | Accepted |
+| 067 | 2026-07-14 | Weak-model answers for required unmapped fields, so an armed submit is never blocked by an empty required box — free-text drafts **and** (amendment) dropdowns/selects. Two changes: (1) free-text answers now draft with a deliberately **weak/cheap model** (`answer_bank.DRAFT_MODEL = "haiku"`; `generate_answer` defaults to it — a grounded, résumé-only paragraph needs no frontier model, and it saves tokens); (2) `freetext_answer(required=…)` force-drafts any **required** field even when it isn't "open-ended" by phrasing (the WHOOP case is a single-line `<input type="text" required>` — `is_open_ended` returns False, so before this it was skipped as "no saved answer" and blocked submit). New `answer_bank.is_draftable_required` gates the force-draft: it excludes numeric-fact (salary/GPA/test-score) and demographic/EEO questions, which we must **never** fabricate — those stay empty for the user (honesty, Guideline #7). Per-field required-ness read live via new `_IS_REQUIRED_JS`/`_is_required` (element `required`/`aria-required`, or a label/card marked `*`/`✱`/`★`/"required"). 4 new tests + drove the real committed `lever_custom_cards.html` headless: the WHOOP required text input now fills (`source=generated`) instead of being skipped; suite green | Accepted |
+| 066 | 2026-07-13 | Lever custom-question label derivation (fixes the WHOOP dry-run report). Root-caused from the run's `report.json` + a live fetch of the Lever DOM: a Lever card renders its question in a `<div class="application-label"><div class="text">…</div></div>` — **not** a `<label>`/`<legend>` — while each radio OPTION is wrapped in its own `<label>` holding just "Yes"/"No". So `_LABEL_JS` fell through to the raw input `name` (`cards[uuid][field0]`) and `_GROUP_QUESTION_JS` returned `''`. Effects: the work-authorization + visa radio groups never filled (resolver got no/garbled question → `None`), and the "Why are you interested in working at WHOOP?" text got the label `cards[…][field0]`, so the generated answer was ungrounded ("vaguely made sense"). Fix: both JS helpers now, before the generic ancestor walk, find the enclosing `.application-question`/`li` card and read `.application-label .text`; the ancestor-walk selectors also include `.application-label`; `clean()` strips the `✱`/`★` required glyphs. Additive — Greenhouse/Ashby (which wrap inputs in real `<label>`s) are unchanged. Two follow-on fixes surfaced during a live headed dry-run and were folded in: **(a) option-label guard** — the reorder must NOT hijack a radio OPTION's own `<label>` ("Yes"/"No"), so `_LABEL_JS` returns the wrapping `<label>` when it has no nested `.application-label`, and falls to the card question only for the EEO-select wrapper (which nests one); **(b) captcha-overlay radio fallback** — Lever embeds an hCaptcha whose invisible enclave iframe sits over the form and swallows the radio click, so new `_check_radio` tries normal → forced → `.checked=`+input/change (the CAPTCHA is never touched; dry-run never submits). **EEO normalization DONE** (not deferred): `option_hints` now maps veteran/disability intent to each ATS's option wording (exact-first + negation-safe fuzzy — never a bare "veteran" that hits both "am a"/"am not a"); Greenhouse "I am not a protected veteran" → Lever "I am not a veteran". Race/gender already matched once labels were clean. Verified against the **real** fetched WHOOP DOM headless AND a full live headed dry-run: **15 filled, 0 errors, nothing submitted** — work-auth Yes, visa No, hybrid Yes, Gender/Race/Veteran filled, "Why WHOOP?" grounded (references WHOOP's mission). Committed PII-free fixture `fixtures/apply_forms/lever_custom_cards.html` + `tests/test_lever_labels.py` (4 tests incl. radio-check + option-label regression guards); fill/submit suite green (full suite 304/305, the one failure is a pre-existing mailbox test-isolation bug unrelated to apply.py). The captcha the user saw is real (Lever embeds hCaptcha) but fires only at **submit** (dry-run never reaches it) — it did not cause the empty fields | Accepted |
+| 065 | 2026-07-09 | One-click Gmail connect via OAuth (extends 057). The bot-email link asked for email + IMAP host + port + a hand-generated **app password** (2FA + digging through Google settings) — the opposite of one-click. Now the primary path is **"Sign in with Google"**: `mailbox.connect_gmail(client_id, client_secret)` runs the loopback consent flow (`google-auth-oauthlib` `InstalledAppFlow.run_local_server`, `access_type=offline`+`prompt=consent` so a refresh token always comes back), reads the email via the Gmail profile endpoint, **tests before it saves** (link-before-save, 057), and stores refresh-token+client-secret in the OS keychain (service `applicationbot-gmail-oauth`) with email/client_id/`auth: oauth` in git-ignored `profile/mailbox.yaml`. Reads use the **Gmail REST API with the read-only scope** (`gmail.readonly`) via `urllib`+Bearer — deliberately NOT IMAP-over-XOAUTH2, which would force Google's full `mail.google.com` scope (send/delete); least privilege (Guideline #5). `MailboxConfig` gained `auth/refresh_token/client_id/client_secret`; `test_connection`/`fetch_verification` branch to `_gmail_*` when `auth=="oauth"` (IMAP/env path byte-identical). Web: Profile "Bot email" panel leads with **Connect Gmail** (client_id/secret + one-time setup steps; app-password moved to an "Advanced" `<details>`), `POST /mailbox/gmail/connect` (CSRF-guarded, threaded so consent doesn't freeze the UI, elapsed-time waiting state), `GET /mailbox` returns non-secret `auth`+`client_id` for one-click reconnect. CLI `connect-gmail`; doctor/status show "Gmail, read-only". New deps `google-auth`/`google-auth-oauthlib`. 9 new tests (fake keyring + injected flow/token/get: keychain-only secrets, read-only fetch, route-to-oauth, save-on-success, no-save on missing-token/failed-read); full suite 298/298; JS node-clean; endpoints driven live (GET shape, 400 on missing creds). Live step flagged: the real Google consent needs the user's Cloud client + browser. Setup burden: a one-time Google Cloud "Desktop app" OAuth client, project set to "In production" so refresh tokens don't expire weekly | Accepted |
 
 ---
 
@@ -1825,3 +1848,1130 @@ cases (closers, guards like "When are you ready to start?" → null and "Are you
 relocate?" → No, the verbatim ITAR blurb, clearance eligibility vs possession), full suite
 **132/132**.
 See [[041-two-pass-page-fill]], [[040-autofill-determinism-hardening]], [[018-answer-bank]].
+
+## 045 — Rank projects by technical impressiveness so the résumé leads with the strongest work
+
+**Context:** Which projects survive a tailored résumé's length budget was decided by JD
+keyword relevance alone (`text_score` in `catalogue.select_relevant`, the rules engine, and
+the Claude tailoring order). Relevance has no notion of *technical impressiveness*, so a
+weak keyword-matching project (a low-code Retool dashboard) could crowd out a genuinely deep
+one (a Rust/macOS systems overlay). The user wanted the pipeline to focus on more
+technically impressive projects.
+
+**Options considered:** (a) manual impressiveness field the user sets; (b) **Claude
+auto-scores** each project, cached; (c) treat list order as the ranking. And for how the
+score interacts with JD relevance: relevance-first w/ rank as tiebreak, rank-dominates, or
+relevance-filters-then-rank-orders.
+
+**Decision:** (b) + relevance-first-with-tiebreak. `impact.py` makes **one Claude pass**
+(subscription CLI, `think=False`, schema-constrained — same path as tailoring, decision 034)
+scoring every project 1–5 on engineering depth/difficulty only (not job fit, not prose),
+written back to a new optional `Project.impact` in the git-ignored resume.yaml (the cache).
+The Profile UI orders projects by that score, shows a ★ badge in each card's collapsed
+header, carries the score through the save round-trip (hidden field), and adds a "Rank by
+impressiveness" button (shared spinner + live elapsed, UI principle #5) that saves current
+edits then re-scores. Selection stays **relevance-first**: `impact` is only a secondary sort
+key in `select_relevant`'s trim and the rules engine, and the tailoring system prompt is told
+to prefer higher-impact projects *among comparably-relevant ones* and drop low-impact
+low-relevance ones first when the budget is tight — so an impressive but off-topic project is
+never forced onto the résumé.
+
+**Reasoning:** Auto-scoring removes manual bookkeeping and calibrates consistently; caching in
+resume.yaml means the cost is paid once per catalogue change, not per tailor. Keeping relevance
+primary preserves existing tailoring behaviour (Guideline #7) — the feature only changes the
+*tiebreak*, which is exactly where crowding-out happened. **Verified live:** scored the real
+7-project résumé — the two deep projects (AgentStatus, ApplicationBot) got 5, the low-code
+dashboard got 2; save/reload stays schema-valid; select_relevant and the rules engine surface
+the high-impact projects first; full suite **132/132**.
+See [[042-tailoring-token-diet]], [[013-catalogue-token-efficiency]], [[034-stripped-claude-cli]].
+
+## 046 — Discovery feedback loop: learn from past judgments to surface higher-fit postings
+
+**Context:** The recurring failure the user hits is "can't find a posting above the fit
+threshold to run a dry-run." Grounded in the real data: a run discovered 673 postings → 301
+after gates → 91 keyword-matched → **but only 10 got a Claude fit score** (`top_n`), of which
+exactly one cleared `min_fit=60`. Two compounding causes: (1) the free keyword pre-filter
+ranks by raw skill-term overlap, which floats **verbose senior JDs** to the top — the exact
+postings an early-career résumé scores *lowest* on (experience dimension averaged 23) — so the
+judge's scarce slots are spent on roles that always score ~20, while any higher-fit early-career
+roles sit unjudged at rank 11–91. (2) The only existing "learning" (decision 043
+`recommended_min_fit`) **only ever RAISES** `min_fit`, which makes "nothing clears" worse; nothing
+steered the *supply* of high-fit postings. The user asked for a loop that learns from past runs
+and tweaks itself so each new run surfaces postings that score higher.
+
+**Options considered:** (a) learn-to-rank the pre-filter from accumulated judged history
+(steer *which* postings get judged); (b) auto-tune the discovery filters from history + a
+"why nothing clears" diagnostic (steer the *pool*, transparent, user-in-loop); (c) both. User
+chose **(c)**.
+
+**Decision:** New `fit_learning.py`. **Store:** every judged Match is appended to git-ignored
+`profile/fit_history.jsonl` (url, ats/board, title, detected level(s), fit, per-dimension
+scores, matched skills, missing) after each live `discover_and_match`; `load()` de-dups by
+canonical URL keeping the latest verdict. **Engine:** a `Predictor` estimates a not-yet-judged
+posting's fit as the average of two **shrinkage-blended** bucket means — its seniority level(s)
+and its board — each pulled toward the global mean by `_SHRINK_K=4` pseudo-counts so a
+rarely-seen bucket can't swing the rank on noise; `active` only at ≥ `MIN_HISTORY=5` rows.
+`matching.match(..., predictor=)` re-sorts the survivors by predicted fit (curated feeds still
+first, keyword score as tiebreak) **before** slicing `top_n`, so the judge sees the postings most
+like past winners. It never changes the final best-first ordering (still the judge's fit_score) —
+only which postings get judged. Zero extra Claude tokens (prediction is arithmetic over stored
+verdicts); a no-op with thin/no history (keeps today's keyword ordering). **Diagnosis:**
+`analyze()` reports dimension means + weakest dimension, per-level and per-board fit segments,
+recurring missing requirements, and `Recommendation`s: narrow `experience_levels` to the winning
+bands (needs a clear ≥2-sample winner/loser split among *detected* levels), lower `min_fit` to
+best-achievable **only when nothing cleared** (surfaces the reality, never auto-lowers on partial
+success), flag chronically-dead boards, and list recurring missing reqs as résumé gaps. Surfaced
+in the pipeline CLI and a Discover-tab panel (`GET /fit-insights`) with one-click apply
+(`POST /fit-insights/apply`, whitelisted to `experience_levels`/`min_fit`, re-validated).
+**Visible improvement over time:** each live run also appends a one-line summary (best/mean
+fit, how many cleared) to `profile/fit_runs.jsonl`; the Discover panel charts it as an inline
+SVG sparkline (best + mean fit vs the dashed min_fit bar, per-run hover) under an "▲ improving"
+headline, and the CLI prints the best-fit series — so the user watches results climb as the
+loop learns, not just a static snapshot.
+
+**Reasoning:** The bottleneck is the pre-filter starving the judge, so the highest-leverage fix
+is spending the judge's slots better — an engine that needs no tokens and self-sharpens each run
+(a). The diagnosis (b) makes the "why" legible and gives the user auditable, one-click control
+rather than a silent model tweak. Shrinkage + a min-history gate keep it from overfitting to a
+handful of samples. It complements, not conflicts with, 043: 043 tunes the *bar* from real
+interview outcomes; 046 steers the *supply* of postings that reach the bar. Preserves existing
+behaviour (Guideline #7): `predictor=None` / inactive ⇒ today's keyword ranking, unchanged final
+ordering. **Verified:** 16 new tests (predictor flips the single judged slot from a skill-stuffed
+senior posting to a bare new-grad one; diagnosis recommendations fire under the right guards);
+diagnosis run on the real judged data correctly names experience (23) as the drag and greenhouse
+(25) as the dead board vs ashby (54); the three endpoints driven live (apply merges into
+discovery.yaml, non-applyable fields rejected); fixed a test-isolation bug where
+`test_discovery_cache` wrote history into the real profile dir; full suite **148/148**.
+See [[043-ai-job-search-adoptions]], [[025-qualification-driven-discovery]], [[037-discovery-snapshot-cache]], [[034-stripped-claude-cli]].
+
+### Update (2026-07-09): cache-served dry runs don't train or chart — say so ("Fresh trains, label the rest")
+
+**Context:** The fit trend showed only one point despite the user doing several dry runs. Root
+cause: a dry run first checks the discovery snapshot cache (037); on a hit it returns the stored
+matches early and never reaches the `append()` (per-posting training) or `record_run()` (one
+trend point) calls — those run *only* on a live, judged (`force_fresh`) run. With a 12h cache
+TTL, every dry run after the first reused the same 91 matches, so nothing new was judged, learned,
+or charted. **Options:** (a) chart a point on every dry run including cache hits — but a cache hit
+is byte-identical prior data, so it plots flat duplicates and adds no training signal, misrepresenting
+"results improving"; (b) keep chart/training tied to fresh judged runs, but stop the silence — tell
+the user when a run was cache-served and that fresh is what adds a point + trains; (c) make the
+default dry run always bypass the cache (full judge + board scrape every run). **Decision (b).** The
+cache-reuse note in the test panel now states the run "added no point to the fit chart and taught
+the search nothing. Re-search fresh to judge live, add a chart point, and train" — the existing
+one-click **Re-search fresh** button is the fix (UI Principles #3, #5: don't silently drop the
+user's action; the message names what didn't happen and the button that makes it happen). No
+data-model change; fresh runs already record correctly. Also (unrelated, same session) the fit
+chart now defaults to **Lifetime** with a Show: Lifetime/Last 30/Last 10 window toggle, and
+`/fit-insights` returns the full run history instead of the last 30.
+
+## 047 — JSON-LD → CSS → LLM enrichment cascade + career-site discovery source (ApplyPilot survey)
+
+**Context:** Surveyed [Pickle-Pixel/ApplyPilot](https://github.com/Pickle-Pixel/ApplyPilot)
+(an agentic auto-apply agent — Claude Code + Playwright MCP *drives the browser*) against our
+system. Its most portable, principle-aligned win is its **Enrich** stage: a three-tier
+extraction cascade (JSON-LD → CSS selectors → AI) that reads a full job description off an
+arbitrary posting page. Our discovery is limited to ~5 known ATSs with public JSON APIs; any
+company career page outside that set can't be discovered or read. Reading a page's published
+`JobPosting` structured data (the same data Google for Jobs indexes) is ToS-clean (Guideline
+#4) and needs no LLM for the common case. User approved this as item #1 of the ApplyPilot
+adoption queue.
+
+**Options considered:** (a) build it as one more `Source` (a career-site scraper); (b) build
+it as a **reusable enrichment module** that a new career-site `Source` consumes *and* that can
+backfill a full JD anywhere an ATS-specific resolver comes up empty (curated-list resolution
+failures, aggregator non-ATS hits, future sources). Chose **(b)** — the cascade is useful in
+more than one place, and coupling it to a single Source would force a rewrite to reuse it.
+
+**Decision:** New `enrich.py` — `fetch_full_jd(url, *, llm=None)` / `enrich_from_html(html,
+url=, llm=)` run the cascade and return an `EnrichResult` whose `.tier` names the winning
+method (`json-ld` | `css` | `llm` | `""`). **Tier 1 (JSON-LD):** regex-find every
+`<script type="application/ld+json">` block, recurse through nested objects / `@graph` arrays,
+keep `@type` == `JobPosting` (string or list), and normalize description (HTML-unescaped →
+plaintext), apply URL (`directApply` → `applicationContact.url` → `url`), title, company,
+location, `baseSalary`, `datePosted`, and `jobLocationType`==TELECOMMUTE → remote. **Tier 2
+(CSS/DOM):** a stdlib `HTMLParser` (`_DescExtractor`) that captures the text of the element
+whose id/class names it a description (`job-description`/`description`/… + `<article>`/`<main>`
+fallback), longest block wins, `<script>`/`<style>` data skipped, a void-tag-aware stack so
+nested markup closes capture at the right element; apply URL from the first `apply`-ish `<a>`.
+**Tier 3 (LLM):** optional — only runs if a caller passes an `llm` callable; the default
+`claude_llm_extractor` shells to the stripped Claude Code CLI (decision 034) with a
+`{description, apply_url}` json-schema over the cleaned, 30k-capped page text. A description
+under 50 chars is treated as "not found" so a stub page falls through. New
+`discovery.CareerSiteSource(urls, *, llm=None)` fetches each configured URL once, emits one
+`Posting` per JobPosting found (ATS auto-detected from the apply URL via `detect_ats_from_url`,
+so a JSON-LD link to a Greenhouse/Workday posting routes into the right Apply adapter), and
+tallies which tier resolved each page in `.stats` for a future "% saved" log line. Wired into
+config: `DiscoveryFilters.career_sites: list[str]` → `build_sources` appends the source when
+non-empty. Refactored `discovery.fetch_json` onto a shared `fetch_text` (same politeness/retry)
+so the cascade fetches HTML through the existing per-host pacing + backoff. LLM tier is **off
+by default** — the cascade is free and offline unless a caller opts in.
+
+**Reasoning:** Cost and safety. On real pages the vast majority resolve at tier 1/2 (ApplyPilot
+reports ~95% saved), so the LLM is rarely touched and never touched unless requested — matching
+our token-discipline decisions (034/041/042). A reusable module (b) means the same cascade can
+later rescue the curated-list/aggregator postings that today flow through with a degraded
+title-only body. No new dependency: JSON-LD via regex + `json`, the CSS tier via stdlib
+`HTMLParser` (no BeautifulSoup/soupsieve). Preserves existing behaviour (Guideline #7): empty
+`career_sites` builds no source; `fetch_json` is byte-for-byte equivalent through the refactor;
+a JS-rendered SPA (no server-side JSON-LD) returns an empty result rather than garbage.
+
+**Verified:** 8 new offline tests (`tests/test_enrich.py`: each tier in isolation, `@graph` +
+`@type`-list handling, the 50-char gate, script-text skipped + longest-block, LLM tier only on
+fall-through *and* only when opted in, CareerSiteSource ATS-detection + per-URL failure skip).
+Full suite **156/156**. **Live-verified:** the cascade on a real Lever hosted posting page →
+tier `json-ld`, 5,099-char JD, correct title/company; a Stripe SPA URL (JS-rendered, no SSR
+JSON-LD) correctly degrades to empty; `career_sites` round-trips through discovery.yaml and
+builds the source. *Remaining:* surface the `.stats` "% saved" line in the CLI/Discover tab;
+optionally wire the cascade as the fallback inside `discovery._resolve_jd`. First of the
+ApplyPilot adoptions (#2 cover letters, #3 `doctor`, #4 `--continuous`, #7 CapSolver, then the
+Workday hybrid) — see NEXT_STEPS.
+See [[043-ai-job-search-adoptions]], [[030-more-discovery-sources]], [[025-qualification-driven-discovery]], [[034-stripped-claude-cli]], [[032-workable-aggregator-bridge]].
+
+## 048 — `doctor` readiness command + runner `--continuous` polling (ApplyPilot survey)
+
+**Context:** Two more ApplyPilot adoptions (survey in decision 047). (1) A fresh clone has no
+guided way to tell whether it's actually ready to run — Claude signed in? Chromium installed?
+profile files present? a discovery source configured? — so the first failure surfaces deep in a
+run instead of up front. ApplyPilot ships `applypilot doctor` for exactly this. (2) The runner is
+one-shot: to keep applying as new postings appear the user must re-run it by hand. ApplyPilot's
+`--continuous` polls indefinitely. User approved both (#3, #4) and asked to do them before cover
+letters (#2), which reuses existing machinery and can wait.
+
+**Decision:** (1) **`doctor.py`** — `python -m applicationbot.doctor` runs six read-only checks
+(`run_checks`) and prints each with ✓/✗/⚠ and, on failure, a one-line **actionable fix** (UI
+Principles #1/#3): Claude Code CLI signed in · Playwright Chromium installed (imports the package,
+then verifies `chromium.executable_path` exists) · résumé loads (+entry/skill counts) · applicant
+profile loads · discovery has ≥1 source (boards / career_sites / Adzuna / early-career) · submit
+safety state (armed/dry-run/kill, info-only). Exit 0 when every **required** check passes, 1
+otherwise (a missing applicant profile is an optional ⚠, not a failure). It never creates or edits
+files — diagnosis only; the external-tool probes are isolated in `_check_*` helpers so tests
+monkeypatch them. (2) **Runner `--continuous [--interval MIN]`** (default 30) — the per-cycle
+discover→judge→apply work moved into a `run_cycle()` closure returning `ok|empty|stop`; a new
+module-level `continuous_loop(run_cycle, gate, *, interval_s, _sleep)` repeats it, waiting between
+cycles via the existing kill-file-abortable `_wait_for_reset`, and stops on the KILL file, Ctrl-C,
+or a fatal `stop` (Claude sign-in — waiting won't fix it). `continuous_loop` takes `run_cycle`/
+`_sleep` injected (same pattern as `run_queue(apply_one)`) so it's testable with no network,
+browser, or real waiting. Cycles reuse the discovery cache by default (cheap) and re-search every
+cycle only with `--fresh` — composes with existing cache semantics (decision 037); `skip_seen`
+keeps already-applied roles out each cycle. Dry-run and the safety gate are unchanged (Guideline
+#3): continuous never lowers the submit bar.
+
+**Reasoning:** `doctor` makes readiness legible and every gap one step from fixed, which is the
+onboarding foundation the audit flagged missing — without pre-creating anything (that's the future
+wizard). `--continuous` is the thin loop the audit/roadmap already wanted, built on the runner's
+existing quota/kill/failure-isolation rather than a parallel path; forcing fresh only on `--fresh`
+keeps Claude cost bounded (a naive re-judge-every-cycle would burn tokens). Both preserve existing
+behaviour (Guideline #7): single-run runner output is byte-identical (the cycle body just moved
+into `run_cycle`), and `doctor` is additive. **Verified:** 8 new offline tests
+(`tests/test_doctor.py`: each check pass/fail + required-vs-optional + exit code; `continuous_loop`
+runs until the kill file, stops immediately on fatal, never waits real time); full suite
+**167/167**. Live: `python -m applicationbot.doctor` prints a green 6/6 readout (exit 0) on the real
+repo; `runner --help` shows the wired `--continuous`/`--interval`. Third and fourth ApplyPilot
+adoptions — remaining: #2 cover letters, #7 CapSolver (DECISIONS entry first, Guideline #4), then
+the Workday hybrid (#5).
+See [[047-jsonld-enrichment-cascade]], [[035-submit-stage]], [[037-discovery-snapshot-cache]].
+
+
+## 051 — Park & resume blocked applications, M1+M2 (AutoApply-AI survey adoption #1)
+
+**Context:** Surveyed [Rayyan9477/AutoApply-AI](https://github.com/Rayyan9477/AutoApply-AI-Agentic-Browser-Automation-for-Job-Search)
+(full-stack FastAPI+React+Redis+Postgres+Prometheus platform on `browser-use`+Playwright).
+Its live-submit path is still "active development" — we are *ahead* on Apply — so the value is
+on the orchestration/UX side. Four ideas surfaced; the user approved #1/#3/#4 and rejected #2:
+- **#1 Park & resume** — their `intervention.py`: when the browser hits a CAPTCHA/login/2FA it
+  can't clear, the worker publishes `needs_intervention {application_id, kind, prompt}`, blocks
+  on a per-app Redis queue (`BLPOP`, 300s), and the UI resolves it (`RPUSH`). This is the fix for
+  three of our open gaps at once — **blocked-work routing**, **durable run state** (a restart
+  orphans a mid-fill browser), and **Workday email-verification**. Our runner previously treated a
+  block as a dead-end outcome (decision 016's exception-queue model): recorded and never revisited.
+- **#3 Deterministic multi-factor ATS pre-score** (their `ats/scorer.py`: skills `0.7·req+0.3·pref`
+  + experience + education-rank + keyword, weighted .4/.3/.2/.1) — queued to order the free
+  pre-filter cheaply; Claude stays the final judge.
+- **#4 Discovery→apply funnel analytics** — queued for the Track tab off `calibration_report()`.
+- **#2 Exa AI semantic discovery** — **rejected**: a paid API, and results overlap our existing
+  `enrich.py` JSON-LD→CSS→AI cascade (decision 047).
+
+Explicitly **not** adopted: their FastAPI/React/Redis/Postgres/Prometheus stack (architectural
+heft that fights simplicity-first and moves nothing toward the pipeline goal) and LiteLLM/Portkey
+multi-provider fallback (conflicts with Claude-only, decision 004; our rate-limit pause/resume,
+decision 035, already covers resilience).
+
+**Decision (M1 — durable state + classification):** Build park & resume *without* Redis, since our
+fill is deterministic (decision 040) — a resolved application resumes by simply re-driving the same
+form on the same posting URL, now getting past the field that stalled it. No browser-state
+serialization, no worker rendezvous, no new dependency.
+- **`parking.py`** — pure `classify(report: ApplyReport) → Optional[ParkReason]`. `ParkReason` =
+  `kind` (needs_answer / form_rejected / login / captcha / site_error) + human `summary` +
+  `resolve` UI deep-link target ("profile-answers" / "credentials" / "") + `resumable` bool +
+  `detail`. Grounded in strings the fill already produces: armed pre-submit-gate blockers
+  ("unresolved required field(s): …") and the dry-run required scan ("… — REQUIRED, not filled")
+  both map to **needs_answer** (deduped via `required_missing`); a login/CAPTCHA wall gates the
+  whole form so it wins over individual fields; "form rejected the submit" → review answers; a
+  no-submit-button / crashed-click is **site_error**, parked as a record but `resumable=False`.
+  Returns None for a clean dry-run (nothing to act on).
+- **`tracker.py`** — new `blocked` status + `blocked_kind`/`blocked_detail` columns (additive
+  `ALTER TABLE` migration, same pattern as decision 043's `fit_score`) + `parked_applications()`
+  returning only still-open resolvable rows.
+- **`apply._record_run`** — an armed-blocked (or required-unanswered) fill is recorded as a
+  `blocked` row carrying the reason, not a silent `dry-run`; a later resolved re-run clears
+  `blocked_kind` and upserts to `applied`, so it drops out of the parked list. Never clobbers a
+  user-set outcome status.
+
+**Reasoning:** Turning a block into durable, classified, resumable state is the foundation the
+autonomous runner needs — a blocked application becomes a one-click fix instead of a lost run, and
+the tracker (already the system of record) is the natural home, so no new store or service.
+Deterministic re-drive beats Redis worker-parking for our design: it needs no long-lived blocked
+worker, survives a server restart for free, and reuses the exact fill path (Guideline #2 — simpler
+than the surveyed approach). Preserves existing behaviour (Guideline #7): a clean dry-run still
+records a `dry-run` row; only genuinely-blocked runs change label, and armed-blocked runs
+(previously mislabelled `dry-run`) are now correctly `blocked`. **Verified:** 11 new offline tests
+(`tests/test_parking.py`: classifier per kind + precedence, dedup, pre-existing-DB migration,
+parked reader open-only, `blocked` status) + full suite **178/178**; drove `_record_run` end-to-end
+against a temp DB — a required-field block parks as `blocked/needs_answer` naming the fields, then a
+resolved submit upserts to `applied` and clears the park.
+
+**Decision (M2 — Resolve cards, runner surfacing, one-click resume):** Surface parked applications
+where the user can act, and make resume one click.
+- **Resolve cards** — new `GET /parked` returns `parked_applications()` enriched with
+  `parking.describe(kind, detail)` (headline · action verb · deep-link target · resumable). A
+  "Applications waiting on you" panel at the top of the Discover tab renders one card each; a
+  `needs_answer`/`form_rejected` card's button switches to the Profile tab and scrolls to the
+  "Needs your answer" list (UI Principle #2 — one click to the fix), a `login`/`captcha` card shows
+  the specific instruction. The panel hides itself when nothing is parked.
+- **Runner surfacing** — `runner._report_parked()` prints, after each cycle, every parked
+  application by name + what's blocking it (best-effort; a DB hiccup never breaks the run).
+- **One-click resume** — a "Re-apply (dry-run)" button on each resumable card POSTs `/parked/reapply`,
+  which runs `_reapply_worker` in the background: it re-drives the DETERMINISTIC fill on the same
+  posting URL with the stored tailored PDF and a fresh resolver (which now picks up the answer the
+  user just saved), reusing the existing test-run progress panel + Finish button. It **always
+  dry-runs** (gate omitted) — the armed runner stays the only submit path (Guideline #3); a clean
+  re-fill just confirms the block is cleared and the tracker upsert drops it out of the parked list.
+  Guards (missing row / no source URL / vanished PDF / a run already active) return an actionable
+  error before any browser launch.
+
+**Reasoning (M2):** The card + deep-link is the payoff of M1's durable state — a blocked application
+is now a one-step fix instead of a lost run, satisfying blocked-work routing. Reusing the test-run
+worker/panel (rather than a second progress UI) keeps the surface consistent (UI Principle #5) and
+the code small (Guideline #2). Keeping resume dry-run honours the safety switch: no UI button ever
+fires an irreversible submit; the user arms the runner for that. **Verified:** 10 more offline tests
+(`describe()` per kind, runner `_report_parked` names/silence, all four re-apply guard paths) — full
+suite **209/209**; drove the live HTTP server against a temp DB (page renders the parked panel + the
+re-apply JS, `GET /parked` returns the right card excluding a resolved row, `/parked/reapply` busy-
+guard fires). **Remaining:** an armed one-click resume (behind an explicit per-click arm), and a
+credentials UI for the `login` deep-link target (today it shows the instruction). See
+[[035-submit-stage]], [[040-autofill-determinism]], [[024-tracking-store]].
+
+## 049 — CAPTCHA auto-solving on the armed submit path (CapSolver) — user-directed, fenced
+
+**⚠ Compliance tension (logged before building, per the commitment + Guideline #4).** Solving a
+CAPTCHA to submit a form circumvents a site's anti-bot control and may breach that site's terms
+of service. In my survey recommendation I put this in the **reject** column on exactly those
+grounds. The user overrode that for their **own** job applications (personal use, toward the
+product's fully-autonomous end goal) and directed us to build it. This entry records the
+disagreement and the decision: we build it, but **fenced** so it cannot run silently or broadly,
+and it is the user's call for their own tool. A second finding from reading ApplyPilot's source:
+its README advertises CapSolver but the **code has none** — it detects a CAPTCHA and fails
+gracefully — so there was nothing to port; this is a from-scratch build.
+
+**Options considered:** (a) don't build it (my survey rec) — rejected by the user; (b) build it
+always-on — rejected (unfenced circumvention, irreversible); (c) build it **fenced**: off by
+default, per-site opt-in, armed-only, key from the environment, every attempt logged. Chose (c).
+
+**Decision:** New `captcha.py`. `build_submit_hook(config, url)` returns `hook(frame) ->
+(handled, detail)`; `apply._attempt_submit` calls it **after** `gate.may_submit()` passes —
+which is reached only on the armed path, so dry-run never solves (Guideline #3). The five gates:
+(1) **off by default** — `captcha.enabled` in profile/safety.yaml must be true; (2) **per-site
+opt-in** — the URL host must suffix-match a domain in `captcha.sites` (empty ⇒ nothing);
+(3) **armed-only** — enforced by the single call site; (4) **key from env** `CAPSOLVER_API_KEY`,
+never YAML (Guideline #12); (5) **every attempt logged** (site, type, outcome) via the injected
+`log`. If any gate is unmet the hook returns `(False, actionable-reason)` and the caller records
+a **blocked** outcome with the fix — it never falls back to submitting a protected form.
+Detection (`_DETECT_JS`) reads a reCAPTCHA-v2 / hCaptcha / Turnstile sitekey off the widget
+container or its iframe `src`; the solve goes through CapSolver's `createTask`/`getTaskResult`
+REST API (urllib — no new dependency, `_post`/`_sleep` injectable); `inject_token` writes the
+response token into the form's `g-/h-captcha-response` / `cf-turnstile-response` field and fires
+input/change. Config lives in safety.yaml (co-located with arming — it is a submission-safety
+setting):
+
+    captcha:
+      enabled: false
+      sites: []            # e.g. [greenhouse.io, ashbyhq.com]
+
+`doctor`'s safety line now reports the CAPTCHA state (off / on + allowlist + whether the key is
+set). `_attempt_submit` gained an optional `solve_captcha=None` param — existing callers/tests
+are byte-identical when it's None (Guideline #7).
+
+**Reasoning:** Given the user's directive, the responsible build is one that can only act with
+deliberate, per-site, keyed, armed opt-in and leaves an audit trail — the same
+safety-switch philosophy as decision 035 (real submission is gated, logged, killable), extended
+to the CAPTCHA that gates it. Defaulting everything off means a fresh clone, a dry-run, or an
+un-allowlisted site behaves exactly as before: a CAPTCHA is a recorded blocker, not a silent
+bypass. **Verified:** 12 offline tests (`tests/test_captcha.py`, zero CapSolver calls): each gate
+blocks with its reason, all-gates-pass solves + injects the token, the CapSolver client polls
+processing→ready and raises on an API error, site-allowlist suffix match rejects
+`evil-greenhouse.io`. Full suite **190/190**; `doctor` prints "CAPTCHA auto-solve off" by default;
+existing submit tests pass unchanged. *Remaining:* one live armed dry-run against a real
+CAPTCHA-gated form once the user sets a key + allowlists a site (no repo test can exercise the
+real CapSolver path without spending). Fifth ApplyPilot adoption; remaining: #2 cover letters,
+then the Workday hybrid (#5).
+See [[035-submit-stage]], [[047-jsonld-enrichment-cascade]], [[048-doctor-continuous]].
+
+## 050 — Workday hybrid: agentic→deterministic (Option C), keyring credentials, M1 begun
+
+**Context:** Account-gated portals are the largest open blocker — Workday alone is ≈32% of US
+enterprise postings and today `pipeline._is_fillable` drops it entirely (no adapter). It was
+surfaced by the ApplyPilot survey (decisions 047–049): ApplyPilot fills Workday by having
+Claude Code + a Playwright-MCP server **drive the browser agentically** — robust to any layout
+but token-heavy, non-deterministic, and (critically) its dry-run safety lives **in the prompt**,
+which an agentic model can ignore. We want Workday coverage without giving up the determinism
+and Python-side safety the rest of Apply relies on (decisions 034/040/041/035).
+
+**Options considered:** (A) pure deterministic adapter on Workday's `data-automation-id`
+selectors — cheapest/most-deterministic but brittle on per-tenant custom questions; (B) pure
+agentic (ApplyPilot) — robust but expensive, non-deterministic, prompt-only safety; (C) **hybrid**
+— deterministic adapter first, an agentic worker only for pages the adapter doesn't recognize,
+distilling each agentic fill into a replayable recipe so agentic use trends to 0, with the final
+submit always behind the Python `SafetyGate`. **User approved (C).** Key enabling fact: Workday's
+`data-automation-id` attributes are **stable across every tenant** (shared widget system), so the
+standard wizard is fillable by exact id — no label matching, no Claude.
+
+**Settled specifics (2026-07-09, user):** (1) account creation via a **dedicated bot-owned email**
+(IMAP/Gmail read for verification links), but **every tenant password persisted** so the user can
+log in manually later; (2) recipes = a **shared committed** library (selectors + question labels
+only, no PII) so every clone inherits learned pages; (3) **M1 = deterministic login + standard
+fields, dry-run only** (agentic fallback = M2, armed submit = M3); (4) custom questions reuse the
+existing `AnswerResolver`/bank/Claude-draft path; (5) page identity = hash of the page's
+`data-automation-id` set; (6) new `workday.py` behind the apply interface, and stop `_is_fillable`
+dropping Workday. Build order (bricks): 1 credential store · 2 adapter field-fill core · 3 wizard
+navigation · 4 account-create/sign-in + email verification · 5 wire-in.
+
+**Decision (this session — bricks 1 & 2):** (1) **`credentials.py`** — per-tenant credential store:
+passwords in the **OS keychain via `keyring`** (new dep, pre-approved), never plaintext YAML
+(Guideline #12); a git-ignored non-secret index `profile/workday_accounts.json` records tenant→email
+so the store is listable (keyring can't enumerate) and the user can see/retrieve every account
+(`python -m applicationbot.credentials list|get|delete`). Tenant key = the Workday host. `backend`
+injected so tests use an in-memory fake. (2) **`workday.py`** — `fill_standard_fields(frame, resume,
+profile, report)` maps Workday's stable automation ids (`legalNameSection_firstName/_lastName`,
+`addressSection_city`, `email`, `phone-number`) to profile-first-then-résumé values, empties dropped
+(never filled blank), each recorded on `report.filled` as `source="workday"`. Handles both wrapped
+inputs (id on a container) and direct inputs (id on the `<input>`). DRY-RUN only — nothing here
+submits. **Brick 3 (same session):** `fill_wizard` walks the multi-page wizard via the VISIBLE
+`pageFooterNextButton`, filling text + custom dropdowns per page and stopping at Review (no Next) —
+it NEVER clicks Submit; page identity is the md5 of the visible `data-automation-id` set (advance
+detection now, recipe key in M2). `fill_dropdowns`/`_fill_dropdown` handle Workday's custom
+button/listbox dropdowns deterministically (open → read visible options → match in code
+exact-then-substring → click by index): country/state (abbrev→full-name via a `_US_STATES` map) and
+the EEO dropdowns. All fills are `:visible`-scoped — never interacting with hidden fields from other
+wizard pages (also removed a 3s-per-hidden-field actionability timeout).
+
+**Reasoning:** Inverting ApplyPilot (deterministic-first, agentic-only-for-the-unknown) keeps the
+Workday path cheap, reproducible, and Python-safety-gated while still promising "any page" coverage
+once the agentic fallback (M2) lands. Building against local Workday-shaped HTML fixtures (real
+automation ids) — the same method that validated every other ATS — means M1 progresses with **zero
+tokens and zero contact with a real Workday** (Guideline #3), deferring the one unavoidable live
+step (a real tenant needs an account) to the account-creation brick. Preserves existing behaviour
+(Guideline #7): `workday.py` is new and unwired; `_is_fillable` still drops Workday until brick 5,
+so no current flow changes. **Verified:** 12 offline tests (`tests/test_credentials.py` ×6 with a
+fake keychain + temp index; `tests/test_workday.py` ×6 — value/dropdown mapping,
+option-matching, a headless fill of `workday_myinfo.html`, and a full headless walk of the 3-page
+`workday_wizard.html` proving text + custom dropdowns fill across pages and Submit is NEVER clicked).
+Full suite **221/221**; the credential store round-trips through the **real macOS keychain** live;
+`profile/workday_accounts.json` confirmed git-ignored. *Remaining M1:* brick 4 (account-create/
+sign-in + IMAP verification), brick 5 (apply dispatch + tracker row + stop `_is_fillable` dropping
+Workday). Then M2 (agentic fallback + recipe distillation), M3 (armed submit).
+See [[049-captcha-autosolve]], [[035-submit-stage]], [[040-autofill-determinism]], [[017-native-ats-autofill]], [[047-jsonld-enrichment-cascade]].
+
+
+## 052 — Deterministic multi-factor pre-score orders the judge queue (AutoApply-AI survey #3)
+
+**Context:** The free keyword pre-filter (`relevance.qualification_score`) ranks postings by a raw
+count of how many of the candidate's skills a JD mentions, and `matching.match` sends only the top
+`top_n` to the Claude judge. Decision 046 identified the failure this count causes: a verbose senior
+JD mentions many skills, so it floats to the top of the queue and consumes the judge's scarce slots,
+while early-career-fit roles sit unjudged below the cut. Decision 046's `Predictor` fixes this once
+there's outcome history; nothing improved the **cold-start** ordering. AutoApply-AI's `ats/scorer.py`
+is a deterministic multi-factor resume-vs-JD score (skills/experience/education/keyword, weighted
+.40/.30/.20/.10) - user approved adopting it (survey #3) to order the queue.
+
+**Decision:** New `ats_score.py` - `ats_prescore(resume, title, jd_text, matched_count=...)` returns a
+zero-token 0-100 pre-score:
+- **skills (.40)** - the matched-skill count, saturated at 6 (= full marks). The surveyed
+  required-vs-preferred split isn't extractable from raw JD text, so a saturated overlap count
+  replaces it honestly.
+- **experience (.30)** - candidate career-span years (earliest experience start -> latest end, 'Present'
+  = today) / the JD's floor experience bar (smallest "N years", ranges read as their low end, absurd
+  >40 ignored). This is the factor that sinks an over-bar senior role for an early-career resume.
+- **education (.20)** - candidate max degree rank (HS=1...PhD=5) / the JD's floor degree.
+- **keyword (.10)** - overlap of the posting TITLE's distinctive tokens with the resume (a distinct
+  signal from skill mentions: catches a 'Sales Engineer' title against a software resume).
+
+A factor whose requirement the JD doesn't state returns None and is renormalized out of the weighted
+average (missing != zero - same principle as `matching.weighted_fit`). `matching.keyword_rank`
+computes it once (reusing the keyword pass's matched count, no re-scan), stores `Match.ats_score`, and
+sorts survivors by `(curated, ats_score, keyword_score)`; the predictor-active path uses `ats_score`
+as the tiebreak below predicted fit.
+
+**Reasoning:** This spends the judge's fixed budget on better candidates from the very first run,
+before any outcome history exists, directly fixing 046's crowd-out - cheaply and deterministically
+(Guideline #2, no tokens, no new dependency). **Claude remains the only fit verdict** (`fit_score`):
+`ats_score` changes *which* postings are judged, never the final best-first ordering (still by
+`fit_score`) nor the `min_skills` gate, so observable output is unchanged except that the judged set
+is better-chosen (Guideline #7). Adapted, not ported: dropped the required/preferred skill split we
+can't extract. Cache-safe: `ats_score` defaults to 0 on pre-052 snapshots. **Verified:** 9 offline
+tests (`tests/test_ats_score.py`: each factor extractor, renormalization of absent requirements, the
+experience factor sinking an under-qualified candidate, and the integration assertion that
+`keyword_rank` now orders a fitting new-grad role ABOVE a higher-keyword senior role; cache round-trip
++ pre-052 load). Full suite **221/221**; live drive on the sample 7-yr resume - the Full-Stack role
+leads (ats 87) over a Staff role with higher keyword overlap (kw 6 vs 4, ats 86), the nursing posting
+gate-dropped. *Optional follow-up:* feed `ats_score` into the `Predictor` as a feature (today it only
+tiebreaks) and surface it in the Discover tab. See [[051-park-and-resume]], [[046-fit-learning]],
+[[043-multidimension-fit]], [[025-hybrid-matching]].
+
+## 053 — Workday M1 brick 4: account create / sign-in + IMAP email verification
+
+**Context:** Workday gates the application behind a per-tenant candidate **account** — the wizard
+adapter (bricks 2–3, decision 050) can't run until we're past sign-in. The settled design: a
+dedicated **bot-owned email** receives verification, but **every tenant password is stored** so the
+user can log in manually later (brick 1, `credentials.py`). Brick 4 adds the account flow and the
+email-verification reader. Constraint: no real Workday during dev (Guideline #3) and no real inbox
+in tests — so everything is built against fakes/fixtures, with the single real-inbox path flagged.
+
+**Decision:** (1) **`mailbox.py`** — IMAP reader for the bot inbox. `extract_verification` (pure,
+tested) pulls a portal-looking verification **link** (URL containing verify/activate/myworkdayjobs/…)
+or, failing that, a 6–8 digit **code** from an email body. `fetch_verification` does one IMAP pass
+(newest-first, filtered by From) and `wait_for_verification` polls until one arrives or times out;
+the IMAP connection (`_connect`) and sleep are injected so tests use a fake IMAP with real
+`email`-module bytes — no network. Credentials come from the **environment** (secrets, Guideline
+#12): `MAILBOX_IMAP_HOST` / `MAILBOX_EMAIL` / `MAILBOX_PASSWORD` (+ optional `_PORT`); missing ⇒
+`load_config` returns None and callers degrade to "verify manually". (2) **`workday.py` account
+functions** — `sign_in` fills+submits the sign-in form; `create_account` reveals the create form
+(toggle), fills email/password/verify-password, ticks the terms checkbox, submits;
+`generate_password` makes a complexity-meeting random password via `secrets`. `ensure_account`
+orchestrates: stored account ⇒ sign in; else ⇒ create on the **bot email** (so verification lands in
+our inbox; falls back to the profile email without a mailbox), **persist immediately** (never lose a
+password even if verification lags), then complete verification via `mailbox` (open the link or type
+the code) when configured. All account controls are `:visible`-scoped (sign-in and create forms
+share `email`/`password` ids — only the shown one is touched, as on real Workday). Nothing here
+submits an application (M1 dry-run). `ensure_account` takes `backend`/`index_path` so tests use a
+fake keychain + temp index (no real profile writes — the isolation lesson from decision 046).
+
+**Reasoning:** Splitting the parser (pure) from the IMAP/browser I/O makes the risky parts
+(link/code extraction, create-vs-sign-in branching, bot-email selection, store-before-verify) fully
+unit-testable offline, leaving exactly one thing that inherently needs the real world — a live inbox
+receiving a real Workday email — as the flagged live step, not a blocker to progress. Storing the
+password before verification directly serves the settled "never lose a password" requirement.
+Preserves existing behaviour (Guideline #7): `mailbox.py` is new; the account functions are unwired
+(brick 5 navigates to the account screen and calls them) so no current flow changes. **Verified:**
+16 offline tests (`tests/test_mailbox.py` ×11 — link-preferred/code-fallback extraction, punctuation
+trim, config gating, newest-matching-sender fetch over a fake IMAP, poll-until-present + timeout;
+`tests/test_workday.py` +5 — password complexity, `sign_in`/`create_account` driven headless against
+`fixtures/apply_forms/workday_account.html` [reveals create form, ticks terms, clicks], and
+`ensure_account` branching: stored⇒sign-in, unstored⇒create+persist+manual-verify flag, and bot-email
++ verification-applied). Full suite **237/237**. *Live step (flagged):* create→verify→login against a
+real tenant with `MAILBOX_*` set. *Remaining M1:* brick 5 (apply dispatch: navigate to the account
+screen → `ensure_account` → `fill_wizard`; stop `_is_fillable` dropping Workday; dry-run tracker row).
+See [[050-workday-hybrid]], [[035-submit-stage]], [[012-pii-out-of-git]].
+
+
+## 054 — Discovery→offer funnel on the Track tab (AutoApply-AI survey #4)
+
+**Context:** The Track tab showed per-status pill counts but no view of the pipeline as a
+*journey* — how many discovered postings actually get filled, submitted, and heard back from.
+AutoApply-AI's dashboard has a conversion funnel; user approved adopting it (survey #4).
+
+**Decision:** `tracker.funnel_report()` returns six stages, each a count of applications whose
+current status falls in that stage's set, plus the conversion from the previous stage:
+Discovered (all) -> Filled (dry-run/blocked/submitted) -> Applied (actually submitted) ->
+Responded (a human replied, a rejection included; `no-response` excluded) -> Interview -> Offer.
+The stage sets are deliberately NESTED (each later set is a subset of the earlier), so counting a
+row by its single latest status still yields a monotone funnel — "reached this stage or beyond" —
+without needing per-row history. Served in the `/track` response, rendered as labeled horizontal
+bars (width relative to Discovered, count + % of top + conversion) above the Track table, and a
+`python -m applicationbot.tracker funnel` CLI command.
+
+**Reasoning:** A funnel over the current status column is honest and cheap — no schema change, no
+history table, read-only. Counting a rejection as a "response" (a human engaged) but `no-response`
+as applied-not-responded matches how the calibration report already frames outcomes (decision 043).
+In dry-run-default mode the funnel correctly shows Applied≈0, making the safety switch visible
+rather than hiding it. Preserves existing behaviour (Guideline #7): additive `funnel` key + new UI
+panel; nothing else changes. **Verified:** 4 offline tests (`tests/test_funnel.py`: monotone
+counts, the rejected-vs-no-response split, conversion rates, empty-DB no-divide-by-zero); full suite
+**241/241**; drove `funnel_report` + the CLI + the live `/track` payload. See [[043-multidimension-fit]],
+[[024-tracking-store]], [[051-park-and-resume]].
+
+
+## 055 — Feed the deterministic pre-score into the fit-learning predictor
+
+**Context:** Decision 052 added `ats_score`, a deterministic 0-100 pre-score that orders the judge
+queue. Decision 046's `Predictor` re-ranks the free pre-filter by fit learned from history, but from
+only two features — seniority level and board. The pre-score is a strong, cheap third signal, and —
+more importantly — its *reliability* varies per résumé: the heuristic may over- or under-credit
+certain postings. Letting the predictor learn the pre-score→actual-fit relationship calibrates it.
+
+**Decision:** (1) `fit_learning._record` now stores each judged posting's `ats_score` in
+`fit_history.jsonl`. (2) `Predictor` builds a third shrunk bucket — the pre-score band (`_prescore`,
+band width 20 → five bands 0-19…80-100) — and `predict(posting, ats_score=None)` averages it with
+the level and board estimates when an `ats_score` is supplied AND history carries pre-scores.
+(3) `matching.match` passes `m.ats_score` into `predict`.
+
+**Reasoning:** This makes the predictor *calibrate* the heuristic instead of blindly trusting it: if
+high-pre-score postings have historically judged low for this résumé, the 80-100 band's learned mean
+is low and the rank is tempered — observed Claude verdicts win over the deterministic guess (shown
+live: a history where ats-90 postings judged 25 makes `predict(ats=90)=43` < `predict(ats=40)=52`).
+Fully back-compatible (Guideline #7): pre-053 history has no `ats_score`, so `_prescore` is empty and
+`predict` returns the exact old level+board average; the `ats_score` arg is optional so existing
+callers and tests are untouched; the band shrinks toward the global mean like every other bucket, so
+a thinly-seen band can't swing the rank. **Verified:** 4 new tests in `tests/test_fit_learning.py`
+(band separation, misleading-band tempering, pre-053 no-op equality, `_record` carries the score);
+full suite **244/244**; drove the calibration case end-to-end.
+
+**Surfacing (added):** `fit_learning.prescore_calibration(records)` groups judged history by
+pre-score band and reports each band's sample count + **mean actual Claude fit**;
+`prescore_insight()` adds a one-line read of the direction (higher quick-score → higher/lower/flat
+actual fit). `/fit-insights` returns it and the Discover-tab fit-insights panel renders it as a
+mini bar chart ("how well the quick pre-score predicts fit") with the interpretation line — so the
+user (and future agents) can *see* whether the heuristic is trustworthy for this résumé and that the
+learner is calibrating it. Hidden until pre-score history exists (post-053 runs). 2 more tests
+(bands report mean fit; the note reads direction incl. inverted/empty); suite **257/257**; drove the
+live `/fit-insights` payload (bands 0-19→20, 40-59→48, 80-100→78, well-calibrated note). *(Also
+fixed a concurrent Workday regression: the new optional bot-email `doctor` check had broken
+`test_all_required_pass`, which asserted all(ok); scoped it to required checks.)* See
+[[052-ats-prescore]], [[046-fit-learning]], [[025-hybrid-matching]].
+
+## 056 — Seen-openings ledger: a preview shows only NEW openings on a re-run
+
+**Context.** The user reported that dry-run/list searches "come back with the same openings
+even on re-runs." Two independent causes compound:
+
+1. **The snapshot cache (decision 037)** reuses the last discovery result verbatim for
+   `cache_ttl_hours` (default 12h) — same postings, same order, no board search, no re-judge.
+2. **Nothing you only *previewed* is remembered.** The only suppression is `skip_seen`, which
+   drops postings already in the **applications tracker** (`pipeline._seen_canonical_urls`). But
+   the tracker is written only when Apply actually runs on a posting — the single top match in
+   `--apply-first`, or an armed runner. A plain list/dry-run records nothing, so `skip_seen` can
+   never fire and the whole ranked list re-surfaces every run.
+
+So the cache makes repeats *exact*, and the missing "seen" memory makes them *persist even on a
+`--fresh` re-search* (the boards still hold the same postings).
+
+**Options considered.**
+
+| Option | What | Verdict |
+|---|---|---|
+| A — Seen ledger (separate store) | Record each surfaced posting the first time it's shown; suppress on re-runs; `--all` to show everything | **Chosen** (user-selected) |
+| B — Just bust the cache in list mode | Re-search + re-rank every run; still shows repeats, just freshly judged | Rejected — doesn't stop repetition, only re-pays for it |
+| C — Write `status='discovered'` tracker rows | Reuse `skip_seen` as the seen-set | Rejected — bloats the applications tracker with hundreds of never-applied rows; pollutes `status_counts`/calibration |
+
+**Decision.** New `applicationbot/discovery_seen.py` — a git-ignored `profile/discovery_seen.json`
+mapping each shown posting's **canonical URL** → first-seen timestamp. `discover_and_match` gains
+`only_new: bool = False`; when True, `_hide_already_shown` drops matches whose canonical URL is in
+the ledger, then records the survivors so the next preview hides them too. It is layered **on top
+of** the cache and `skip_seen` and re-applied fresh each run — the cached snapshot still holds the
+FULL ranked result, so `--all`/reset can always recover everything.
+
+Kept deliberately **separate from the tracker**: a ledger entry means "shown once", a tracker row
+means "applied / acted on", so previewing never touches application history or the outcome-
+calibration stats built from it (decision 043).
+
+**Wiring.**
+- CLI `pipeline` list path: `only_new=True` by default; `--all` shows everything (no suppress, no
+  record), `--reset-seen` clears the ledger then runs; `python -m applicationbot.discovery_seen
+  {count,clear}` inspects/resets it. Summary line reports how many were hidden.
+- Web testing worker: normal run = new-only; **"Re-search fresh"** (`force_fresh`) shows all again
+  (`only_new=False`) — the user explicitly asked to see the full board result. The empty-result
+  message names how many were hidden and points at "Re-search fresh".
+- **Autonomous runner: unchanged** (`only_new` stays False) — it applies to matches, which land in
+  the tracker, so `skip_seen` already keeps it from repeating; suppressing not-yet-applied matches
+  there could starve its queue.
+
+**PII (Guideline #12).** The ledger holds URLs of roles you're targeting → git-ignored `profile/`,
+never committed, never leaves the machine.
+
+**Verified.** 6 new offline tests (module round-trip/dedup/canonicalize/clear + bad-file tolerance;
+pipeline new-only hides on re-run via the cache-hit path, surfaces just the genuinely new posting,
+`--all` ignores+doesn't-record, off-by-default writes no ledger). Full suite **250/250**. See
+[[037-discovery-cache]], [[025-hybrid-matching]] (skip_seen), [[024-tracking-store]].
+
+## 057 — Link the bot email inbox (secure store + Profile-tab UI + CLI)
+
+**Context:** Brick 4 (decision 053) made Workday account verification hands-off *if* a bot inbox is
+configured — but the only way to configure it was env vars (`MAILBOX_*`), with nothing persisted and
+no UI. The user asked for "a place to link the email account" before wiring Workday into the pipeline
+(brick 5). It has to be secure (an IMAP password is a live secret, Guideline #12) and usable from the
+web UI (UI Principle #1: setup is a working surface, not a to-do list).
+
+**Decision:** A proper linking surface across three faces, one secure store. **Store:** the
+**password lives in the OS keychain** (`keyring`, service `applicationbot-mailbox`, decision 050's
+pattern) — never on disk; only host/email/port go in git-ignored `profile/mailbox.yaml`.
+`mailbox.save_link/load_link/clear_link/link_status/is_linked` manage it; `load_config` now prefers a
+stored link, then falls back to the environment (headless still works). `test_connection` does a real
+IMAP login + INBOX select and returns an **actionable** (ok, message) (UI Principle #3);
+`suggest_host` guesses the IMAP host from common email domains. `link_status` is non-secret (never
+returns the password). **Web UI:** a "Bot email — for Workday verification (optional)" panel in the
+Profile tab (`GET /mailbox`, `POST /mailbox/link`, `POST /mailbox/unlink`) with email/host/port/
+app-password fields, a **Link & test** button (shared spinner, UI Principle #5) that **tests before
+it saves — bad credentials are never stored**, an Unlink button, and a live linked/unlinked status.
+**CLI:** `python -m applicationbot.mailbox link|status|test|unlink` (password prompted, not echoed) for
+headless. `doctor` gains an optional Bot-email check reporting linked/unlinked + how to fix.
+
+**Reasoning:** Keychain-for-secret + git-ignored-file-for-config mirrors the Workday credential
+decision (050) and avoids the plaintext-password-in-YAML anti-pattern the audit already flagged for
+Greenhouse. Test-before-save means a "Linked ✓" is a *working* link, not a stored guess. Three faces
+(UI/CLI/doctor) over one store means the web user gets the "place to link" they asked for while
+headless/cron runs keep working via env or the same keychain link. Preserves existing behaviour
+(Guideline #7): `load_config` still returns the env config when nothing is linked, so decision-053
+callers are unchanged; env-only tests still pass. **Verified:** 8 new offline tests
+(`tests/test_mailbox.py`: host suggestion, save/load with the password in the keychain and NOT in the
+file, link-over-env precedence + env fallback, status/clear round-trip, test_connection ok + actionable
+failure). Full suite **257/257**; served JS `node --check`-clean; the three endpoints driven live (fresh
+status → a bad-host link **fails the test and does not save** → still unlinked → 400 on empty fields →
+unlink); `doctor` shows the ⚠ line; `profile/mailbox.yaml` confirmed git-ignored. Unblocks brick 5:
+Workday's `ensure_account` calls `mailbox.load_config()`, which now finds the linked inbox.
+See [[053-workday-brick4-accounts]], [[050-workday-hybrid]], [[049-captcha-autosolve]], [[012-pii-out-of-git]].
+
+
+## 058 — Per-click armed resume for parked applications (park & resume M3)
+
+**Context:** Decisions 051 (M1/M2) made a blocked application resumable, but the "Re-apply" button
+was always dry-run — the autonomous runner (armed via `profile/safety.yaml`) was the only path that
+actually submitted. That forced an all-or-nothing choice: to submit even ONE reviewed application
+you had to globally arm the system, which also lets the runner submit everything. The user asked to
+"look into one-click resume"; after presenting the trade-offs they chose a **per-click arm**: submit
+one specific application on demand, without touching the global arm.
+
+**Options considered (arming model):** (A) **per-click arm + confirm** — the card submits THIS
+application even when `safety.yaml` is disarmed, gated by a confirm dialog; (B) respect the global
+`safety.yaml` only (button submits solely when already globally armed); (C) keep it dry-run only.
+**User chose (A).** It gives a deliberate, human-in-the-loop, one-at-a-time submit — arguably the
+safest *real*-submit path — without arming the fire-and-forget runner.
+
+**Decision:** A red "Submit for real ▶" button on each resumable parked card. `_reapply_gate(arm)`
+returns a one-shot `SafetyGate(armed=True, max_submissions_per_run=1)` (or `None` when not armed);
+`_reapply_worker(app_id, arm=True)` passes it into the SAME `run_apply` armed path the runner uses,
+so the pre-submit required-field gate, confirmation detection, and the tracker `applied`/`blocked`
+recording (decision 035) are all reused — no new submit logic. `/parked/reapply` takes an `arm`
+flag; `start_reapply(arm=…)` threads it through.
+
+**Safety architecture (this adds a second arming path, so it is fenced):**
+- The per-click gate is armed for exactly ONE submission (cap 1) and is independent of
+  `safety.yaml` — but the global `profile/KILL` file STILL halts it (checked in `SafetyGate.may_submit`
+  immediately before the click). Verified live: with `KILL` present the armed gate refuses.
+- `run_apply`'s pre-submit gate still blocks the click while any REQUIRED field is unresolved, so an
+  unresolved block records `blocked`, never a bad submit.
+- A client-side `confirm()` names the company before the POST — no accidental one-click submit.
+- Because a POST can now trigger an irreversible submission on the loopback server, the ARMED branch
+  of `/parked/reapply` requires a same-origin request (`_same_origin`: a present Origin/Referer must
+  be a loopback host; absent passes) — closing the drive-by cross-site-submit hole for the one
+  endpoint that can now submit. The dry-run branch is unaffected.
+
+**Reasoning:** Reusing `run_apply`'s armed path (not a parallel submit) keeps the single audited
+submit implementation and its safety gate; the per-click arm is strictly *narrower* than the global
+arm (one application, cap 1, still KILL-able), so it doesn't weaken the safety model — it adds a more
+granular, more deliberate option. The same-origin check is scoped to the newly-dangerous branch
+rather than a broad CSRF retrofit (the audit's general CSRF item stays open, tracked separately).
+Preserves existing behaviour (Guideline #7): dry-run re-apply is byte-identical; nothing submits
+unless the user clicks the red button and confirms. **Verified:** 6 new tests in
+`tests/test_parking.py` (gate armed/cap/kill-file identity; the `_same_origin` matrix incl. a
+cross-origin Referer; and a live-server assertion that an armed cross-origin POST gets 403 with NO
+run started, while same-origin starts one) + JS `node --check`-clean; full suite **260/260**; drove
+the KILL-halts-the-armed-gate invariant end-to-end. *Remaining (optional):* a credentials UI for the
+`login`-kind parked cards (still instruction-only). See [[051-park-and-resume]], [[035-submit-stage]],
+[[040-autofill-determinism]].
+
+## 059 — Workday M1 brick 5: end-to-end wire-in (dry-run). M1 complete.
+
+**Context:** Bricks 1–4 built the Workday pieces in isolation (credentials, field-fill, wizard
+nav + dropdowns, account create/sign-in + IMAP verify) but nothing was wired into the pipeline —
+`_is_fillable` still dropped every Workday posting before the matcher, and `run_apply` had no path
+to the adapter. Brick 5 connects them so the whole Workday flow runs end-to-end through the
+existing Discover → Apply → Track pipeline, DRY-RUN (M1 never submits).
+
+**Decision:** (1) **`workday.apply_workday(page, url, resume, profile, report, …)`** orchestrates
+the flow: `start_application` (click Apply → Apply Manually to reach the account screen;
+`:visible`/role-based, no-op if already there) → `ensure_account` (decision 053) → best-effort
+résumé upload if a file field is present → `fill_wizard` (bricks 2–3). It records progress on the
+report and **never submits** — there is no armed/submit branch in the Workday path at all.
+(2) **`run_apply` dispatch:** when `detect_ats(url) == "workday"`, route to `apply_workday` instead
+of `_open_application_form` + native-autofill + `_fill_all_pages` + `_attempt_submit`; the
+non-Workday path is byte-identical, just indented under the `else` (Guideline #7). The bot mailbox
+is loaded via `mailbox.load_config()` (the linked inbox from decision 057, or env). (3) **Gate
+opened:** `pipeline._is_fillable` now returns True for `ats == "workday"`, and the aggregator→ATS
+bridge marks a resolved Workday posting `auto_applyable=True` — so Workday postings discovered via
+curated feeds / the aggregator bridge reach the matcher and the adapter instead of being dropped.
+The existing tracker-record path logs the run as a `dry-run` row unchanged.
+
+**Reasoning:** A single dispatch point in `run_apply` keeps every downstream consumer (pipeline
+testing-mode, the autonomous runner, the web Discover tab) working through the same entry with no
+per-caller changes. Routing Workday to its own path (rather than teaching the generic filler about
+Workday's custom-widget DOM + account gate) keeps both paths simple and independently testable.
+DRY-RUN-only for the whole Workday path means opening the fillability gate is safe: an unverified
+real-tenant navigation records a `blocked`/`failed` outcome (the parking model), never a submission
+and never a crash (`apply_workday` catches and reports). Preserves existing behaviour (Guideline
+#7): the six public-API ATSs are untouched; only Workday changes, and it was previously a no-op
+(dropped). **Verified:** new end-to-end fixture `workday_full.html` (job page → Apply → Apply
+Manually → account **create** → 3-page wizard → Review) driven headless: account created + stored
+with the profile email, all standard fields + custom dropdowns filled across 3 pages, résumé
+attached, and `window.__submitted` stays **False** — Submit is never clicked. Plus a dispatch test
+(`run_apply` on a Workday URL calls `apply_workday`, NOT `_open_application_form`) and
+`_is_fillable(workday) is True`. Updated the decision-035 fillability test to the new behaviour.
+Full suite **264/264**. **Live step (flagged, unchanged from brick 4):** the whole flow against a
+real Workday tenant with a linked bot inbox — the button labels / automation ids are the tuning
+surface. **M1 (deterministic login + standard fields, dry-run only) is complete.** Next: M2
+(agentic fallback for unrecognized pages + recipe distillation), M3 (armed submit).
+See [[053-workday-brick4-accounts]], [[057-mailbox-link]], [[050-workday-hybrid]], [[035-submit-stage]], [[024-tracking-store]].
+
+
+## 060 — MyGreenhouse password: plaintext YAML → OS keychain
+
+**Context:** `ApplicationProfile.greenhouse_password` (the MyGreenhouse native-autofill login,
+decision 017) was a **plaintext field in `profile/application_profile.yaml`** AND was **sent to the
+browser on every `GET /profile`** and round-tripped through `/profile/update`. The full-system audit
+(2026-07-06) flagged both ("stop serving the plaintext Greenhouse password via GET /profile";
+Guideline #12 — PII/secrets must not sit in readable files). The codebase already had the correct
+pattern twice — `credentials.py` (050) and `mailbox.py` (057) put the secret in the OS keychain via
+`keyring` and keep only non-secret metadata in a file — so this aligns Greenhouse to it.
+
+**Decision:** The password now lives in the OS keychain; the email stays in the YAML (non-secret,
+as mailbox keeps host/email).
+- **`apply_profile`**: `set_greenhouse_password`/`get_greenhouse_password` (keychain, service
+  `applicationbot-greenhouse`, injectable backend for tests); `greenhouse_linked(profile)` = email +
+  stored password; `greenhouse_credentials(profile)` = (email, keychain-password, falling back to a
+  not-yet-migrated plaintext value). `save_profile` drops `greenhouse_password` from the YAML dump.
+- **One-time auto-migration** in `load_profile`: a legacy plaintext value is moved into the keychain
+  and scrubbed from the YAML (idempotent; best-effort — if `keyring` is unavailable the plaintext is
+  left and still works via the fallback). No manual step (Guideline #8).
+- **web**: `GET /profile` strips the password and adds `greenhouse_linked`; `/profile/update` routes
+  a typed password to the keychain (**blank = keep the stored one**, so an ordinary save never wipes
+  it) and never persists it; new `POST /profile/greenhouse/unlink` clears it. The Profile field is
+  **write-only** (placeholder shows saved-state, value never prefilled) with a **Disconnect** button.
+- **apply**: `_greenhouse_native_autofill` reads `apply_profile.greenhouse_credentials(profile)`.
+
+**Reasoning:** Removes BOTH exposures (plaintext-on-disk and served-over-HTTP) using the proven
+keychain pattern — no new dependency (`keyring` already in for 050), no new store to maintain. The
+email staying in YAML keeps the connected/not-connected UI honest without a secret. Write-only +
+"blank keeps existing" avoids the classic bug where re-saving a form wipes a password the UI can't
+display. Preserves behaviour (Guideline #7): autofill still uses the same credentials, just sourced
+from the keychain; the migration means existing users lose nothing on upgrade. **Verified:** 6 tests
+(`tests/test_greenhouse_creds.py`, in-memory keyring fake: round-trip, linked logic, keychain-then-
+plaintext precedence, YAML never carries the password, migration scrubs + is idempotent) + full suite
+**270/270**; drove `GET /profile` + migration + unlink over the live HTTP server — the password is
+absent from the payload, the plaintext is scrubbed from the YAML on load, the keychain holds it, and
+Disconnect flips `greenhouse_linked` to false. `profile/*` is already git-ignored; the keychain is
+OS-level (no file). *Note:* a generic credentials UI for `login`-kind parked cards was investigated
+and rejected the same day (near-empty trigger set; Workday already uses the keychain) — this is the
+real credential-hygiene win instead. See [[057-mailbox-link]], [[050-workday-credentials]],
+[[017-native-ats-autofill]], [[058-armed-resume]].
+
+## 061 — Workday M2 (part 1): recipe backbone + agentic-fallback distillation
+
+**Context:** M1 fills Workday's standard fields by stable `data-automation-id`, but a tenant's
+custom "Application Questions" have unknown ids the deterministic adapter can't handle. Option C's
+answer (decision 050): an agentic worker fills such a page ONCE, and we distill a **recipe** so
+the same page replays deterministically forever after — agentic use trends to 0. This decision is
+the offline-testable core (recipe store + detection + replay + distillation); the live agentic
+invocation (Claude over CDP) is built but flagged, and the pipeline wire-in is M2 part 2.
+
+**Decision:** (1) **`workday_recipes.py`** — a **shared, committed, PII-free** library
+(`applicationbot/workday_recipes.json`, ships as `{}`): `{page_signature: [{automation_id, control,
+question}]}`. A recipe stores only the selector + control kind + question label — **never an answer
+value** (the answer is re-resolved per user at replay), so it's safe to commit and share across
+clones. `load_recipes`/`get_recipe`/`save_recipe` (upsert, dedupe by automation_id). Page signature
+= the md5 of the visible `data-automation-id` set (`_page_signature`, from M1). (2) **Detection:**
+`workday.unrecognized_fields(page)` returns the VISIBLE, still-EMPTY, fillable controls whose id
+isn't in the adapter's known set (`_KNOWN_IDS`) — each `{automation_id, control, question}` (label
+from `<label>`/aria-label). (3) **Replay:** `replay_recipe(page, recipe, resolver, report)` fills a
+learned page deterministically — each field's answer re-resolved via the existing `AnswerResolver`
+(text/dropdown/checkbox), source `workday-recipe`, no Claude. (4) **Agentic worker + distillation:**
+`run_agent_fill` hands the page's unrecognized fields to a Claude-Code + Playwright-MCP worker bound
+to OUR browser over CDP (`_agent_argv`/`_agent_mcp_config` mirror ApplyPilot's launcher; `agent_prompt`
+carries the fields + compact applicant facts + HARD RULES: never navigate, never fabricate
+citizenship/work-auth/education), then **distills the recipe by DIFFING which fields went
+empty→filled** — robust, with **no dependence on parsing opaque MCP element refs**. `_spawn` is
+injectable so tests drive a fake agent with no Claude/CDP.
+
+**Reasoning:** The diff-based distillation is the key insight: rather than reverse-engineering the
+agent's MCP tool calls (which reference accessibility refs like "e5", not stable selectors), we
+observe the DOM outcome — the fields that became filled ARE the recipe, keyed on their stable
+`data-automation-id`. This makes the whole learn→replay loop deterministic and offline-testable, and
+keeps recipes PII-free (selectors + labels only) so the committed library is shareable. Reusing
+`AnswerResolver` at replay (not storing the agent's answers) means a learned page fills correctly for
+*every* user, not just the one whose agent learned it. Preserves existing behaviour (Guideline #7):
+all new code is unwired into the pipeline until M2 part 2; M1 paths unchanged. **Verified:** 8 offline
+tests (`tests/test_workday_recipes.py`): store round-trip + **PII-free assertion** + merge-dedupe;
+`unrecognized_fields` finds custom questions and skips known + already-filled (headless on new
+`workday_custom.html`); `replay_recipe` fills resolvable + skips open-ended; distillation captures
+exactly the diff (agent filled 2 of 3 → recipe has those 2); and the **full learn-once → replay
+loop** (agent learns a field → persist → fresh page → deterministic replay re-resolves it per user,
+**no agent**). Full suite **278/278**. **Remaining (M2 part 2):** wire into `fill_wizard`/
+`apply_workday` (deterministic → recipe replay → agentic fallback → persist), launch the browser with
+a CDP endpoint in `run_apply`, gate the agentic fallback (off by default, needs Claude); then the
+flagged live step — a real tenant's custom page.
+See [[059-workday-brick5-wirein]], [[050-workday-hybrid]], [[040-autofill-determinism]], [[034-stripped-claude-cli]].
+
+
+## 062 — General CSRF/origin guard on state-changing POSTs
+
+**Context:** The full-system audit flagged "CSRF/origin guard on state-changing POSTs" as open.
+Decision 058 added a same-origin check to the ONE endpoint that could then fire an irreversible
+submit (`/parked/reapply` armed), but every other POST to the localhost UI — `/profile/update`,
+`/discovery/update`, `/track/*`, `/mailbox/*`, `/resume/*`, `/pdf`, `/tailor`, `/test-run`,
+`/fit-insights/apply`, the dry-run reapply — is also state-changing (writes files, launches a
+browser). Without a guard, a web page on another site the user has open in the same browser could
+POST to `http://127.0.0.1:8000/...` and drive the server (the response is CORS-blocked, but the
+side effect already happened server-side).
+
+**Decision:** One choke point at the top of `do_POST`: `if not _same_origin(self): 403` before any
+body read or dispatch — so every current and future POST is covered by construction. `_same_origin`
+generalized from the 058 version:
+- missing Origin/Referer → pass (same-origin fetches often omit Origin; non-browser clients
+  curl/CLI/tests send none, and they are not the CSRF threat model);
+- a loopback Origin host (127.0.0.1/localhost/::1) → pass;
+- otherwise the Origin host must equal the `Host` header the client addressed — so the guard is
+  correct when the server is bound to a LAN IP or hostname via `--host`, not only 127.0.0.1.
+
+A browser sets `Origin` itself on cross-site POSTs, so a remote attacker page cannot forge it to a
+loopback value. The now-redundant per-endpoint check in `/parked/reapply` (058) was removed (clean
+up my own mess). GET requests stay unguarded — they are read-only here.
+
+**Reasoning:** A single wrapper is the right altitude for a blanket policy — per-endpoint checks rot
+as endpoints are added (exactly how 058 left the rest exposed). Matching Origin against the actual
+`Host` (not a hardcoded loopback list) fixes a real correctness bug the naive version had: a
+`--host 0.0.0.0` bind accessed over the LAN would have blocked the app's OWN POSTs. Allowing a
+missing Origin keeps the CLI/tests and legit same-origin fetches working while still blocking
+browser-driven cross-site POSTs (browsers always send Origin cross-origin). Preserves behaviour
+(Guideline #7): same-origin UI use is unchanged; only cross-origin POSTs — which never had a
+legitimate purpose — now 403. This also retro-guards the parallel agent's `/mailbox/*` endpoints,
+a strict improvement, without touching their code. **Verified:** 6 tests
+(`tests/test_web_csrf.py`: a real cross-origin POST to `/track/add` gets 403 with the handler never
+called, a cross-site Referer likewise, no-Origin and loopback-Origin reach the handler, a
+cross-origin GET still works; `_same_origin` unit matrix incl. the LAN-bind Host match) + full suite
+**280/280**. Together with decision 060 (greenhouse password → keychain), the audit's
+"CSRF/origin guard … stop serving the plaintext Greenhouse password" item is now fully closed. See
+[[058-armed-resume]], [[060-greenhouse-keychain]], [[035-submit-stage]].
+
+## 063 — Workday M2 (part 2): agentic fallback + recipe replay wired into the pipeline
+
+**Context:** Decision 061 built the M2 core (recipe store, unrecognized-field detection, replay,
+agentic distillation) but left it unwired. Part 2 activates it inside the Workday apply path and
+opens the browser's CDP endpoint so the agentic worker can attach — completing M2 except the
+flagged live Claude-over-MCP run.
+
+**Decision:** (1) **Per-page handling** — `workday._resolve_unrecognized(page, resolver, report,
+…)` runs after each page's deterministic fill: replay a learned recipe (free, deterministic) first;
+only if custom fields still remain AND the agentic fallback is armed does it call `run_agent_fill`
+(decision 061) and persist the learned recipe. `fill_wizard`/`apply_workday` gained optional
+`resolver`/`agentic`/`cdp_port`/`store_path`/`_agent_spawn` params and call it per page — **no
+resolver ⇒ pure M1, unchanged** (Guideline #7). (2) **CDP endpoint** — `run_apply` computes
+`wd_agentic = (ats == "workday") and workday.agentic_enabled()`, and for such runs launches Chromium
+with `--remote-debugging-port=<free port>` (`workday._free_port()`) so the Playwright-MCP worker can
+`connectOverCDP` to the SAME page; the port + resolver + `agentic` flag thread into `apply_workday`.
+(3) **Gating** — `workday.agentic_enabled()` reads `workday_agentic` from profile/safety.yaml,
+**off by default** (the fallback spends Claude tokens on novel pages; opt-in, mirroring the CapSolver
+fencing of decision 049). Recipe **replay is always on** when a resolver is present (it's free);
+only learning a NEW page via Claude is gated, and it also degrades to a recorded note if Claude Code
+isn't signed in.
+
+**Reasoning:** Replay-before-agent means the expensive path runs at most once per distinct page
+across all runs/users (then the committed recipe covers it) — the "agentic → 0" property, now
+actually in the loop. Gating only the agentic *learning* (not replay) keeps steady-state cost at
+zero while still letting a fresh page be learned when the user opts in. Threading everything as
+optional kwargs keeps the M1 path and all its tests byte-identical. Opening CDP only for armed
+Workday runs avoids the free-port dance + extra Chrome surface on every other apply. **Verified:**
+4 new tests — `agentic_enabled` off-by-default/opt-in; `fill_wizard` **learn-once (agentic on) →
+replay (agentic off), agent runs exactly ONCE**, customGithub re-resolved per user via the recipe;
+`fill_wizard` with no resolver stays pure M1; and a **live drive of `run_apply`** (agentic armed,
+adapter stubbed) confirming Chromium launches with a real `--remote-debugging-port` and
+`agentic=True` + a real free `cdp_port` + the resolver reach `apply_workday`. Full suite **283/283**.
+**M2 is complete** but for the one flagged live step: a real tenant's custom page driven by the
+actual Claude-Code + Playwright-MCP worker (needs Claude signed in, npx, and `workday_agentic: true`).
+Next: M3 (armed submit).
+See [[061-workday-m2-recipes]], [[059-workday-brick5-wirein]], [[049-captcha-autosolve]], [[035-submit-stage]].
+
+## 064 — Workday M3: armed submit (gated by the SafetyGate)
+
+**Context:** M1/M2 fill a Workday application end-to-end but `apply_workday` never clicked the final
+Submit — dry-run only. M3 extends the armed submit path (decision 035) to the Workday wizard so an
+armed run actually applies, with the same safety architecture the open ATSs use. Submission is
+irreversible (Guideline #3), so it stays behind the SafetyGate — armed, kill-switchable, capped,
+re-checked at the last moment.
+
+**Decision:** `workday._attempt_workday_submit(page, report, gate)` — reached only from
+`apply_workday` when `gate.armed`, after `fill_wizard` has walked to the Review page. Order: (1) a
+visible `pageFooterSubmitButton` must be present (else `blocked` — not the Review page); (2)
+`_workday_unmet_required(page)` scans visible `aria-required`/`required` fields (and custom
+dropdowns still on their "Select One" placeholder) that are empty → `blocked` with the field names,
+BEFORE any click; (3) `gate.may_submit()` (armed + no profile/KILL + under the per-run cap) checked
+immediately before the click → `blocked` with the reason otherwise; (4) click Submit and
+`gate.record_submission()` (count the click, not the confirmation — conservative vs. the cap); (5)
+confirmation detection — reuse `apply._confirmation_evidence` (URL/text) → `submitted`; a visible
+Workday error (`role=alert` / `data-automation-id*=error`) → `blocked` "rejected the submit"; and if
+the Submit control is gone with neither → `unconfirmed`-but-submitted so a re-run never double-submits
+(decision 035's rule). `apply_workday` gained a `gate` param; `run_apply` passes its gate into the
+Workday branch (so the Workday path owns its own submit and the generic `_attempt_submit`/dry-run
+branch is skipped). Any doubt is a recorded `blocked` outcome, never a prompt.
+
+**Reasoning:** Reusing the exact SafetyGate semantics (may_submit/record_submission, decision 035)
+means Workday inherits every existing guarantee — `armed: false` default, the `profile/KILL` global
+halt, the per-run cap, and the `--dry-run` force-disarm on the CLIs — with no parallel safety logic
+to keep in sync. Workday-specific bits (required-field scan, validation-error detection, Review-page
+gating) are the only new surface, and they fail *closed* (block, don't submit) on any uncertainty.
+Preserves existing behaviour (Guideline #7): no gate / unarmed ⇒ M1/M2 dry-run, unchanged; the six
+open ATSs are untouched. **Verified:** 5 new tests driving fixtures headless — armed happy path
+submits (confirmation detected, cap incremented); an empty required field blocks BEFORE the click
+(cap untouched, `window.__submitted` False); the KILL file blocks; an unarmed gate blocks; and the
+**full armed flow** (`workday_full.html`: Apply → create account → wizard → Review → **Submit**)
+sets `submitted`/`submit_state=submitted`/cap=1. Full suite **289/289**. **Workday M1+M2+M3 are now
+code-complete;** the sole remaining item is the flagged live run on a real tenant (armed dry-run
+first, then a real submit once the user arms it) — which also exercises the M2 Claude-over-MCP agent.
+See [[035-submit-stage]], [[059-workday-brick5-wirein]], [[063-workday-m2-part2]], [[049-captcha-autosolve]].
+
+## 065 — One-click Gmail connect via OAuth
+
+**Context:** The bot-email link (decision 057) was the friction point the user called out: to connect
+Gmail you had to enable 2FA, dig through Google account settings to mint a 16-char **app password**,
+and hand-type email + IMAP host + port. That is the opposite of "one-click." The genuine one-click
+way to connect Gmail is OAuth — "Sign in with Google": a button → a browser consent screen → done.
+
+**Options considered:** (A) **OAuth + IMAP-over-XOAUTH2** — smallest code change (reuse the whole
+IMAP fetch path) but Gmail's IMAP only accepts the **full `mail.google.com` scope** (read *and* send
+*and* delete) — far more access than reading a verification email needs. (B) **OAuth + Gmail REST API
+with `gmail.readonly`** — read-only, least-privilege, but the fetch path moves off imaplib. (C) keep
+app-password, just deep-link the user to Google's app-password page — smoother, still not one-click.
+Chosen: **(B)**. The user picked "OAuth (true one-click)"; read-only is the correct grant for a bot
+that only reads verification mail (Guideline #5), and both restricted scopes carry the same Google
+verification burden anyway, so readonly is strictly better than the IMAP-forced full scope.
+
+**Decision:** `mailbox.connect_gmail(client_id, client_secret)` runs the loopback consent flow
+(`google-auth-oauthlib` `InstalledAppFlow.from_client_config(...).run_local_server`, with
+`access_type=offline`+`prompt=consent` so Google returns a refresh token *every* run — it omits it on
+silent re-consent otherwise), reads the connected address from the Gmail `/profile` endpoint, then
+**tests the connection before saving** (the link-before-save rule of 057): nothing is persisted unless
+a refresh token comes back AND a read succeeds. Storage mirrors 057/060 — refresh token + client
+secret in the OS keychain (service `applicationbot-gmail-oauth`, one JSON entry), and only non-secret
+email / client_id / `auth: oauth` in git-ignored `profile/mailbox.yaml`. Reads go through the Gmail
+REST API (`gmail.readonly`) with `urllib` + a Bearer token minted from the refresh token
+(`google.oauth2.credentials.Credentials.refresh`); `_gmail_fetch_verification` lists `from:<sender>`
+newest-first, pulls each message `format=raw`, and reuses the existing pure `_body_text` +
+`extract_verification`. `MailboxConfig` gained `auth`/`refresh_token`/`client_id`/`client_secret`;
+`test_connection` and `fetch_verification` branch to the `_gmail_*` helpers when `auth == "oauth"` and
+are **byte-identical on the IMAP/env path** (Guideline #7). Web: the Profile "Bot email" panel now
+leads with a **Connect Gmail** button (client_id/secret fields + a collapsible 3-step setup guide;
+the old IMAP app-password form moved into an "Advanced" `<details>`); `POST /mailbox/gmail/connect`
+(CSRF-guarded by 062, threaded so the blocking consent doesn't freeze the UI, with an elapsed-time
+"waiting for Google" state per UI Principle #5); `GET /mailbox` also returns the non-secret `auth` and
+`client_id` so a reconnect pre-fills the id and is one click. CLI `python -m applicationbot.mailbox
+connect-gmail --client-id … --client-secret …`; doctor/`status` report "Gmail, read-only".
+
+**Reasoning:** OAuth is the only real one-click for Gmail, and read-only via the REST API keeps the
+grant minimal while reusing all the tested parsing. Keeping the password/env IMAP path unchanged means
+other providers and headless runs still work, and the secret-storage pattern is the same keychain-only
+one already audited (057/060) — no plaintext, `profile/*` already git-ignored. The one unavoidable
+cost is a **one-time Google Cloud "Desktop app" OAuth client** (client_id/secret) and setting the
+project to "In production" so refresh tokens don't expire on Google's 7-day Testing-mode clock —
+surfaced directly in the panel's setup steps and in the "did Google return a reusable token?" error.
+
+**Verified:** 9 new offline tests (fake keyring + injected flow/token/get) — secrets live only in the
+keychain (yaml holds neither the refresh token nor the client secret), read-only fetch reads the
+newest matching message, `test_connection`/`fetch_verification` route to the OAuth path without
+touching imaplib, `connect_gmail` saves on success and saves **nothing** when Google returns no token
+or the test read fails. Full suite **298/298**; served JS node-clean; endpoints driven live (`GET
+/mailbox` returns the new fields, `POST /mailbox/gmail/connect` 400s with an actionable message on
+missing creds). **Live step flagged:** the actual Google consent needs the user's Cloud client +
+a browser — like the real-inbox step of 053. New deps: `google-auth`, `google-auth-oauthlib`.
+See [[057-link-bot-email]], [[060-greenhouse-password-keychain]], [[062-csrf-origin-guard]],
+[[053-workday-account-verification]].
+
+**Amendment (2026-07-13) — UI now leads with the app password, not OAuth.** On seeing the OAuth
+setup (register a Google Cloud app, copy Client ID + secret), the user asked "what happened to just
+pasting the email and password?" Reality check: Google blocked normal-password IMAP login in May
+2022, so pasting a real Gmail password never worked — but the **app-password** flow (email + a
+generated 16-char code) is fewer, more familiar steps than the OAuth app for a single user, and it is
+what "paste email + password" actually means today. OAuth is one-click only *at connect time*; its
+one-time setup is heavier. So the Profile panel was flipped: the **app-password form is now primary**
+(Gmail address + app password, with a "How to get an app password" guide linking 2-Step Verification
++ App passwords, and a collapsed "Not Gmail? Set your mail server" for host/port — auto-detected
+otherwise), and **OAuth moved into a collapsed "Prefer read-only access?" `<details>`** (its trade-off
+— full-mailbox app password vs read-only OAuth — stated inline). No backend change: both `/mailbox/link`
+and `/mailbox/gmail/connect` and all of `mailbox.py` are unchanged; this is UI emphasis + copy only.
+JS node-clean; both paths driven live (app-password `/mailbox/link` 400s on missing fields; panel copy
+served). Decision 065's "primary path is Sign in with Google" is superseded by this: **app password is
+primary, OAuth is the read-only alternative.**
+
+---
+
+## 067 — Weak-model draft for required unmapped free-text fields
+
+**Context:** An armed submit is gated on every REQUIRED field being resolved (decision 035). The user's
+concrete case: WHOOP's "Why are you interested in working at WHOOP?" is a **single-line
+`<input type="text" required>`**, not a textarea. `answer_bank.is_open_ended` only returns True for a
+textarea or a >25-char question containing an explicit open-ended phrase ("describe", "how would you",
+…) — "why are you interested" is none of those — so `freetext_answer` returned `None`, the field was
+recorded as "no saved answer", and it blocked the submit. Any required custom question phrased outside
+the heuristic hit the same wall. The user asked: fill **all** required fields, and where there's no
+mapped/banked answer, draft one with "a very weak claude model."
+
+**Options considered:** (A) broaden `is_open_ended` globally to draft more short fields — over-broad,
+would draft *optional* short fields too and risks fabricating where silence is correct. (B) draft only
+when the field is **required** and safe to draft — targeted at exactly the blocking case. (C) do nothing
+and keep parking these for the user — safe but leaves the user hand-filling every off-heuristic required
+question, against the "fully automated" goal (Guideline #0). Chosen: **(B)**.
+
+**Decision:** Two changes.
+1. **Weak model by default.** `answer_bank.DRAFT_MODEL = "haiku"` (alias, not a pinned snapshot — the
+   CLI resolves the latest Haiku, consistent with the `backends.py` tier aliases). `generate_answer`
+   now defaults its `model` to `DRAFT_MODEL`; a caller override is still honored. A grounded,
+   résumé-only paragraph doesn't need a frontier model, and Haiku is cheaper/faster.
+2. **Force-draft required fields.** `AnswerResolver.freetext_answer` gained `required: bool`. When a
+   free-text field is required, it drafts even if `is_open_ended` is False — **but** only through the
+   new `answer_bank.is_draftable_required`, which refuses **numeric-fact** questions (salary, GPA, test
+   scores — fabricating them invents data, the AppLovin incident that motivated `_NUMERIC_FACT`) and
+   **demographic/EEO** questions (self-identification is the applicant's to make). Those stay empty and
+   the pre-submit gate parks them for the user (honesty, Guideline #7). Per-field required-ness is read
+   live in the fill loop via new `_IS_REQUIRED_JS`/`_is_required` — the element's `required`/
+   `aria-required`, or an enclosing `<label>`/`label[for]`/`.application-question`/`fieldset` marked
+   with a required glyph (`*`/`✱`/`★`) or the word "required" (covers Greenhouse's `*` and Lever's `✱`).
+
+**Reasoning:** The blocker is specifically *required* fields; gating the broadened drafting on
+required-ness keeps optional fields untouched (preserved behavior) while closing the automation gap.
+The numeric/demographic exclusions mean "fill all required fields" is honored *except* where filling
+would mean fabricating — there the correct outcome is still to park for the user, unchanged. Weak-model
+default is the user's explicit ask and a token win; it applies to all free-text drafting (including the
+already-working open-ended path), which only makes those cheaper.
+
+**Verified:** 4 new tests (`tests/test_required_draft.py`) — the `is_draftable_required` gate
+(drafts an ordinary short question, refuses salary/GPA/gender/empty); a short company-specific question
+drafts only when `required=True` and is left `(None, "")` otherwise; a required numeric-fact never
+drafts; `generate_answer` sends `--model haiku` by default. Drove the **real committed**
+`fixtures/apply_forms/lever_custom_cards.html` headless (stubbed draft, zero tokens): the WHOOP
+required text input now fills with `source=generated` where before it was skipped/blocking. Full suite
+green except the one pre-existing mailbox test-isolation failure (leaks the user's real
+`profile/mailbox.yaml`, unrelated to apply.py). See [[066]] (the label fix that made this field's
+question readable in the first place), and the decision-035 submit-gate this unblocks.
+
+**Amendment (2026-07-14) — extend the same idea to required DROPDOWNS/SELECTS.** The free-text fix
+left a sibling gap the user flagged: a **required dropdown/select** with no mapped answer still blocked
+submit. Two sub-cases: (a) no answer at all — the resolver, semantic classify, and hints all miss (a
+combobox was captured "no saved answer"; a native `<select>` reads as `is_free` because it has no
+`type` attribute, so it fell to `_fill_select(None)` and *errored*); (b) an answer that matches no
+option — comboboxes already Claude-pick this (`pick_dropdown_option`), native selects didn't. The honest
+move for (a) is **not** to invent an option but to let the weak model **choose the best-fitting OFFERED
+option**, grounded in the résumé — which is exactly what a human does. New
+`answer_bank.choose_required_option(question, options, resume, …)`: résumé-grounded, uses `DRAFT_MODEL`,
+returns an option **verbatim** or None, and **refuses** the same class the free-text path does —
+demographic/EEO (`is_draftable_required`) plus fact-owning **enumerated** questions (`_ENUMERATED`:
+clearance, GPA, scores). `AnswerResolver.choose_option` wraps it (off when generation is disabled). In
+the fill loop the capture branch now (i) includes native selects, (ii) in round 1 **defers** an unmapped
+dropdown/select to the two-pass batch (so a free classification attempt runs first), and (iii) in round 2
+/ single pass tries `choose_option` for a **required** control before capturing — committing via the
+existing paths (combobox through `decided_options`→`_fill_combobox`, reported tier `option:claude` and
+learned; native select via `_fill_select`). `_selectable_options` feeds the picker only options with a
+non-empty `value`, so a "Select…" placeholder is never chosen. For sub-case (b) the native-select
+dispatch now mirrors the combobox: on no-match it tries `pick_dropdown_option` before recording a skip.
+Honesty unchanged from the parent decision: filling a required box is honored *except* where it means
+guessing a fact the applicant owns — those stay captured for the user. **Verified:** 4 new tests
+(`tests/test_required_dropdown.py`) — the gate (picks an answerable option, refuses clearance/gender/
+empty, declines on `-1`), generation-off is a no-op, and an **end-to-end headless drive** of the new
+committed `fixtures/apply_forms/required_dropdowns.html` (stubbed CLI, zero tokens): the two answerable
+required dropdowns fill with `source=option:claude` (never the placeholder), while the clearance and
+gender dropdowns are refused and captured. Full suite **309 passed**, same one pre-existing mailbox
+failure. ([answer_bank.py](applicationbot/answer_bank.py), [apply.py](applicationbot/apply.py))

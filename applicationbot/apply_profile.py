@@ -80,9 +80,10 @@ class ApplicationProfile(BaseModel):
     veteran_status: str = ""
     disability_status: str = ""
 
-    # ATS-native autofill credentials (git-ignored with the rest of the profile). When set,
-    # the Apply stage logs into the ATS's own candidate account and uses its autofill first,
-    # falling back to our field-by-field autofill (decision 017).
+    # ATS-native autofill credentials (decision 017). The email is non-secret and lives here;
+    # the PASSWORD is NOT stored here — it lives in the OS keychain (decision 060, mirroring
+    # credentials.py/mailbox.py). This field remains only as the write-only transport for the UI
+    # and to migrate a legacy plaintext value out of the YAML; it is never persisted with a value.
     greenhouse_email: str = ""
     greenhouse_password: str = ""
 
@@ -96,16 +97,85 @@ class ApplicationProfile(BaseModel):
     dropdown_aliases: dict[str, list[str]] = Field(default_factory=dict)
 
 
+# ------------------------------------------------ MyGreenhouse password (OS keychain, decision 060)
+
+_GH_SERVICE = "applicationbot-greenhouse"
+_GH_ACCOUNT = "mygreenhouse"  # a single MyGreenhouse login (not per-tenant, unlike Workday)
+
+
+def _gh_keyring():
+    import keyring  # lazy: only imported when the keychain is actually touched
+
+    return keyring
+
+
+def set_greenhouse_password(password: str, *, backend=None) -> None:
+    """Store (or, given ''/None, clear) the MyGreenhouse password in the OS keychain — never in
+    plaintext YAML (Guideline #12). Mirrors credentials.py/mailbox.py."""
+    backend = backend or _gh_keyring()
+    if password:
+        backend.set_password(_GH_SERVICE, _GH_ACCOUNT, password)
+    else:
+        try:
+            backend.delete_password(_GH_SERVICE, _GH_ACCOUNT)
+        except Exception:
+            pass
+
+
+def get_greenhouse_password(*, backend=None) -> str:
+    """The stored MyGreenhouse password from the keychain, or '' if none/unavailable."""
+    backend = backend or _gh_keyring()
+    try:
+        return backend.get_password(_GH_SERVICE, _GH_ACCOUNT) or ""
+    except Exception:
+        return ""
+
+
+def greenhouse_linked(profile: "ApplicationProfile", *, backend=None) -> bool:
+    """True when MyGreenhouse is usable — an email in the profile AND a password in the keychain."""
+    return bool((profile.greenhouse_email or "").strip() and get_greenhouse_password(backend=backend))
+
+
+def greenhouse_credentials(profile: "ApplicationProfile", *, backend=None) -> tuple[str, str]:
+    """(email, password) for MyGreenhouse autofill: email from the profile, password from the
+    keychain — falling back to a not-yet-migrated legacy plaintext field only if the keychain
+    is empty, so an un-migrated profile still works."""
+    email = (profile.greenhouse_email or "").strip()
+    pw = get_greenhouse_password(backend=backend) or (profile.greenhouse_password or "").strip()
+    return email, pw
+
+
+def _migrate_greenhouse_password(profile: "ApplicationProfile", path: str | Path) -> None:
+    """One-time: move a legacy plaintext `greenhouse_password` out of the YAML into the keychain,
+    then blank it on disk (Guideline #8/#12). Idempotent — a no-op once the field is empty.
+    Best-effort: if the keychain is unavailable the plaintext is left in place (still usable via
+    the fallback in `greenhouse_credentials`)."""
+    pw = (getattr(profile, "greenhouse_password", "") or "").strip()
+    if not pw:
+        return
+    try:
+        set_greenhouse_password(pw)
+        profile.greenhouse_password = ""
+        save_profile(profile, path)  # rewrite the YAML without the plaintext secret
+    except Exception:
+        pass
+
+
 def load_profile(path: str | Path = DEFAULT_PATH) -> ApplicationProfile:
     p = Path(path)
     if not p.exists():
         return ApplicationProfile()
     data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
-    return ApplicationProfile.model_validate(data)
+    profile = ApplicationProfile.model_validate(data)
+    _migrate_greenhouse_password(profile, path)  # plaintext YAML password → keychain (once)
+    return profile
 
 
 def save_profile(profile: ApplicationProfile, path: str | Path = DEFAULT_PATH) -> None:
-    body = yaml.safe_dump(profile.model_dump(), sort_keys=False, allow_unicode=True)
+    # The password is never persisted to YAML — it lives in the keychain (decision 060).
+    data = profile.model_dump()
+    data.pop("greenhouse_password", None)
+    body = yaml.safe_dump(data, sort_keys=False, allow_unicode=True)
     Path(path).write_text(_HEADER + body, encoding="utf-8")
 
 

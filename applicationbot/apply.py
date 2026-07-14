@@ -731,6 +731,36 @@ class AnswerResolver:
                 return ["Male", "Man"]
             if g in ("female", "woman"):
                 return ["Female", "Woman"]
+        # Veteran & disability self-ID: the SAME three choices are worded differently per ATS
+        # (Greenhouse "I am not a protected veteran" vs Lever "I am not a veteran"), so the stored
+        # value rarely matches an option verbatim. Map the applicant's intent to exact option
+        # strings (tried exact-first) plus negation-safe fuzzy tokens — never a bare "veteran",
+        # which would substring-match BOTH the "am a" and "am not a" options.
+        decline_kw = ("decline", "wish not", "not to answer", "prefer not", "don't wish",
+                      "do not wish", "choose not", "don't want", "do not want")
+        vet = (self.profile.veteran_status or "").strip().lower()
+        if _has(n, "veteran", "military") and vet:
+            if any(t in vet for t in decline_kw):
+                return ["Decline to self-identify", "I don't wish to answer",
+                        "I do not wish to answer", "I choose not to disclose"]
+            if "not a" in vet or re.match(r"\s*no\b", vet):
+                return ["I am not a protected veteran", "I am not a veteran", "Not a Veteran",
+                        "not a protected veteran", "not a veteran"]
+            return ["I identify as one or more of the classifications of protected veteran",
+                    "I am a protected veteran", "I am a veteran", "Protected Veteran",
+                    "identify as one or more"]
+        dis = (self.profile.disability_status or "").strip().lower()
+        if _has(n, "disability") and dis:
+            if any(t in dis for t in decline_kw):
+                return ["I do not want to answer", "I don't wish to answer",
+                        "Decline to self-identify", "I choose not to disclose"]
+            if re.match(r"\s*no\b", dis) or "do not have a disability" in dis \
+                    or "not have a disability" in dis:
+                return ["No, I do not have a disability and have not had one in the past",
+                        "No, I do not have a disability", "do not have a disability",
+                        "I don't have a disability"]
+            return ["Yes, I have a disability, or have had one in the past",
+                    "Yes, I have a disability", "have a disability"]
         # State/province dropdowns: offer the full name, then the abbreviation.
         if ("province" in n or re.search(r"\bstate\b", n)) and _has(
                 n, "province", "reside", "residence", "live", "located", "which state",
@@ -741,9 +771,11 @@ class AnswerResolver:
                 return [st] + ([abbr] if abbr else [])
         return None
 
-    def freetext_answer(self, label: str, is_textarea: bool = False) -> tuple[Optional[str], str]:
-        """Answer a free-text field. Banked/structured answer first; else, for open-ended
-        questions, a grounded Claude draft (cached for reuse unless company-specific). Returns
+    def freetext_answer(self, label: str, is_textarea: bool = False,
+                        required: bool = False) -> tuple[Optional[str], str]:
+        """Answer a free-text field. Banked/structured answer first; else a grounded Claude draft
+        for open-ended questions, OR for any REQUIRED field (which must be filled to submit) that
+        isn't a numeric-fact/demographic question we must never fabricate. Returns
         (answer, source) where source is 'resolver' | 'generated' | '' (couldn't answer)."""
         value = self.resolve(label)
         if value is not None:
@@ -760,7 +792,11 @@ class AnswerResolver:
         banked = None if label in self.semantic_done else self._bank_semantic(label)
         if banked is not None:
             return banked, "resolver"
-        if not answer_bank.is_open_ended(label, is_textarea):
+        # Draft when the question invites prose, OR it's a required field that must be filled to
+        # submit — the latter is why an oddly-phrased required question ("Why WHOOP?" as a short
+        # input) still gets an answer instead of blocking the submit.
+        if not (answer_bank.is_open_ended(label, is_textarea)
+                or (required and answer_bank.is_draftable_required(label))):
             return None, ""
         company_specific = answer_bank.is_company_specific(label)
         if company_specific and not (self.company or self.jd):
@@ -773,6 +809,17 @@ class AnswerResolver:
             self.learned.append(QA(question=label, answer=ans, generated=True))
         return ans, "generated"
 
+    def choose_option(self, label: str, options: list[str]) -> Optional[str]:
+        """For a REQUIRED dropdown/select we couldn't map (resolve, semantic classify, and hints
+        all missed), let the weak model pick the best-fitting OFFERED option so the field doesn't
+        block the submit. Returns an option verbatim, or None when generation is off, the question
+        is one we must not guess (demographic / fact the applicant owns), or nothing honestly fits.
+        Never invents an option — only chooses among those offered."""
+        if not self.enable_generation:
+            return None
+        return answer_bank.choose_required_option(
+            label, options, self.resume, company=self.company, jd=self.jd, model=self.model)
+
 
 # --------------------------------------------------------------- Greenhouse (Playwright)
 #
@@ -784,7 +831,7 @@ class AnswerResolver:
 # JS run in the page to derive a control's human question label (aria-label → aria-labelledby
 # → <label for> → wrapping <label> → nearest ancestor label/legend → placeholder/name).
 _LABEL_JS = r"""(el) => {
-  const clean = s => (s || '').replace(/\s+/g, ' ').replace(/\*/g, '').trim();
+  const clean = s => (s || '').replace(/\s+/g, ' ').replace(/[*✱★]/g, '').trim();
   if (el.getAttribute('aria-label')) return clean(el.getAttribute('aria-label'));
   const lb = el.getAttribute('aria-labelledby');
   if (lb) {
@@ -798,12 +845,24 @@ _LABEL_JS = r"""(el) => {
     const l = document.querySelector('label[for="' + sel + '"]');
     if (l) return clean(l.innerText);
   }
+  // A radio/checkbox OPTION is wrapped in its own <label> ("Yes"/"No") — return that so option
+  // matching works. An EEO <select> is ALSO wrapped in a <label>, but that wrapper nests a
+  // <div class="application-label"> (the question) and its innerText folds in every <option>
+  // ("Veteran status Select ... I am a veteran I am not a veteran …"); detect that nested label
+  // and skip to the card lookup below instead of returning the polluted wrapper text.
   const wrap = el.closest('label');
+  if (wrap && !wrap.querySelector('.application-label')) return clean(wrap.innerText);
+  // Lever renders a card's question in a <div class="application-label"> (not a real <label>).
+  const card = el.closest('.application-question');
+  if (card) {
+    const ql = card.querySelector('.application-label .text, .application-label');
+    if (ql && clean(ql.innerText)) return clean(ql.innerText);
+  }
   if (wrap) return clean(wrap.innerText);
   let node = el;
   for (let i = 0; i < 5 && node.parentElement; i++) {
     node = node.parentElement;
-    const l = node.querySelector('label, legend');
+    const l = node.querySelector('label, legend, .application-label');
     if (l && clean(l.innerText)) return clean(l.innerText);
   }
   return clean(el.getAttribute('placeholder') || el.getAttribute('name') || '');
@@ -811,13 +870,17 @@ _LABEL_JS = r"""(el) => {
 
 # JS: for a radio, the group's QUESTION (its own label is just the option, e.g. "Yes").
 _GROUP_QUESTION_JS = r"""(el) => {
-  const clean = s => (s || '').replace(/\s+/g, ' ').replace(/\*/g, '').trim();
+  const clean = s => (s || '').replace(/\s+/g, ' ').replace(/[*✱★]/g, '').trim();
   const fs = el.closest('fieldset');
   if (fs) { const lg = fs.querySelector('legend'); if (lg && clean(lg.innerText)) return clean(lg.innerText); }
+  // Lever puts the group's question in a <div class="application-label"> on the enclosing
+  // .application-question card; the option <label>s only hold "Yes"/"No" (too short to win below).
+  const card = el.closest('.application-question');
+  if (card) { const ql = card.querySelector('.application-label .text, .application-label'); if (ql && clean(ql.innerText)) return clean(ql.innerText); }
   let node = el;
   for (let i = 0; i < 6 && node.parentElement; i++) {
     node = node.parentElement;
-    const long = Array.from(node.querySelectorAll('label, legend'))
+    const long = Array.from(node.querySelectorAll('label, legend, .application-label'))
       .map(l => clean(l.innerText)).filter(t => t.length > 12);
     if (long.length) return long.sort((a, b) => b.length - a.length)[0];
   }
@@ -838,6 +901,37 @@ _REQUIRED_LABELS_JS = r"""(scope) => {
   });
   return out;
 }"""
+
+# JS: is THIS control required? Element flag (required / aria-required), or its label/card
+# marked with a required glyph ("*"/"✱"/"★") or the word "required" (Greenhouse marks label
+# text with "*"; Lever uses "✱" in the .application-label card).
+_IS_REQUIRED_JS = r"""(el) => {
+  const marks = t => /[*✱★]/.test(t || '') || /\brequired\b/i.test(t || '');
+  if (el.required || el.getAttribute('aria-required') === 'true') return true;
+  if (el.id) {
+    const sel = (window.CSS && CSS.escape) ? CSS.escape(el.id) : el.id;
+    const l = document.querySelector('label[for="' + sel + '"]');
+    if (l && marks(l.innerText)) return true;
+  }
+  const wrap = el.closest('label');
+  if (wrap && marks(wrap.innerText)) return true;
+  const card = el.closest('.application-question, fieldset');
+  if (card) {
+    const q = card.querySelector('.application-label, label, legend');
+    if (q && marks(q.innerText)) return true;
+  }
+  return false;
+}"""
+
+
+def _is_required(loc) -> bool:
+    """True if this control is required (element attr, or its label/card marks it). Used to force
+    a weak-model draft for an unmapped required free-text field so an armed submit isn't blocked."""
+    try:
+        return bool(loc.evaluate(_IS_REQUIRED_JS))
+    except Exception:
+        return False
+
 
 _TEXTLIKE = {"", "text", "email", "tel", "url", "number", "search"}
 
@@ -928,8 +1022,8 @@ def _greenhouse_native_autofill(page, ctx, profile, report: "ApplyReport") -> No
 
     NOTE: this drives the real my.greenhouse.io sign-in; it is best-effort and UNVERIFIED
     against a live account (needs a real MyGreenhouse login to confirm the exact flow)."""
-    email = (getattr(profile, "greenhouse_email", "") or "").strip()
-    pw = (getattr(profile, "greenhouse_password", "") or "").strip()
+    from . import apply_profile
+    email, pw = apply_profile.greenhouse_credentials(profile)  # password from the OS keychain
     if not (email and pw):
         return
     try:
@@ -1262,6 +1356,18 @@ def _record_capture(report: "ApplyReport", question: str, kind: str, options=Non
     report.captured[question] = {"kind": kind, "options": [o for o in (options or []) if o][:40]}
 
 
+def _selectable_options(loc, fallback: list[str]) -> list[str]:
+    """A native <select>'s REAL choices — its options with a non-empty value, so a model pick never
+    lands on a "Select…" placeholder (value="") that would commit an empty selection. Falls back to
+    `fallback` (all option texts) on any error."""
+    try:
+        return [o.strip() for o in loc.evaluate(
+            "el => Array.from(el.options).filter(o => o.value !== '')"
+            ".map(o => (o.textContent||'').trim())") if (o or "").strip()] or fallback
+    except Exception:
+        return fallback
+
+
 def _field_options(page, loc, tag: str, role: str) -> list[str]:
     """Selectable option texts for a native <select> or a react-select combobox, for recreating the
     field. Empty for a text input or a searchable typeahead with nothing shown (falls back to text).
@@ -1517,14 +1623,41 @@ def _fill_all_fields(page, resolver: AnswerResolver, report: "ApplyReport", done
         # answer from the profile. Open-ended text goes to the drafting path instead.
         if value is None and not is_free:
             value = resolver.resolve_semantic(label)
-        if value is None and not hints and not is_free:
+        # No mapped answer and no hints. Dropdowns/selects are included even though a native
+        # <select> reads as is_free (it has no type attribute) — a required one must still fill.
+        if value is None and not hints and (role == "combobox" or tag == "select" or not is_free):
             kind = "select" if tag == "select" else ("dropdown" if role == "combobox" else "text")
-            if resolver.pending is not None and resolver.pending.has(label):
-                # Deferred to the batched decision step — round 2 revisits it. Record the
-                # control's kind/options so a classified dropdown can join the pick batch.
-                resolver.pending.enrich(label, kind, _field_options(page, loc, tag, role))
+            options = _field_options(page, loc, tag, role)
+            if resolver.pending is not None:
+                # Round 1 of a two-pass fill — defer to the batched decision step; round 2 (where
+                # a model call is allowed) revisits it. Record the control's kind/options so a
+                # classified dropdown can join the pick batch. Idempotent for already-deferred labels.
+                resolver.pending.defer_question(label)
+                resolver.pending.enrich(label, kind, options)
                 continue
-            _record_capture(report, label, kind, _field_options(page, loc, tag, role))
+            # Round 2 / single pass: a REQUIRED dropdown/select we still couldn't map would block an
+            # armed submit. Let the weak model choose the best-fitting OFFERED option (it never
+            # invents one; demographic / fact-owning questions are refused → captured for the user).
+            if kind in ("dropdown", "select") and _is_required(loc):
+                pickable = _selectable_options(loc, options) if tag == "select" else options
+                picked = resolver.choose_option(label, pickable)
+                if picked:
+                    try:
+                        if role == "combobox":
+                            resolver.decided_options[label] = picked  # commit + learn as tier claude
+                            got = _fill_combobox(page, loc, picked, None,
+                                                 resolver=resolver, label=label)
+                            text = got[0] if got else None
+                        else:
+                            text = _fill_select(loc, picked)
+                    except Exception as e:
+                        text = None
+                        report.errors.append(f"{label}: {type(e).__name__}: {e}")
+                    if text:
+                        report.filled.append(FilledField(label, text, kind, source="option:claude"))
+                        done.add(label)
+                        continue
+            _record_capture(report, label, kind, options)
             report.skipped.append(f"{label} — no saved answer")
             done.add(label)
             continue
@@ -1544,10 +1677,24 @@ def _fill_all_fields(page, resolver: AnswerResolver, report: "ApplyReport", done
                 else:
                     report.skipped.append(f"{label} — no dropdown option matched {value!r}")
             elif tag == "select":
-                report.filled.append(FilledField(label, _fill_select(loc, value, hints), "select"))
+                try:
+                    report.filled.append(FilledField(label, _fill_select(loc, value, hints), "select"))
+                except Exception:
+                    # No <option> matched the answer. Parity with the combobox path: let the model
+                    # map the answer onto an offered option before giving up (then it's captured).
+                    opts = _field_options(page, loc, tag, role)
+                    chosen = (answer_bank.pick_dropdown_option(label, value, opts, model=resolver.model)
+                              if resolver.enable_generation and value else None)
+                    if chosen:
+                        report.filled.append(FilledField(
+                            label, _fill_select(loc, chosen), "select", source="option:claude"))
+                    else:
+                        report.skipped.append(f"{label} — no <option> matched {value!r}")
             elif is_free:
-                # Banked/structured answer, else a grounded Claude draft for open-ended questions.
-                ans, source = resolver.freetext_answer(label, is_textarea=(tag == "textarea"))
+                # Banked/structured answer, else a grounded Claude draft for open-ended questions
+                # (and any required field, so a required unmapped question doesn't block submit).
+                ans, source = resolver.freetext_answer(
+                    label, is_textarea=(tag == "textarea"), required=_is_required(loc))
                 if source == "pending":
                     continue  # deferred to the batch — round 2 revisits
                 if ans is None:
@@ -1561,6 +1708,29 @@ def _fill_all_fields(page, resolver: AnswerResolver, report: "ApplyReport", done
         except Exception as e:
             report.errors.append(f"{label}: {type(e).__name__}: {e}")
         done.add(label)
+
+
+def _check_radio(loc) -> bool:
+    """Select a radio, resilient to an overlay that intercepts the real click — Lever embeds an
+    hCaptcha whose invisible enclave iframe sits over the form and swallows pointer events. Try a
+    normal check, then a forced check, then set `.checked` directly and fire input/change so any
+    listener notices. Returns True once the input reads as checked. NOT captcha circumvention: the
+    CAPTCHA widget is never touched and still gates submission (dry-run never submits anyway)."""
+    for attempt in (lambda: loc.check(timeout=4000),
+                    lambda: loc.check(force=True, timeout=2000)):
+        try:
+            attempt()
+            if loc.is_checked():
+                return True
+        except Exception:
+            pass
+    try:
+        loc.evaluate("el => { el.checked = true; "
+                     "el.dispatchEvent(new Event('input', {bubbles: true})); "
+                     "el.dispatchEvent(new Event('change', {bubbles: true})); }")
+        return bool(loc.is_checked())
+    except Exception:
+        return False
 
 
 def _fill_radio_groups(page, resolver: AnswerResolver, report: "ApplyReport", done: set) -> None:
@@ -1610,12 +1780,12 @@ def _fill_radio_groups(page, resolver: AnswerResolver, report: "ApplyReport", do
             except Exception:
                 opt = ""
             if opt and (opt == v or v in opt):
-                try:
-                    radios.nth(i).check(timeout=4000)
+                if _check_radio(radios.nth(i)):
                     report.filled.append(FilledField(q, value, "radio"))
                     picked = True
-                except Exception as e:
-                    report.errors.append(f"{q}: {type(e).__name__}: {e}")
+                else:
+                    report.errors.append(f"{q}: could not check option {opt!r} "
+                                         "(click intercepted by an overlay?)")
                 break
         if not picked:
             report.skipped.append(f"{q} — no radio option matching {value!r}")
@@ -2040,7 +2210,7 @@ def _confirmation_evidence(page, frame) -> str:
     return ""
 
 
-def _attempt_submit(page, frame, report: "ApplyReport", gate) -> None:
+def _attempt_submit(page, frame, report: "ApplyReport", gate, solve_captcha=None) -> None:
     """The armed submit path (decision 035). Pre-submit gate: every REQUIRED field must be
     filled AND the SafetyGate must allow it (armed + no profile/KILL file + under the
     per-run cap, re-checked immediately before the click). On any doubt the application is
@@ -2070,6 +2240,14 @@ def _attempt_submit(page, frame, report: "ApplyReport", gate) -> None:
         report.submit_state = "blocked"
         report.blockers = [reason]
         return
+    if solve_captcha is not None:
+        # Reached only when armed (decision 049): if a CAPTCHA stands between us and submit,
+        # auto-solve it when enabled + site-allowlisted + keyed, else block with the fix.
+        handled, detail = solve_captcha(frame)
+        if not handled:
+            report.submit_state = "blocked"
+            report.blockers = [detail]
+            return
     btn = _find_submit_button(frame)
     if btn is None:
         report.submit_state = "blocked"
@@ -2230,9 +2408,18 @@ def _record_run(report: ApplyReport, resume_pdf: str, role: str, company: str,
     URL. Upserts by source URL so re-running a posting updates its row instead of duplicating
     it, and never clobbers user-owned fields (status/notes) on a re-run — except upgrading
     status to `applied` when we really submitted. Returns (id, 'recorded' | 'updated')."""
-    from . import tracker  # lazy — keep apply.py importable without touching the DB
+    from . import parking, tracker  # lazy — keep apply.py importable without touching the DB
 
-    status = "applied" if report.submitted else "dry-run"
+    # Park a user-resolvable block: an armed run that filled the form but withheld the submit
+    # becomes a `blocked` row (not a silent `dry-run`), carrying the reason so the UI can offer
+    # a one-click Resolve. A clean dry-run, or a genuine site failure, classifies to None here.
+    reason = parking.classify(report)
+    if report.submitted:
+        status = "applied"
+    elif report.submit_state == "blocked":
+        status = "blocked"
+    else:
+        status = "dry-run"
     method = "auto" if report.submitted else "dry-run"
     m = meta or {}
     company = (m.get("company") or company or "").strip()
@@ -2251,8 +2438,14 @@ def _record_run(report: ApplyReport, resume_pdf: str, role: str, company: str,
         changes: dict = {"resume_path": resume_pdf, "portal": report.ats, "method": method}
         if m.get("fit_score") is not None:
             changes["fit_score"] = m["fit_score"]  # runner-owned: this run's judge verdict
+        # Refresh the parked reason to this run's truth (a resolved re-run clears it); never
+        # clobber a user-set outcome status (rejected/interview/…) — only machine states flip.
+        changes["blocked_kind"] = reason.kind if reason else ""
+        changes["blocked_detail"] = reason.detail if reason else ""
         if report.submitted:
             changes["status"] = "applied"
+        elif status == "blocked" and existing.get("status") in ("discovered", "tailored", "dry-run", "blocked"):
+            changes["status"] = "blocked"
         for col, val in (("company", company), ("role", role), ("location", location),
                          ("remote", remote), ("pay", pay)):
             if val and not existing.get(col):
@@ -2268,6 +2461,8 @@ def _record_run(report: ApplyReport, resume_pdf: str, role: str, company: str,
         "company": company, "role": role, "location": location, "remote": remote, "pay": pay,
         "portal": report.ats, "method": method, "status": status,
         "fit_score": m.get("fit_score"),
+        "blocked_kind": reason.kind if reason else "",
+        "blocked_detail": reason.detail if reason else "",
         "source_url": source_url, "resume_path": resume_pdf,
         "notes": f"[auto] {what}: {len(report.filled)} field(s) filled "
                  f"({native} native, {drafted} AI-drafted); {len(report.skipped)} need attention."
@@ -2316,9 +2511,21 @@ def run_apply(
     report = ApplyReport(url=url, ats=ats)
     done: set = set()  # labels already handled — dedupe across passes + required scan
 
+    # The Workday agentic fallback (decision 061) needs the browser to expose a CDP endpoint the
+    # Playwright-MCP worker attaches to. Only opened for a Workday run with the fallback armed
+    # (`workday_agentic: true` in profile/safety.yaml); recipe replay works without it.
+    wd_agentic = False
+    if ats == "workday":
+        from . import workday as _workday
+        wd_agentic = _workday.agentic_enabled()
+    cdp_port = _workday._free_port() if wd_agentic else None
+
     with sync_playwright() as pw:
+        launch_kwargs = {"headless": not headed, "slow_mo": slow_mo}
+        if cdp_port:
+            launch_kwargs["args"] = [f"--remote-debugging-port={cdp_port}"]
         try:
-            browser = pw.chromium.launch(headless=not headed, slow_mo=slow_mo)
+            browser = pw.chromium.launch(**launch_kwargs)
         except Exception as e:
             raise RuntimeError(
                 "Could not launch Chromium. Install it once with: playwright install chromium\n"
@@ -2335,54 +2542,78 @@ def run_apply(
             # embedded iframe), so filling too early or on the wrong frame fills nothing. This
             # reveals the form, waits for it, and returns the FRAME it lives in + the ATS
             # re-derived from that frame (e.g. a Greenhouse form embedded on stripe.com).
-            form_loaded, frame, ats = _open_application_form(page, ats, report)
-            report.ats = ats  # re-derived from the form's frame (e.g. greenhouse embedded on stripe.com)
-
-            # Role + company from the page title: grounds Claude-drafted answers AND labels
-            # the tracker row.
-            role, company = "", ""
-            try:
-                role, company = _title_role_company(page.title())
-            except Exception:
-                pass
-            if resolver.enable_generation and not resolver.company:
-                resolver.company = company or None
-
-            if debug:
-                _dump_fields(frame)
-
-            if form_loaded:
-                _upload_resume(frame, resume_pdf, report)
-
-                # ---- native autofill FIRST (decision 017) ----
-                if ats == "greenhouse":
-                    _greenhouse_native_autofill(page, ctx, resolver.profile, report)
-                _trigger_native_autofill(frame, ats, report)  # resume-parse button (Workday etc.)
-                page.wait_for_timeout(1500)  # let any parse-on-upload settle
-
-                # ---- our resolver fills only what's still empty, page by page, in the
-                # form's frame — walks Next/Continue wizards to the final page ----
-                frame = _fill_all_pages(page, frame, resolver, report, done, resume_pdf)
-            # else: report carries an actionable "form did not load" error; skip filling.
-
-            if form_loaded and gate is not None and getattr(gate, "armed", False):
-                # ARMED (decision 035): pre-submit gate + kill-switch check + submit +
-                # confirmation detection. Any doubt leaves report.submitted False with the
-                # reason in report.blockers.
-                _attempt_submit(page, frame, report, gate)
+            if ats == "workday":
+                # Workday hybrid (decision 059): the account gate + custom-widget DOM need their
+                # own navigation/fill path, not `_open_application_form` + `_fill_all_pages`.
+                # `apply_workday` owns the whole flow incl. its own armed submit (M3, decision 064),
+                # so the gate is passed in and the generic `_attempt_submit` branch below is skipped.
+                report.ats = "workday"
+                role, company = "", ""
+                try:
+                    role, company = _title_role_company(page.title())
+                except Exception:
+                    pass
+                if resolver.enable_generation and not resolver.company:
+                    resolver.company = company or None
+                from . import mailbox
+                from . import workday as _workday
+                form_loaded = _workday.apply_workday(
+                    page, url, resolver.resume, resolver.profile, report,
+                    resume_pdf=resume_pdf, mailbox_config=mailbox.load_config(),
+                    resolver=resolver, agentic=wd_agentic, cdp_port=cdp_port, gate=gate)
             else:
-                report.submitted = False  # DRY-RUN — the default (Guideline #3)
+                form_loaded, frame, ats = _open_application_form(page, ats, report)
+                report.ats = ats  # re-derived from the form's frame (e.g. greenhouse embedded on stripe.com)
+
+                # Role + company from the page title: grounds Claude-drafted answers AND labels
+                # the tracker row.
+                role, company = "", ""
+                try:
+                    role, company = _title_role_company(page.title())
+                except Exception:
+                    pass
+                if resolver.enable_generation and not resolver.company:
+                    resolver.company = company or None
+
+                if debug:
+                    _dump_fields(frame)
+
                 if form_loaded:
-                    # Probe (never click) the submit control so every dry-run live-validates
-                    # the armed path's selectors for free — no tokens, no risk.
-                    try:
-                        btn = _find_submit_button(frame)
-                        report.submit_probe = (
-                            "found: " + repr((btn.evaluate("el => el.innerText || el.value || ''")
-                                              or "").strip()) if btn is not None
-                            else "NOT FOUND — an armed run could not submit this form")
-                    except Exception:
-                        pass
+                    _upload_resume(frame, resume_pdf, report)
+
+                    # ---- native autofill FIRST (decision 017) ----
+                    if ats == "greenhouse":
+                        _greenhouse_native_autofill(page, ctx, resolver.profile, report)
+                    _trigger_native_autofill(frame, ats, report)  # resume-parse button (Workday etc.)
+                    page.wait_for_timeout(1500)  # let any parse-on-upload settle
+
+                    # ---- our resolver fills only what's still empty, page by page, in the
+                    # form's frame — walks Next/Continue wizards to the final page ----
+                    frame = _fill_all_pages(page, frame, resolver, report, done, resume_pdf)
+                # else: report carries an actionable "form did not load" error; skip filling.
+
+                if form_loaded and gate is not None and getattr(gate, "armed", False):
+                    # ARMED (decision 035): pre-submit gate + kill-switch check + submit +
+                    # confirmation detection. Any doubt leaves report.submitted False with the
+                    # reason in report.blockers. The captcha hook (decision 049) auto-solves a
+                    # blocking CAPTCHA only when enabled + site-allowlisted in profile/safety.yaml
+                    # (off by default); otherwise it records a blocked outcome with the fix.
+                    from . import captcha
+                    hook = captcha.build_submit_hook(captcha.load_config(), url)
+                    _attempt_submit(page, frame, report, gate, solve_captcha=hook)
+                else:
+                    report.submitted = False  # DRY-RUN — the default (Guideline #3)
+                    if form_loaded:
+                        # Probe (never click) the submit control so every dry-run live-validates
+                        # the armed path's selectors for free — no tokens, no risk.
+                        try:
+                            btn = _find_submit_button(frame)
+                            report.submit_probe = (
+                                "found: " + repr((btn.evaluate("el => el.innerText || el.value || ''")
+                                                  or "").strip()) if btn is not None
+                                else "NOT FOUND — an armed run could not submit this form")
+                        except Exception:
+                            pass
             _show_done_banner(page, report, ok=form_loaded)  # visible signal in the browser
 
             try:
@@ -2430,9 +2661,19 @@ def run_apply(
 
             if pause:
                 if hold is not None:
-                    # Web-driven: wait until the caller (e.g. a "Finish" button) releases us,
-                    # instead of blocking on terminal input which has no TTY in a server.
-                    hold.wait()
+                    # Web-driven: release when the caller (e.g. a "Finish" button) sets `hold`
+                    # OR when the user closes the browser window themselves. Poll instead of a
+                    # bare hold.wait(): a manually-closed window never sets `hold`, so a blocking
+                    # wait would leave this thread stuck forever, never reaching the `finally`
+                    # below — and the Playwright driver + Chromium helper processes would keep
+                    # running after the window is gone.
+                    while not hold.is_set():
+                        try:
+                            page.wait_for_timeout(400)  # pumps events; raises once the browser closes
+                        except Exception:
+                            break
+                        if not browser.is_connected():
+                            break
                 else:
                     done_note = ("SUBMITTED" if report.submitted
                                  else "DRY RUN — not submitted")
@@ -2442,8 +2683,17 @@ def run_apply(
                     except EOFError:
                         pass
         finally:
-            ctx.close()
-            browser.close()
+            # Best-effort: the user may have already closed the window, so these can raise
+            # "Target/Browser closed" — swallow it so cleanup always completes and
+            # sync_playwright() exits, tearing down the driver + Chromium helper processes.
+            try:
+                ctx.close()
+            except Exception:
+                pass
+            try:
+                browser.close()
+            except Exception:
+                pass
 
     return report
 
