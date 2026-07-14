@@ -537,6 +537,27 @@ Posted to the agent bus 2026-07-06; independent of the engine work above.
 
 ## Recently added (this session, latest first)
 
+- 2026-07-14 — **Web UI revamp: left nav rail + dark mode (decision 068).** The Review-only
+  tailoring sidebar was docked on the left of *every* tab (dead, confusing space on
+  Discover/Profile/Track). Now the left column is a persistent app **nav rail** (Review ·
+  Discover · Profile · Track, with icons + Claude-status badge + theme toggle); the
+  tailoring controls moved into the Review view as a compact top control bar. All colors
+  moved to CSS **tokens** with a full **light/dark** theme (`prefers-color-scheme` default +
+  a persisted `data-theme` toggle; `color-scheme` set so native selects/date-pickers follow).
+  Pure presentation — no server code, element IDs, or JS wiring changed (one `.controls
+  .ctrl.hidden` rule added so the paste-a-posting toggle still hides). `web.py` INDEX_HTML
+  only. Verified live (Playwright) across all four tabs in both themes, the fixture/paste
+  toggle both ways, and a full `rules`-engine tailor→render→PDF flow; console clean;
+  `test_web_csrf.py` green. **Follow-up done same session:** the Discover **fit-trend chart**
+  was redrawn through CSS-class tokens (accent/muted/warn-line/grid/surface-ringed dots) so it
+  re-themes live, plus a dataviz redesign — recessive 0/50/100 grid, translucent area under the
+  headline series, swatch legend, per-point hover; the pre-score bars already themed. Both
+  verified in light + dark. **Then the remaining inline-colored JS was migrated too** —
+  screening-answer status pills/marks, account ✓/○ rows, connect messages: every JS hex →
+  a semantic token (`--ok`/`--bad`/`--warn-line`/`--warn-strong`/`--muted` + a new `--ai`
+  purple for AI-drafted/auto-from-profile). No raw hex left in the JS; computed colors verified
+  per theme. ([web.py](applicationbot/web.py))
+
 - 2026-07-14 — **Required unmapped DROPDOWNS/SELECTS get a weak-model choice — never block submit
   (decision 067 amendment).** Sibling to the free-text fix below: a required dropdown/select the
   resolver, semantic classify, and hints all miss still blocked submit (a combobox was captured "no

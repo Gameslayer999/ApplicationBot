@@ -11,6 +11,7 @@
 
 | # | Date | Decision | Status |
 |---|------|----------|--------|
+| 068 | 2026-07-14 | Web UI revamp: left **nav rail** + design-token system with **dark mode**. The Review-only tailoring sidebar (résumé/engine/quality/length/Tailor) was permanently docked on the left of *every* tab — dead, confusing space on Discover/Profile/Track (a navigation bug). Now the left column is a persistent app **nav rail** (Review · Discover · Profile · Track, with icons + a Claude-status badge + theme toggle at the foot); the tailoring controls moved into the Review view as a compact top control bar (only shown where they apply). All colors migrated to CSS custom-property **tokens** with a full **light/dark** theme (`prefers-color-scheme` default + a persisted `data-theme` toggle stored in `localStorage`; `color-scheme` set so native selects/date-pickers/scrollbars follow). Pure presentation — **no server code, no element IDs, and no JS wiring changed** (Guideline #7); the only functional touch is a `.controls .ctrl.hidden` rule so the paste-a-posting toggle still hides. `web.py` INDEX_HTML only. Verified live via Playwright across all four tabs in both themes (console clean), the fixture/paste toggle both ways, and a full `rules`-engine tailor → render → PDF-button flow; `test_web_csrf.py` green | Accepted |
 | 001 | 2026-07-03 | Primary language: Python (polyglot later if needed) | Accepted |
 | 002 | 2026-07-03 | Resume model: structured source-of-truth + LLM tailoring | Accepted |
 | 003 | 2026-07-03 | Test data: real job descriptions collected as static fixtures | Accepted |
@@ -2975,3 +2976,72 @@ committed `fixtures/apply_forms/required_dropdowns.html` (stubbed CLI, zero toke
 required dropdowns fill with `source=option:claude` (never the placeholder), while the clearance and
 gender dropdowns are refused and captured. Full suite **309 passed**, same one pre-existing mailbox
 failure. ([answer_bank.py](applicationbot/answer_bank.py), [apply.py](applicationbot/apply.py))
+
+## 068 — Web UI revamp: left nav rail + design tokens with dark mode
+
+**Context.** The web UI (`web.py`, a single stdlib `http.server` serving one inline
+`INDEX_HTML`) had grown four tabs — Review, Discover, Profile, Track — selected by a row
+of plain-button "tabs" at the top of `<main>`. But the **left `<aside>` held only the
+Review tab's tailoring controls** (résumé picker, job source, engine, quality, length,
+Tailor button) and was rendered *outside* the tab-switching logic, so it stayed docked on
+the left of **every** tab. On Track and Profile that 320px column was pure dead weight and
+actively confusing (a "Tailor résumé" button while looking at the application tracker).
+The user asked to "make it a bit more modern and easier to navigate."
+
+**Options considered.**
+- **A — Left nav rail (chosen).** Convert the left column into a persistent app-nav rail
+  (the four destinations, with icons, a Claude-status badge, and a theme toggle at the
+  foot) and move the tailoring controls *into* the Review view. Fixes the dead-sidebar
+  bug directly and reads as a conventional modern app shell.
+- **B — Top nav bar.** Drop the sidebar entirely; a top bar holds nav + status. More
+  horizontal content room but a bigger restructure and loses the natural home for the
+  persistent Claude-status badge.
+- Visual scope: full refresh **with** dark mode (chosen) vs. light-only.
+
+Both chosen by the user (nav model = rail; scope = refresh + dark mode).
+
+**Decision / implementation.** `web.py` `INDEX_HTML` only — no server code, no route, no
+element ID, and no JS behavior changed (Guideline #7 — pure presentation).
+- **Tokens + theming.** The `:root` now defines semantic CSS custom properties
+  (`--bg/--surface/--surface-2/--ink/--strong/--muted/--faint/--line/--accent/
+  --accent-weak/--ok/--bad/--warn/…/--track/--shadow/--radius`). Every hardcoded color in
+  the component CSS was migrated to a token (`color:#fff` left literal — white text on
+  accent/red fills is correct in both themes; only backgrounds moved). A **dark** palette
+  is applied via `@media (prefers-color-scheme: dark) :root:not([data-theme=light])` **and**
+  `:root[data-theme="dark"]`, and `color-scheme` is set per theme so native selects,
+  date-pickers, and scrollbars follow. A small footer toggle flips `data-theme` and
+  persists the choice in `localStorage` (`ab-theme`); default follows the OS.
+- **Nav rail.** `<aside class="nav">` = brand, `.navlist` of the existing `.tab`
+  `data-view` buttons (restyled as vertical nav items with icons — the original
+  tab-switch JS is untouched), then a `.nav-foot` with the `#account` badge and
+  `#theme-toggle`.
+- **Controls moved.** The résumé/job/engine/quality/length/Tailor fields moved into
+  `#view-review` as a `.controls` flex bar (only visible on Review). One CSS rule added —
+  `.controls .ctrl.hidden { display:none }` — because `.controls .ctrl` out-specifies the
+  utility `.hidden`, which the paste-a-posting ↔ saved-fixture toggle relies on.
+
+**Verification.** Drove the running server headless with Playwright: all four tabs
+screenshotted in **both** light and dark (nav highlight, cards, Track table + funnel bars +
+date inputs, Profile forms, Discover panels all adapt); the job-source toggle confirmed
+both ways (fixture picker ↔ paste box); a full `rules`-engine (zero-token) run
+tailored → rendered the résumé + "why this tailoring" panel + Download-PDF button; browser
+console clean; `tests/test_web_csrf.py` green (server behavior unchanged).
+
+**Follow-up done (same session) — charts wired to the theme + redesigned.** The Discover
+fit-trend SVG hardcoded its colors in JS (blue/gray/magenta); it's now redrawn entirely
+through CSS-class tokens (`.fc-best`=--accent, `.fc-mean`=--muted, `.fc-bar`=--warn-line
+dashed, grid=--line, dots surface-ringed), so it re-themes live with no JS color logic. The
+redesign (dataviz method) adds a recessive 0/50/100 grid with reference labels, a
+translucent area under the headline "best" series, a labelled swatch legend (identity never
+color-alone), and per-point hover tooltips. The pre-score bar chart already used
+`var(--accent)`/`var(--track)` (CSS-driven), so it themed already. Verified in both themes
+(console clean, 6 hover targets, no label collision after dropping the redundant on-chart
+threshold label).
+
+**Then the remaining inline-colored JS was migrated too** (screening-answer status
+pills/marks, the account ✓/○ rows, and the Gmail/app-password connect messages): every
+hardcoded hex in the JS moved to a semantic token — `#0b7a3b`→`--ok`, `#b21f2d`→`--bad`,
+`#e0a400`→`--warn-line`, `#b26a00`→`--warn-strong`, `#b0b0b0`→`--muted`, and the AI-drafted /
+auto-from-profile purple got a **new `--ai` token** (`#6a4bd0` light / `#a48bf0` dark). No raw
+hex remains in the JS. Verified via computed colors: pill dots resolve to the exact originals
+in light and adapt in dark (amber `#b8862f`, green `#4cc282`, purple `#a48bf0`).
