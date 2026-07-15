@@ -474,15 +474,12 @@ value ÷ effort:
 
 ### Test-suite hygiene (observed 2026-07-15)
 
-- [ ] **`test_mailbox.py::test_load_config_needs_all_three` leaks a real secret when it fails.**
-      It asserts `load_config({...})` returns `None`, but `load_config` falls back to the
-      user's real `profile/mailbox.yaml` + keychain, so it returns the live config — and
-      pytest prints the **real Gmail app password** in the assertion diff. Two bugs in one:
-      the test is environment-dependent (fails on any machine with a linked mailbox), and a
-      failing test writes a live credential to the terminal/CI log (Guideline #5/#12).
-      Fix: have the test point `load_config` at a temp path/isolated env, and consider
-      `repr`-masking secrets in `MailboxConfig` so they can never print. Pre-existing —
-      predates 2026-07-15, confirmed failing on a clean tree.
+- [x] **`test_mailbox.py::test_load_config_needs_all_three` leaked a real secret when it
+      failed** — fixed 2026-07-15 (decision 075). It was environment-dependent (`load_config`
+      prefers a stored link over env, so it read the real `profile/mailbox.yaml`) *and* the
+      failure printed the live app-password. Test now pins `backend=_FakeKeyring(),
+      path=_link_path()`; `password`/`refresh_token`/`client_secret` are `repr=False` so no
+      traceback, log, or diff can print them again. Suite **351/351 green**.
 - [ ] **`test_lever_labels.py::test_lever_eeo_selects_get_clean_label_and_normalize` is
       flaky.** Failed once in 3 consecutive full-suite runs on an unmodified `apply.py`;
       passes in isolation and on re-run. Playwright timing under load is the likely cause.
@@ -1748,6 +1745,17 @@ Record each decision in [DECISIONS.md](DECISIONS.md) once the user chooses.
 ---
 
 ## Recently completed
+
+- 2026-07-15 — **Mailbox test isolation + secrets never render** (decision 075). The one
+  long-standing suite failure: `test_load_config_needs_all_three` asserted `load_config(...)
+  is None`, but `load_config` prefers a stored **link** over env (decision 057) and defaults
+  to the real `profile/mailbox.yaml` — so on a linked machine it returned the live config,
+  failed, and pytest printed the **real Gmail app-password**. Test now pins
+  `backend=_FakeKeyring(), path=_link_path()` (the idiom the rest of the file already used);
+  mutation-checked that it still catches its regression. Separately, `password`/
+  `refresh_token`/`client_secret` are now `field(repr=False)`, so no traceback/log/diff can
+  print a credential again — values still work, `asdict()` unchanged. Suite **351/351 green**
+  (first fully-green run). Not a product bug: link-over-env precedence was always intended.
 
 - 2026-07-15 — **GitHub repo job boards: drop-in feeds + Workday/SmartRecruiters unlocked**
   (decisions 073, 074). We already scraped GitHub boards (SimplifyJobs, decision 031); the

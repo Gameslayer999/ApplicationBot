@@ -28,7 +28,7 @@ from __future__ import annotations
 import os
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -64,15 +64,18 @@ _KNOWN_IMAP_HOSTS = {
 
 @dataclass
 class MailboxConfig:
+    # The three secret fields are `repr=False` (decision 075): they stay fully usable in code but
+    # never render in a repr/str, so a traceback, log line, or pytest assertion diff carrying a
+    # config cannot print a live credential (Guideline #5). `link_status()` is the safe view.
     host: str
     email: str
-    password: str = ""
+    password: str = field(default="", repr=False)
     port: int = 993
     source: str = ""  # "linked" (keychain+file) | "env" — for status display only
     auth: str = "password"  # "password" (IMAP app-password/env) | "oauth" (Gmail read-only)
-    refresh_token: str = ""  # oauth: long-lived token to mint access tokens
+    refresh_token: str = field(default="", repr=False)  # oauth: mints access tokens
     client_id: str = ""      # oauth: Google Cloud "Desktop app" client (non-secret)
-    client_secret: str = ""  # oauth: paired secret (kept in the keychain)
+    client_secret: str = field(default="", repr=False)  # oauth: paired secret (keychain)
 
 
 def suggest_host(email: str) -> str:

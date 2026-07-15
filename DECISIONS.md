@@ -11,6 +11,7 @@
 
 | # | Date | Decision | Status |
 |---|------|----------|--------|
+| 075 | 2026-07-15 | **Mailbox secrets are `repr=False`; the env-vs-link test pins an unlinked path.** `test_load_config_needs_all_three` asserted `load_config({...}) is None`, but `load_config` prefers a stored **link** over env (decision 057) and defaults to the real `profile/mailbox.yaml` — so on any machine with a linked mailbox it returned the live config, failed, and pytest printed the **real Gmail app-password** in the assertion diff. Two distinct bugs: (1) the test was environment-dependent (passed only on an unlinked box, e.g. CI) — fixed by passing `backend=_FakeKeyring(), path=_link_path()`, the isolation idiom the rest of the file already used and this one test predated; mutation-checked that it still catches the regression it exists for. (2) **any** repr of a `MailboxConfig` leaked a live credential — a traceback, log line, or diff would do it. `password`/`refresh_token`/`client_secret` are now `field(repr=False)` on the dataclass: values stay fully usable in code and `asdict()` is unchanged, they simply never render in `repr`/`str`; non-secret fields still print so repr stays useful for debugging. `link_status()` remains the safe view. Rejected leaving it at (1): that closes only the one known leak path and the exposure recurs on the next failure that prints a config. Behaviour change flagged and approved (Guideline #7): debug output no longer shows those three values. Suite **351/351 green** (was 349/1 with this pre-existing failure). Related: the bot-inbox address was scrubbed from `DECISIONS.md`/`NEXT_STEPS.md` before the 069-074 commit — it was absent from HEAD and is contact detail (Guideline #12) | Accepted |
 | 074 | 2026-07-15 | **Resolve Workday (and SmartRecruiters) JDs in the curated feeds, unlocking +1,053 candidates the filter was discarding.** `_CURATED_ATS` gated curated listings to Greenhouse/Lever/Ashby — the only ATSs with a hand-written `_resolve_jd` helper. Measured against the live feeds, that discarded **755 active Workday** and **298 SmartRecruiters** postings *the Apply stage can already submit to* (`pipeline._is_fillable` explicitly allows `workday`; `workday.apply_workday` is a complete backend). The gate was never about fillability — it was about JD resolution. **Workday resolves with no new code**: it renders client-side but still ships schema.org JSON-LD in the initial HTML, so `enrich.fetch_full_jd` (the existing cascade from #047) returns a full JD on a plain GET — **10/10 live postings via the `json-ld` tier, no browser, no LLM call** (called without `llm=`, so it stops at the free tiers). Rejected Playwright (my initial assumption — the spike disproved it: unnecessary cost/fragility) and Workday's `/wday/cxs/` JSON API (works 15/15 but returns *less* text than the JSON-LD and needs a bespoke tenant/site URL rewrite). SmartRecruiters needed only a tuple entry — `_resolve_smartrecruiters_jd` already existed. Flagged: SmartRecruiters routes to **generic autofill** (`apply.detect_ats` doesn't know it — decision #030), which is less proven than the Workday backend. Verified live end-to-end: real config → `build_sources` → `discover` returned 6 postings / 0 errors including a **Workday** JD (Northrop Grumman, 5,521 chars) and a SmartRecruiters JD, all clearing `_is_fillable` and routing to the right backend | Accepted |
 | 073 | 2026-07-15 | **Any GitHub repo job board is drop-in config, not code** (`early_career.feeds`). The curated source hard-coded two SimplifyJobs URLs. Investigated adding more repos and **measured the marginal yield first**: the two live `vanshb03` boards add only **103 new fillable postings** over Simplify's 1,093 (8 overlap) — while `max_resolve` truncates the pool to 40, so more repos ≈ **zero** real gain. Conclusion recorded: **the funnel neck (40 of 1,130), not feed count, is the binding constraint** — so the value here is optionality (drop in a board when one matters), not breadth, and no extra repos ship enabled by default. Chose to **extend `early_career` with `feeds:`** over a new top-level `github_boards:` block — backwards compatible, no migration, `kinds` keeps naming the built-ins. A feed is a bare string (built-in name or raw URL) or `{name, url}`; feeds are named `<owner>/<repo>` so they read cleanly in logs and the cache fingerprint. **No per-feed field mapping**: SimplifyJobs' `listings.json` is the de-facto schema (vansh is a fork) and every field was already read via `.get()`, so a URL alone suffices. Kept **one source** rather than one-source-per-feed (which would get per-feed error isolation free from `discover()`) so ranking stays **global** across feeds and `max_resolve` stays a whole-run budget — per-feed sources would have silently multiplied Claude cost per board added (Guideline #7). A bad feed therefore **fails loudly** naming the feed and the fix, rather than silently shrinking results (UI Principle #5); `discover()` still isolates the source so the run continues. Web UI gained the feeds field — without it `readDiscForm` would have **silently wiped** `feeds` on every save. Verified live: a dropped-in `vanshb03/New-Grad-2026` URL flowed config → discovery → full-JD Postings, 0 errors | Accepted |
 | 072 | 2026-07-15 | **LinkedIn job alerts as a discovery source, ingested by email forwarding into the already-linked bot inbox.** LinkedIn has no compliant live-link (API is partner-gated; scraping `linkedin.com/jobs/view` is robots-disallowed — Guideline #4, same conclusion `linkedin.py` already reached for profile data), but the alert emails LinkedIn sends *to the user* are the user's own data and carry the lead: company + title + location. Ingest path: a Gmail filter in the user's personal account forwards `jobalerts-noreply@linkedin.com` to the bot inbox (the address linked in `profile/mailbox.yaml`), which `mailbox.py` already reads — so **no new auth, no second link slot, and the personal inbox is never exposed to the bot**. Rejected: OAuth read-only on the personal account (needs a ~10min Google Cloud setup, and still grants the bot standing access to a personal inbox) and an IMAP app-password on it (2min but grants full read/write/delete on personal mail — fails Guideline #5 least-privilege). Alerts yield **leads, not applyable postings** (the email links to `linkedin.com/comm/jobs/view/<id>`, which redirects to LinkedIn — not an ATS — so `bridge_aggregator_postings` dead-ends and the body is a card snippet with no JD). Staged build: **(A)** `LinkedInAlertSource` parses alerts → `Posting(ats="linkedin_alert", auto_applyable=False)` leads, shaped on `AdzunaSource`; **(B)** a company→ATS-board resolver (does not exist today) matches each lead to the employer's public Greenhouse/Lever/Ashby board for a full JD + fillable apply URL, so leads reach Apply and the pipeline stays fully automated (Guideline #0) — A alone would add a human triage step and is a stepping stone only | Accepted |
@@ -3435,3 +3436,48 @@ title-only body and still flows — it does not kill the run (Guideline #7).
 0 errors including a **Workday** posting (Northrop Grumman, 5,521-char real JD) and a
 SmartRecruiters posting (2,382 chars). Both clear `_is_fillable` and route correctly
 (`workday` → `apply_workday`, `smartrecruiters` → generic). Nothing was submitted (Guideline #3).
+
+---
+
+## 075 — Mailbox secrets never render; the env-vs-link test pins an unlinked path
+
+**Context.** `test_load_config_needs_all_three` failed on the developer's machine while passing in
+CI, and its failure output printed the user's **real Gmail app-password**.
+
+**Root cause — two independent bugs.**
+
+1. **The test was environment-dependent.** `load_config` prefers a stored **link** over the
+   environment (decision 057) and defaults to `path=profile/mailbox.yaml`. The test passed an
+   `env` dict but no `path`/`backend`, so on any machine with a linked mailbox `load_link` read
+   the real file + keychain and returned the live config — never reaching the env dict. It passed
+   only on an unlinked box.
+2. **Any repr of a `MailboxConfig` leaked a live credential.** The failing assert printed the
+   config; the same would happen in any traceback or log line. Bug (1) is what fired it, but (2)
+   is the actual exposure and would recur on the next failure that prints a config.
+
+**Not a product bug.** Link-over-env precedence is the intended, documented behaviour (057/065).
+Only the test and the model's rendering were wrong.
+
+**Decisions.**
+
+| | Choice |
+|---|---|
+| Test isolation | Pass `backend=_FakeKeyring(), path=_link_path()` — the idiom the rest of `test_mailbox.py` already used and which this one test predated (it sits above the helpers). No new fixture invented. |
+| Secret rendering | `password` / `refresh_token` / `client_secret` → `field(repr=False)` on the dataclass. |
+| Rejected | Fixing only the test: closes the one known leak path and leaves the exposure live for every other failure that prints a config. |
+
+**Scope of the repr change.** Values stay fully usable in code and `dataclasses.asdict()` is
+unaffected — they simply never appear in `repr`/`str`. Non-secret fields still render, so repr
+stays useful for debugging. `link_status()` remains the safe, explicit view (it already asserted
+`"password" not in st`). Behaviour change flagged and approved (Guideline #7): debug output no
+longer shows those three values.
+
+**Verified.** `test_config_repr_never_prints_secrets` guards all three fields against a future
+edit silently undoing the masking, and asserts the values still work. The isolation fix was
+**mutation-checked**: with `_env_config` stubbed to drop the all-three requirement, the test still
+fails — so it was isolated, not neutered. Suite **351/351 green** (was 349 passed / 1 failed, this
+being the pre-existing failure).
+
+**Related.** The bot-inbox address was scrubbed from `DECISIONS.md`/`NEXT_STEPS.md` before the
+069–074 commit: it was not present in HEAD, and it is contact detail that must not enter git
+(Guideline #12) — the repo must carry no user's data.

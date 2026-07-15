@@ -32,10 +32,16 @@ def test_extract_empty():
     assert mailbox.extract_verification("no link, no code here") == ""
 
 
-def test_load_config_needs_all_three(monkeypatch):
-    assert mailbox.load_config({"MAILBOX_IMAP_HOST": "imap.x.com"}) is None
+def test_load_config_needs_all_three():
+    # Must pin an unlinked path + fake keychain: load_config prefers a stored link over env
+    # (decision 057), so on the default path this reads the developer's REAL profile/mailbox.yaml
+    # and returns their live config — failing the assert and printing their app-password in the
+    # pytest diff. The env dict is only reached when nothing is linked.
+    kr, p = _FakeKeyring(), _link_path()
+    assert mailbox.load_config({"MAILBOX_IMAP_HOST": "imap.x.com"}, backend=kr, path=p) is None
     cfg = mailbox.load_config({"MAILBOX_IMAP_HOST": "imap.x.com", "MAILBOX_EMAIL": "bot@x.com",
-                               "MAILBOX_PASSWORD": "pw", "MAILBOX_IMAP_PORT": "1993"})
+                               "MAILBOX_PASSWORD": "pw", "MAILBOX_IMAP_PORT": "1993"},
+                              backend=kr, path=p)
     assert cfg and cfg.host == "imap.x.com" and cfg.email == "bot@x.com" and cfg.port == 1993
 
 
@@ -126,6 +132,20 @@ def _link_path():
     import tempfile
     from pathlib import Path
     return Path(tempfile.mkdtemp()) / "mailbox.yaml"
+
+
+def test_config_repr_never_prints_secrets():
+    """A traceback / log / pytest diff carrying a config must not leak a live credential
+    (decision 075) — the real leak this guards: a failing assert printed a real app-password."""
+    cfg = MailboxConfig(host="imap.gmail.com", email="bot@x.com", password="app-pw-123",
+                        port=993, source="linked", auth="oauth",
+                        refresh_token="rt-secret", client_id="cid.apps", client_secret="cs-secret")
+    for secret in ("app-pw-123", "rt-secret", "cs-secret"):
+        assert secret not in repr(cfg) and secret not in str(cfg)
+    # non-secret fields still render (repr stays useful for debugging), and the values still work
+    assert "imap.gmail.com" in repr(cfg) and "bot@x.com" in repr(cfg) and "cid.apps" in repr(cfg)
+    assert cfg.password == "app-pw-123" and cfg.refresh_token == "rt-secret"
+    assert cfg.client_secret == "cs-secret"
 
 
 def test_suggest_host_from_domain():
