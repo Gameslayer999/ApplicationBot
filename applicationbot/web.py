@@ -171,6 +171,9 @@ def _test_worker(force_fresh: bool = False) -> None:
 
 
 def start_test_run(force_fresh: bool = False) -> dict:
+    if _loop_running():
+        return {"ok": False, "error": "The auto-apply loop is running (it owns the browser). "
+                "Stop the loop first, or use its Apply buttons."}
     with _TEST_LOCK:
         if _TEST_STATE.get("phase") == "running":
             return {"ok": False, "error": "A test run is already in progress."}
@@ -269,6 +272,9 @@ def _reapply_worker(app_id: int, *, arm: bool = False) -> None:
 
 
 def start_reapply(app_id: int, *, arm: bool = False) -> dict:
+    if _loop_running():
+        return {"ok": False, "error": "The auto-apply loop is running (it owns the browser). "
+                "Use its Apply buttons, or stop the loop first."}
     with _TEST_LOCK:
         if _TEST_STATE.get("phase") == "running":
             return {"ok": False, "error": "A run is already in progress — let it finish first."}
@@ -277,6 +283,226 @@ def start_reapply(app_id: int, *, arm: bool = False) -> dict:
     threading.Thread(target=_reapply_worker, kwargs={"app_id": app_id, "arm": arm},
                      daemon=True).start()
     return {"ok": True}
+
+
+# --------------------------------------------------------------------------- auto-apply loop
+# The "prepare-then-prompt" mode (decision 069): discover as many matches as possible, prepare
+# each cleared one (tailor → PDF → headless dry-run fill) into a "Ready to apply" queue, and let
+# the user submit each with one click. The loop core lives in autoloop.py (pure, tested); this is
+# the web glue — one worker thread that OWNS the single browser slot for its lifetime, so the
+# test-run / re-apply buttons are refused while it runs (they'd fight for the browser). User
+# Apply clicks are enqueued and drained by the loop thread itself, keeping everything serialized.
+
+_LOOP_LOCK = threading.Lock()
+_LOOP_STATE: dict = {"running": False, "phase": "idle", "message": "", "prepared": 0,
+                     "ready_ids": [], "current": None}
+_LOOP_STOP = threading.Event()
+_LOOP_SUBMITS: list[int] = []  # app-ids the user clicked "Apply" on, awaiting the loop thread
+
+
+def _loop_reset() -> dict:
+    return {"running": True, "phase": "starting", "message": "Starting…",
+            "prepared": 0, "ready_ids": [], "current": None}
+
+
+def _loop_set(**kw) -> None:
+    with _LOOP_LOCK:
+        _LOOP_STATE.update(kw)
+
+
+def _loop_running() -> bool:
+    with _LOOP_LOCK:
+        return bool(_LOOP_STATE.get("running"))
+
+
+def _loop_submit(app_id: int) -> None:
+    """Armed one-shot submit of one prepared application, headless, on the loop thread. Reuses
+    the per-click armed SafetyGate (decision 058): armed for exactly one submission, independent
+    of profile/safety.yaml, still halted by the KILL file and the pre-submit required-field gate.
+    A block/unconfirmed records that outcome — never a silent submit."""
+    from . import backends
+    from .apply import AnswerResolver, run_apply
+
+    app = tracker.get_application(app_id)
+    if not app:
+        _loop_set(message="That application is no longer in the tracker.")
+        return
+    url = (app.get("source_url") or "").strip()
+    pdf = (app.get("resume_path") or "").strip()
+    company, role = app.get("company", ""), app.get("role", "")
+    who = f"{company} — {role}".strip(" —")
+    if not url or not pdf or not Path(pdf).is_file():
+        _loop_set(message=f"Can't submit {who}: its URL or tailored PDF is missing.")
+        return
+    _loop_set(phase="submitting", current={"company": company, "role": role, "fit": app.get("fit_score")},
+              message=f"Submitting to {who}…")
+    resolver = AnswerResolver(
+        resume=load_resume("profile/resume.yaml"),
+        profile=apply_profile.load_profile(),
+        enable_generation=backends.claude_code_available(),
+    )
+    report = run_apply(
+        url, pdf, resolver, headed=False, pause=False,
+        meta={"company": company, "role": role, "source_url": url,
+              "fit_score": app.get("fit_score") or None},
+        gate=_reapply_gate(True))
+    if report.submitted and report.submit_state == "submitted":
+        _loop_set(message=f"Submitted to {who} — {report.confirmation or 'confirmation seen'}.")
+    elif report.submit_state in ("unconfirmed", "blocked"):
+        _loop_set(message=(f"{who}: not submitted ({report.submit_state}) — "
+                           + (report.confirmation or "; ".join(report.blockers) or "see the tracker")))
+    else:
+        _loop_set(message=f"{who}: filled but not submitted (the arm did not take).")
+    # Drop it from the ready list whatever the outcome — a submitted row is no longer 'dry-run',
+    # and a re-blocked one moves to the parked panel; either way it shouldn't sit in "ready".
+    with _LOOP_LOCK:
+        if app_id in _LOOP_STATE["ready_ids"]:
+            _LOOP_STATE["ready_ids"].remove(app_id)
+
+
+def _loop_take_submits() -> list[int]:
+    with _LOOP_LOCK:
+        ids = list(_LOOP_SUBMITS)
+        _LOOP_SUBMITS.clear()
+    return ids
+
+
+def _loop_worker(rescan: bool = False, force_retailor: bool = False) -> None:
+    from . import autoloop, backends, pipeline
+    from .filters import load_filters
+    from .runner import cleared_queue
+
+    try:
+        resume = load_resume("profile/resume.yaml")
+        filters = load_filters()
+        try:
+            profile = apply_profile.load_profile()
+        except Exception:
+            profile = None
+
+        if not backends.claude_code_available():
+            _loop_set(running=False, phase="error", message=(
+                "Sign in to Claude first — the loop needs the fit judge and won't auto-apply on "
+                "keyword rank alone. Run `claude` in a terminal, then /login."))
+            return
+        if not filters.boards and not (filters.adzuna.app_id or os.environ.get("ADZUNA_APP_ID")):
+            _loop_set(running=False, phase="error", message=(
+                "No target boards in Discovery settings. Add boards, then start the loop."))
+            return
+
+        min_fit, _ = pipeline.effective_min_fit(filters)
+
+        # rescan (user opt-in): re-prepare postings that were already scored, REUSING their
+        # cached fit scores (decision 037) — no board re-search, no Claude re-judge (a fit
+        # score rarely changes between runs). Computed once up front from the freshest
+        # snapshot; served as a single bounded batch so it re-prepares the set once, then
+        # reports caught-up. If nothing is cached, bail with an actionable message rather than
+        # silently doing nothing (UI principle #3).
+        rescan_pool: list = []
+        if rescan:
+            rescan_pool = cleared_queue(
+                pipeline.cached_matches(resume, filters, profile=profile), min_fit)
+            if not rescan_pool:
+                _loop_set(running=False, phase="caught_up", current=None, message=(
+                    "Nothing recently scored to re-prepare. Start a normal auto-apply loop "
+                    "first (it scores and caches matches); then re-check to re-prepare them "
+                    "without re-scoring, while the cache is fresh."))
+                return
+
+        served = {"done": False}
+
+        def discover_batch():
+            if rescan:
+                # One-shot: serve the pre-scored pool once, then empty ⇒ caught up.
+                if served["done"]:
+                    return []
+                served["done"] = True
+                return rescan_pool
+            # only_new=True (decision 053/056): each search returns ONLY postings not judged
+            # before, so no posting is ever re-judged — the loop spends judge tokens only on
+            # genuinely new openings and stops when nothing new remains (user's token cap).
+            res = pipeline.discover_and_match(resume, filters, profile=profile,
+                                              use_claude=True, only_new=True)
+            for e in res.errors:
+                _loop_set(message=f"discovery note: {e}")
+            return cleared_queue(res.matches, min_fit)
+
+        def prepare_one(m):
+            p = m.posting
+            _loop_set(phase="preparing",
+                      current={"company": p.company, "role": p.title, "fit": m.fit_score},
+                      message=f"Preparing {p.company} — {p.title} (fit {m.fit_score})…")
+            # Dry-run prepare (gate=None): run_testing_mode reuses the already-tailored PDF when
+            # the résumé/profile haven't changed (stamp match) — re-fill only, no Claude
+            # re-tailor. This is what makes a rescan of unchanged postings spend zero tokens.
+            # force_retailor overrides that to regenerate the résumé anyway (the escape hatch).
+            pipeline.run_testing_mode(
+                resume, m, "profile/resume.yaml", apply_profile.DEFAULT_PATH,
+                backend="auto", headed=False, slow_mo=0, pause=False, gate=None,
+                force_retailor=force_retailor)
+            row = tracker.find_by_source_url(p.url)
+            with _LOOP_LOCK:
+                _LOOP_STATE["prepared"] += 1
+                # A clean dry-run row is "ready to apply"; a blocked one goes to the parked
+                # panel instead (parking.py), so it never shows as ready.
+                if row and row.get("status") == "dry-run" and row["id"] not in _LOOP_STATE["ready_ids"]:
+                    _LOOP_STATE["ready_ids"].append(row["id"])
+
+        def on_event(kind, payload=None):
+            if kind == "searching":
+                _loop_set(phase="searching", current=None,
+                          message="Searching every board for new matches…")
+            elif kind == "caught_up":
+                _loop_set(phase="caught_up",
+                          message="Caught up — no new matches to prepare.")
+
+        reason = autoloop.auto_apply_loop(
+            discover_batch, prepare_one, _loop_take_submits, _loop_submit,
+            _LOOP_STOP.is_set, on_event=on_event)
+
+        with _LOOP_LOCK:
+            ready_n = len(_LOOP_STATE["ready_ids"])
+        if reason == "caught_up":
+            _loop_set(running=False, phase="caught_up", current=None, message=(
+                f"Caught up — no new matches. {ready_n} application(s) ready for you to apply. "
+                "Start the loop again later to re-search."))
+        else:
+            _loop_set(running=False, phase="stopped", current=None,
+                      message=f"Loop stopped. {ready_n} application(s) ready for you to apply.")
+    except Exception as e:
+        _loop_set(running=False, phase="error", message=f"{type(e).__name__}: {e}")
+
+
+def start_loop(rescan: bool = False, force_retailor: bool = False) -> dict:
+    with _LOOP_LOCK:
+        if _LOOP_STATE.get("running"):
+            return {"ok": False, "error": "The auto-apply loop is already running."}
+        _LOOP_STOP.clear()
+        _LOOP_SUBMITS.clear()
+        _LOOP_STATE.clear()
+        _LOOP_STATE.update(_loop_reset())
+    threading.Thread(target=_loop_worker, args=(rescan, force_retailor), daemon=True).start()
+    return {"ok": True}
+
+
+def stop_loop() -> dict:
+    if not _loop_running():
+        return {"ok": True, "already": True}
+    _LOOP_STOP.set()
+    _loop_set(message="Stopping after the current step finishes…")
+    return {"ok": True}
+
+
+def queue_submit(app_id: int) -> dict:
+    """Apply to one prepared application. While the loop runs, enqueue it for the loop thread
+    (which owns the browser); otherwise submit directly via the per-click armed re-apply."""
+    with _LOOP_LOCK:
+        running = bool(_LOOP_STATE.get("running"))
+        if running and app_id not in _LOOP_SUBMITS:
+            _LOOP_SUBMITS.append(app_id)
+    if running:
+        return {"ok": True, "queued": True}
+    return start_reapply(app_id, arm=True)
 
 
 def list_resumes() -> list[dict[str, str]]:
@@ -526,6 +752,23 @@ class Handler(BaseHTTPRequestHandler):
             with _TEST_LOCK:
                 self._json(200, dict(_TEST_STATE))
             return
+        if path == "/loop/status":
+            # Auto-apply loop state + the "Ready to apply" list (decision 069). The ready list
+            # is resolved live from the tracker so a row that has since been submitted (status
+            # left 'dry-run') or edited drops out automatically.
+            with _LOOP_LOCK:
+                st = dict(_LOOP_STATE)
+                ready_ids = list(st.pop("ready_ids", []))
+            ready = []
+            for aid in ready_ids:
+                a = tracker.get_application(aid)
+                if a and a.get("status") == "dry-run":
+                    ready.append({"id": aid, "company": a["company"], "role": a["role"],
+                                  "fit": a.get("fit_score"), "portal": a["portal"],
+                                  "url": a["source_url"]})
+            st["ready"] = ready
+            self._json(200, st)
+            return
         if path != "/":
             self._json(404, {"error": "not found"})
             return
@@ -685,6 +928,16 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/test-run/close":
                 _TEST_HOLD.set()  # release the review hold so the browser closes
                 self._json(200, {"ok": True})
+            elif path == "/loop/start":
+                p = json.loads(raw or b"{}")
+                self._json(200, start_loop(bool(p.get("rescan")), bool(p.get("retailor"))))
+            elif path == "/loop/stop":
+                self._json(200, stop_loop())
+            elif path == "/loop/apply":
+                # Apply to one prepared application. Cross-origin already rejected by the
+                # do_POST origin guard (decision 062) — an armed submit is doubly safe there.
+                p = json.loads(raw or b"{}")
+                self._json(200, queue_submit(int(p["id"])))
             else:
                 self._json(404, {"error": "not found"})
         except Exception as e:  # surface a readable message to the UI
@@ -1014,7 +1267,7 @@ INDEX_HTML = """<!doctype html>
   .tjmeta { font-size:12px; color:var(--muted); margin-top:3px; word-break:break-all; }
   .tjwhy { font-size:12.5px; margin-top:4px; line-height:1.45; }
   .tjmiss { font-size:12px; color:var(--warn); margin-top:3px; }
-  #parked-panel { border-left:4px solid var(--warn-line); }
+  #parked-panel { border-left:4px solid var(--warn-line); padding-left:18px; }
   .pkcard { border:1px solid var(--line); border-radius:6px; padding:10px 12px; margin-bottom:8px; background:var(--surface)df6; }
   .pk-head { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
   .pk-title { font-weight:700; font-size:14px; }
@@ -1025,6 +1278,20 @@ INDEX_HTML = """<!doctype html>
   .pk-submit { background:#b3261e; border-color:#b3261e; color:#fff; }
   .pk-submit:hover { background:#8f1e18; border-color:#8f1e18; }
   .pk-note { font-size:12.5px; color:var(--muted); }
+  /* Auto-apply loop (decision 069) */
+  #loop-panel { border-left:4px solid var(--accent); padding-left:18px; }
+  #loop-stop { width:auto; margin:0; background:var(--btn-dark); border-color:var(--btn-dark); color:#fff; }
+  .loopstat { margin-top:12px; padding:10px 12px; border:1px solid var(--line); border-radius:8px;
+              background:var(--surface-2); font-size:13px; display:flex; align-items:center; gap:9px; line-height:1.4; }
+  .loopstat.err { border-color:var(--bad); color:var(--bad); }
+  .loopstat .lp-count { margin-left:auto; font-weight:700; color:var(--muted); white-space:nowrap; }
+  .loop-ready-head { font-weight:700; font-size:13.5px; margin:16px 0 8px; }
+  .loop-apply { width:auto; margin:0; background:#b3261e; border-color:#b3261e; color:#fff; }
+  .loop-apply:hover { background:#8f1e18; border-color:#8f1e18; }
+  .loop-apply:disabled { opacity:.6; }
+  .loop-rescan { display:flex; gap:8px; align-items:flex-start; margin-top:10px; font-size:12.5px;
+                 color:var(--muted); line-height:1.4; max-width:560px; }
+  .loop-rescan input { width:auto; margin:2px 0 0; flex:0 0 auto; }
 </style>
 </head>
 <body>
@@ -1045,6 +1312,31 @@ INDEX_HTML = """<!doctype html>
 
   <main>
     <div id="view-discover" class="hidden">
+      <div class="editor" id="loop-panel">
+        <h3 style="margin-top:0">Auto-apply loop</h3>
+        <p class="editing">Find as many matches as possible and prepare each one — tailor your
+          résumé, export the PDF, and fill the application (a <b>dry-run</b> in the background,
+          never submitted). Prepared applications stack up below as <b>Ready to apply</b>; click
+          <b>Apply&nbsp;▶</b> on any one and the bot submits just that application for you
+          (irreversible — it confirms first). The loop only re-searches once it has worked through
+          everything it already found, so it doesn't burn Claude usage re-judging the same
+          postings. Stop it any time.</p>
+        <div class="saverow">
+          <button id="loop-start" type="button">▶ Start auto-apply loop</button>
+          <button id="loop-stop" type="button" class="hidden">■ Stop loop</button>
+          <span id="loop-msg" class="msg"></span>
+        </div>
+        <label class="loop-rescan"><input type="checkbox" id="loop-rescan">
+          Re-prepare postings I've already seen — re-fills every match from the last search
+          (not just new openings), reusing each one's cached fit score so it doesn't re-score,
+          and reusing its already-tailored résumé unless your résumé or profile changed since.
+          Spends no Claude usage when nothing changed.</label>
+        <label class="loop-rescan"><input type="checkbox" id="loop-retailor">
+          Re-tailor from scratch — regenerate each résumé with Claude even when nothing changed,
+          instead of reusing the last tailored PDF (spends Claude usage on every posting).</label>
+        <div id="loop-status" class="loopstat hidden"></div>
+        <div id="loop-ready"></div>
+      </div>
       <div class="editor" id="parked-panel" style="display:none">
         <h3 style="margin-top:0">Applications waiting on you</h3>
         <p class="editing">These were filled but couldn't finish on their own — each needs one
@@ -1455,7 +1747,7 @@ document.querySelectorAll(".tab").forEach(t => t.addEventListener("click", () =>
   $("view-track").classList.toggle("hidden", v !== "track");
   if (v === "profile") loadProfile();
   if (v === "track") loadTrack();
-  if (v === "discover") { loadParked(); loadSources(); loadFitInsights(); loadDisc(); pollTest(); }
+  if (v === "discover") { pollLoop(); loadParked(); loadSources(); loadFitInsights(); loadDisc(); pollTest(); }
 }));
 $("resume").addEventListener("change", () => { if (!$("view-profile").classList.contains("hidden")) loadProfile(); });
 
@@ -1582,6 +1874,108 @@ async function pollTest() {
   if (running || filled) { clearTimeout(TEST_TIMER); TEST_TIMER = setTimeout(pollTest, 1200); }
   else { btnDone(btn); }
 }
+
+// ---- Discover: auto-apply loop (decision 069) --------------------------------
+// Poll /loop/status while the loop runs. The loop owns the browser, so preparation runs in the
+// background (no window pops up); each prepared application appears as a "Ready to apply" card
+// with an Apply ▶ button that submits just that one (armed, one-shot, confirmed first).
+let LOOP_TIMER = null;
+async function pollLoop() {
+  if (LOOP_TIMER) { clearTimeout(LOOP_TIMER); LOOP_TIMER = null; }
+  let s;
+  try { s = await (await fetch("/loop/status")).json(); }
+  catch (e) { return; }
+  renderLoop(s);
+  if (s.running) LOOP_TIMER = setTimeout(pollLoop, 2000);
+}
+
+function renderLoop(s) {
+  const start = $("loop-start"), stop = $("loop-stop"), status = $("loop-status"), ready = $("loop-ready");
+  const running = !!s.running;
+  start.classList.toggle("hidden", running);
+  stop.classList.toggle("hidden", !running);
+  $("loop-rescan").disabled = running;
+  $("loop-retailor").disabled = running;
+  if (running || (s.message && s.phase !== "idle")) {
+    status.classList.remove("hidden");
+    status.className = "loopstat" + (s.phase === "error" ? " err" : "");
+    status.innerHTML = "";
+    if (running && s.phase !== "caught_up") status.appendChild(el("span", {class:"spin"}));
+    status.appendChild(el("span", {text: s.message || (running ? "Working…" : "")}));
+    if (s.prepared) status.appendChild(el("span", {class:"lp-count", text: s.prepared + " prepared"}));
+  } else {
+    status.classList.add("hidden");
+  }
+  const list = (s && s.ready) || [];
+  ready.innerHTML = "";
+  if (list.length) {
+    ready.appendChild(el("div", {class:"loop-ready-head", text:"Ready to apply (" + list.length + ")"}));
+    list.forEach(a => ready.appendChild(loopReadyCard(a)));
+  }
+}
+
+function loopReadyCard(a) {
+  const title = (a.company || "—") + (a.role ? " — " + a.role : "");
+  const tags = [];
+  if (a.fit != null) tags.push("fit " + a.fit);
+  if (a.portal) tags.push(a.portal);
+  const head = el("div", {class:"pk-head"}, [
+    el("span", {class:"pk-title", text:title}),
+    tags.length ? el("span", {class:"pk-tag", text:tags.join(" · ")}) : null]);
+  const apply = el("button", {class:"loop-apply", type:"button", text:"Apply ▶",
+    title:"Submit this one application (irreversible) — confirms first",
+    on:{click:(ev)=>applyReady(a.id, ev.target, title)}});
+  return el("div", {class:"pkcard"}, [head, el("div", {class:"pk-actions"}, [apply])]);
+}
+
+// Submit one prepared application. While the loop runs it's queued for the loop thread (which owns
+// the browser); if the loop is idle it falls back to the per-click armed re-apply, which drives the
+// shared test-progress panel below. Always confirms first (irreversible).
+async function applyReady(id, btn, who) {
+  const ok = confirm("Really SUBMIT this application" + (who ? " to " + who : "") + "?\\n\\n"
+    + "This is a real, irreversible submission. The bot fills the form and clicks Submit; the "
+    + "pre-submit check still stops it if a required field is unanswered.");
+  if (!ok) return;
+  const label = btn ? btn.textContent : "";
+  if (btn) { btn.disabled = true; btn.textContent = "Submitting…"; }
+  const msg = $("loop-msg"); msg.className = "msg"; msg.textContent = "";
+  try {
+    const r = await (await fetch("/loop/apply", {method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ id })})).json();
+    if (!r.ok) {
+      if (btn) { btn.disabled = false; btn.textContent = label; }
+      msg.className = "msg err"; msg.textContent = r.error || "Could not submit.";
+      return;
+    }
+    if (r.queued) { if (btn) btn.textContent = "Queued…"; }
+    else { pollTest(); }  // loop idle → start_reapply drives the shared progress panel
+    pollLoop();
+  } catch (e) {
+    if (btn) { btn.disabled = false; btn.textContent = label; }
+    msg.className = "msg err"; msg.textContent = String(e.message || e);
+  }
+}
+
+$("loop-start").addEventListener("click", async () => {
+  const btn = $("loop-start"), msg = $("loop-msg");
+  msg.className = "msg"; msg.textContent = "";
+  btnBusy(btn, "Starting…");
+  try {
+    const rescan = $("loop-rescan").checked, retailor = $("loop-retailor").checked;
+    const r = await (await fetch("/loop/start", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({rescan, retailor})})).json();
+    btnDone(btn);
+    if (!r.ok) { msg.className = "msg err"; msg.textContent = r.error || "Could not start."; return; }
+    pollLoop();
+  } catch (e) { btnDone(btn); msg.className = "msg err"; msg.textContent = String(e.message || e); }
+});
+
+$("loop-stop").addEventListener("click", async () => {
+  const btn = $("loop-stop"); btnBusy(btn, "Stopping…");
+  try { await fetch("/loop/stop", {method:"POST", headers:{"Content-Type":"application/json"}, body:"{}"}); }
+  catch (e) {}
+  btnDone(btn);
+  pollLoop();
+});
 
 // ---- Discover: applications parked on a user-resolvable block (park & resume) ----
 async function loadParked() {
@@ -2527,11 +2921,14 @@ function renderDiscForm(f, levels) {
   const kindBox = (v,label) => { const i = mkChk(null, kinds.includes(v)); i.dataset.eck = v; return el("label", {class:"chkrow"}, [i, " " + label]); };
   form.appendChild(el("div", {class:"sec"}, [
     el("h4", {text:"Early-career feeds (new-grad & internships)"}),
-    el("div", {class:"editing", text:"Discover from community-curated SimplifyJobs lists of new-grad and internship roles — early-career by construction, no company list needed. Best when your target boards are senior-heavy. Only roles on ATSs we can fill (Greenhouse/Lever/Ashby) are used."}),
+    el("div", {class:"editing", text:"Discover from community-curated GitHub lists of new-grad and internship roles — early-career by construction, no company list needed. Best when your target boards are senior-heavy. Only roles on ATSs we can fill (Greenhouse/Lever/Ashby/Workday/SmartRecruiters) are used."}),
     chkRow("Enable early-career feeds", "ec_enabled", ec.enabled),
     el("label", {text:"Include"}),
     el("div", {class:"lvls"}, [kindBox("new-grad","new-grad"), kindBox("intern","internships")]),
     numFld("How many top-matching listings to pull full descriptions for (per run)", "ec_max_resolve", ec.max_resolve==null?40:ec.max_resolve),
+    area("Extra GitHub job boards (one raw listings.json URL per line; any repo using the SimplifyJobs schema)", "ec_feeds",
+         (ec.feeds||[]).map(x => typeof x === "string" ? x : x.url).join("\\n"),
+         "https://raw.githubusercontent.com/<owner>/<repo>/<branch>/.github/scripts/listings.json"),
   ]));
 
   const a = f.adzuna || {};
@@ -2579,6 +2976,7 @@ function collectDisc() {
       enabled: discChk("ec_enabled"),
       kinds: [...document.querySelectorAll("#disc-form [data-eck]")].filter(c => c.checked).map(c => c.dataset.eck),
       max_resolve: discInt("ec_max_resolve", 40),
+      feeds: linesOf(discVal("ec_feeds")),
     },
   };
 }

@@ -29,12 +29,19 @@ from pathlib import Path
 from typing import Optional
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 import os
 
 from .apply_profile import ApplicationProfile
-from .discovery import AdzunaSource, CareerSiteSource, CuratedListSource, Source, build_source
+from .discovery import (
+    _BUILTIN_FEEDS,
+    AdzunaSource,
+    CareerSiteSource,
+    CuratedListSource,
+    Source,
+    build_source,
+)
 from .models import Resume
 
 DEFAULT_PATH = "profile/discovery.yaml"
@@ -61,13 +68,48 @@ class AdzunaConfig(BaseModel):
     max_pages: int = 1  # 50 results/page; raise for more breadth
 
 
+class FeedSpec(BaseModel):
+    """One GitHub job board. Written in YAML as either a bare string — a built-in name
+    ("new-grad") or a raw listings.json URL — or as an explicit {name, url} pair."""
+
+    name: str = ""
+    url: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce(cls, v):
+        if not isinstance(v, str):
+            return v
+        s = v.strip()
+        if not s.startswith(("http://", "https://")):
+            return {"name": s, "url": _BUILTIN_FEEDS.get(s, "")}
+        # Name a dropped-in feed after its repo, so it reads as "vanshb03/New-Grad-2026" in
+        # logs and the discovery-cache fingerprint rather than a 100-char URL.
+        m = re.search(r"githubusercontent\.com/([^/]+)/([^/]+)/", s)
+        return {"name": f"{m.group(1)}/{m.group(2)}" if m else s, "url": s}
+
+
 class EarlyCareerConfig(BaseModel):
-    """Discover from community new-grad/internship JSON feeds (SimplifyJobs) — early-career by
-    construction, no company list needed. Off by default (DECISIONS.md #031)."""
+    """Discover from community new-grad/internship JSON feeds — early-career by construction,
+    no company list needed. Off by default (DECISIONS.md #031). `feeds` accepts any GitHub repo
+    publishing the SimplifyJobs listings.json schema (DECISIONS.md #073)."""
 
     enabled: bool = False
     kinds: list[str] = Field(default_factory=lambda: ["new-grad", "intern"])  # new-grad | intern
     max_resolve: int = 40  # how many top title-relevant listings to resolve full JD for + judge
+    feeds: list[FeedSpec] = Field(default_factory=list)  # extra boards; built-in name or raw URL
+
+    @field_validator("feeds")
+    @classmethod
+    def _known(cls, v: list[FeedSpec]) -> list[FeedSpec]:
+        for f in v:
+            if not f.url:
+                raise ValueError(
+                    f"early_career.feeds: '{f.name}' is not a built-in feed "
+                    f"({', '.join(_BUILTIN_FEEDS)}). Use a built-in name, or give the raw "
+                    f"listings.json URL of a GitHub job board."
+                )
+        return v
 
 
 # Experience-level taxonomy (Configure/Discover gate). Each level maps to a regex matched
@@ -172,6 +214,7 @@ def build_sources(
         sources.append(CuratedListSource(
             resume, kinds=tuple(filters.early_career.kinds or ["new-grad", "intern"]),
             max_resolve=filters.early_career.max_resolve,
+            feeds={f.name: f.url for f in filters.early_career.feeds},
         ))
     return sources
 

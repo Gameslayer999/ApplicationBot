@@ -11,6 +11,11 @@
 
 | # | Date | Decision | Status |
 |---|------|----------|--------|
+| 074 | 2026-07-15 | **Resolve Workday (and SmartRecruiters) JDs in the curated feeds, unlocking +1,053 candidates the filter was discarding.** `_CURATED_ATS` gated curated listings to Greenhouse/Lever/Ashby — the only ATSs with a hand-written `_resolve_jd` helper. Measured against the live feeds, that discarded **755 active Workday** and **298 SmartRecruiters** postings *the Apply stage can already submit to* (`pipeline._is_fillable` explicitly allows `workday`; `workday.apply_workday` is a complete backend). The gate was never about fillability — it was about JD resolution. **Workday resolves with no new code**: it renders client-side but still ships schema.org JSON-LD in the initial HTML, so `enrich.fetch_full_jd` (the existing cascade from #047) returns a full JD on a plain GET — **10/10 live postings via the `json-ld` tier, no browser, no LLM call** (called without `llm=`, so it stops at the free tiers). Rejected Playwright (my initial assumption — the spike disproved it: unnecessary cost/fragility) and Workday's `/wday/cxs/` JSON API (works 15/15 but returns *less* text than the JSON-LD and needs a bespoke tenant/site URL rewrite). SmartRecruiters needed only a tuple entry — `_resolve_smartrecruiters_jd` already existed. Flagged: SmartRecruiters routes to **generic autofill** (`apply.detect_ats` doesn't know it — decision #030), which is less proven than the Workday backend. Verified live end-to-end: real config → `build_sources` → `discover` returned 6 postings / 0 errors including a **Workday** JD (Northrop Grumman, 5,521 chars) and a SmartRecruiters JD, all clearing `_is_fillable` and routing to the right backend | Accepted |
+| 073 | 2026-07-15 | **Any GitHub repo job board is drop-in config, not code** (`early_career.feeds`). The curated source hard-coded two SimplifyJobs URLs. Investigated adding more repos and **measured the marginal yield first**: the two live `vanshb03` boards add only **103 new fillable postings** over Simplify's 1,093 (8 overlap) — while `max_resolve` truncates the pool to 40, so more repos ≈ **zero** real gain. Conclusion recorded: **the funnel neck (40 of 1,130), not feed count, is the binding constraint** — so the value here is optionality (drop in a board when one matters), not breadth, and no extra repos ship enabled by default. Chose to **extend `early_career` with `feeds:`** over a new top-level `github_boards:` block — backwards compatible, no migration, `kinds` keeps naming the built-ins. A feed is a bare string (built-in name or raw URL) or `{name, url}`; feeds are named `<owner>/<repo>` so they read cleanly in logs and the cache fingerprint. **No per-feed field mapping**: SimplifyJobs' `listings.json` is the de-facto schema (vansh is a fork) and every field was already read via `.get()`, so a URL alone suffices. Kept **one source** rather than one-source-per-feed (which would get per-feed error isolation free from `discover()`) so ranking stays **global** across feeds and `max_resolve` stays a whole-run budget — per-feed sources would have silently multiplied Claude cost per board added (Guideline #7). A bad feed therefore **fails loudly** naming the feed and the fix, rather than silently shrinking results (UI Principle #5); `discover()` still isolates the source so the run continues. Web UI gained the feeds field — without it `readDiscForm` would have **silently wiped** `feeds` on every save. Verified live: a dropped-in `vanshb03/New-Grad-2026` URL flowed config → discovery → full-JD Postings, 0 errors | Accepted |
+| 072 | 2026-07-15 | **LinkedIn job alerts as a discovery source, ingested by email forwarding into the already-linked bot inbox.** LinkedIn has no compliant live-link (API is partner-gated; scraping `linkedin.com/jobs/view` is robots-disallowed — Guideline #4, same conclusion `linkedin.py` already reached for profile data), but the alert emails LinkedIn sends *to the user* are the user's own data and carry the lead: company + title + location. Ingest path: a Gmail filter in the user's personal account forwards `jobalerts-noreply@linkedin.com` to the bot inbox (the address linked in `profile/mailbox.yaml`), which `mailbox.py` already reads — so **no new auth, no second link slot, and the personal inbox is never exposed to the bot**. Rejected: OAuth read-only on the personal account (needs a ~10min Google Cloud setup, and still grants the bot standing access to a personal inbox) and an IMAP app-password on it (2min but grants full read/write/delete on personal mail — fails Guideline #5 least-privilege). Alerts yield **leads, not applyable postings** (the email links to `linkedin.com/comm/jobs/view/<id>`, which redirects to LinkedIn — not an ATS — so `bridge_aggregator_postings` dead-ends and the body is a card snippet with no JD). Staged build: **(A)** `LinkedInAlertSource` parses alerts → `Posting(ats="linkedin_alert", auto_applyable=False)` leads, shaped on `AdzunaSource`; **(B)** a company→ATS-board resolver (does not exist today) matches each lead to the employer's public Greenhouse/Lever/Ashby board for a full JD + fillable apply URL, so leads reach Apply and the pipeline stays fully automated (Guideline #0) — A alone would add a human triage step and is a stepping stone only | Accepted |
+| 071 | 2026-07-14 | Draft short, optional **"Why &lt;Company&gt;?"** prompts. Ramp's Ashby form renders "Why Ramp?" as a short, OPTIONAL single-line `<input>`; it was left blank because `is_open_ended` needs either a textarea or a >25-char question containing an open-ended phrase, and the bare "Why Ramp?" matched none — nor any `_COMPANY_SPECIFIC` phrase, so it wasn't even recognized as company-specific. Fix (`answer_bank.py`): `is_company_specific` now also matches any prompt that simply opens with "why " (the company name is dynamic and can't be listed) → excluded from structured mapping + caching; and `is_open_ended` treats a company-specific prompt as draftable even when short/single-line. Net: "Why Ramp?" is now grounded-drafted (résumé + company + JD, weak model) whenever company/JD context exists (the pipeline sets both), and never cached. Refines decision 067 (which drafted such short fields only when REQUIRED). Behaviour change flagged (Guideline #7): an optional "Why <company>?" that used to be left for the user is now auto-drafted — the reported failure. Verified: live probe of the real Ramp form's fields + `tests/test_determinism_gates.py`/`test_required_draft.py` (gate + end-to-end draft/decline, updated required-draft contract) | Accepted |
+| 070 | 2026-07-14 | Fix SPA Apply-reveal timing: retry the "Apply" reveal-click inside the form-load poll loop instead of once before it. Ashby (and other JS-mounted ATS whose real form lives at a separate route, e.g. `<posting>/application`) mount the "Apply for this Job" control *after* domcontentloaded; the old one-shot pre-loop click fired before the button existed, never navigated, and the loop then watched an empty posting page until the 25s timeout — the exact "Application form did not load" failure on a Ramp/Ashby posting. Now the reveal-click retries each poll pass until the control appears (`revealed` latch prevents re-clicking once done). General fix, no ATS special-casing; behaviour preserved when a form is already rendered. `apply.py` `_open_application_form` only. Verified live against the reported Ramp Ashby URL (loads `/application`, 12 fields, no errors) + `tests/test_open_application_form.py` (2, fake-page regression: fails on old code with the exact 25s error, passes on the fix) | Accepted |
 | 068 | 2026-07-14 | Web UI revamp: left **nav rail** + design-token system with **dark mode**. The Review-only tailoring sidebar (résumé/engine/quality/length/Tailor) was permanently docked on the left of *every* tab — dead, confusing space on Discover/Profile/Track (a navigation bug). Now the left column is a persistent app **nav rail** (Review · Discover · Profile · Track, with icons + a Claude-status badge + theme toggle at the foot); the tailoring controls moved into the Review view as a compact top control bar (only shown where they apply). All colors migrated to CSS custom-property **tokens** with a full **light/dark** theme (`prefers-color-scheme` default + a persisted `data-theme` toggle stored in `localStorage`; `color-scheme` set so native selects/date-pickers/scrollbars follow). Pure presentation — **no server code, no element IDs, and no JS wiring changed** (Guideline #7); the only functional touch is a `.controls .ctrl.hidden` rule so the paste-a-posting toggle still hides. `web.py` INDEX_HTML only. Verified live via Playwright across all four tabs in both themes (console clean), the fixture/paste toggle both ways, and a full `rules`-engine tailor → render → PDF-button flow; `test_web_csrf.py` green | Accepted |
 | 001 | 2026-07-03 | Primary language: Python (polyglot later if needed) | Accepted |
 | 002 | 2026-07-03 | Resume model: structured source-of-truth + LLM tailoring | Accepted |
@@ -3045,3 +3050,388 @@ hardcoded hex in the JS moved to a semantic token — `#0b7a3b`→`--ok`, `#b21f
 auto-from-profile purple got a **new `--ai` token** (`#6a4bd0` light / `#a48bf0` dark). No raw
 hex remains in the JS. Verified via computed colors: pill dots resolve to the exact originals
 in light and adapt in dark (amber `#b8862f`, green `#4cc282`, purple `#a48bf0`).
+
+---
+
+## 069 — Auto-apply loop: prepare-then-prompt mode with a per-application Apply gate
+
+**Context.** The user asked for "the more autonomous looping mode: it should look for as
+many matches as possible, then get started on them one by one and prompt me as it needs me
+to start applying." Two runner modes already existed but neither matched: the dry-run
+runner (`runner.run_queue`, gate off) prepares everything and prompts nothing; the armed
+runner (gate on) submits everything up to a cap and prompts nothing. The ask is the
+**middle** mode — prepare each match (tailor → PDF → dry-run fill) and then wait for a
+per-application go-ahead before the real submit.
+
+**Options decided with the user (AskUserQuestion).**
+- **Prompt surface = the web UI queue** (not a terminal prompt or push notification):
+  prepared applications stack up as "Ready to apply" cards in the Discover tab; the loop
+  keeps preparing while the user decides.
+- **Apply action = auto-submit that one** (not "hand me the filled browser"): clicking
+  Apply arms a one-shot submit for just that application, reusing the per-click `SafetyGate`
+  from decision 058 (armed, cap 1, KILL-halted, pre-submit required-field gated).
+- **Breadth = search everything, and re-search ONLY when the current batch is drained**
+  (user's exact constraint: "we don't run through tokens"), plus **a Stop control** to halt
+  the loop while running.
+
+**Decision / implementation.**
+- **`autoloop.py` (new, pure, tested).** `auto_apply_loop(discover_batch, prepare_one,
+  take_submit_requests, submit_one, should_stop, on_event)` — the ordering brain, fully
+  injected (no browser/network/threading), returns `"stopped"` | `"caught_up"`. Each round:
+  drain the user's queued submits FIRST (they're waiting), then discover a batch, then
+  prepare each match — re-checking stop + new submit requests between every application, so
+  an Apply click is never blocked by more than one in-flight preparation.
+- **Token frugality by construction.** `discover_batch` calls
+  `pipeline.discover_and_match(only_new=True)` (decisions 053/056), so each search returns
+  only postings never judged before — no posting is ever re-judged, and when a search
+  returns nothing new the loop reaches `caught_up` and stops rather than re-searching into
+  the void. This is what satisfies the "don't burn tokens" requirement.
+- **Single browser, serialized.** The web server drives one browser at a time (the existing
+  `_TEST_STATE` slot). The loop worker OWNS that browser for its lifetime: preparation runs
+  headless in the background (no window pops up), and user Apply clicks are **enqueued**
+  (`_LOOP_SUBMITS`) and drained by the loop thread itself — never a second concurrent
+  browser. `start_test_run`/`start_reapply` are refused while the loop runs (they'd fight
+  for the browser). When the loop is idle, `queue_submit` falls back to the existing
+  per-click armed `start_reapply(arm=True)`.
+- **Web glue (`web.py`).** `_LOOP_STATE`/`_LOOP_LOCK`/`_LOOP_STOP`/`_LOOP_SUBMITS`;
+  `_loop_worker` (builds the four callables from `pipeline`/`runner`, refuses to start
+  without the Claude judge — never auto-applies on keyword rank alone, or without boards);
+  `_loop_prepare` records a `dry-run` tracker row and, if clean (not parked), adds its id to
+  the ready list; `_loop_submit` does the armed headless submit and drops the row from ready
+  whatever the outcome; `start_loop`/`stop_loop`/`queue_submit`. Routes: `GET /loop/status`
+  (state + a live-resolved ready list — a row since submitted or edited drops out
+  automatically), `POST /loop/start|stop|apply`, all under the decision-062 origin guard.
+- **UI (`INDEX_HTML`).** An "Auto-apply loop" panel at the top of the Discover tab: Start /
+  Stop, a live status line (shared `.spin` while working + phase message + prepared count),
+  and "Ready to apply" cards (company — role, fit · portal) each with a red **Apply ▶** that
+  `confirm()`s then submits just that one. Polls `/loop/status` every 2s while running; a
+  blocked preparation still routes to the existing parked panel (parking.py), so it never
+  shows as "ready".
+
+**Why this shape.** It reuses everything already proven — `run_testing_mode` for prepare,
+the decision-058 per-click armed gate for submit, `only_new` discovery for token frugality,
+the parked panel for blocked fills — and adds only a thin, pure ordering core plus web glue.
+Full automation stays gated (Guideline #3): nothing submits without an explicit per-app
+click, the KILL file and pre-submit gate still apply, and the default remains dry-run.
+
+**Verification.** `tests/test_autoloop.py` (6) — ordering, stop-mid-batch, submit draining,
+caught-up, events. `tests/test_autoloop_web.py` (5) — the real worker thread driven with
+fakes (no browser/Claude/network): prepares a batch, populates the ready queue, reaches
+`caught_up`, rejects a double start, routes `queue_submit` correctly. Served JS node-clean;
+`/loop/*` endpoints driven live on the running server. Suite 331 pass (the one pre-existing
+`test_mailbox` failure is environmental — the real linked inbox leaks into it — and predates
+this change). **Flagged live step (needs the user):** one real loop run — Claude signed in,
+boards configured — to watch discovery → prepare → a real Apply ▶ submit end-to-end. Not run
+here to avoid spending Claude usage / a live submission uninvited (Guideline #3, NEXT_STEPS
+token policy).
+
+**Follow-up (2026-07-14) — "re-prepare postings I've already seen" opt-in (reuse cached
+scores).** The token-frugal default (`only_new=True`) means once the loop has judged a
+posting it is never re-considered, so there was no way to re-run auto-apply over postings
+already dry-run (e.g. to re-tailor/re-fill after a résumé/PDF change). Added an opt-in
+checkbox on the loop panel that starts the loop with `rescan=True`
+(`start_loop(rescan)` → `_loop_worker(rescan)`).
+
+*First cut re-judged (rejected):* rescan via `discover_and_match(only_new=False)` would
+re-run the Claude fit judge on the whole set. The user's point — "there's not many reasons
+we'd get a different fit score the second time" — makes that pure token waste, and with
+`only_new=False` discovery also never empties (it would re-prepare forever without a manual
+one-shot guard). *Chosen:* reuse the discovery snapshot's cached scores instead. New
+`pipeline.cached_matches(resume, filters, profile)` returns the freshest snapshot's full
+ranked matches — postings + cached fit scores (decision 037) — with **no board re-search and
+no Claude re-judge**, and, unlike a normal cache hit, **without** applying `skip_seen` or the
+seen-openings ledger, so already-prepared postings are included (that's the point). The loop
+computes this pool once up front, serves it as a single bounded batch (re-prepare the set
+once → `caught_up`), and if nothing is cached bails immediately with an actionable message
+("Start a normal auto-apply loop first … then re-check while the cache is fresh," UI
+principle #3) rather than silently doing nothing. So rescan spends zero judge tokens and only
+re-does the preparation (tailor → PDF → dry-run fill).
+
+*Reuse the tailored PDF too (2nd follow-up).* The user: "if nothing has changed in profile
+since last time running the dry run, no need to retailor the résumé either." The tailor
+(`tailor_resume`) is the remaining Claude call in `run_testing_mode`. mtime comparison is
+unusable here: the fill auto-writes the profile file (learned screening answers via
+`remember_answers`), so its mtime is always newer than the PDF even with no user edit. So we
+stamp instead: `pipeline.tailor_stamp(resume, profile, jd)` hashes exactly the inputs that
+determine the PDF — the résumé, the three profile *link* fields flowed onto the header
+(LinkedIn/GitHub/portfolio), and the JD — and `resume_store.write_stamp` writes it to a
+`<pdf>.stamp` sidecar. Deliberately hashing only the PDF-relevant fields means the fill's own
+answer-learning never spuriously invalidates a reusable PDF mid-batch. Stamps are
+cascade-cleaned by `delete_if_managed` and `prune`.
+
+*Applies to every dry run, not just rescan (3rd follow-up).* Per the user ("this should also
+take effect when doing dry runs"), the reuse is keyed on the run being a **dry run** rather
+than on an explicit rescan flag: `run_testing_mode` reuses the stamped PDF (skipping tailor +
+render) whenever `gate` is absent/unarmed and the stamp matches; a **real armed submit always
+re-tailors**, so an actual submission never rides on a reused artifact (behaviour preserved).
+This covers the web "Test run" button, the auto-apply loop's preparation, the autonomous
+runner's dry-run mode, and the CLI `--apply-first` — re-running any of them on an unchanged
+posting no longer re-tailors. (The earlier `reuse_if_unchanged` parameter is gone, folded into
+the gate check.) Net: an unchanged rescan — and any repeated dry run of an unchanged posting —
+spends **zero** Claude tokens end-to-end (no re-judge, no re-tailor); only the local re-fill
+runs.
+
+*Escape hatch (4th follow-up).* `run_testing_mode(force_retailor=True)` overrides the reuse and
+regenerates the résumé even when the stamp matches, for the occasional "re-tailor anyway" —
+surfaced as a second loop-panel checkbox ("Re-tailor from scratch") wired through
+`start_loop(rescan, force_retailor)` → `_loop_worker` → the loop's `prepare_one`. Off by
+default; the user expects to use it rarely.
+
+Also fixed the loop/parked panels' accent bar overlapping the text (added `padding-left:18px`
+— the `border-left:4px` had no inner padding). Verification: `tests/test_discovery_cache.py`
+(+2 — `cached_matches` reuses the snapshot without re-search and ignores `skip_seen`; empty
+when no fresh snapshot), `tests/test_autoloop_web.py` (+2 — rescan reuses cached scores without
+ever calling `discover_and_match`; empty-cache bails with the actionable message), and
+`tests/test_rescan_reuse.py` (new, 7 — stamp is stable/input-sensitive and ignores non-PDF
+profile fields; sidecar roundtrip + cascade cleanup; `run_testing_mode` skips the tailor on an
+unchanged dry run, re-tailors when a profile link changed, always re-tailors for an armed
+submit, and `force_retailor` regenerates despite a matching stamp). Suite 332 pass (the one
+pre-existing `test_mailbox` env failure predates this).
+
+## 070 — Fix SPA Apply-reveal timing (Ashby "form did not load")
+
+**Context.** Applying to a Ramp posting on Ashby (`jobs.ashbyhq.com/Ramp/<id>`) failed with
+"⚠ ApplicationBot could not fill this application. Application form did not load within 25s at
+<posting URL>" — no fields filled. The posting page and the application form are on **different
+routes**: the form lives at `<posting>/application`.
+
+**Root cause (reproduced live).** `_open_application_form` tried to reveal the form with a
+single "Apply" click **before** its poll loop. Ashby is a SPA that mounts the "Apply for this
+Job" control *after* `domcontentloaded`, so at click time `get_by_role(...).count()` was `0` —
+the click never fired, the page never navigated to `/application`, and the loop then polled the
+posting page (0 form fields) until the 25s deadline, reporting the timeout against the posting
+URL. Probes confirmed: posting page = 0 fields; direct `/application` = 12 fields; the same
+click path with even a 2s pre-wait navigates and finds 11 fields in 0.5s.
+
+**Options.**
+1. **Ashby special-case** — navigate directly to `<posting>/application`. Deterministic, but
+   ATS-specific knowledge baked into the loader; doesn't help other SPA ATS with the same
+   timing.
+2. **Retry the reveal-click inside the poll loop** (chosen) — attempt the "Apply" click on each
+   pass until the control appears, latched by `revealed` so it fires at most once. Fixes the
+   whole *class* of "reveal control mounts late" bugs with no per-ATS code.
+
+**Decision.** Option 2. The reveal-click moved from a one-shot pre-loop attempt into the poll
+loop. Behaviour is preserved when a form is already rendered (fields present → returns before
+any click). `apply.py` `_open_application_form` only; no interface change (Guideline #7).
+
+**Verification.** Live: driven through the real `_open_application_form` against the reported
+Ramp Ashby URL — returns `loaded=True`, frame URL `…/application`, 12 fields, no errors.
+`tests/test_open_application_form.py` (2, fake page modelling the late-mounting button + form):
+the regression test fails on the pre-fix code with the exact 25s "form did not load" error and
+passes on the fix; a form-already-present case asserts no click fires. Rest of suite green
+(301 pass excluding the pre-existing environmental `test_mailbox` failure).
+
+## 071 — Draft short, optional "Why <Company>?" prompts (Ramp "Why Ramp?" left blank)
+
+**Context.** A Ramp dry-run (after decision 070 fixed the form loading) filled every field
+except **"Why Ramp?"**, which the applicant would want answered. On Ashby the field is a short,
+**OPTIONAL** single-line `<input type=text>` labelled exactly "Why Ramp?".
+
+**Root cause.** Three gates each rejected it:
+- `is_open_ended("Why Ramp?", is_textarea=False)` → False: not a textarea, and the fallback
+  needs `len > 25` **and** an `_OPEN_ENDED` phrase ("describe", "tell us", …) — "why ramp?" is 9
+  chars and contains none.
+- It matched no `_COMPANY_SPECIFIC` phrase (all are "why do you want to work", "why us", "why
+  this company", … — none catch a bare "Why <Company>?"), so `is_company_specific` was False.
+- It's **not required**, so `freetext_answer`'s `required and is_draftable_required(...)`
+  fallback (decision 067) didn't apply either.
+So `freetext_answer` returned `("", "")` — unanswered. (Being unrecognized as company-specific
+also meant it was eligible for structured mapping/caching, a latent mis-map risk.)
+
+**Decision (`answer_bank.py`).**
+1. `is_company_specific` also returns True for any prompt that simply opens with "why " (plus a
+   bare "why"/"why?"). The company name is dynamic and can't be enumerated, but a "why …" prompt
+   is inherently employer/role-specific — so it is excluded from structured mapping
+   (`_classifiable`) and from the answer bank (`valid_mapping`), and is never cached.
+2. `is_open_ended` treats a company-specific question as draftable even when it's a short,
+   single-line input (before the length/keyword heuristic).
+
+Result: "Why Ramp?" is now drafted by the grounded weak-model path (résumé + company + JD) — the
+pipeline already constructs the resolver with `company=p.company` and `jd=jd.body`, so the
+`company_specific and not (company or jd)` guard passes. The draft is not cached.
+
+**Behaviour change (Guideline #7, deliberate).** An OPTIONAL "Why <company>?" that decision 067
+left for the user is now auto-drafted. This is the requested fix; `test_required_draft.py` was
+updated to encode it (and still asserts a genuinely arbitrary optional short field stays blank,
+drafting only when required).
+
+**Verification.** Live probe of the real Ramp `/application` form enumerated its fields and
+confirmed "Why Ramp?" is an optional single-line input now classified open-ended +
+company-specific + non-classifiable. `tests/test_determinism_gates.py`: gate assertions +
+end-to-end `freetext_answer` drafts with company context and declines without it (never banked).
+`tests/test_required_draft.py`: updated contract. Suite 303 pass (excl. the pre-existing
+environmental `test_mailbox` failure + slow Workday). Not driven against a live submit (dry-run,
+Guideline #3) and no live Claude call spent uninvited — the draft path is proven with a stubbed CLI.
+
+---
+
+## 072 — LinkedIn job alerts as a discovery source (email-forwarded into the bot inbox)
+
+**Context.** The user asked whether their personal Gmail could be wired in so the bot could parse
+their LinkedIn job alerts. LinkedIn's saved searches are already tuned to what they want, so the
+alerts are a high-signal stream the pipeline currently ignores.
+
+**Constraint that shapes everything.** There is no compliant way to read LinkedIn *jobs* directly:
+the API is partner-gated and `linkedin.com/jobs/view` is robots-disallowed, so scraping it fails
+Guideline #4. `linkedin.py` already reached this exact conclusion for profile data (its compliant
+path is the user-requested data export). But an alert email **sent to the user** is the user's own
+data — parsing their own inbox raises none of those issues.
+
+**Options considered (ingest).**
+
+| Option | Cost | Access granted |
+|---|---|---|
+| Gmail OAuth read-only on the personal account | ~10min one-time Google Cloud setup (no OAuth client exists — the bot inbox links via IMAP app-password, so decision 065's path has never been exercised) | Standing read access to a personal inbox |
+| IMAP app-password on the personal account | ~2min; reuses the proven bot-inbox code path | **Full read/write/delete** on personal mail — fails Guideline #5 |
+| **Gmail filter forwards alerts → bot inbox** (chosen) | ~3min of clicking, no code | **None.** Bot only ever sees forwarded alerts |
+
+**Decision.** Forwarding. A filter on `jobalerts-noreply@linkedin.com` in the personal account
+forwards to the linked bot inbox (`profile/mailbox.yaml`, git-ignored), which `mailbox.py` already reads. This needs
+**no new auth, no second link slot, and no change to `mailbox.py` at all** — the second link slot
+scoped at the start of this task was dropped once forwarding was chosen. Gmail's auto-forward
+preserves the body verbatim and the original `From` header, so both the LinkedIn links and
+sender-matching survive. Verified the bot inbox currently receives zero LinkedIn mail (probe over
+the live IMAP link), confirming a forward is required rather than already-present mail.
+
+*Residual manual step (Guideline #8).* Creating the Gmail filter cannot be scripted: an IMAP
+app-password cannot manage filters, which need the Gmail API's `gmail.settings.basic` scope — and
+acquiring that scope would reintroduce exactly the personal-inbox access this decision avoids. The
+step is one-time and documented above; the cost of scripting it is strictly worse than the cost of
+doing it once. Gmail's forwarding-address confirmation code *is* automatable from our side — it
+lands in the bot inbox and `extract_verification` already parses it.
+
+**What alerts actually yield: leads, not applyable postings.** The email links to
+`linkedin.com/comm/jobs/view/<id>`, which redirects to a LinkedIn job page — not an ATS. So
+`detect_ats_from_url` returns `"other"`, `bridge_aggregator_postings` dead-ends with
+`auto_applyable=False`, and the body is only the card snippet (title/company/location, no JD).
+Recovering the JD or the true apply URL from LinkedIn would require the scraping ruled out above.
+
+**Staged build (approved).**
+- **(A)** `LinkedInAlertSource` reads the bot inbox, parses alert cards → `Posting(ats=
+  "linkedin_alert", …, extra={"snippet_only": True})`. Shaped directly on `AdzunaSource`, which is
+  already a snippet-only, redirect-linked, bridged source — the pattern exists and needs no new
+  abstraction.
+- **(B)** A **company→ATS-board resolver** (grepped for; does not exist today) matches each lead's
+  company to its public Greenhouse/Lever/Ashby board — all three already supported with full JD and
+  a fillable apply URL — so the lead re-enters the pipeline as an auto-applyable posting. Coverage
+  will be partial: the resolver is a fuzzy company-name → board-token guess.
+
+**Reasoning for the staging.** A alone produces leads a human triages, which cuts against the
+fully-automated goal (Guideline #0) — it is a stepping stone, not a destination, and is built first
+only because it is independently verifiable (Guideline #6). B is what makes the source earn its
+place. The honest open question, recorded for reassessment after A: **what LinkedIn alerts add over
+Adzuna**, which already aggregates many boards and is already bridged. The gain is that the user's
+saved searches are pre-tuned; the loss is materially worse data on arrival. If A's lead quality
+does not beat Adzuna's recall on the same filters, B should not be built.
+
+**Status.** Approach approved; no code written yet. Blocked on the user creating the Gmail filter
+(a real alert corpus is needed to build the parser against real markup rather than assumed markup).
+
+---
+
+## 073 — Any GitHub repo job board is drop-in config, not code
+
+**Context.** The user asked whether we could scrape GitHub repo job boards. We already did:
+`CuratedListSource` (#031) pulls two SimplifyJobs `listings.json` feeds off
+`raw.githubusercontent.com`. The real question was which *other* repos to add — and whether
+adding repos is the change that matters.
+
+**Measured before building.** Probing the live feeds:
+
+| Stage | Count |
+|---|---|
+| Active postings in the two Simplify feeds | 3,459 |
+| Pass `_CURATED_ATS` | 1,130 |
+| Actually resolved + judged (`max_resolve`) | **40** |
+
+The two live `vanshb03` boards contribute 111 fillable postings, of which **103 are new** (only 8
+overlap Simplify) — a ~9% wider pool feeding a stage that already discards 97% of what it fetches.
+`Ouckah`/`coderQuad` are dead (404); `speedyapply` is README-markdown only.
+
+**Conclusion.** More feeds ≈ zero marginal applications. **The funnel neck — 40 of 1,130 — is the
+binding constraint, not feed count.** So this decision buys *optionality*, not breadth: dropping in
+a board is now free when a specific board matters, and **no extra repos ship enabled by default**.
+The real yield came from #074 (widening the neck) and from `max_resolve` itself, which is the
+Claude-judge budget knob.
+
+**Options considered.**
+
+| Option | Verdict |
+|---|---|
+| Extend `early_career` with `feeds:` | **Chosen** — backwards compatible, no migration, `kinds` still names the built-ins |
+| New top-level `github_boards:` block | Rejected — cleaner conceptually, but makes `early_career.kinds` legacy and needs a migration path for no functional gain |
+| Hard-code the vansh feeds as new built-ins | Rejected — bakes in a choice the user should make; the drop-in mechanism subsumes it |
+
+**Schema.** A feed is a bare string (built-in name, or a raw URL) or an explicit `{name, url}`.
+Bare URLs are named `<owner>/<repo>` so they read cleanly in logs and in the discovery-cache
+fingerprint. **No per-feed field mapping exists or is needed**: SimplifyJobs' `listings.json` is
+the de-facto standard for these boards (vansh is a fork of it), feeds differ only in optional
+extras (`category`/`degrees` vs `season`), and every field was already read with a `.get()`
+default. A URL alone is the whole configuration.
+
+**One source, not one-per-feed.** Making each feed its own `Source` would inherit per-feed error
+isolation from `discover()` for free. Rejected: `max_resolve` would become **per feed**, so the two
+built-ins alone would double the Claude judge cost and each added board would multiply it again — a
+silent behaviour change (Guideline #7). Keeping one source preserves **global ranking** across all
+feeds (pick the 40 most relevant overall) and keeps `max_resolve` a whole-run budget.
+
+**Consequence: a bad feed fails loudly.** With one source, a broken drop-in feed would otherwise
+silently shrink results — the "ignored my input" failure UI Principle #5 calls a bug. So
+`_listings()` validates each feed and raises `DiscoveryError` naming the feed, the URL, and the fix
+(a 404/repo-page URL, or a non-listings schema, reports the missing keys). `discover()` still
+isolates the source, so the rest of the run proceeds. Trade-off accepted: a typo'd custom feed
+costs the built-ins for that run — correct, because it is a config error the user fixes once, and
+`fetch_json` already retries transient failures 3×.
+
+**Web UI.** `readDiscForm()` rebuilt `early_career` from scratch on save, so without a matching
+field it would have **silently wiped `feeds`** on every settings save. Added the field (reusing the
+existing `area()`/`linesOf` pattern from `keywords`/`career_sites`), which is also the natural home
+for "paste a board URL".
+
+**Verified.** Live, no stubs: a YAML config carrying a `vanshb03/New-Grad-2026` URL →
+`build_sources` → `discover` produced 6 full-JD Postings, 0 errors, with the custom feed merged
+alongside the built-in and named `vanshb03/New-Grad-2026`. Plus `tests/test_curated_feeds.py`
+(13 tests: drop-in, merge/dedup, global `max_resolve` budget, both bad-feed errors, config
+coercion, fingerprint name).
+
+---
+
+## 074 — Resolve Workday + SmartRecruiters JDs in the curated feeds
+
+**Context.** `_CURATED_ATS` gated curated listings to Greenhouse/Lever/Ashby. Measured against the
+live feeds, that discarded **755 active Workday** and **298 SmartRecruiters** postings — from feeds
+we already fetch, pointing at ATSs the Apply stage can already submit to (`pipeline._is_fillable`
+explicitly allows `workday`; `workday.apply_workday` is a complete backend with recipes).
+
+**Root cause.** The gate was never about *fillability* — it was about *JD resolution*.
+`_CURATED_ATS` listed exactly the ATSs with a hand-written `_resolve_jd` helper. Anything else was
+dropped rather than emitted with an empty body.
+
+**The spike (which reversed my recommendation).** I flagged upfront that Workday renders
+client-side and might need Playwright. **That was wrong, and testing it before building is what
+caught it.** Workday still ships schema.org JSON-LD in the initial HTML, so the existing enrichment
+cascade (#047) resolves it on a plain GET. Running the repo's own `enrich.fetch_full_jd` against 10
+real Workday postings: **10/10 resolved via the `json-ld` tier**, 2–11k chars each, no browser and
+no LLM call (no `llm=` → it stops at the free JSON-LD/CSS tiers).
+
+| Approach | Result | Verdict |
+|---|---|---|
+| `enrich.fetch_full_jd` (existing cascade) | 10/10 live, json-ld tier, free | **Chosen** — one branch, no new subsystem |
+| Workday `/wday/cxs/` JSON API | 15/15 live, but *less* text than JSON-LD | Rejected — bespoke tenant/site URL rewrite for a worse body |
+| Playwright | not tested | Rejected — the spike proved it unnecessary |
+
+SmartRecruiters needed only a tuple entry: `_resolve_smartrecruiters_jd` already existed and was
+simply never reachable.
+
+**Flagged (Guideline #2).** SmartRecruiters is fillable but `apply.detect_ats` doesn't know it, so
+it routes to **generic autofill** rather than a dedicated backend (consistent with #030) — less
+proven than the Workday path. Accepted deliberately by the user when scoping.
+
+**Failure mode preserved.** A resolver failure still returns `''`, so the posting degrades to a
+title-only body and still flows — it does not kill the run (Guideline #7).
+
+**Verified.** Live end-to-end: real config → `build_sources` → `discover` returned 6 postings /
+0 errors including a **Workday** posting (Northrop Grumman, 5,521-char real JD) and a
+SmartRecruiters posting (2,382 chars). Both clear `_is_fillable` and route correctly
+(`workday` → `apply_workday`, `smartrecruiters` → generic). Nothing was submitted (Guideline #3).

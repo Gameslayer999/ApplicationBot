@@ -236,6 +236,36 @@ def discover_and_match(
     )
 
 
+def cached_matches(
+    resume: Resume,
+    filters: DiscoveryFilters,
+    *,
+    profile: ApplicationProfile | None = None,
+    use_claude: bool = True,
+    bridge: bool = True,
+) -> list[Match]:
+    """The freshest discovery snapshot's full ranked matches — postings + cached Claude fit
+    scores (decision 037) — with NO board re-search and NO Claude re-judge. Unlike a normal
+    `discover_and_match` cache hit, neither `skip_seen` nor the seen-openings ledger is
+    applied, so postings already prepared/applied ARE included: this is for re-preparing an
+    already-scored set while reusing its scores (a fit score rarely changes run to run).
+
+    Returns `[]` when no fresh, fingerprint-matching snapshot exists (caching disabled, stale,
+    or the résumé/boards/filters changed) — the caller then has nothing cached to re-prepare."""
+    if not filters.cache_ttl_hours:
+        return []
+    sources = build_sources(filters, resume, profile)
+    if not sources:
+        return []
+    from . import discovery_cache
+    effective_claude = use_claude and backends.claude_code_available()
+    fp = discovery_cache.fingerprint(
+        resume, filters, [s.name for s in sources], use_claude=effective_claude, bridge=bridge,
+    )
+    snap = discovery_cache.load(fp, ttl_hours=filters.cache_ttl_hours)
+    return list(snap.matches) if snap else []
+
+
 def _fmt_match(i: int, m: Match) -> str:
     p = m.posting
     if m.judged_by == "claude":
@@ -315,6 +345,22 @@ def pick_top(matches: list[Match], *, min_fit: int) -> Match | None:
     return matches[0] if matches else None
 
 
+def tailor_stamp(resume: Resume, profile: ApplicationProfile, jd) -> str:
+    """A content hash of everything that determines a posting's tailored PDF: the résumé, the
+    profile links flowed onto the header (LinkedIn/GitHub/portfolio), and the JD the résumé is
+    tailored to. Stamped beside the PDF so a re-prepare can reuse it when nothing that affects
+    it changed — deliberately ignores the rest of the profile (e.g. learned screening answers),
+    which the fill re-reads fresh but which never change the PDF."""
+    import hashlib
+    import json
+    payload = {
+        "resume": resume.model_dump(),
+        "links": [profile.linkedin_url, profile.github_url, profile.portfolio_url],
+        "jd": jd.body or "",
+    }
+    return hashlib.sha1(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+
 def run_testing_mode(
     resume: Resume,
     match_obj: Match,
@@ -329,12 +375,20 @@ def run_testing_mode(
     hold=None,
     on_filled=None,
     gate=None,
+    force_retailor: bool = False,
 ):
     """Tailor → PDF → apply for ONE posting, watched live. Dry-run (never submits) unless an
     armed SafetyGate is passed (decision 035). Returns the ApplyReport. `status_cb(step,
     message)` receives progress (in addition to printing) so a UI can surface it; `hold` (a
     threading.Event) replaces the terminal review pause for web runs; `on_filled(report)`
-    fires the moment filling finishes, before the hold."""
+    fires the moment filling finishes, before the hold.
+
+    On a **dry run** (no armed gate), if the posting's existing tailored PDF was made from the
+    same inputs — its stamp still matches (decision 069 follow-up) — the tailor (a Claude call)
+    and PDF render are skipped and that PDF is reused; the fill still runs. A real armed submit
+    always re-tailors, so an actual submission never rides on a reused artifact. `force_retailor`
+    overrides the reuse and regenerates the résumé even when the stamp matches (the user's
+    "re-tailor anyway" escape hatch)."""
     from .apply import AnswerResolver, run_apply
     from .pdf import render_pdf
     from .tailor import tailor_resume
@@ -346,29 +400,41 @@ def run_testing_mode(
 
     p = match_obj.posting
     jd = p.to_job_description()
-
-    say("tailor", f"▶ Tailoring résumé for: {p.company} — {p.title}")
-    result = tailor_resume(resume, jd, backend=backend)
-    print(f"  tailored via {result.backend}" + (f" — {'; '.join(result.warnings)}" if result.warnings else ""))
-    for note in result.tailored.relevance_notes:
-        print(f"  note: {note}")
-
-    say("pdf", "▶ Exporting tailored résumé to PDF…")
-    # Stable, git-ignored, per-posting path (decision 029) — not $TMPDIR, which macOS
-    # purges out from under the Track row's resume_path.
     # Flow the apply-profile links (LinkedIn/GitHub/portfolio) onto the résumé header when it has
     # none, so the submitted PDF carries them (they're stored once, in the apply profile).
     profile = load_profile(profile_path)
-    pdf_resume = resume_with_profile_links(resume, profile)
-    pdf_bytes = render_pdf(pdf_resume, result.tailored)
-    pdf_path = resume_store.write_pdf(pdf_bytes, p.company, p.title, p.url)
-    print(f"  résumé PDF → {pdf_path}")
+    stamp = tailor_stamp(resume, profile, jd)
 
-    # ATS text-layer check (decision 043): what an ATS parser would actually see in this
-    # PDF — readability of name/email/phone + which JD-requested skills survived tailoring.
-    from .ats_check import verify_pdf
-    for note in verify_pdf(pdf_bytes, pdf_resume, jd.body or None).notes():
-        say("pdf", f"  {note}")
+    # Reuse the existing tailored PDF when this is a dry run and nothing that affects it changed
+    # (its stamp still matches). The path is deterministic per posting (decision 029), so we
+    # check the stamp beside it directly — no tracker lookup, no Claude tailor, no re-render. A
+    # real armed submit re-tailors so it never rides on a reused artifact.
+    dry_run = gate is None or not getattr(gate, "armed", False)
+    reuse_path = resume_store.path_for(p.company, p.title, p.url)
+    if not force_retailor and dry_run and reuse_path.is_file() and resume_store.read_stamp(reuse_path) == stamp:
+        pdf_path = str(reuse_path)
+        say("tailor", f"▶ Reusing tailored résumé (unchanged since last dry-run): {p.company} — {p.title}")
+    else:
+        say("tailor", f"▶ Tailoring résumé for: {p.company} — {p.title}")
+        result = tailor_resume(resume, jd, backend=backend)
+        print(f"  tailored via {result.backend}" + (f" — {'; '.join(result.warnings)}" if result.warnings else ""))
+        for note in result.tailored.relevance_notes:
+            print(f"  note: {note}")
+
+        say("pdf", "▶ Exporting tailored résumé to PDF…")
+        # Stable, git-ignored, per-posting path (decision 029) — not $TMPDIR, which macOS
+        # purges out from under the Track row's resume_path.
+        pdf_resume = resume_with_profile_links(resume, profile)
+        pdf_bytes = render_pdf(pdf_resume, result.tailored)
+        pdf_path = resume_store.write_pdf(pdf_bytes, p.company, p.title, p.url)
+        resume_store.write_stamp(pdf_path, stamp)
+        print(f"  résumé PDF → {pdf_path}")
+
+        # ATS text-layer check (decision 043): what an ATS parser would actually see in this
+        # PDF — readability of name/email/phone + which JD-requested skills survived tailoring.
+        from .ats_check import verify_pdf
+        for note in verify_pdf(pdf_bytes, pdf_resume, jd.body or None).notes():
+            say("pdf", f"  {note}")
 
     apply_url = p.apply_url or p.url
     say("apply", f"▶ DRY-RUN apply (watch it fill; never submits): {apply_url}")

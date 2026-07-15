@@ -149,6 +149,34 @@ def test_skip_seen_prunes_cached_matches(monkeypatch=None):
         assert hit.matches[0].posting.company == "Co2"
 
 
+def test_cached_matches_reuses_snapshot_without_research_or_skip_seen():
+    # `cached_matches` (rescan re-prepare path): returns the full snapshot — postings + cached
+    # fit scores — with NO board search and WITHOUT applying skip_seen, so already-tracked
+    # postings are still included (the point is to re-prepare them reusing their score).
+    with tempfile.TemporaryDirectory() as d, _Env(Path(d), [_posting(1), _posting(2)]) as env:
+        import applicationbot.pipeline as pl
+        r = _resume()
+        _run(r, _filters(skip_seen=False))  # populate a 2-match snapshot
+        assert env.searches == 1
+        from applicationbot.discovery import canonical_url
+        orig = pl._seen_canonical_urls
+        pl._seen_canonical_urls = lambda filters: {canonical_url(_posting(1).url)}
+        try:
+            cached = pl.cached_matches(r, _filters(skip_seen=True))
+        finally:
+            pl._seen_canonical_urls = orig
+        assert env.searches == 1  # reused the snapshot, no re-search / re-judge
+        assert [m.posting.company for m in cached] == ["Co1", "Co2"]  # tracked Co1 kept
+        assert all(m.fit_score == 80 for m in cached)  # scores reused from the snapshot
+
+
+def test_cached_matches_empty_when_no_fresh_snapshot():
+    with tempfile.TemporaryDirectory() as d, _Env(Path(d), [_posting(1)]) as env:
+        assert pipeline.cached_matches(_resume(), _filters()) == []  # nothing cached yet
+        assert pipeline.cached_matches(_resume(), _filters(cache_ttl_hours=0)) == []  # caching off
+        assert env.searches == 0  # never triggers a live search
+
+
 def test_module_roundtrip_and_staleness():
     with tempfile.TemporaryDirectory() as d:
         path = Path(d) / "c.json"

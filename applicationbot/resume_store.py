@@ -54,6 +54,33 @@ def write_pdf(data: bytes, company: str, role: str, source_url: str) -> str:
     return str(dest)
 
 
+# --- tailoring stamp -------------------------------------------------------------------
+# A tiny sidecar (``<pdf>.stamp``) holding a content hash of the inputs that produced the
+# PDF (résumé + profile links + JD). The rescan re-prepare path reuses a PDF instead of
+# re-tailoring (a Claude call) when its stamp still matches — robust to the profile file's
+# own churn from learned screening answers, which mtime comparison would misread as a change.
+
+def _stamp_path(pdf_path: str | Path) -> Path:
+    return Path(str(pdf_path) + ".stamp")
+
+
+def read_stamp(pdf_path: str | Path) -> str | None:
+    """The stamp written beside ``pdf_path``, or None if absent/unreadable."""
+    try:
+        return _stamp_path(pdf_path).read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+
+
+def write_stamp(pdf_path: str | Path, key: str) -> None:
+    """Record ``key`` beside ``pdf_path``. Best-effort (a missing stamp only forces a
+    re-tailor next time, never a crash)."""
+    try:
+        _stamp_path(pdf_path).write_text(key, encoding="utf-8")
+    except OSError:
+        pass
+
+
 def is_managed(path: str | Path) -> bool:
     """True iff ``path`` lives under ``TAILORED_DIR`` — the guard that keeps cascade
     delete from ever removing a user-supplied résumé outside this folder."""
@@ -70,6 +97,7 @@ def delete_if_managed(path: str | Path) -> bool:
         return False
     try:
         Path(path).unlink(missing_ok=True)
+        _stamp_path(path).unlink(missing_ok=True)
         return True
     except OSError:
         return False
@@ -95,6 +123,7 @@ def prune(*, max_bytes: int = MAX_BYTES, keep: Path | None = None) -> int:
         size = f.stat().st_size
         try:
             f.unlink()
+            _stamp_path(f).unlink(missing_ok=True)
             total -= size
             removed += 1
         except OSError:

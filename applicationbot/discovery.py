@@ -718,17 +718,30 @@ class CareerSiteSource(Source):
 #
 # Community-maintained, daily-updated JSON lists of EARLY-CAREER roles (new-grad + internships)
 # — early-career by construction, so no senior roles to filter out (DECISIONS.md #031). The
-# lists are URL-only (a title + an application link, no JD text), and ~40% of active links point
-# at Greenhouse/Lever/Ashby — ATSs we can both fetch a full JD from AND fill. We rank listings by
+# lists are URL-only (a title + an application link, no JD text), and ~63% of active links point
+# at an ATS we can both fetch a full JD from AND fill (`_CURATED_ATS`). We rank listings by
 # title-relevance to the résumé, resolve the FULL JD for the top-K via the linked ATS, and emit
 # normal full-JD Postings so the matcher/apply pipeline is unchanged. Personal-use only (public
 # job links; the lists carry no explicit redistribution license).
+#
+# NOTE (measured 2026-07-15, DECISIONS.md #073): the built-in feeds carry ~3.4k active postings,
+# ~2.2k of them in `_CURATED_ATS` — but `max_resolve` (default 40) is what actually caps a run.
+# Adding feeds widens a pool that is already ~50x oversubscribed; `max_resolve` is the real knob.
 
-_SIMPLIFY_FEEDS = {
+_BUILTIN_FEEDS = {
     "new-grad": "https://raw.githubusercontent.com/SimplifyJobs/New-Grad-Positions/dev/.github/scripts/listings.json",
     "intern": "https://raw.githubusercontent.com/SimplifyJobs/Summer2026-Internships/dev/.github/scripts/listings.json",
 }
-_CURATED_ATS = ("greenhouse", "lever", "ashby")  # resolvable full JD AND fillable in Apply
+# Any GitHub repo publishing the SimplifyJobs `listings.json` schema can be dropped in via
+# `early_career.feeds` with no code change (DECISIONS.md #073) — that schema is the de-facto
+# standard for these boards, and every field below is read with a `.get()` default, so feeds
+# carrying only a subset (e.g. no `category`/`degrees`) still work.
+_FEED_REQUIRED_KEYS = ("title", "url", "company_name", "active")
+
+# ATSs a curated listing may point at and still flow all the way through: we can resolve a full
+# JD from the URL AND fill the form in Apply. greenhouse/lever/ashby/smartrecruiters resolve via
+# their public JSON APIs; workday resolves via the shared enrichment cascade (DECISIONS.md #074).
+_CURATED_ATS = ("greenhouse", "lever", "ashby", "workday", "smartrecruiters")
 # Tokens that signal LEVEL not role — excluded from title-relevance so "intern" alone doesn't
 # rank a "Marketing Intern" as relevant to a software résumé.
 _LEVEL_TOKENS = {"intern", "internship", "junior", "senior", "staff", "lead", "i", "ii", "iii",
@@ -839,6 +852,15 @@ def _resolve_recruitee_jd(url: str) -> str:
     return "\n\n".join(x for x in [desc, reqs] if x)
 
 
+def _resolve_workday_jd(url: str) -> str:
+    """Workday renders the visible page client-side but still ships schema.org JSON-LD in the
+    initial HTML, so the shared enrichment cascade resolves it with a plain GET — no browser and
+    no LLM call (no `llm=`, so it stops at the free JSON-LD/CSS tiers)."""
+    from . import enrich  # local: enrich imports from this module
+
+    return enrich.fetch_full_jd(url).description
+
+
 def _resolve_jd(url: str, ats: str, ashby_cache: dict) -> str:
     """Fetch one job's full JD via its ATS. Returns '' on any failure (the caller keeps a
     title-only body so the posting still flows through, just judged on less)."""
@@ -849,6 +871,8 @@ def _resolve_jd(url: str, ats: str, ashby_cache: dict) -> str:
             return _resolve_lever_jd(url)
         if ats == "ashby":
             return _resolve_ashby_jd(url, ashby_cache)
+        if ats == "workday":
+            return _resolve_workday_jd(url)
         if ats == "smartrecruiters":
             return _resolve_smartrecruiters_jd(url)
         if ats == "workable":
@@ -873,16 +897,45 @@ def _title_relevance(resume, title: str, category: str = "") -> int:
 
 
 class CuratedListSource(Source):
-    """Early-career discovery from the SimplifyJobs new-grad/internship JSON feeds
-    (DECISIONS.md #031). Keeps `active` roles whose apply link is a resolvable+fillable ATS
-    (Greenhouse/Lever/Ashby), ranks them by title-relevance to the résumé, resolves the full JD
-    for the top `max_resolve`, and emits full-JD Postings. Personal-use only (public job links)."""
+    """Early-career discovery from GitHub job-board JSON feeds (DECISIONS.md #031, #073). Ships
+    with the SimplifyJobs new-grad/internship lists; any repo publishing the same `listings.json`
+    schema can be added via `feeds` with no code change. Keeps `active` roles whose apply link is
+    a resolvable+fillable ATS (`_CURATED_ATS`), ranks them by title-relevance to the résumé across
+    ALL feeds jointly, resolves the full JD for the top `max_resolve`, and emits full-JD Postings.
+    Personal-use only (public job links)."""
 
-    def __init__(self, resume, kinds=("new-grad", "intern"), max_resolve: int = 40) -> None:
+    def __init__(self, resume, kinds=("new-grad", "intern"), max_resolve: int = 40,
+                 feeds: dict[str, str] | None = None) -> None:
         self.resume = resume
         self.kinds = tuple(kinds)
         self.max_resolve = max_resolve
-        self.name = "curated:" + ",".join(self.kinds)
+        # Built-ins named by `kinds`, plus any dropped-in {name: url}. Ranking is global across
+        # the merged set, so max_resolve stays a whole-run budget however many feeds are added.
+        self.feeds = {k: _BUILTIN_FEEDS[k] for k in self.kinds if k in _BUILTIN_FEEDS}
+        self.feeds.update(feeds or {})
+        self.name = "curated:" + ",".join(sorted(self.feeds))
+
+    def _listings(self, name: str, url: str) -> list:
+        """Fetch one feed and validate it looks like a listings.json board. Raises DiscoveryError
+        naming the feed and the fix — a dropped-in URL that 404s or points at the wrong file is a
+        config error the user must see, not something to silently skip (Agent Guideline #11)."""
+        data = fetch_json(url)
+        if not isinstance(data, list):
+            raise DiscoveryError(
+                f"feed '{name}' ({url}) returned {type(data).__name__}, expected a JSON array of "
+                f"listings. Check the URL points at a raw listings.json (raw.githubusercontent.com"
+                f"/<owner>/<repo>/<branch>/.github/scripts/listings.json), not the repo page."
+            )
+        first = next((e for e in data if isinstance(e, dict)), None)
+        missing = [k for k in _FEED_REQUIRED_KEYS if first is not None and k not in first]
+        if first is None or missing:
+            raise DiscoveryError(
+                f"feed '{name}' ({url}) is not a SimplifyJobs-schema job board"
+                + (f" — entries are missing {', '.join(missing)}." if missing else " — it is empty.")
+                + f" Required keys: {', '.join(_FEED_REQUIRED_KEYS)}. Remove it from"
+                f" early_career.feeds in profile/discovery.yaml, or point it at a compatible feed."
+            )
+        return data
 
     def fetch(self) -> list[Posting]:
         import html as _html
@@ -892,13 +945,9 @@ class CuratedListSource(Source):
 
         seen: set[str] = set()
         listings: list[tuple[dict, str]] = []
-        for kind in self.kinds:
-            feed = _SIMPLIFY_FEEDS.get(kind)
-            if not feed:
-                continue
-            data = fetch_json(feed)
-            for e in data if isinstance(data, list) else []:
-                if not e.get("active"):
+        for name, feed in self.feeds.items():
+            for e in self._listings(name, feed):
+                if not isinstance(e, dict) or not e.get("active"):
                     continue
                 url = e.get("url", "")
                 ats = detect_ats_from_url(url)

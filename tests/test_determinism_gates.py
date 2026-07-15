@@ -152,6 +152,38 @@ def test_numeric_fact_questions_are_never_open_ended():
     assert answer_bank.is_open_ended("Please describe your experience with Python and Go")
 
 
+def test_short_why_company_prompt_is_open_ended_and_company_specific():
+    # Ramp's application renders "Why Ramp?" as a short, OPTIONAL single-line <input> — the
+    # length/keyword heuristic left it blank (live Ramp dry-run 2026-07-14). A bare "Why <X>?"
+    # is an employer-specific reason: draftable open-ended, never mappable, never cacheable.
+    for q in ("Why Ramp?", "Why us?", "Why this role?"):
+        assert answer_bank.is_open_ended(q), q          # drafted even though short + single-line
+        assert answer_bank.is_company_specific(q), q    # excluded from caching
+        assert answer_bank._classifiable(q) is False, q  # excluded from structured mapping
+    # A generic optional single-line field is NOT swept in — only "why …" prompts.
+    assert not answer_bank.is_open_ended("Additional comments")
+    assert not answer_bank.is_company_specific("Where do you plan on working from?")
+
+
+def test_why_company_prompt_is_drafted_when_company_known():
+    # End-to-end through the resolver: a short optional "Why Ramp?" input now drafts (grounded in
+    # the company) instead of being left blank. The draft is NOT cached (company-specific).
+    q = "Why Ramp?"
+    resume = Resume(contact=Contact(name="Test User", email="t@example.com"))
+    r = AnswerResolver(resume=resume, profile=ApplicationProfile(),
+                       enable_generation=True, company="Ramp")
+    with _fake_claude("I want to build financial infrastructure at Ramp."):
+        ans, source = r.freetext_answer(q, is_textarea=False, required=False)
+    assert source == "generated" and ans
+    assert not any(getattr(x, "question", "") == q for x in r.learned)  # never banked
+
+    # Without company OR jd context there's nothing to ground it — leave it for the user.
+    r2 = AnswerResolver(resume=resume, profile=ApplicationProfile(), enable_generation=True)
+    with _fake_claude("should not be called"):
+        ans2, source2 = r2.freetext_answer(q, is_textarea=False, required=False)
+    assert (ans2, source2) == (None, "")
+
+
 def test_salary_rule_with_no_data_falls_through_to_bank():
     # An empty desired_salary must not short-circuit resolve(): a USER-entered banked answer
     # to the same question still wins (the early `return None` used to skip the bank).

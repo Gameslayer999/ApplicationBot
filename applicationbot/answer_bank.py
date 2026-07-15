@@ -69,7 +69,12 @@ _ENUMERATED = ("clearance", "employment history", "gpa", "sat score", "act score
 
 def is_company_specific(question: str) -> bool:
     n = _norm(question)
-    return any(t in n for t in _COMPANY_SPECIFIC)
+    if any(t in n for t in _COMPANY_SPECIFIC):
+        return True
+    # Bare "Why <Company>?" / "Why <Team>?" motivational prompts (e.g. Ramp's "Why Ramp?"): the
+    # company name is dynamic so it can't be listed, but any question that simply opens with
+    # "why" asks for an employer-specific reason — open-ended prose, and never cacheable.
+    return n.startswith("why ") or n in ("why", "why?")
 
 
 def is_demographic(question: str) -> bool:
@@ -92,6 +97,11 @@ def is_open_ended(question: str, is_textarea: bool = False) -> bool:
     if any(t in n for t in _NUMERIC_FACT):
         return False
     if is_textarea:
+        return True
+    # Company/role-specific motivational prompts ("Why Ramp?", "Why us?", "Why this role?") want
+    # a written answer even when rendered as a short single-line <input> — the length/keyword
+    # heuristic below would otherwise reject a terse one and leave it blank.
+    if is_company_specific(question):
         return True
     return len(n) > 25 and any(t in n for t in _OPEN_ENDED)
 

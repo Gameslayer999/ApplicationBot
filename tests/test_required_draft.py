@@ -36,10 +36,16 @@ def test_is_draftable_required_gates():
 def test_required_short_question_gets_drafted(monkeypatch):
     monkeypatch.setattr(answer_bank, "generate_answer", lambda *a, **k: "Because their mission fits.")
     r = _resolver()
-    # Not open-ended and not required → left for the user (no fabrication of arbitrary short fields).
-    assert r.freetext_answer(SHORT_Q, is_textarea=False, required=False) == (None, "")
-    # Same question, required → drafted so the submit isn't blocked.
+    # "Why WHOOP?" is a company-specific motivational prompt: now drafted whether or not it's
+    # required (an OPTIONAL "Why <company>?" left blank was the Ramp bug, 2026-07-14).
+    assert r.freetext_answer(SHORT_Q, is_textarea=False, required=False) == (
+        "Because their mission fits.", "generated")
     assert r.freetext_answer(SHORT_Q, is_textarea=False, required=True) == (
+        "Because their mission fits.", "generated")
+    # A genuinely arbitrary short field (not open-ended, not company-specific) is still left for
+    # the user when optional, and only drafted when REQUIRED (decision 067).
+    assert r.freetext_answer("Favorite color?", is_textarea=False, required=False) == (None, "")
+    assert r.freetext_answer("Favorite color?", is_textarea=False, required=True) == (
         "Because their mission fits.", "generated")
 
 

@@ -1120,20 +1120,13 @@ def _open_application_form(page, ats: str, report: "ApplyReport", timeout_ms: in
     This is what makes 'verify the application loaded before filling' true rather than assumed."""
     import time
 
-    # If no form is visible anywhere yet, try to reveal it via an "Apply" control.
-    frame, n = _find_form_frame(page)
-    if n < 2:
-        for role in ("link", "button"):
-            try:
-                btn = page.get_by_role(role, name=re.compile(r"\bapply\b", re.I)).first
-                if btn.count() and btn.is_visible():
-                    btn.click(timeout=4000)
-                    break
-            except Exception:
-                continue
-
     # Poll every frame until one holds a real form (covers navigation + async/iframe mounts).
+    # If no form is visible yet, keep trying to reveal it via an "Apply" control on EACH pass:
+    # SPA ATS pages (e.g. Ashby, whose form lives at <posting>/application) mount the Apply
+    # button after domcontentloaded, so a single pre-loop click fires before the button exists
+    # and never navigates — the poll then just watches an empty posting page until it times out.
     deadline = time.time() + timeout_ms / 1000
+    revealed = False
     while time.time() < deadline:
         frame, n = _find_form_frame(page)
         if n >= 2:
@@ -1144,6 +1137,16 @@ def _open_application_form(page, ats: str, report: "ApplyReport", timeout_ms: in
                 pass
             page.wait_for_timeout(600)
             return True, frame, _ats_from_frame(frame, ats)
+        if not revealed:
+            for role in ("link", "button"):
+                try:
+                    btn = page.get_by_role(role, name=re.compile(r"\bapply\b", re.I)).first
+                    if btn.count() and btn.is_visible():
+                        btn.click(timeout=4000)
+                        revealed = True
+                        break
+                except Exception:
+                    continue
         page.wait_for_timeout(500)
 
     report.errors.append(

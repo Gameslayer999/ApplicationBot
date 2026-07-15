@@ -97,6 +97,36 @@ and free-form notes.
 
 ## Now
 
+### LinkedIn job alerts as a discovery source (decision 072) — BLOCKED ON USER
+
+Approach approved 2026-07-15; no code written yet. Ingest is by **email forwarding**, not by
+linking the personal Gmail: a filter on `jobalerts-noreply@linkedin.com` forwards to the
+already-linked bot inbox (the address linked in `profile/mailbox.yaml`). **No `mailbox.py` changes
+needed** — the second link slot originally scoped was dropped once forwarding was chosen.
+
+- [ ] **USER:** add the forwarding address in personal Gmail (Settings → Forwarding and POP/IMAP).
+      Gmail emails a confirmation code **to the bot inbox** — an agent can read it out with
+      `fetch_verification(cfg, sender_contains="forwarding-noreply@google.com")`; no need to log in.
+- [ ] **USER:** create the filter (From: `jobalerts-noreply@linkedin.com` → Forward to bot inbox).
+      Click **Search** on the filter form first — 0 results means the alerts use a different sender
+      and the filter should widen to `linkedin.com`. Tick *Also apply to matching conversations* to
+      forward the existing backlog → gives the parser a real corpus immediately.
+- [ ] **(A)** `LinkedInAlertSource`: read the bot inbox, parse alert cards → `Posting(ats=
+      "linkedin_alert", extra={"snippet_only": True})`. Shape it on `AdzunaSource` (already
+      snippet-only + redirect-linked + bridged). **Build against the real forwarded markup — do not
+      guess the card structure.** Leads only: `auto_applyable=False` (the email links to
+      `linkedin.com/comm/jobs/view/<id>` → redirects to LinkedIn, not an ATS; scraping the job page
+      is robots-disallowed, Guideline #4).
+- [ ] **(B)** Company→ATS-board resolver (**does not exist today** — grepped). Match a lead's
+      company to its public Greenhouse/Lever/Ashby board → full JD + fillable apply URL → lead
+      re-enters the pipeline auto-applyable. This is what makes the source worth having; A alone
+      adds a human triage step and cuts against Guideline #0.
+- [ ] **Reassess before building B:** does A's lead quality actually beat Adzuna's recall on the
+      same filters? Adzuna already aggregates many boards and is already bridged. If not, stop at A
+      or drop the source (see decision 072's open question).
+
+Probe run 2026-07-15: bot inbox currently has **0** LinkedIn messages — the forward is required.
+
 ### Heaviest engine work (audit 2026-07-06) — build toward "fill AND submit any application, any site"
 
 Ordered by value ÷ difficulty. Verification policy: **minimize live dry-runs** (token-heavy)
@@ -375,9 +405,11 @@ value ÷ effort:
       `python -m applicationbot.pipeline --apply-first` (Claude judge on, headed browser) and
       eyeball one job go discover → tailor → fill live. So far verified headless + rules-tailor;
       confirm the Claude-judged pick + Claude-tailor + visible fill all behave.
-- [ ] **Autonomous runner over ALL qualified matches** — loop the testing-mode core across the
-      ranked list (not just the top match), dry-run by default, global kill switch, blockers as
-      periodic updates not prompts. Builds directly on `pipeline.run_testing_mode`.
+- [x] **Autonomous runner over ALL qualified matches** — done two ways: the CLI
+      `runner.run_queue` (decision 035) loops every cleared match dry-run/armed, and the web
+      **auto-apply loop** (decision 069) prepares each cleared match into a "Ready to apply"
+      queue and submits one per Apply click. Both dry-run by default, kill-file/Stop halted.
+      *Remaining live step:* one real web-loop run end-to-end (see below).
 - [~] **Surface Discover in the web UI** — **done (first cut):** a **"Discover" tab** with a
       one-click **"Find & fill one application (dry-run)"** button that runs the whole
       testing-mode loop in a background thread, streams step-by-step progress (incl. a Claude
@@ -416,6 +448,45 @@ value ÷ effort:
       `check_factual_drift`, `select_backend`).
 
 ## Next
+
+### Discovery funnel — surfaced by decisions 073/074 (2026-07-15)
+
+- [ ] **`max_resolve` is now the binding constraint on early-career discovery.** Measured:
+      1,130 fillable candidates survive `_CURATED_ATS` (up from ~1,130 → ~2,183 after 074),
+      but only **40** are resolved + judged per run. Raising it is the single highest-yield
+      knob left; it is also the Claude-judge cost knob, so it needs a deliberate
+      cost/benefit call from the user rather than a default bump. Consider surfacing the
+      discarded count in the UI ("40 of 2,183 judged") — silence here currently reads as
+      "we looked at everything", which UI Principle #5 calls a bug.
+- [ ] **iCIMS is dropped (158 active postings) on a technicality.** `apply.detect_ats`
+      recognizes iCIMS, but `discovery.detect_ats_from_url` does **not** — it returns
+      `"other"`, so `_is_fillable` rejects those postings before Apply ever sees them.
+      Resolve the JD (likely via the same `enrich` cascade that unlocked Workday) and check
+      whether the generic autofill path can actually fill an iCIMS form before enabling.
+- [ ] **Two divergent ATS detectors are a latent trap.** `discovery.detect_ats_from_url`
+      (knows smartrecruiters/recruitee/workable, no iCIMS, returns `"other"`) and
+      `apply.detect_ats` (knows iCIMS, not the other three, returns `"generic"`) drift
+      independently — decision 074 had to reason about both to know where a posting lands.
+      Consider one shared detector with an explicit fillable/resolvable capability map.
+- [ ] **`ATS_SOURCES` is overloaded** — it is both the discovery-source registry *and* the
+      fillability predicate (`pipeline._is_fillable`, `discovery.py`). Adding a
+      discovery-only source to that dict would silently assert an apply adapter exists.
+
+### Test-suite hygiene (observed 2026-07-15)
+
+- [ ] **`test_mailbox.py::test_load_config_needs_all_three` leaks a real secret when it fails.**
+      It asserts `load_config({...})` returns `None`, but `load_config` falls back to the
+      user's real `profile/mailbox.yaml` + keychain, so it returns the live config — and
+      pytest prints the **real Gmail app password** in the assertion diff. Two bugs in one:
+      the test is environment-dependent (fails on any machine with a linked mailbox), and a
+      failing test writes a live credential to the terminal/CI log (Guideline #5/#12).
+      Fix: have the test point `load_config` at a temp path/isolated env, and consider
+      `repr`-masking secrets in `MailboxConfig` so they can never print. Pre-existing —
+      predates 2026-07-15, confirmed failing on a clean tree.
+- [ ] **`test_lever_labels.py::test_lever_eeo_selects_get_clean_label_and_normalize` is
+      flaky.** Failed once in 3 consecutive full-suite runs on an unmodified `apply.py`;
+      passes in isolation and on re-run. Playwright timing under load is the likely cause.
+      Needs a deterministic wait rather than a re-run until it is trusted.
 
 ### Apply stage (decision 016) — the current focus
 
@@ -536,6 +607,25 @@ Posted to the agent bus 2026-07-06; independent of the engine work above.
 ---
 
 ## Recently added (this session, latest first)
+
+- 2026-07-14 — **Auto-apply loop: prepare-then-prompt mode (decision 069).** The autonomous
+  looping mode the user asked for — "look for as many matches as possible, then get started on
+  them one by one and prompt me as it needs me to start applying." Sits between the two runner
+  modes: it prepares each cleared match as a background **dry-run** (tailor → PDF → headless
+  fill) into a **"Ready to apply"** queue in the Discover tab, and each card's red **Apply ▶**
+  submits just that one application (per-click armed one-shot, decision 058 — confirms first,
+  KILL-halted, pre-submit gated). **Token-frugal by construction** (user's constraint): each
+  search asks discovery for `only_new` postings, so no posting is ever re-judged and the loop
+  reaches "caught up" and stops when nothing new remains, instead of re-searching into the void.
+  A **Stop** button halts it. One browser, serialized: the loop owns the browser slot (prepare
+  runs headless), user Apply clicks are enqueued and drained by the loop thread, and
+  test-run/re-apply are refused while it runs. New pure `autoloop.py` (the ordering brain) +
+  `web.py` glue (`_loop_worker`, `start/stop_loop`, `queue_submit`, `GET /loop/status`,
+  `POST /loop/start|stop|apply`) + a Discover-tab panel. 11 tests (6 core + 5 real-worker-thread
+  glue with fakes); JS node-clean; `/loop/*` driven live. **Flagged live step (needs you):** one
+  real loop run (Claude signed in, boards configured) to watch discover → prepare → a real
+  Apply ▶ submit — not run here to avoid spending Claude usage / a live submission uninvited.
+  ([autoloop.py](applicationbot/autoloop.py), [web.py](applicationbot/web.py))
 
 - 2026-07-14 — **Web UI revamp: left nav rail + dark mode (decision 068).** The Review-only
   tailoring sidebar was docked on the left of *every* tab (dead, confusing space on
@@ -1658,6 +1748,58 @@ Record each decision in [DECISIONS.md](DECISIONS.md) once the user chooses.
 ---
 
 ## Recently completed
+
+- 2026-07-15 — **GitHub repo job boards: drop-in feeds + Workday/SmartRecruiters unlocked**
+  (decisions 073, 074). We already scraped GitHub boards (SimplifyJobs, decision 031); the
+  investigation measured the funnel first and found the constraint was elsewhere. Of **3,459**
+  active postings in the two feeds, only 1,130 passed `_CURATED_ATS` and only **40**
+  (`max_resolve`) were resolved+judged — 97% discarded. **(a)** `_CURATED_ATS` now includes
+  **workday + smartrecruiters**, recovering **755 + 298** postings from feeds we already fetch,
+  pointing at ATSs Apply can already fill. Workday needed no new resolver: it ships JSON-LD in
+  its initial HTML, so `enrich.fetch_full_jd` resolves it on a plain GET (**10/10 live, json-ld
+  tier, no browser, no LLM call**) — my Playwright caveat was disproved by the spike.
+  **(b)** `early_career.feeds` accepts any GitHub board publishing the SimplifyJobs
+  `listings.json` schema as a **bare URL** — no code, no field mapping (the schema is the
+  de-facto standard; fields were already read via `.get()`). Ranking stays global across feeds
+  so `max_resolve` remains a whole-run budget. Bad feeds fail loudly naming the feed + fix; the
+  web UI gained the field (without it, saving settings would have silently wiped `feeds`).
+  Verified live end-to-end: dropped-in `vanshb03/New-Grad-2026` → 6 full-JD Postings, 0 errors,
+  including a Workday JD (Northrop Grumman, 5,521 chars). `tests/test_curated_feeds.py` (13).
+
+- 2026-07-14 — **Fix "Why Ramp?" left blank — short/optional "Why &lt;Company&gt;?" prompts now
+  drafted** (decision 071): the field is a short, OPTIONAL single-line `<input>`, so it failed
+  every draft gate — not a textarea, under the 25-char open-ended threshold, matched no
+  `_COMPANY_SPECIFIC` phrase, and not required. Fix in `answer_bank.py`: `is_company_specific`
+  now matches any prompt opening with "why " (dynamic company name can't be listed → also
+  excluded from mapping/caching), and `is_open_ended` treats company-specific prompts as
+  draftable even when short/single-line. Now grounded-drafted (résumé + company + JD) whenever
+  company/JD context exists — the pipeline sets both. Refines decision 067 (was: draft short
+  fields only when required). Verified via live Ramp-form field probe + gate/end-to-end tests
+  (`test_determinism_gates.py`, `test_required_draft.py` contract updated).
+- 2026-07-14 — **Fix "Application form did not load" on Ashby (Ramp) — SPA reveal-click timing**
+  (decision 070): the "Apply for this Job" reveal-click was attempted once *before* the form-load
+  poll loop, but Ashby mounts that control after `domcontentloaded`, so the click fired on a
+  not-yet-existing button, never navigated to the form's `<posting>/application` route, and the
+  loop timed out at 25s on the empty posting page. Moved the reveal-click *into* the poll loop
+  (retries each pass until the control appears; `revealed` latch avoids re-clicking). General
+  fix for any late-mounting SPA ATS, no special-casing. Verified live against the reported Ramp
+  URL (loads `/application`, 12 fields, 0 errors) + new `tests/test_open_application_form.py` (2,
+  regression fails on old code with the exact error, passes on the fix). `apply.py` only.
+- 2026-07-14 — **Auto-apply loop: "re-prepare postings I've already seen" opt-in + accent-bar
+  fix** (decision 069 follow-up): a checkbox on the loop panel starts it with `rescan=True`,
+  re-preparing (re-tailor → PDF → dry-run fill) the whole last-scored set — including
+  already-dry-run postings — while **reusing each one's cached fit score** via new
+  `pipeline.cached_matches` (no board re-search, no Claude re-judge) **and reusing the
+  already-tailored PDF** when the résumé/profile links are unchanged (a `<pdf>.stamp` content
+  hash — new `pipeline.tailor_stamp` + `resume_store.read/write_stamp`). PDF reuse now applies
+  to **every dry run** (Test-run button, loop prepare, autonomous/CLI dry-run), keyed on the
+  gate being unarmed; a real armed submit always re-tailors. So any repeated dry run of an
+  unchanged posting spends zero Claude tokens — only the local re-fill runs. A second loop-panel
+  checkbox ("Re-tailor from scratch" → `force_retailor`) is the escape hatch to regenerate
+  anyway. Rescan is a bounded one-shot; bails with an actionable message when nothing is cached.
+  Also fixed the loop/parked panels' accent bar overlapping the text (`padding-left:18px`).
+  `tests/test_autoloop_web.py`, `tests/test_discovery_cache.py`, `tests/test_rescan_reuse.py`
+  (new) green; suite 331 pass.
 
 - 2026-07-09 — **Readiness closers + ITAR gates auto-answered** (decision 044): "Are you
   up for it?" / "Are you ready?" / "Does this sound like you?" resolve to Yes (guarded
