@@ -1477,8 +1477,16 @@ def _fill_combobox(page, loc, value: Optional[str], hints: Optional[list[str]] =
         + ([(value, "literal")] if value else []) \
         + [(h, "hint") for h in (hints or []) if h] \
         + [(l, "learned") for l in learned if l]
-    use_claude = resolver is not None and getattr(resolver, "enable_generation", False) \
-        and bool(value) and label not in picks_done
+    gen_on = resolver is not None and getattr(resolver, "enable_generation", False) and bool(value)
+    # Phase 1's static open-list pick (and the round-1 batch defer) is asked ONCE per label —
+    # `picks_done` suppresses re-asking it in round 2. Phase 2b's typeahead pick is deliberately
+    # NOT suppressed: its options come from what the async search returns per query, not the open
+    # list the batch already declined. A searchable picker's open list is unrelated to the answer
+    # (a school picker shows the first 60 schools ALPHABETICALLY — never the applicant's), so the
+    # batch always declines it; without the exemption round 2 fell through to the substring
+    # fallback, which takes the first fuzzy match and can land on a branch campus instead of the
+    # main one (decision 080, follow-up to 033/079).
+    use_claude = gen_on and label not in picks_done
 
     # Phase 1 — literal match on the options shown on open; then Claude-pick for static lists.
     if _open_combobox(page, loc):
@@ -1521,7 +1529,9 @@ def _fill_combobox(page, loc, value: Optional[str], hints: Optional[list[str]] =
     # the best option from the results — it's told to prefer the primary/main campus. Claude runs
     # BEFORE the non-Claude substring fallback so an ambiguous multi-campus list resolves to the
     # main campus, not whichever campus appears first. Learns the vetted mapping for next time.
-    if use_claude:
+    # Gated on `gen_on`, NOT `use_claude`: a searchable picker the batch already declined (from its
+    # unrelated open list) must still get this per-query pick in round 2 (decision 080).
+    if gen_on:
         for q in _search_queries(value):
             if not _open_combobox(page, loc):
                 break
@@ -1583,6 +1593,7 @@ def _fill_all_fields(page, resolver: AnswerResolver, report: "ApplyReport", done
                 "el => ({tag: el.tagName.toLowerCase(), "
                 "type: (el.getAttribute('type')||'').toLowerCase(), "
                 "role: (el.getAttribute('role')||'').toLowerCase(), "
+                "ariaHidden: (el.getAttribute('aria-hidden')||'').toLowerCase() === 'true', "
                 "chrome: !!el.closest('nav,header,footer,[role=search],[role=navigation]')})"
             )
         except Exception:
@@ -1590,6 +1601,13 @@ def _fill_all_fields(page, resolver: AnswerResolver, report: "ApplyReport", done
         tag, typ, role = k["tag"], k["type"], k["role"]
         if typ in ("hidden", "submit", "button", "file", "checkbox", "radio", "search"):
             continue  # radios handled as groups below; search boxes aren't application fields
+        # react-select renders a second, aria-hidden requiredInput next to its real combobox
+        # input, sharing the field's label. Its empty type reads as free text, so without this
+        # skip it gets .fill()'d — writing nothing visible but claiming the label as "done",
+        # which suppresses round 2's recommit of the actual dropdown (School submitted empty on
+        # a SpaceX dry run — decision 079). An aria-hidden input is never a field a user fills.
+        if k.get("ariaHidden"):
+            continue
         if k.get("chrome"):
             continue  # page nav/header/footer/search chrome, not the application form
         # react-select combobox inputs are often 1px / opacity:0 — don't skip them on

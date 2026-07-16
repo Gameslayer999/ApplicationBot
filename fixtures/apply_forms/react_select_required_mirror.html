@@ -1,0 +1,49 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>react-select with aria-hidden requiredInput mirror</title></head>
+<body>
+<h1>Education</h1>
+<p>Reproduces Greenhouse's react-select "School" field: ONE labelled control renders TWO
+inputs — the real combobox AND an aria-hidden `requiredInput` mirror used only for HTML
+required-validation. The mirror shares the field's label (resolved via ancestor walk). Its
+empty `type` reads as free text, so before decision 079 it got .fill()'d — claiming the label
+as "done" and suppressing the dropdown's committed selection (School submitted empty).</p>
+
+<div class="select-shell">
+  <label id="school-label">School</label>
+  <div class="select__control">
+    <input id="school--0" role="combobox" aria-labelledby="school-label" autocomplete="off">
+  </div>
+  <!-- react-select's hidden required mirror: no type, aria-hidden, tabindex -1 -->
+  <input class="requiredInput" aria-hidden="true" tabindex="-1" required value="">
+  <div class="menu" id="menu-school--0" hidden>
+    <div class="select__option">Harvard University</div>
+    <div class="select__option">Pennsylvania State University-Main Campus</div>
+    <div class="select__option">Pennsylvania State University-Erie, The Behrend College</div>
+    <div class="select__option">Stanford University</div>
+  </div>
+</div>
+
+<script>
+document.querySelectorAll('.select__control').forEach(ctrl => {
+  const input = ctrl.querySelector('input');
+  const menu = document.getElementById('menu-' + input.id);
+  const options = Array.from(menu.querySelectorAll('.select__option'));
+  const filter = () => {
+    const q = input.value.toLowerCase();
+    options.forEach(o => {
+      o.style.display = o.textContent.toLowerCase().includes(q) ? '' : 'none';
+    });
+  };
+  ctrl.addEventListener('click', () => { menu.hidden = false; filter(); });
+  input.addEventListener('input', filter);
+  input.addEventListener('keydown', e => { if (e.key === 'Escape') menu.hidden = true; });
+  options.forEach(o => o.addEventListener('click', () => {
+    input.value = o.textContent;
+    input.dataset.committed = o.textContent;
+    menu.hidden = true;
+  }));
+});
+</script>
+</body>
+</html>

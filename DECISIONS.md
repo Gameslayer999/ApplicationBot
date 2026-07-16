@@ -11,6 +11,11 @@
 
 | # | Date | Decision | Status |
 |---|------|----------|--------|
+| 080 | 2026-07-16 | **A searchable combobox the batch declined still gets its round-2 typeahead Claude pick — so the school picker prefers the MAIN campus, not a branch (decision-033/079 follow-up).** After decision 079 fixed School submitting empty, it committed via the `substring` fallback (first fuzzy match) rather than the Claude pick that's meant to prefer the primary campus. Root cause, found by driving the live SpaceX Greenhouse form: the School react-select is an **async search** whose OPEN list is the **first 60 schools alphabetically** (Acadia, Adamson… — never the applicant's), and typing `Pennsylvania State` returns `Pennsylvania State University` **and** `…- Schuylkill Campus`. Round 1 defers a batch pick over the alphabetical open list; the batch (correctly) declines it — but `_resolve_pending` marked the label `picks_done`, and `picks_done` gated **both** Phase 1's static open-list pick **and** Phase 2b's article-stripped typeahead pick. So round 2 skipped Phase 2b (the one built for async school pickers, told to prefer the main campus) and fell through to Phase 2c's substring fallback, which takes the first fuzzy match — a branch campus if the async lists it first. Fix: split the gate — Phase 2b now runs on `gen_on` (generation + a value), **not** `use_claude` (which still respects `picks_done`), because Phase 2b's options come from the per-query async results, not the open list the batch already saw. Phase 1's static re-ask stays suppressed (no wasted calls); a genuinely static undecidable dropdown types to zero options in Phase 2b and makes no extra call. Rejected freeing `picks_done` wholesale (would re-ask Phase 1's static pick every round 2). **Verified live on SpaceX**: School commits `Pennsylvania State University` (main) via the Claude typeahead. New async-picker fixture + two-pass test lists the branch campus first and fails without the fix (`'…- Schuylkill Campus'`, `source=substring`), passes with it (`main`, `source=option:claude`); combobox/two-pass/required-dropdown/multipage/fillability/lever/determinism suites green | Accepted |
+| 079 | 2026-07-16 | **Skip `aria-hidden` inputs when filling — react-select's requiredInput mirror was hijacking its own dropdown (School submitted empty).** A SpaceX dry run left the Greenhouse **School** field on `Select…` while Degree/Discipline filled — yet the report logged School as *filled* (`source=resolver`, plain text). Root-caused by driving the real form: Greenhouse renders each react-select as **two** inputs sharing one label — the real combobox (`role=combobox`) and an **`aria-hidden="true"` `requiredInput` shadow** (empty `type`, `tabindex=-1`) used only for HTML required-validation. When the résumé value (`The Pennsylvania State University`) doesn't literally match an option on open — the decision-033 article-prefix case — the combobox **defers** its pick to the batched Claude decision and returns via a `continue` that **doesn't mark the label done**. The loop then reaches the mirror, whose empty `type ∈ _TEXTLIKE` and `role != combobox` classify it as **free text**, so it's `.fill()`'d — writing into an invisible input, but **marking "School" done**. Round 2 then skips the label, so the real dropdown is never committed → submits empty, while the report falsely reads filled. Fix is one guard in `_fill_all_fields`: **skip any `aria-hidden="true"` input** (never a field a user fills), so the mirror can't claim the label and round 2 recommits the actual selection. General across every react-select field/ATS, not SpaceX-specific. Rejected marking the label `done` on defer (breaks round 2's recommit, which relies on the label staying open). **Verified on the live SpaceX form**: School now commits through the combobox (`control=combobox`, a real Penn State option) instead of the phantom text fill; Degree/Discipline unchanged. New fixture reproduces the dual-input structure and the regression test fails without the guard (`FilledField(control='text', source='resolver')`) and passes with it; related fill suites (combobox, two-pass, multipage, fillability, lever, corpus) green | Accepted |
+| 078 | 2026-07-15 | **The tracker's Source URL is the link itself; editing moves behind an ✎ toggle.** The cell rendered as a text `<input>` with a 12px `↗` beside it, so the URL *looked* like plain text and the only clickable target was the glyph — the obvious affordance did nothing (UI Principle #1). The URL is now an `<a>` whose text is the URL (`target=_blank`, `rel=noopener noreferrer`); an `✎` swaps in the same input, and committing it saves via the existing `saveCell` and returns to the link. Editing is **kept**, not dropped: the cell has always been editable and a manually-added row needs a way to set its URL (Guideline #7). The link renders only for `http(s)` — anything else (empty, or a stored `javascript:`/`data:` string) falls back to the input, a guard inherited unchanged from the `↗`. Only the **cell** re-renders on save, never the row: `saveCell` writes "Saved ✓" after its `await`, so replacing the row would land the confirmation on a detached node (UI Principle #5). **Surfaced a real layout bug**: a long URL is unbreakable text, so as a link it inflated the column to **583px** — past the 220px default and the resize handle — squeezing every other column (Company → 83px); an `<input>` never did this because its intrinsic width is small. `contain:inline-size` on the link keeps its text out of the table's intrinsic width so `table-layout:fixed` honours the `<col>` again, **reproducing the baseline geometry exactly** (measured against a `git stash` baseline: table 1370px, Source URL 98px, all 16 columns identical). **Verified in the real UI on the real tracker**: 18/18 rows render as links with correct hrefs and zero inputs; a full `✎` → edit → `Saved ✓` → link-with-new-href round trip on live row 21, with the original value written back so `applications.db` is untouched. Suite **375/375**. Known gap: the column is 98px, so links show truncated (`https://j…`) with the full URL on hover — the input truncated identically and the squeeze is pre-existing (`width:auto` + `table-layout:fixed` ignores the 220px default even at baseline); widening it, or shortening the label to `smartrecruiters.com/…/87644936`, is a separate change | Accepted |
+| 077 | 2026-07-15 | **Bot-walled applications are parked as their own kind (`bot_wall`) and retried later — fixing two bugs decision 076 introduced.** 076 made a bot wall detectable but not *routable*, and the user's own live run proved it: **real tracker row 21** came back `status='dry-run'`, `blocked_kind='captcha'`. Both wrong. (1) **Mis-parked as CAPTCHA** — `classify` scanned `"captcha" in " ".join(errors)`, and the wall's own vendor host is **`captcha-delivery.com`**, so an IP block was labelled "A CAPTCHA is in the way — solve it in the open browser": there is no puzzle, and a headless run has no browser to solve it in. Fixed by a **structured `ApplyReport.bot_wall`** flag classified **first** — deliberately not prose-matching, since prose-matching *is* the bug. (2) **Advertised as ready to apply** — a walled run never reaches submit, so `submit_state` stayed `"dry-run"`, and `web.py` treats **any** dry-run row as "ready to apply"; a posting we were *refused* on sat in the ready queue. `_record_run` now records `blocked` when `bot_wall` is set, so it lands in `parked_applications`. New `parking.BOT_WALL` is resumable **by time, not by the user** (`resolve=""`, verb **"Try again"**) — the existing `/parked` + `_reapply_worker` are kind-agnostic, so "go back and do them later" needed **no new plumbing**. Copy corrected where the new kind broke it (Guideline #11 / UI #3-4): the tracker note says **"Refused"** not "Dry-run: 0 field(s) filled" (the exact line that made row 21 unreadable); the runner header no longer tells every parked row it is "waiting on you — resolve" (a wall waits on the **site**) and each line now carries its own verb; the web card no longer calls a refusal a "site error". **Submit for real** is deliberately KEPT on the card — if the block has lifted, the armed retry is exactly the "do it later" path. **Verified on the user's real data**: row 21 re-driven live → `blocked`/`bot_wall`/`blocked by captcha-delivery.com`; the card **rendered and screenshotted** in the real UI via a real Discover-tab click; both fixes **mutation-checked**. 5 new tests, suite **374/374**. Known gap: an upsert never clobbers user-owned `notes`, so row 21's pre-existing note still reads "Dry-run" — `blocked_kind`/`detail` carry the truth and drive every surface | Accepted |
+| 076 | 2026-07-15 | **Agentic nav fallback + host-keyed nav recipes, and bot walls reported as refusals — three distinct causes behind one "couldn't find the application".** The reported failure (tracker row 21, SmartRecruiters, 0 fields) was investigated rather than assumed, and was **not one bug**: (1) `detect_ats` had no SmartRecruiters branch (the gap decision **074 flagged**); (2) `_open_application_form` revealed forms only via `/\bapply\b/i`, but SmartRecruiters' control says **"I'm interested"** → new `_REVEAL_CONTROL`, anchored so "Not interested" can't match; (3) **the real blocker, found only by driving it live**: the site answers with **HTTP 403 + a DataDome wall** (`geo.captcha-delivery.com`) rendered **inside an iframe over an empty host page** — so the run misreported a **refusal** as "form did not load", and a first main-frame-only detector saw nothing. New `_bot_wall_evidence` walks every frame (text signals + vendor hosts); a wall now yields a precise error and **suppresses the agentic fallback** — an agent hits the identical wall from the same IP, and aiming one at a bot wall is evasion (Guideline #4). Layer 2 (the user's ask) mirrors decisions 061/063 exactly: when `nav_agentic: true` (**off by default**; replay always free) a Claude+Playwright-MCP worker over CDP reaches the form **once**, and `nav_recipes.py` distils a **host-keyed, PII-free, committed** recipe (`{host: {url_suffix, reveal_labels}}`) by **DIFFING the DOM** (what navigated / what vanished) — never parsing MCP refs — so every later posting on that host replays deterministically with no Claude. Host is the key, so one learned posting unblocks the whole site. `_distil_nav` verb-filters vanished controls (a cookie banner must never become a recipe) and yields **nothing** rather than a wrong recipe on an opaque route; `is_shareable_host` keeps loopback/private hosts out of the shared library (a live drive really did try to commit `127.0.0.1`). Rejected: agent-only (first run on every site costs Claude, and this posting stays blocked) and on-by-default (spends tokens unasked, diverges from `workday_agentic`). **Verified:** the flagged live Claude-over-MCP step of 061/063 is now **actually driven** — a real worker opened the fixture form, learned `"Join our team"`, and a replay opened it with the agent asserted to run exactly once; the real posting now reports the DataDome refusal precisely (was: a misleading timeout); the bot-wall guard is **mutation-checked** through `run_apply`. 18 new tests (fixtures reproduce the real page + the real iframe wall); suite **369/369**. **Honest limit: the SmartRecruiters fix could not be confirmed end-to-end — this environment's cloud egress IP is the one DataDome named** | Accepted |
 | 075 | 2026-07-15 | **Mailbox secrets are `repr=False`; the env-vs-link test pins an unlinked path.** `test_load_config_needs_all_three` asserted `load_config({...}) is None`, but `load_config` prefers a stored **link** over env (decision 057) and defaults to the real `profile/mailbox.yaml` — so on any machine with a linked mailbox it returned the live config, failed, and pytest printed the **real Gmail app-password** in the assertion diff. Two distinct bugs: (1) the test was environment-dependent (passed only on an unlinked box, e.g. CI) — fixed by passing `backend=_FakeKeyring(), path=_link_path()`, the isolation idiom the rest of the file already used and this one test predated; mutation-checked that it still catches the regression it exists for. (2) **any** repr of a `MailboxConfig` leaked a live credential — a traceback, log line, or diff would do it. `password`/`refresh_token`/`client_secret` are now `field(repr=False)` on the dataclass: values stay fully usable in code and `asdict()` is unchanged, they simply never render in `repr`/`str`; non-secret fields still print so repr stays useful for debugging. `link_status()` remains the safe view. Rejected leaving it at (1): that closes only the one known leak path and the exposure recurs on the next failure that prints a config. Behaviour change flagged and approved (Guideline #7): debug output no longer shows those three values. Suite **351/351 green** (was 349/1 with this pre-existing failure). Related: the bot-inbox address was scrubbed from `DECISIONS.md`/`NEXT_STEPS.md` before the 069-074 commit — it was absent from HEAD and is contact detail (Guideline #12) | Accepted |
 | 074 | 2026-07-15 | **Resolve Workday (and SmartRecruiters) JDs in the curated feeds, unlocking +1,053 candidates the filter was discarding.** `_CURATED_ATS` gated curated listings to Greenhouse/Lever/Ashby — the only ATSs with a hand-written `_resolve_jd` helper. Measured against the live feeds, that discarded **755 active Workday** and **298 SmartRecruiters** postings *the Apply stage can already submit to* (`pipeline._is_fillable` explicitly allows `workday`; `workday.apply_workday` is a complete backend). The gate was never about fillability — it was about JD resolution. **Workday resolves with no new code**: it renders client-side but still ships schema.org JSON-LD in the initial HTML, so `enrich.fetch_full_jd` (the existing cascade from #047) returns a full JD on a plain GET — **10/10 live postings via the `json-ld` tier, no browser, no LLM call** (called without `llm=`, so it stops at the free tiers). Rejected Playwright (my initial assumption — the spike disproved it: unnecessary cost/fragility) and Workday's `/wday/cxs/` JSON API (works 15/15 but returns *less* text than the JSON-LD and needs a bespoke tenant/site URL rewrite). SmartRecruiters needed only a tuple entry — `_resolve_smartrecruiters_jd` already existed. Flagged: SmartRecruiters routes to **generic autofill** (`apply.detect_ats` doesn't know it — decision #030), which is less proven than the Workday backend. Verified live end-to-end: real config → `build_sources` → `discover` returned 6 postings / 0 errors including a **Workday** JD (Northrop Grumman, 5,521 chars) and a SmartRecruiters JD, all clearing `_is_fillable` and routing to the right backend | Accepted |
 | 073 | 2026-07-15 | **Any GitHub repo job board is drop-in config, not code** (`early_career.feeds`). The curated source hard-coded two SimplifyJobs URLs. Investigated adding more repos and **measured the marginal yield first**: the two live `vanshb03` boards add only **103 new fillable postings** over Simplify's 1,093 (8 overlap) — while `max_resolve` truncates the pool to 40, so more repos ≈ **zero** real gain. Conclusion recorded: **the funnel neck (40 of 1,130), not feed count, is the binding constraint** — so the value here is optionality (drop in a board when one matters), not breadth, and no extra repos ship enabled by default. Chose to **extend `early_career` with `feeds:`** over a new top-level `github_boards:` block — backwards compatible, no migration, `kinds` keeps naming the built-ins. A feed is a bare string (built-in name or raw URL) or `{name, url}`; feeds are named `<owner>/<repo>` so they read cleanly in logs and the cache fingerprint. **No per-feed field mapping**: SimplifyJobs' `listings.json` is the de-facto schema (vansh is a fork) and every field was already read via `.get()`, so a URL alone suffices. Kept **one source** rather than one-source-per-feed (which would get per-feed error isolation free from `discover()`) so ranking stays **global** across feeds and `max_resolve` stays a whole-run budget — per-feed sources would have silently multiplied Claude cost per board added (Guideline #7). A bad feed therefore **fails loudly** naming the feed and the fix, rather than silently shrinking results (UI Principle #5); `discover()` still isolates the source so the run continues. Web UI gained the feeds field — without it `readDiscForm` would have **silently wiped** `feeds` on every save. Verified live: a dropped-in `vanshb03/New-Grad-2026` URL flowed config → discovery → full-JD Postings, 0 errors | Accepted |
@@ -3481,3 +3486,317 @@ being the pre-existing failure).
 **Related.** The bot-inbox address was scrubbed from `DECISIONS.md`/`NEXT_STEPS.md` before the
 069–074 commit: it was not present in HEAD, and it is contact detail that must not enter git
 (Guideline #12) — the repo must carry no user's data.
+
+---
+
+## 076 — Agentic nav fallback + host-keyed nav recipes; bot walls reported as refusals
+
+**Context:** A dry-run "failed because it couldn't find the application" (tracker row 21 —
+SmartRecruiters, 0 fields filled). The ask: let a Claude agent watch, get to the application, and
+save that so future applications through a similar site aren't blocked. Investigating the actual
+run — rather than building to the description — showed **one symptom over three distinct causes**,
+only one of which the requested feature addresses.
+
+**What was actually wrong**
+
+| # | Cause | Evidence | Fix |
+|---|---|---|---|
+| 1 | `detect_ats` didn't know SmartRecruiters → `generic` | the gap decision **074 already flagged** | a `smartrecruiters` branch (+ `_ats_from_frame`) |
+| 2 | The reveal only matched `/\bapply\b/i` | the real page says **"I'm interested"** ×5, "apply" ×0 | `_REVEAL_CONTROL`, anchored so **"Not interested"** can't match |
+| 3 | **The real blocker** — the site *refuses* us | live drive: **HTTP 403** + DataDome wall, page named **our own egress IP** | `_bot_wall_evidence` → report a refusal, never call an agent |
+
+Cause 3 was invisible to tests and to the tracker row; it appeared only by driving the real URL and
+reading the screenshot. The first detector still missed it: the wall is served by
+`geo.captcha-delivery.com` **into an iframe while the host page's body is empty**, so a main-frame
+text scan returned `""`. It walks every frame now (text signals + vendor hosts).
+
+**Decision**
+
+1. **Deterministic first** (free): SmartRecruiters detection + a reveal pattern that isn't
+   hardcoded to the word "apply".
+2. **Bot walls are refusals, not missing forms.** A wall produces a precise error ("the site
+   refused the request… ApplicationBot will not try to evade the block") and **suppresses the
+   agentic fallback**: a Claude worker drives the same browser from the same IP into the identical
+   wall, so it would burn tokens to fail — and aiming an agent at a bot wall is evasion
+   (Guideline #4). The misleading timeout error is dropped when a wall is found.
+3. **Agentic nav + learned recipes** (the ask), mirroring decisions 061/063 so there is **one
+   mental model**: `nav_agentic: true` in `profile/safety.yaml`, **off by default**; a
+   Claude+Playwright-MCP worker over CDP reaches the form **once**; `nav_recipes.py` stores
+   `{host: {url_suffix, reveal_labels}}` — **PII-free and committed**, so a clone inherits every
+   site already learned. **Replay is always on and free; only learning a new host is gated.**
+
+**Why these shapes**
+
+- **Host is the key.** Every SmartRecruiters posting shares `jobs.smartrecruiters.com`, so learning
+  *one* posting unblocks the site — precisely "future applications through a similar site are not
+  blocked". Per-posting keys would learn nothing reusable.
+- **Distil by DOM diff, not by reading the agent.** Like 061: we observe what *navigated* and what
+  *vanished*, so we never parse opaque MCP element refs, and the loop stays offline-testable.
+- **A recipe records the route only** — a path suffix and control labels. No answers (those are
+  re-resolved per user by `AnswerResolver`), so the shared library is PII-free by construction.
+- **Refuse to guess.** `_distil_nav` verb-filters vanished controls (a dismissed cookie banner must
+  never become a recipe replayed on every posting) and returns **nothing** rather than a wrong
+  recipe when the route is opaque. `is_shareable_host` keeps loopback/private hosts out of the
+  committed library — not hypothetical: the live drive learned `127.0.0.1` from a local fixture.
+- **The nav worker is forbidden to fill.** Its prompt is the inverse of the Workday worker's:
+  navigation is the job, filling/uploading/submitting/account-creation are hard-barred, so the
+  fallback can never touch an answer or reach the submit path.
+
+**Options rejected**
+
+| Option | Why not |
+|---|---|
+| Agent-only (no deterministic fix) | The first run on *every* site costs a Claude call, and the reported posting stays blocked until the learner works. |
+| On by default | Spends tokens without asking and diverges from how `workday_agentic` is gated (061/063). |
+| Ask per site | Breaks the no-human-in-the-loop goal (Guideline #3) and stalls autoloop runs. |
+
+**Verified** (driving the real thing, not only tests):
+
+- **The live Claude-over-MCP step left flagged by 061/063 is now actually driven** — a real Claude
+  Code + Playwright MCP worker attached to our browser over CDP, opened the fixture form, and the
+  route was distilled to `"Join our team"` (cookie-banner decoy correctly excluded); 5 fields
+  filled, nothing submitted. Replay then opened it with **the agent asserted to run exactly once**.
+- The **real posting** now reports `smartrecruiters blocked automated access … 'captcha-delivery.com'`
+  instead of a misleading 25s timeout, with the "arm the agent" advice correctly withheld.
+- The bot-wall guard is **mutation-checked through `run_apply`**: neutering `_bot_wall_evidence`
+  makes the test fail (an earlier version of that test passed vacuously — it called
+  `_open_application_form`, which never invokes the fallback — and was rewritten to drive the real
+  branch).
+- 18 new tests; fixtures reproduce the real posting **and** the real iframe-over-empty-body wall.
+  Suite **369/369**.
+
+**Honest limit / open item.** The SmartRecruiters fix is **not confirmed end-to-end**: this build
+environment's egress IP (an AWS address) is the exact IP DataDome named, so every live attempt is
+403'd here regardless of the code. Causes 1 and 2 are proven against committed fixtures of the real
+page; whether they alone unblock that posting from a **home network** is unverified — and if
+SmartRecruiters walls the user's IP too, no amount of nav work fixes it and the correct behaviour is
+the refusal message this decision adds. Re-drive from the user's machine to settle it.
+
+---
+
+## 077 — Bot-walled applications are parked as `bot_wall` and retried later
+
+**Context:** Decision 076 taught the run to *detect* a bot wall, but not what to *do* with one. The
+request — "flag applications that restrict because they find bot activity so we can go back and do
+them later" — exposed that 076 left the wall detectable but unroutable. The user's **own live run**
+proved it in production data: real tracker **row 21** read `status='dry-run'`,
+`blocked_kind='captcha'`. Both fields were wrong, and both were 076's doing.
+
+**The two bugs**
+
+| # | Bug | Why it happened | Fix |
+|---|---|---|---|
+| 1 | An IP block was parked as a **solvable CAPTCHA** ("solve it in the open browser") | `classify` scanned `"captcha" in " ".join(errors)`; the wall's vendor host is literally **`captcha-delivery.com`**. There is no puzzle, and a headless run has no browser to solve it in. | Structured `ApplyReport.bot_wall`, classified **first** |
+| 2 | A posting we were **refused** on showed as **"ready to apply"** | A walled run never reaches submit → `submit_state` stayed `"dry-run"`, and `web.py` marks **any** dry-run row ready | `_record_run` records `blocked` when `bot_wall` is set |
+
+**Decision**
+
+1. **`ApplyReport.bot_wall`** carries the evidence as a field, and `parking.classify` reads *that*,
+   **before** the CAPTCHA branch. Deliberately **not** prose-matching our own error text —
+   prose-matching is precisely what produced bug 1.
+2. **`parking.BOT_WALL`** is a first-class kind that is **resumable by time, not by the user**:
+   `resolve=""` (no setting fixes it), verb **"Try again"**. `/parked` and `_reapply_worker` are
+   kind-agnostic, so the flag/list/retry loop the request asked for needed **no new plumbing** —
+   the runner lists it and the UI offers it automatically.
+3. **Copy corrected wherever the new kind broke it** (Guideline #11, UI Principles #3–#4): the
+   tracker note now says **"Refused: … the site refused automated access"** instead of
+   `"Dry-run: 0 field(s) filled"` — the exact line that made row 21 unreadable to the user; the
+   runner's header no longer claims every parked row is "waiting on you — resolve" (a wall waits on
+   the **site**) and each line carries its own verb; the web card no longer calls a refusal a
+   "site error".
+
+**Why `Submit for real` stays on the card.** It looks like a dead button on an unreachable posting,
+but it isn't: if the block has lifted, the armed retry fills *and* submits — which is exactly the
+"go back and do it later, for real" path. Removing it would delete the feature being asked for.
+A wall never risks a bad submit: with no form served, the pre-submit gate has nothing to click.
+
+**Why not auto-retry on a timer.** Deferred, not rejected — the request was to *flag so we can go
+back*, and the one-click retry delivers that. Automatic retry needs a backoff policy and a rule for
+when a site is hopeless (Guideline #4: repeatedly hammering a host that has refused us is exactly
+the abusive request pattern we must not build). Logged in NEXT_STEPS as a decision to make.
+
+**Verified — on the user's real data, not only fixtures:**
+
+- Row 21 re-driven live → `blocked` / `bot_wall` / `blocked by captcha-delivery.com` (was
+  `dry-run` / `captcha`).
+- The Resolve card **rendered and screenshotted in the real web UI**, reached by a real click on
+  the Discover tab: headline "The site blocked automated access", the precise note, and both retry
+  buttons. JS syntax-checked with `node --check` (after filling serve-time placeholders).
+- Both fixes **mutation-checked**: neutering the `bot_wall` classify branch, and reverting the
+  `blocked` status, each make their test fail.
+- 5 new tests; suite **374/374**.
+
+**Known gap.** An upsert never clobbers user-owned fields, so row 21's *pre-existing* note still
+reads "Dry-run: 0 field(s) filled". Only newly-inserted rows get the "Refused" note. The
+`blocked_kind`/`blocked_detail` carry the truth and drive every surface (runner, card, API), so the
+stale note is cosmetic — and weakening the never-clobber-user-edits rule to fix it would be a worse
+trade (Guideline #7).
+
+---
+
+## 078 — The tracker's Source URL is the link itself; editing moves behind an ✎ toggle
+
+**Context.** The Source URL cell rendered as a text `<input>` with a small `↗` link beside it
+(decision 068's table). The URL *looked* like plain text: the only clickable target was a 12px
+glyph, while the obvious affordance — the URL — did nothing. The user asked for the URLs in the
+Track table to be actual links instead of plain text boxes.
+
+**Decision.** The cell now renders the URL as an `<a>` whose text *is* the URL: click anywhere on
+it to open the posting (`target=_blank`, `rel=noopener noreferrer`). An `✎` button beside it swaps
+in the same text input; committing it saves through the existing `saveCell` and returns to the
+link. The link view is used only for an `http(s)` value — anything else (empty, or a stored
+`javascript:`/`data:` string) renders as the input, which both gives a manually-added row a way to
+type its URL and keeps a non-http scheme from ever becoming a clickable payload. That http-only
+guard is inherited unchanged from the `↗` it replaces.
+
+**Why keep an editing path at all.** The cell has always been editable and a manually-added row
+needs a way to set its URL — making it a bare link would silently delete that (Guideline #7). The
+toggle keeps the capability while letting the default state be the one the user actually wants.
+
+**Why re-render only the cell.** `saveCell` writes "Saved ✓" into the row *after* its `await`, so
+re-rendering the row on save would detach that span and land the confirmation (or the error) on a
+dead node — a silent failure (UI Principle #5). `render()` rewrites the `.urlcell` only.
+
+**The layout bug this surfaced.** A long URL is unbreakable text, so as a link it inflated the
+column to **583px** — past the 220px default and the resize handle — squeezing every other column
+(Company 83px). The old `<input>` never did this: an input has a small intrinsic width. Fixed with
+`contain:inline-size` on the link, which keeps its text out of the table's intrinsic width so
+`table-layout:fixed` honours the `<col>` width again. Verified by measuring the real table: the
+fixed version reproduces the pre-change geometry **exactly** (table 1370px, Source URL 98px, all
+16 columns identical to baseline).
+
+**Verified — driven in the real web UI on the user's real tracker, not fixtures:**
+
+- All **18** rows render as `<a>` with the URL as its text, correct `href`, `target=_blank`,
+  `rel="noopener noreferrer"`; **zero** inputs in the default view.
+- **Edit round trip on real row 21**: `✎` → input pre-filled with the current URL → changed →
+  `Saved ✓` → back to a link carrying the **new** href. The original value was then written back,
+  so `applications.db` is unchanged.
+- Column geometry measured against a `git stash` baseline (above). The resize handle behaves
+  identically to baseline under the same synthetic drag.
+- Suite **375/375**.
+
+**Known gap.** The column renders at 98px, so the link shows truncated (`https://j…`) with the full
+URL on hover — the same truncation the input had, and pre-existing (the table is `width:auto` +
+`table-layout:fixed`, which squeezes columns proportionally; the 220px default is not honoured even
+at baseline). Widening the default or shortening the label to something readable (`smartrecruiters.com/…/87644936`)
+is a separate change, not folded into this one.
+
+---
+
+## 079 — Skip `aria-hidden` inputs when filling (react-select requiredInput mirror hijacked its dropdown)
+
+**Context.** A dry run against **SpaceX — New Graduate Engineer, Software (Starlink)**
+(Greenhouse) left the **School** field on its `Select…` placeholder while Degree and Discipline
+filled correctly. The run's `report.json` nonetheless listed School as *filled*
+(`value="The Pennsylvania State University"`, `source=resolver`) — so the field looked done but
+would submit empty. The user asked why, and for a fix general enough to keep hands-off runs
+correct.
+
+**Investigation (driven, not assumed).** A read-only DOM capture of the live form showed School is
+**not** misclassified — its input is a proper `role="combobox"` react-select, structurally
+identical to Degree/Discipline. Reproducing the real `_fill_page` against the live form revealed
+the actual mechanism: Greenhouse renders each react-select as **two** inputs sharing one label:
+
+1. the real combobox input (`role="combobox"`), and
+2. an **`aria-hidden="true"` `requiredInput` shadow** — empty `type`, `tabindex="-1"`, `role=""` —
+   used only for the browser's native required-field validation.
+
+The résumé value `The Pennsylvania State University` matches no option on open (the async list
+indexes it under *"Pennsylvania State University-…"* — the decision-033 article-prefix problem), so
+`_fill_combobox` **defers** its pick to the batched Claude decision and returns `None` via a
+`continue` that **does not add the label to `done`**. The fill loop then reaches the hidden mirror;
+its empty `type` is in `_TEXTLIKE` and its `role != "combobox"`, so it's classified as a **free-text
+field** and `loc.fill()`'d with the school name — writing into an invisible input that shows
+nothing, but **marking "School" done**. In round 2 the deferred combobox pick would normally be
+recommitted, but the label is already `done`, so it's skipped and the real dropdown is never
+committed. Degree/Discipline escaped this only because their values matched an option literally on
+first open (`option:hint`/`option:literal`), resolving in round 1 before the mirror was reached.
+
+**Decision.** Skip any input with `aria-hidden="true"` in `_fill_all_fields`, right after the
+existing `type in ("hidden", …)` skip. An `aria-hidden` input is removed from the accessibility
+tree — it is never a field a human fills — so skipping it is safe in general, and it stops the
+mirror from claiming the label. With the mirror gone, round 1's combobox defer leaves the label
+open, and round 2 recommits the real selection. The fix is one guard plus one extra property in the
+per-control `evaluate`; it is general to **every** react-select field on Greenhouse (and any ATS
+using the same requiredInput pattern), not a SpaceX special-case.
+
+**Rejected.** Marking the label `done` when a combobox defers its pick — that would suppress round
+2's recommit, which deliberately relies on the deferred label staying *un-done* so it can be
+revisited. The mirror, not the defer, is the defect.
+
+**Verified.**
+- **Live SpaceX form, before:** `_fill_combobox` called once for School → returns `None`; School
+  recorded `control='text'`, `source='resolver'` (the mirror); the visible dropdown stays `Select…`.
+- **Live SpaceX form, after:** `_fill_combobox` called **twice** (round 1 defers → `None`; round 2
+  recommits) → School filled `control='combobox'` with a real Penn State option; Degree/Discipline
+  unchanged.
+- **Regression test** (`tests/test_required_input_mirror.py` + fixture
+  `fixtures/apply_forms/react_select_required_mirror.html`) reproduces the dual-input structure and
+  a deferred pick. It **fails without the guard** (`FilledField(control='text', source='resolver')`)
+  and **passes with it** (`control='combobox'`, `source='option:claude'`, the mirror never typed
+  into).
+- Related fill suites green: combobox, two-pass, multipage, fillability, lever-labels,
+  resolver-corpus.
+
+**Known limit.** In the live after-run the round-2 pick committed via the `substring` tier rather
+than the Claude pick (the batched pick didn't literally match, so Phase 2c's substring fallback
+landed "Pennsylvania State University"). That still commits a *real* option (not plain text), so the
+field submits validly; tightening the async school picker to prefer the main-campus option every
+time is the separate decision-033 follow-up, not folded in here.
+
+---
+
+## 080 — A searchable combobox the batch declined still gets its round-2 typeahead Claude pick
+
+**Context.** Decision 079 stopped School from submitting empty, but it then committed via the
+`substring` tier — the non-Claude first-fuzzy-match fallback — instead of the Claude pick that is
+explicitly told to prefer the primary/main campus. On the live SpaceX form the substring pick
+happened to land on the right entry, but it takes *whatever the async lists first*, so it can commit
+a **branch campus** ("…- Schuylkill Campus") over the main one. The user asked to make the picker
+reliably prefer the main campus.
+
+**Investigation (driven).** Read-only capture of the live Greenhouse School react-select showed it
+is an **async search**, not a static list:
+
+- On **open** (empty query) it returns the **first 60 schools alphabetically** — `Acadia
+  University`, `Adamson University`, `Adelphi University`, … — never the applicant's school.
+- Typing `Pennsylvania State` returns two options after ~3s: `Pennsylvania State University` and
+  `Pennsylvania State University - Schuylkill Campus`. (A short 1.1s read returned **zero** — the
+  async XHR hadn't come back yet.)
+
+So round 1's batch pick is made over the alphabetical open list and **correctly declines** (no
+option fits "The Pennsylvania State University"). The bug: `_resolve_pending` then added the label
+to `picks_done`, and `picks_done` gated **both** Phase 1's static open-list Claude pick **and**
+Phase 2b's article-stripped typeahead Claude pick. Round 2 therefore skipped Phase 2b — the path
+built for async school pickers (decision 033), which types progressively shorter, article-stripped
+queries and lets Claude pick the primary campus from the real per-query results — and fell through
+to Phase 2c's substring fallback.
+
+**Decision.** Split the gate. Phase 2b now runs on a new `gen_on` (generation enabled + a non-empty
+value), **not** `use_claude` (which still ANDs in `label not in picks_done`). Rationale: Phase 2b's
+candidates come from what the async search returns **per query**, which is unrelated to the open
+list the batch already declined — so re-running it in round 2 is not a redundant re-ask. Phase 1's
+static open-list pick stays gated by `picks_done`, so a genuinely static dropdown the batch couldn't
+resolve is not re-asked (and in Phase 2b a static list filtered by the full value typically yields
+zero options → no Claude call, so no extra cost there either). The primary-campus preference itself
+already lives in the pick prompt (`'The Pennsylvania State University' → 'Pennsylvania
+State University-Main Campus'`); this change just lets that prompt actually run.
+
+**Rejected.** Freeing `picks_done` wholesale (only marking labels the batch *decided*) — that would
+re-run Phase 1's static open-list pick every round 2 for any declined dropdown, spending Claude
+calls to re-derive the same decline. Splitting the gate targets exactly the async case.
+
+**Verified (live SpaceX form).** Driving the real `_fill_page` against the SpaceX Greenhouse
+posting, `_fill_combobox` is called twice for School — round 1 defers (`None`), round 2 commits
+`('Pennsylvania State University', 'claude')` — and School is recorded
+`control='combobox'`, `source='option:claude'` with the **main campus** value. Before this fix the
+same run committed via `source='option:substring'`; Degree/Discipline are unchanged.
+
+**Verified (fixture).** New `fixtures/apply_forms/async_school_picker.html` mimics the real picker:
+open list is alphabetical decoys, the full "The …" query is a prefix miss (zero options), and the
+article-stripped query returns the two campuses **with the branch listed first**. The two-pass test
+(`tests/test_async_school_pick.py`) drives the real `_fill_page`: without the fix School commits
+`Pennsylvania State University - Schuylkill Campus` (`source=substring`, the wrong branch); with it,
+`Pennsylvania State University` (`source=option:claude`, the main campus). Regression suites green:
+combobox, two-pass, required-dropdown, multipage, fillability, lever-labels, determinism-gates.

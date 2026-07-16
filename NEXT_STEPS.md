@@ -97,6 +97,25 @@ and free-form notes.
 
 ## Now
 
+### Confirm the SmartRecruiters fix from the user's own network (decision 076) — BLOCKED ON USER
+
+The nav work is verified; **the SmartRecruiters posting that prompted it is not**. Every live
+attempt from the build environment is 403'd by DataDome, which named *this machine's* cloud egress
+IP — so the block may be about where the build runs, not about the user's home network.
+
+- [ ] **USER:** re-drive the reported posting from your own machine and report which happens:
+  ```
+  python -m applicationbot.apply "https://jobs.smartrecruiters.com/Consultadd4/87644936" \
+      --pdf "<your résumé>.pdf" --resume profile/resume.yaml --headless --no-pause --no-record --dry-run
+  ```
+  - **Fields fill** → causes 1+2 were the whole story; nothing further to do.
+  - **"blocked automated access"** → SmartRecruiters walls the user too. That is the site refusing
+    us, and the honest answer is to apply there by hand — **do not** build evasion (Guideline #4).
+    Consider instead **dropping SmartRecruiters from discovery** so the pipeline stops queueing
+    postings it can never submit (it contributed ~298 of the 074 unlock).
+  - **"form did not load"** (no wall) → a *fourth* cause past the `oneclick-ui` page; arm
+    `nav_agentic: true` and let the learner take it.
+
 ### LinkedIn job alerts as a discovery source (decision 072) — BLOCKED ON USER
 
 Approach approved 2026-07-15; no code written yet. Ingest is by **email forwarding**, not by
@@ -1726,6 +1745,15 @@ Posted to the agent bus 2026-07-06; independent of the engine work above.
 
 ## Decisions needed
 
+- **Should bot-walled applications retry automatically, or stay one-click?** (decision 077 shipped
+  the flag + manual "Try again"; auto-retry was deferred, not rejected.) Full automation
+  (Guideline #0) argues the runner should re-attempt a `bot_wall` row on a later cycle without the
+  user. Guideline #4 argues the opposite: a site that refused us must not be hammered on a timer —
+  that *is* an abusive request pattern. Needed before building: a backoff (hours? next daily
+  cycle?), a cap (how many refusals before a host is declared hopeless), and whether a hopeless
+  host should be **dropped from discovery** so the pipeline stops queueing postings it can never
+  submit (SmartRecruiters contributed ~298 of the 074 unlock — see the SmartRecruiters item in
+  **Now**, which may settle this on its own).
 - Tech stack and primary language.
 - ~~Scraping strategy~~ — **resolved (decision 026):** no scraping; public ATS APIs
   (Greenhouse/Lever/Ashby) + Adzuna aggregator behind a pluggable source interface,
@@ -1745,6 +1773,113 @@ Record each decision in [DECISIONS.md](DECISIONS.md) once the user chooses.
 ---
 
 ## Recently completed
+
+- 2026-07-16 — **Apply: a searchable combobox the batch declined still gets its round-2 typeahead
+  Claude pick — school picker now prefers the MAIN campus** (decision 080, follow-up to 033/079).
+  After 079, School committed via the `substring` fallback (first fuzzy match), which can land on a
+  branch campus. The live Greenhouse School field is an async search: its open list is the first 60
+  schools alphabetically (never the applicant's), so the round-1 batch declines it and marked the
+  label `picks_done` — which also suppressed Phase 2b, the article-stripped typeahead + Claude pick
+  built for async school pickers. Fix: Phase 2b now runs on `gen_on` (generation + a value), not
+  `use_claude` (which still respects `picks_done`), because its options come from the per-query
+  async results, not the open list the batch saw. New async-picker fixture + two-pass test list the
+  branch campus first: without the fix School = `…- Schuylkill Campus` (`substring`); with it =
+  `Pennsylvania State University` (`option:claude`). Combobox/two-pass/required-dropdown/multipage/
+  fillability/lever/determinism suites green.
+
+- 2026-07-16 — **Apply: `aria-hidden` inputs are skipped — react-select's requiredInput mirror
+  no longer hijacks its own dropdown** (decision 079). A SpaceX (Greenhouse) dry run left the
+  **School** field on `Select…` while Degree/Discipline filled, yet the report logged School as
+  filled (`source=resolver`, plain text). Root cause, found by driving the live form: Greenhouse
+  renders each react-select as two inputs sharing one label — the real combobox and an
+  `aria-hidden` `requiredInput` shadow. When the résumé value doesn't literally match an option,
+  the combobox defers its pick to the batch and returns *without* marking the label done; the loop
+  then reaches the mirror (empty `type` → free text), `.fill()`s it, and marks the label done — so
+  round 2 never recommits the real selection and the field submits empty. Fix: one guard in
+  `_fill_all_fields` skipping `aria-hidden="true"` inputs (never a fillable field), general to every
+  react-select field/ATS. Verified live — School now commits through the combobox with a real
+  option. New fixture + regression test (`tests/test_required_input_mirror.py`) fails without the
+  guard and passes with it; combobox/two-pass/multipage/fillability/lever/corpus suites green.
+
+- 2026-07-15 — **Track table: the Source URL *is* the link; editing moved behind an ✎**
+  (decision 078 — supersedes the `↗` entry below). The `↗` made the URL openable but left it
+  looking like plain text in a box: the only clickable target was a 12px glyph, while the
+  obvious affordance — the URL itself — did nothing (UI Principle #1). The cell now renders an
+  `<a>` whose text is the URL; `✎` swaps in the same input, and committing saves via `saveCell`
+  and returns to the link. The `http(s)`-only guard and the save-then-sync ordering are
+  inherited unchanged from the `↗`; only the cell re-renders, never the row (the "Saved ✓"
+  span must survive the await — UI Principle #5).
+  **Layout bug found and fixed:** a long URL is unbreakable text, so as a link it stretched the
+  column to **583px** — past the 220px default and the resize handle — squeezing every other
+  column (Company → 83px). An `<input>` never did this (small intrinsic width).
+  `contain:inline-size` on the link keeps its text out of the table's intrinsic width so
+  `table-layout:fixed` honours the `<col>` again; measured against a `git stash` baseline, the
+  geometry is now **identical** (table 1370px, Source URL 98px, all 16 columns).
+  Verified in the live UI on the real tracker: 18/18 rows are links with correct hrefs and zero
+  inputs; a full ✎ → edit → "Saved ✓" → link-with-new-href round trip on row 21. Suite 375/375.
+  Heeding the WAL note below, the probe's write was reverted **through the UI** (same write
+  path, not a file copy) and confirmed directly against `applications.db`: row 21 holds its
+  original URL, 0 rows contain the test value.
+  ↳ **Open, deliberately not folded in:** the column renders at 98px, so links show truncated
+  (`https://j…`, full URL on hover). Pre-existing — the input truncated identically, and
+  `width:auto` + `table-layout:fixed` squeezes columns proportionally so the 220px default is
+  ignored even at baseline. Fix by widening the default or labelling the link
+  `smartrecruiters.com/…/87644936` instead of the raw URL.
+
+- 2026-07-15 — **Track table: Source URL is a real link.** The column rendered the URL as a
+  plain editable input; it now keeps that input (the cell has always been editable — a
+  manually-added row needs a way to set its URL, Guideline #7) and adds a `↗` anchor
+  (`target=_blank`, `rel=noopener noreferrer`) beside it, shown only for an `http(s)` value —
+  an empty cell has nothing to open, and rejecting other schemes stops a stored
+  `javascript:`/`data:` string becoming a clickable payload. The link re-syncs in place as the
+  cell is edited (a stale link would quietly open the **wrong** posting); a first cut called
+  `loadTrack()` instead, which re-rendered the row and detached the span `saveCell` writes
+  "Saved ✓" into **after** its await — losing the confirmation and silently swallowing save
+  errors (UI Principle #5). `saveCell` now returns success so the link only follows a real
+  save. Verified by driving the live UI: link appears/vanishes/re-points as the value changes,
+  "Saved ✓" still shows, `node --check` clean, suite 375/375.
+  ⚠ **Process note for future agents:** that UI probe wrote a test URL into the **real**
+  `applications.db`, and the backup/restore did not undo it — the DB is in **WAL mode**, so
+  copying `applications.db` alone lets `applications.db-wal` replay the edit back. Row counts
+  matched, which hid it. Repaired and verified row-by-row against the pre-probe copy (0 diffs).
+  **Never point a UI probe at the real tracker**: `tracker.list_applications(path=DEFAULT_DB)`
+  binds its default at import, so reassigning `tracker.DEFAULT_DB` does **not** redirect it —
+  a temp-DB probe needs the server to be given the path, or restore with
+  `PRAGMA wal_checkpoint(TRUNCATE)` and diff every row.
+
+- 2026-07-15 — **Bot-walled applications parked as `bot_wall`, retryable later** (decision
+  077). Fixes two bugs **076 introduced**, both proved by the user's own live run — real
+  tracker **row 21** came back `status='dry-run'`, `blocked_kind='captcha'`. (1) The wall's
+  vendor host is literally `captcha-delivery.com`, so `classify`'s `"captcha" in errors` scan
+  mis-parked an IP block as "solve it in the open browser" — there's no puzzle and a headless
+  run has no browser; now a **structured `ApplyReport.bot_wall`** is classified first (no
+  prose-matching — that *was* the bug). (2) A walled run never reaches submit, so it stayed a
+  `dry-run` row — which `web.py` advertises as **"ready to apply"**; now recorded `blocked`,
+  so it parks. New `parking.BOT_WALL` is resumable **by time, not the user** (`resolve=""`,
+  verb "Try again"); `/parked` + `_reapply_worker` are kind-agnostic, so flag→list→retry
+  needed **no new plumbing**. Copy fixed where the kind broke it: note says "Refused" not
+  "Dry-run: 0 field(s) filled"; the runner no longer tells a wall it's "waiting on you";
+  the card no longer calls a refusal a "site error". Verified **on the real row** + the card
+  **screenshotted in the real UI**; both fixes mutation-checked. Suite **374/374**.
+
+- 2026-07-15 — **Agentic nav fallback + host-keyed nav recipes; bot walls reported as
+  refusals** (decision 076). Chased the reported "dry-run couldn't find the application"
+  (tracker row 21, SmartRecruiters, 0 fields) to **three** distinct causes, not one:
+  `detect_ats` didn't know SmartRecruiters (the gap **074 flagged**); the reveal only matched
+  `/\bapply\b/i` while the real control says **"I'm interested"**; and — found only by driving
+  the real URL — the site answers **403 + a DataDome bot wall** in an **iframe over an empty
+  body**, which the run misreported as "form did not load". Now: `_bot_wall_evidence` walks
+  every frame and a wall yields a precise refusal that **suppresses the agent** (an agent hits
+  the same wall from the same IP; aiming one at a bot wall is evasion — Guideline #4). The
+  requested learner ships as `nav_recipes.py` + `run_agent_nav`, mirroring 061/063: opt-in
+  `nav_agentic: true` (**off by default**, replay always free), a Claude+MCP worker reaches the
+  form **once**, and the route is distilled **by DOM diff** into a **PII-free, committed,
+  host-keyed** recipe — so one learned posting unblocks the whole site with no Claude after.
+  **The live Claude-over-MCP step flagged by 061/063 is now actually driven** (real worker →
+  form → learned `"Join our team"` → replay with the agent asserted to run exactly once).
+  18 tests, suite **369/369**. ⚠ **Unconfirmed:** the SmartRecruiters fix itself — this build
+  environment's cloud egress IP is the exact IP DataDome named, so every live attempt 403s
+  here. See **Now**.
 
 - 2026-07-15 — **Mailbox test isolation + secrets never render** (decision 075). The one
   long-standing suite failure: `test_load_config_needs_all_three` asserted `load_config(...)

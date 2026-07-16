@@ -1,0 +1,58 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Async searchable school picker (react-select-shaped)</title></head>
+<body>
+<h1>Education</h1>
+<p>Reproduces a Greenhouse-style async School picker: the OPEN menu (empty query) shows a default
+slice of schools ALPHABETICALLY — never the applicant's — so a batch pick over it declines. Typing
+a query fetches matching schools; the full résumé value ("The Pennsylvania State University") is a
+prefix miss (returns nothing, like the real index), but the article-stripped query returns the two
+Penn State campuses. The BRANCH campus is listed first, so a first-fuzzy-match substring fallback
+would commit the wrong campus — the Claude pick must prefer the main one (decision 080).</p>
+
+<div class="select-shell">
+  <label id="school-label">School</label>
+  <div class="select__control">
+    <input id="school--0" role="combobox" aria-labelledby="school-label" autocomplete="off">
+  </div>
+  <div class="menu" id="menu-school--0" hidden></div>
+</div>
+
+<script>
+// Query -> options, mimicking a prefix-indexed async search.
+function lookup(qRaw) {
+  const q = (qRaw || "").trim().toLowerCase();
+  if (!q) return ["Acadia University", "Adamson University", "Adelphi University"]; // default slice
+  if (q.startsWith("the ")) return [];              // article prefix misses, like the real index
+  if (q.includes("pennsylvania state"))
+    return ["Pennsylvania State University - Schuylkill Campus",  // BRANCH listed first on purpose
+            "Pennsylvania State University"];                     // main campus second
+  return [];
+}
+
+const ctrl = document.querySelector(".select__control");
+const input = document.getElementById("school--0");
+const menu = document.getElementById("menu-school--0");
+
+function render(opts) {
+  menu.innerHTML = "";
+  opts.forEach(text => {
+    const d = document.createElement("div");
+    d.className = "select__option";
+    d.textContent = text;
+    d.addEventListener("click", () => {
+      input.value = text;
+      input.dataset.committed = text;
+      menu.hidden = true;
+    });
+    menu.appendChild(d);
+  });
+  menu.hidden = false;
+}
+
+ctrl.addEventListener("click", () => render(lookup(input.value)));
+input.addEventListener("input", () => render(lookup(input.value)));
+input.addEventListener("keydown", e => { if (e.key === "Escape") menu.hidden = true; });
+</script>
+</body>
+</html>

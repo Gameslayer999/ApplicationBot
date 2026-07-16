@@ -1092,6 +1092,19 @@ INDEX_HTML = """<!doctype html>
   .ttable .reslink { color:var(--accent); text-decoration:none; font-size:12px; white-space:nowrap; padding:5px 6px; display:inline-block; }
   .ttable .reslink:hover { text-decoration:underline; }
   .ttable .muted { color:var(--muted); padding:5px 6px; display:inline-block; }
+  /* Source URL: the URL is the link and takes the cell's width, truncating with an ellipsis;
+     the ✎ button beside it swaps in the editable input. */
+  .ttable .urlcell { display:flex; align-items:center; gap:2px; }
+  .ttable .urlcell .urltext { flex:1; min-width:0; }
+  /* contain:inline-size keeps the URL's own (very long, unbreakable) text out of the table's
+     intrinsic width: without it the link stretches the column far past the width set here and on
+     the resize handle, squeezing every other column. */
+  .ttable .urllink { flex:1; min-width:0; contain:inline-size; color:var(--accent); text-decoration:none;
+                     font-size:12px; padding:5px 6px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .ttable .urllink:hover { text-decoration:underline; }
+  .ttable .urledit { width:auto; margin:0; flex:none; padding:4px 6px; background:var(--surface);
+                     color:var(--muted); border:1px solid var(--line); font-size:12px; }
+  .ttable .urledit:hover { color:var(--accent); }
   .twrap { overflow-x:auto; }
   .tempty { color:var(--muted); padding:24px; text-align:center; border:1px dashed var(--line); border-radius:8px; }
   /* Consistent waiting indicator: spinner + label (+ elapsed seconds for long waits). */
@@ -2003,6 +2016,10 @@ function parkedCard(p) {
     actions.append(el("span", {class:"pk-note", text:(p.action || "Store the login") + ", then re-apply this posting."}));
   else if (p.kind === "captcha")
     actions.append(el("span", {class:"pk-note", text:"Re-apply this posting and solve the CAPTCHA in the browser window that opens."}));
+  else if (p.kind === "bot_wall")
+    // Not a site error and not a CAPTCHA: the site refused us, so there is nothing to answer or
+    // configure. Both re-apply buttons stay — if the block has lifted, the retry just works.
+    actions.append(el("span", {class:"pk-note", text:"The site refused us as automated traffic and never showed the form — nothing to fix on your side. Try again later or from a different network, or apply by hand."}));
   else
     actions.append(el("span", {class:"pk-note", text:"This is a site error, not something you can answer — skip it or try again later."}));
   if (p.resumable) {
@@ -2148,6 +2165,50 @@ function renderFunnel(funnel) {
   }
 }
 
+// The Source URL cell: the URL itself is the link — clicking the text opens the posting in a new
+// tab. The cell stays editable (a manually-added row needs a way to set its URL), so an ✎ button
+// swaps the link for a text input; committing the input saves and returns to the link. A value
+// that isn't an http(s) URL has nothing to open, so it renders as the input directly — that also
+// keeps a stored `javascript:`/`data:` string from ever becoming a clickable payload.
+function urlCell(app) {
+  const cell = el("span", {class:"urlcell"});
+  let editing = false;
+  // Re-render only this cell, never the whole row: saveCell writes "Saved ✓" into the row AFTER
+  // its await, so replacing the row first detaches that span and the save (or its error) lands on
+  // a dead node — no confirmation, a silent failure (UI Principle #5).
+  const render = () => {
+    cell.innerHTML = "";
+    if (editing || !isHttpUrl(app.source_url)) {
+      const input = el("input", {type:"text", value:app.source_url || "", class:"urltext",
+        title:app.source_url || "", placeholder:"https://…",
+        on:{change: async (e) => {
+          const v = e.target.value.trim();
+          if (!(await saveCell(app.id, "source_url", v))) return;  // save failed → row shows error
+          app.source_url = v;
+          editing = false;
+          render();
+        }}});
+      cell.append(input);
+      if (editing) input.focus();
+      return;
+    }
+    // The column is narrow, so the URL renders truncated with an ellipsis — the title makes the
+    // full URL readable on hover without widening the column.
+    cell.append(
+      el("a", {class:"urllink", href:app.source_url, target:"_blank", rel:"noopener noreferrer",
+        title:"Open " + app.source_url, text:app.source_url}),
+      el("button", {class:"urledit", type:"button", text:"✎", title:"Edit this URL",
+        on:{click:()=>{ editing = true; render(); }}}));
+  };
+  render();
+  return cell;
+}
+
+function isHttpUrl(v) {
+  try { const u = new URL((v || "").trim()); return u.protocol === "http:" || u.protocol === "https:"; }
+  catch (e) { return false; }
+}
+
 function statusCell(app) {
   const sel = el("select", {class:"st-" + app.status.replace("-","")});
   for (const s of TRACK_STATE.statuses) {
@@ -2199,6 +2260,7 @@ function renderTrack(apps) {
           ? el("a", {class:"reslink", href:"/track/resume?id=" + app.id, target:"_blank",
                      title:app.resume_path, text:"View résumé ↗"})
           : el("span", {class:"muted", text:"—"});
+      else if (key === "source_url") input = urlCell(app);
       else input = el("input", {type:"text", value:app[key] || "", on:{change:e=>saveCell(app.id, key, e.target.value)}});
       return el("td", {}, [input]);
     });
@@ -2279,8 +2341,10 @@ async function saveCell(id, field, value) {
     if (!d.ok) throw new Error(d.error || "save failed");
     if (saved) { saved.className = "rowsaved"; saved.textContent = "Saved ✓"; setTimeout(()=>{ saved.textContent = ""; }, 1500); }
     if (field === "status") { const dd = await (await fetch("/track")).json(); renderCounts(dd.counts); }
+    return true;   // callers that must react only to a REAL save (urlCell's ↗) can await this
   } catch (e) {
     if (saved) { saved.className = "msg err"; saved.textContent = String(e.message || e); }
+    return false;
   }
 }
 

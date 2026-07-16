@@ -187,11 +187,15 @@ def _report_parked(say=print) -> None:
         return
     if not parked:
         return
-    say(f"\n{len(parked)} application(s) waiting on you — resolve in the Discover tab, then re-apply:")
+    # Header stays neutral and each line carries its OWN verb: not every parked application is
+    # waiting on the user — a bot-walled one (decision 077) is waiting on the site, and telling
+    # the user to "resolve" it would send them looking for a fix that doesn't exist (UI Principle #4).
+    say(f"\n{len(parked)} application(s) parked, not submitted — open the Discover tab:")
     for a in parked[:10]:
         d = parking.describe(a.get("blocked_kind", ""), a.get("blocked_detail", ""))
         who = f"{a['company']} — {a['role']}".strip(" —") or a.get("source_url", "?")
-        say(f"  - {who}: {d['label']}" + (f" ({d['detail']})" if d["detail"] else ""))
+        verb = f" → {d['action']}" if d["action"] else ""
+        say(f"  - {who}: {d['label']}{verb}" + (f" ({d['detail']})" if d["detail"] else ""))
     if len(parked) > 10:
         say(f"  … and {len(parked) - 10} more.")
 

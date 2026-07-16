@@ -169,8 +169,29 @@ def test_runner_report_parked_names_blocked_applications(tmp_path, monkeypatch):
     lines: list[str] = []
     runner._report_parked(say=lines.append)
     blob = "\n".join(lines)
-    assert "1 application(s) waiting on you" in blob
+    assert "1 application(s) parked" in blob
     assert "Acme — SWE" in blob and "Work authorization" in blob
+    assert "Answer the questions" in blob, "each line must carry its own action verb"
+
+
+def test_runner_never_tells_the_user_to_resolve_a_bot_wall(tmp_path, monkeypatch):
+    """A bot-walled application is waiting on the SITE, not on the user. The old header told every
+    parked row it was "waiting on you — resolve", which sends the user hunting for a fix that does
+    not exist for this kind (UI Principle #4)."""
+    import functools
+
+    from applicationbot import runner
+    db = tmp_path / "apps.db"
+    tracker.add_application({"company": "Consultadd", "role": "Python Developer", "status": "blocked",
+                             "blocked_kind": parking.BOT_WALL,
+                             "blocked_detail": "blocked by captcha-delivery.com"}, path=db)
+    monkeypatch.setattr(tracker, "parked_applications",
+                        functools.partial(tracker.parked_applications, path=db))
+    lines: list[str] = []
+    runner._report_parked(say=lines.append)
+    blob = "\n".join(lines)
+    assert "waiting on you" not in blob and "resolve" not in blob.lower()
+    assert "The site blocked automated access" in blob and "Try again" in blob
 
 
 def test_runner_report_parked_silent_when_none(tmp_path, monkeypatch):
@@ -305,3 +326,69 @@ def test_reapply_route_blocks_cross_origin(web_temp_db, monkeypatch):
         assert code == 200 and started == [True]
     finally:
         srv.shutdown()
+
+
+# --------------------------------------------------- bot walls (decision 077)
+
+def test_bot_wall_parks_as_bot_wall_not_as_a_solvable_captcha():
+    """The bug this exists for: the wall's own vendor host is "captcha-delivery.com", so the
+    `"captcha" in text` scan classified a DataDome IP block as a CAPTCHA and told the user to
+    "solve it in the open browser" — there is no puzzle, and a headless run has no browser to
+    solve it in. The structured flag must win over the error prose."""
+    r = ApplyReport(url="x", ats="smartrecruiters", bot_wall="captcha-delivery.com", errors=[
+        "smartrecruiters blocked automated access to this posting "
+        "(page says: 'captcha-delivery.com') — the form was never served."])
+    reason = parking.classify(r)
+    assert reason is not None
+    assert reason.kind == parking.BOT_WALL, f"mis-parked as {reason.kind}"
+    assert reason.kind != CAPTCHA
+    assert "captcha-delivery.com" in reason.detail
+    assert reason.resumable is True, "the site may let us in later — it must be retryable"
+    assert reason.resolve == "", "there is no setting the user can change to fix a bot wall"
+
+
+def test_bot_wall_card_says_try_again_and_deep_links_nowhere():
+    d = parking.describe(parking.BOT_WALL, "blocked by captcha-delivery.com")
+    assert d["label"] == "The site blocked automated access"
+    assert d["action"] == "Try again"
+    assert d["resolve"] == "" and d["resumable"] is True
+
+
+def test_a_real_captcha_still_parks_as_captcha():
+    """Guard the fix's blast radius: a genuine CAPTCHA (no bot_wall flag) is unchanged."""
+    r = ApplyReport(url="x", blockers=["a captcha stands in the way of submit"])
+    assert parking.classify(r).kind == CAPTCHA
+
+
+def test_bot_walled_run_is_recorded_blocked_never_ready_to_apply(monkeypatch):
+    """The second half of the bug: a bot-walled run never reaches submit, so `submit_state` stays
+    "dry-run" — and web.py advertises ANY dry-run row as "ready to apply". A posting we were
+    REFUSED on must never appear ready; it must be a parked `blocked` row we can retry later."""
+    from applicationbot import apply as apply_mod
+
+    captured: dict = {}
+    monkeypatch.setattr(tracker, "find_by_source_url", lambda *a, **k: None)
+    monkeypatch.setattr(tracker, "add_application", lambda data, **k: captured.update(data) or 1)
+
+    report = ApplyReport(url="https://jobs.smartrecruiters.com/Co/1", ats="smartrecruiters",
+                         bot_wall="captcha-delivery.com")
+    assert report.submit_state == "dry-run"  # precondition: it never reached the submit path
+    apply_mod._record_run(report, "r.pdf", "", "")
+
+    assert captured["status"] == "blocked", "a refused posting must not sit in the ready queue"
+    assert captured["blocked_kind"] == parking.BOT_WALL
+    assert "Refused" in captured["notes"] and "captcha-delivery.com" in captured["notes"]
+    assert "Dry-run" not in captured["notes"], "it was not a dry-run of the form — none was served"
+
+
+def test_bot_walled_row_surfaces_as_parked_for_later(tmp_path):
+    """End of the chain: the flagged row is what `parked_applications` returns, so the runner
+    lists it and the UI offers it — "go back and do them later" needs no new plumbing."""
+    db = tmp_path / "t.db"
+    tracker.add_application({"company": "Consultadd", "role": "Python Developer",
+                             "source_url": "https://jobs.smartrecruiters.com/Co/1",
+                             "status": "blocked", "blocked_kind": parking.BOT_WALL,
+                             "blocked_detail": "blocked by captcha-delivery.com"}, path=db)
+    parked = tracker.parked_applications(path=db)
+    assert len(parked) == 1 and parked[0]["blocked_kind"] == parking.BOT_WALL
+    assert parking.describe(parked[0]["blocked_kind"])["action"] == "Try again"

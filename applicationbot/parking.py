@@ -30,6 +30,7 @@ NEEDS_ANSWER = "needs_answer"   # required question(s) had no answer → Profile
 FORM_REJECTED = "form_rejected"  # the form rejected the submit → review answers
 LOGIN = "login"                 # the site needs a sign-in / verification first → credentials
 CAPTCHA = "captcha"             # a CAPTCHA stands in the way → solve in the browser
+BOT_WALL = "bot_wall"           # the site REFUSED us as a bot → nothing to fix; retry later
 SITE_ERROR = "site_error"       # genuine failure (no submit button, click crashed) — NOT resumable
 
 
@@ -73,6 +74,18 @@ def classify(report: "ApplyReport") -> Optional[ParkReason]:
     for the user to act on. Order reflects specificity: a login/CAPTCHA wall gates the whole
     form, so it wins over individual missing fields."""
     text = " ".join(report.blockers + report.errors).lower()
+
+    # FIRST — and read from a structured flag, never from the error prose. The site refused us, so
+    # the form was never served: this run proves nothing about the posting and is worth retrying
+    # later, unchanged. It must outrank CAPTCHA: the wall's own vendor host is
+    # "captcha-delivery.com", so the `"captcha" in text` scan below would otherwise mis-park an IP
+    # block as a puzzle the user could "solve in the open browser" — which does not exist here.
+    if getattr(report, "bot_wall", ""):
+        return ParkReason(
+            BOT_WALL,
+            "The site refused us as automated traffic — the application form was never shown. "
+            "Nothing to fix on your side; try again later or from a different network.",
+            "", True, f"blocked by {report.bot_wall}")
 
     if "captcha" in text:
         return ParkReason(
@@ -120,6 +133,9 @@ _KIND_DISPLAY = {
     FORM_REJECTED: ("The form rejected the submission", "Review your answers", "profile-answers", True),
     LOGIN: ("Sign-in required first", "Store the login", "credentials", True),
     CAPTCHA: ("A CAPTCHA is in the way", "Solve it in the browser", "", True),
+    # Resumable, but by TIME rather than by the user: the fix is to re-run later, so the card's
+    # verb is "Try again" and it deep-links nowhere — there is no setting that unblocks this.
+    BOT_WALL: ("The site blocked automated access", "Try again", "", True),
     SITE_ERROR: ("Couldn't be completed", "", "", False),
 }
 
