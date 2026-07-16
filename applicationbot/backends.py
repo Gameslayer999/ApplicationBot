@@ -91,7 +91,12 @@ What you SHOULD do:
 - If the base resume has a summary, rewrite it to speak directly to this job (true facts \
 only).
 - Reorder and select experience, bullets, projects, activities, and skills so the most \
-relevant material comes first.
+relevant material comes first. Order experience by RELEVANCE TO THIS JOB first — an entry \
+whose role/domain matches the posting outranks an unrelated one regardless of dates (e.g. \
+for a software-engineering job a software role must come before an unrelated tutoring or \
+retail role, even if the unrelated one is more recent). Break ties by recency: among \
+entries of comparable job-relevance, put the most recent nearer the top. This same \
+relevance-first, recency-as-tiebreak order applies to projects and activities too.
 - Each project may carry an `impact` score (1–5, technical impressiveness). Relevance to \
 this job is the primary signal, but among comparably-relevant projects prefer higher-\
 impact ones, and when the length budget forces you to drop projects, drop the \
@@ -104,13 +109,17 @@ thing done — a feature built or shipped, a bug or class of bugs fixed, a syste
 automated / migrated / integrated, a process optimized — plus the technology used and \
 what changed because of it. Replace vague verbs ("worked on", "helped with", \
 "responsible for", "assisted") with the specific action and outcome.
-- QUANTIFY impact wherever the base resume supports it — scope, scale, or result (users, \
-requests or events per day, latency, %, counts, revenue, time saved, team/cohort size, \
-number of features or fixes). Prefer bullets that carry a real magnitude. But use ONLY \
-numbers that are present in, or directly and safely implied by, the base resume: if a \
-bullet has no factual basis for a metric, keep it specific and outcome-focused rather \
-than inventing, estimating, or rounding up a number. A truthful bullet with no metric is \
-always better than a fabricated figure.
+- QUANTIFY impact. The base resume is already full of real numbers — magnitudes, %, \
+counts, scale, latency, revenue, time saved, users, requests/events per day, team/cohort \
+size, number of features or fixes. Your FIRST duty on every bullet is to PRESERVE those \
+figures: if a base bullet carries a number, the rewritten bullet MUST keep that number \
+(rephrase the words freely, but never drop the metric). When the length budget forces a \
+choice of WHICH bullets to keep, prefer the ones that carry a real magnitude over ones \
+that don't — lead each entry with its most quantified, job-relevant bullet. Use ONLY \
+numbers present in, or directly and safely implied by, the base resume: if a bullet has \
+no factual basis for a metric, keep it specific and outcome-focused rather than inventing, \
+estimating, or rounding up a number. A truthful bullet with no metric beats a fabricated \
+figure — but never silently strip a metric the base resume already supports.
 - For EVERY experience, project, and activity entry you include, set its `tailor_note` to \
 ONE short sentence explaining why it's here and how you tailored it for THIS job — what \
 made it relevant, why it's ordered where it is, or what you emphasized or cut. This is \

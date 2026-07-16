@@ -25,7 +25,7 @@ _BULLETS_PER_ENTRY = 4
 @dataclass(frozen=True)
 class LengthBudget:
     pages: float = 1.0
-    line_chars: int = 100  # ~characters that fit on one line at your resume/ATS width
+    line_chars: int = 103  # ~characters that fit on one line at your resume/ATS width (34pt margins)
 
     @property
     def max_experience(self) -> int:

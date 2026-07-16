@@ -23,6 +23,11 @@ from .models import (
 
 DEFAULT_ORDER = list(SECTION_KEYS)
 
+# Bump when the PDF layout changes (margins, fonts, header, spacing). Folded into the
+# tailoring stamp (pipeline.tailor_stamp) so a layout change invalidates cached PDFs and a
+# dry run re-renders instead of reusing a PDF built by the old layout.
+LAYOUT_VERSION = 2
+
 # Core-font PDFs use latin-1; map common unicode punctuation, replace the rest.
 _REPL = {
     "–": "-", "—": "-", "•": "-", "·": "-", "→": "->",
@@ -44,8 +49,8 @@ def _t(s: object) -> str:
 class _Resume(FPDF):
     def __init__(self):
         super().__init__(orientation="P", unit="pt", format="letter")
-        self.set_margins(42, 40, 42)
-        self.set_auto_page_break(True, margin=40)
+        self.set_margins(34, 34, 34)
+        self.set_auto_page_break(True, margin=34)
         self.add_page()
 
     def _two_col(self, left: str, right: str, lfont, rfont, gap: float = 2):
@@ -81,14 +86,27 @@ class _Resume(FPDF):
         self.ln(5)
 
 
+def _fit_font(pdf: _Resume, text: str, style: str, size: float, floor: float):
+    """Set Helvetica/`style` at the largest size <= `size` (down to `floor`) at which `text`
+    fits the content width — so a long name or contact line can never spill past the margins
+    (a plain `cell` doesn't wrap or shrink; it just overprints past the page edge)."""
+    while size > floor:
+        pdf.set_font("Helvetica", style, size)
+        if pdf.get_string_width(text) <= pdf.epw:
+            return
+        size -= 0.5
+    pdf.set_font("Helvetica", style, floor)
+
+
 def _contact(pdf: _Resume, c: Contact):
-    pdf.set_font("Helvetica", "B", 20)
+    _fit_font(pdf, _t(c.name), "B", 20, 12)
     pdf.cell(0, 24, _t(c.name), align="C", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     bits = [b for b in (c.location, c.email, c.phone) if b] + list(c.links)
     if bits:
-        pdf.set_font("Helvetica", "", 9)
+        line = _t("  |  ".join(bits))
+        _fit_font(pdf, line, "", 9, 6.5)
         pdf.set_text_color(*MUTED)
-        pdf.cell(0, 13, _t("  |  ".join(bits)), align="C", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.cell(0, 13, line, align="C", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         pdf.set_text_color(*INK)
 
 

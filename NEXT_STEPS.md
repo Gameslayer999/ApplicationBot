@@ -1774,6 +1774,49 @@ Record each decision in [DECISIONS.md](DECISIONS.md) once the user chooses.
 
 ## Recently completed
 
+- 2026-07-16 — **Track tab: "Dry-run" date shows the LATEST run + each posting expands to a per-run
+  history log** (decision 084). Two follow-ups to 083: (1) `apply.py._record_run`'s update path now
+  explicitly stamps `date_dry_run = today` on every dry-run re-run (the tracker only auto-stamps the
+  first), so the column reflects the *last* run; a plain field edit still never moves it. (2) New
+  append-only `application_runs` table logs one row per apply run (outcome, résumé, fill summary,
+  `ran_at`); the `applications` table stays one-row-per-posting so dedup/funnel/loop are untouched
+  (chosen over one-Track-row-per-run, which would inflate the funnel). Track gains a "Runs" column —
+  `N runs ▾` lazy-loads `/track/runs?id=` into an inline sub-row; 0 runs → "—". `delete_application`
+  cascades; a defensive one-time migration seeds one run per pre-existing dry-run posting from
+  `created_at`/`notes` (references only columns an old schema has). Verified end-to-end incl. driving
+  the Track tab headless (expand/collapse works); 356 passed (2 pre-existing bot_wall failures).
+- 2026-07-16 — **Track tab: a "Dry-run" date column shows when each dry run ran** (decision 083). The
+  dry-run time lived only in `created_at`/`updated_at` (never surfaced); a dry-run row leaves
+  `date_applied` blank and `date_discovered` marks only when the posting was found. New `date_dry_run`
+  column (`tracker.py`) auto-stamped `date.today()` when a row's status is/becomes `dry-run` — mirroring
+  the `date_applied` mechanism — plus a Track-tab "Dry-run" column between Discovered and Applied
+  (`web.py`), rendered as an editable date input. The `_connect` migration ALTERs the column in and
+  backfills existing dry-run rows from `substr(created_at,1,10)`, so all 17 pre-existing dry-run rows
+  show a real date. No `apply.py` change (dry-runs record via `add_application`, which now stamps).
+  Verified on temp + real DB (17/17 backfilled, 0 blank); funnel/calibration/runner/web-CSRF suites
+  green (2 pre-existing `test_parking.py` bot_wall failures unrelated).
+- 2026-07-16 — **Tailor: the reuse-stamp now tracks the tailoring LOGIC, not just the data — so
+  prompt/layout changes stop silently no-op'ing on dry runs** (decision 082). A dry run reuses a
+  posting's stored tailored PDF when its `.stamp` matches (skips the Claude call + render), but
+  `pipeline.tailor_stamp` hashed only résumé + profile links + JD — not the prompt or renderer. So the
+  081 prompt/margin changes produced no visible change on a Stripe dry run (stale PDF reused). Fix:
+  fold `backends.SYSTEM_PROMPT` (content-hashed) and new `pdf.LAYOUT_VERSION` (int, bumped to 2) into
+  the stamp, so any tailoring/layout edit auto-invalidates cached PDFs and the next dry run re-tailors.
+  Only affects the dry-run preview — a real armed submit already always re-tailors. Immediate unblock
+  that already existed: the loop panel's "Re-tailor from scratch" checkbox. Verified: toggling prompt
+  or layout changes the stamp; 357 tests pass (2 pre-existing bot_wall parking failures unrelated).
+- 2026-07-16 — **Tailor: tighter résumés — preserve metrics, relevance-first experience order,
+  narrower margins, header no longer spills off the page** (decision 081). Base résumé is already
+  metric-dense, so the `backends.SYSTEM_PROMPT` QUANTIFY rule now makes *preserving* a base bullet's
+  number the model's first duty (keeping the anti-fabrication guard intact) and leads each entry with
+  its most-quantified bullet. Experience is now ordered relevance-to-the-posting first with recency
+  only as the tiebreak (a software role above tutoring for an SWE job, regardless of dates). PDF
+  margins 42/40/42 → 34/34/34 pt (`pdf._Resume`) with `LengthBudget.line_chars` 100 → 103 to match
+  the wider column. New `pdf._fit_font` shrinks the contact name/line to fit the content width — fixes
+  the header overprinting ~33pt past each page edge (sample contact line was 610pt vs 544pt usable).
+  Verified: sample renders 1 page, contact auto-shrinks 9→8pt to fit, name held at 20pt; 23
+  pdf/tailor/length/render tests green. Metric-density/ordering gains show on the next live tailoring
+  run.
 - 2026-07-16 — **Apply: a searchable combobox the batch declined still gets its round-2 typeahead
   Claude pick — school picker now prefers the MAIN campus** (decision 080, follow-up to 033/079).
   After 079, School committed via the `substring` fallback (first fuzzy match), which can land on a

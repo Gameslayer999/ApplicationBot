@@ -41,7 +41,7 @@ STATUSES = ["discovered", "tailored", "dry-run", "blocked", "applied", "responde
 # for chasing a silent application.
 EDITABLE = [
     "company", "role", "location", "remote", "pay", "portal", "method",
-    "source_url", "date_discovered", "date_applied", "status", "resume_path", "notes",
+    "source_url", "date_discovered", "date_dry_run", "date_applied", "status", "resume_path", "notes",
     "fit_score", "follow_up_date", "blocked_kind", "blocked_detail",
 ]
 
@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS applications (
     method          TEXT NOT NULL DEFAULT '',       -- auto / dry-run / manual
     source_url      TEXT NOT NULL DEFAULT '',
     date_discovered TEXT NOT NULL DEFAULT '',       -- ISO date
+    date_dry_run    TEXT NOT NULL DEFAULT '',       -- ISO date the form was last dry-run filled, blank otherwise
     date_applied    TEXT NOT NULL DEFAULT '',       -- ISO date, blank until applied
     status          TEXT NOT NULL DEFAULT 'discovered',
     resume_path     TEXT NOT NULL DEFAULT '',       -- tailored résumé used (file path)
@@ -68,19 +69,68 @@ CREATE TABLE IF NOT EXISTS applications (
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL
 );
+
+-- Append-only log: one row per apply run (decision 084). The `applications` table holds one
+-- row per posting (its current state); this holds the history of every dry-run / blocked /
+-- submitted attempt against it, each with its own `ran_at`. The Track tab expands a posting to
+-- show its runs. Never edited or deduped — a pure audit trail.
+CREATE TABLE IF NOT EXISTS application_runs (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    application_id  INTEGER NOT NULL,               -- the applications.id this run was against
+    source_url      TEXT NOT NULL DEFAULT '',
+    company         TEXT NOT NULL DEFAULT '',       -- denormalized so a run reads standalone
+    role            TEXT NOT NULL DEFAULT '',
+    portal          TEXT NOT NULL DEFAULT '',
+    outcome         TEXT NOT NULL DEFAULT '',        -- dry-run / blocked / applied
+    resume_path     TEXT NOT NULL DEFAULT '',        -- tailored résumé used for this run
+    detail          TEXT NOT NULL DEFAULT '',        -- "N field(s) filled (…); M need attention" + any blocker
+    ran_at          TEXT NOT NULL                    -- ISO datetime the run happened
+);
+CREATE INDEX IF NOT EXISTS idx_runs_app ON application_runs(application_id);
 """
+
+# Columns a caller may set when recording a run. `id`/`ran_at` are managed here.
+RUN_FIELDS = ["application_id", "source_url", "company", "role", "portal",
+              "outcome", "resume_path", "detail"]
 
 
 def _connect(path: str | Path = DEFAULT_DB) -> sqlite3.Connection:
     conn = sqlite3.connect(str(path))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")  # concurrent runner-writes + UI-reads
+    runs_existed = bool(conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='application_runs'"
+    ).fetchone())
     conn.executescript(_SCHEMA)
     # Migration for DBs created before decision 043 (CREATE IF NOT EXISTS won't add columns).
     cols = {r[1] for r in conn.execute("PRAGMA table_info(applications)")}
-    for missing in ("fit_score", "follow_up_date", "blocked_kind", "blocked_detail"):
+    for missing in ("fit_score", "follow_up_date", "blocked_kind", "blocked_detail", "date_dry_run"):
         if missing not in cols:
             conn.execute(f"ALTER TABLE applications ADD COLUMN {missing} TEXT NOT NULL DEFAULT ''")
+            cols.add(missing)
+            if missing == "date_dry_run":
+                # Backfill pre-existing dry-run rows from created_at (the row's insert time, i.e.
+                # when the dry-run was recorded) so the Track tab shows a date, not a blank, for
+                # runs made before this column existed. Date portion only, matching the column.
+                conn.execute(
+                    "UPDATE applications SET date_dry_run = substr(created_at, 1, 10) "
+                    "WHERE status = 'dry-run' AND date_dry_run = ''"
+                )
+    if not runs_existed:
+        # First time the run log exists: seed it with one run per pre-existing dry-run posting,
+        # from created_at, so the history isn't empty for runs made before this table. Reference
+        # only columns the applications table actually has (an old DB may predate some) — a
+        # missing column contributes '' — so the seed never fails on a partially-migrated schema.
+        src = lambda c: c if c in cols else "''"
+        detail = (f"CASE WHEN {src('notes')} LIKE '[auto] %' THEN substr({src('notes')}, 8) "
+                  f"ELSE {src('notes')} END") if "notes" in cols else "''"
+        conn.execute(
+            "INSERT INTO application_runs "
+            "(application_id, source_url, company, role, portal, outcome, resume_path, detail, ran_at) "
+            f"SELECT id, {src('source_url')}, {src('company')}, {src('role')}, {src('portal')}, "
+            f"  'dry-run', {src('resume_path')}, {detail}, {src('created_at')} "
+            "FROM applications WHERE status = 'dry-run'"
+        )
     return conn
 
 
@@ -104,6 +154,8 @@ def add_application(data: dict[str, Any], *, path: str | Path = DEFAULT_DB) -> i
     row["status"] = _validate_status(data.get("status") or "discovered")
     if not row["date_discovered"]:
         row["date_discovered"] = date.today().isoformat()
+    if row["status"] == "dry-run" and not row["date_dry_run"]:
+        row["date_dry_run"] = date.today().isoformat()
     if row["status"] == "applied" and not row["date_applied"]:
         row["date_applied"] = date.today().isoformat()
     now = _now()
@@ -134,6 +186,12 @@ def update_application(app_id: int, changes: dict[str, Any], *, path: str | Path
             existing = cur.fetchone()
         if existing is not None and not existing["date_applied"]:
             fields["date_applied"] = date.today().isoformat()
+    if fields.get("status") == "dry-run" and not fields.get("date_dry_run"):
+        with _connect(path) as conn:
+            cur = conn.execute("SELECT date_dry_run FROM applications WHERE id=?", (app_id,))
+            existing = cur.fetchone()
+        if existing is not None and not existing["date_dry_run"]:
+            fields["date_dry_run"] = date.today().isoformat()
     fields["updated_at"] = _now()
     assignments = ", ".join(f"{k}=?" for k in fields)
     vals = list(fields.values()) + [app_id]
@@ -149,6 +207,8 @@ def delete_application(app_id: int, *, path: str | Path = DEFAULT_DB) -> bool:
         ).fetchone()
         cur = conn.execute("DELETE FROM applications WHERE id=?", (app_id,))
         deleted = cur.rowcount > 0
+        if deleted:  # cascade: drop this posting's run history so no orphans linger
+            conn.execute("DELETE FROM application_runs WHERE application_id=?", (app_id,))
     # Cascade: remove the tailored PDF this row owned (decision 029) — but only if it's
     # a file we manage under profile/tailored/, never a user-supplied path.
     if deleted and row and row["resume_path"]:
@@ -175,6 +235,41 @@ def find_by_source_url(url: str, *, path: str | Path = DEFAULT_DB) -> Optional[d
         )
         row = cur.fetchone()
     return dict(row) if row else None
+
+
+# ---------------------------------------------------------------- run history (decision 084)
+
+def record_run(data: dict[str, Any], *, path: str | Path = DEFAULT_DB) -> int:
+    """Append one apply run to the history log; returns its new id. Unknown keys ignored.
+    `ran_at` is stamped here (ISO datetime). Callers pass at least `application_id`/`outcome`."""
+    row = {k: ("" if data.get(k) is None else str(data.get(k))) for k in RUN_FIELDS}
+    cols = RUN_FIELDS + ["ran_at"]
+    vals = [row[k] for k in RUN_FIELDS] + [_now()]
+    placeholders = ", ".join("?" for _ in cols)
+    with _connect(path) as conn:
+        cur = conn.execute(
+            f"INSERT INTO application_runs ({', '.join(cols)}) VALUES ({placeholders})", vals
+        )
+        return int(cur.lastrowid)
+
+
+def runs_for_application(app_id: int, *, path: str | Path = DEFAULT_DB) -> list[dict[str, Any]]:
+    """Every run recorded against one posting, newest first."""
+    with _connect(path) as conn:
+        cur = conn.execute(
+            "SELECT * FROM application_runs WHERE application_id=? ORDER BY id DESC", (app_id,)
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+def run_counts(*, path: str | Path = DEFAULT_DB) -> dict[int, int]:
+    """{application_id: number of runs} — lets the Track tab show a per-posting run count
+    without loading every run up front (details are fetched lazily when a row is expanded)."""
+    with _connect(path) as conn:
+        cur = conn.execute(
+            "SELECT application_id, COUNT(*) AS n FROM application_runs GROUP BY application_id"
+        )
+        return {int(r["application_id"]): int(r["n"]) for r in cur.fetchall()}
 
 
 def seen_source_urls(*, statuses: Optional[list[str]] = None, path: str | Path = DEFAULT_DB) -> set[str]:

@@ -704,16 +704,32 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/track":
             q = parse_qs(urlparse(self.path).query)
+            apps = tracker.list_applications(
+                status=(q.get("status", [""])[0] or None),
+                search=(q.get("search", [""])[0] or None),
+            )
+            # Attach each posting's run count so the Track tab can show "N runs" without loading
+            # every run up front (the runs themselves are fetched lazily on expand, /track/runs).
+            rc = tracker.run_counts()
+            for a in apps:
+                a["run_count"] = rc.get(a["id"], 0)
             self._json(200, {
-                "applications": tracker.list_applications(
-                    status=(q.get("status", [""])[0] or None),
-                    search=(q.get("search", [""])[0] or None),
-                ),
+                "applications": apps,
                 "counts": tracker.status_counts(),
                 "funnel": tracker.funnel_report(),
                 "statuses": tracker.STATUSES,
                 "fields": tracker.EDITABLE,
             })
+            return
+        if path == "/track/runs":
+            # The run history for one posting (decision 084), newest first — fetched lazily when
+            # the user expands a Track row. Id comes from our own DB (localhost-only server).
+            q = parse_qs(urlparse(self.path).query)
+            try:
+                aid = int(q.get("id", ["0"])[0])
+            except (ValueError, TypeError):
+                aid = 0
+            self._json(200, {"runs": tracker.runs_for_application(aid) if aid else []})
             return
         if path == "/parked":
             # Applications parked on a user-resolvable block (parking.py) + display metadata
@@ -1105,6 +1121,19 @@ INDEX_HTML = """<!doctype html>
   .ttable .urledit { width:auto; margin:0; flex:none; padding:4px 6px; background:var(--surface);
                      color:var(--muted); border:1px solid var(--line); font-size:12px; }
   .ttable .urledit:hover { color:var(--accent); }
+  /* Run history: a per-posting run count that expands an inline sub-row (decision 084). */
+  .ttable .runsbtn { width:auto; margin:0; padding:4px 7px; background:var(--surface); color:var(--accent);
+                     border:1px solid var(--line); font-size:12px; white-space:nowrap; }
+  .ttable .runsbtn:hover { border-color:var(--accent); }
+  .ttable .runsbtn .caret { display:inline-block; transition:transform .12s; margin-left:3px; }
+  .ttable .runsbtn.open .caret { transform:rotate(180deg); }
+  .ttable tr.runsrow > td { padding:0; background:var(--track); }
+  .runsbox { padding:8px 12px; display:flex; flex-direction:column; gap:6px; }
+  .runline { display:flex; align-items:baseline; gap:10px; font-size:12px; }
+  .runline .runwhen { color:var(--muted); white-space:nowrap; font-variant-numeric:tabular-nums; }
+  .runline .runoutcome { font-weight:600; white-space:nowrap; }
+  .runline .rundetail { color:var(--text); flex:1; min-width:0; }
+  .runline .reslink { padding:0; }
   .twrap { overflow-x:auto; }
   .tempty { color:var(--muted); padding:24px; text-align:center; border:1px dashed var(--line); border-radius:8px; }
   /* Consistent waiting indicator: spinner + label (+ elapsed seconds for long waits). */
@@ -2096,8 +2125,8 @@ function goToProfileAnswers() {
 const TRACK_COLS = [
   ["status","Status",120], ["fit_score","Fit",60], ["company","Company",140], ["role","Role",180], ["location","Location",140],
   ["remote","Remote",80], ["pay","Pay",100], ["portal","Portal",110], ["method","Method",90],
-  ["source_url","Source URL",220], ["date_discovered","Discovered",120], ["date_applied","Applied",120],
-  ["follow_up_date","Follow up",110], ["resume_path","Résumé used",160], ["notes","Notes",240],
+  ["source_url","Source URL",220], ["date_discovered","Discovered",120], ["date_dry_run","Dry-run",120], ["date_applied","Applied",120],
+  ["run_count","Runs",76], ["follow_up_date","Follow up",110], ["resume_path","Résumé used",160], ["notes","Notes",240],
 ];
 let TRACK_STATE = { status:null, search:"", statuses:[] };
 
@@ -2253,7 +2282,8 @@ function renderTrack(apps) {
     const tds = vis.map(([key]) => {
       let input;
       if (key === "status") input = statusCell(app);
-      else if (key === "date_discovered" || key === "date_applied")
+      else if (key === "run_count") input = runsCell(app);
+      else if (key === "date_discovered" || key === "date_dry_run" || key === "date_applied")
         input = el("input", {type:"date", value:app[key] || "", on:{change:e=>saveCell(app.id, key, e.target.value)}});
       else if (key === "resume_path")
         input = app.resume_path
@@ -2281,6 +2311,52 @@ function renderTrack(apps) {
   const table = el("table", {class:"ttable"},
     [el("colgroup", {}, cols), el("thead", {}, [head]), el("tbody", {}, rows)]);
   body.append(el("div", {class:"twrap"}, [table]));
+}
+
+// "Runs" cell: a per-posting run count that expands an inline history sub-row (decision 084).
+// 0 runs → a muted dash (nothing to expand).
+function runsCell(app) {
+  const n = app.run_count || 0;
+  if (!n) return el("span", {class:"muted", text:"—"});
+  return el("button", {class:"runsbtn", type:"button", title:"Show this posting's run history",
+    on:{click:(ev)=>toggleRuns(ev.currentTarget, app)}},
+    [document.createTextNode(n + (n === 1 ? " run" : " runs")), el("span", {class:"caret", text:"▾"})]);
+}
+
+// Toggle the run-history sub-row under a posting. Lazy-loads /track/runs on first open so the
+// main table stays light; a second click collapses it.
+async function toggleRuns(btn, app) {
+  const tr = btn.closest("tr");
+  const next = tr.nextElementSibling;
+  if (next && next.classList.contains("runsrow")) { next.remove(); btn.classList.remove("open"); return; }
+  btn.classList.add("open");
+  const holder = el("div", {class:"runsbox"});
+  const rr = el("tr", {class:"runsrow"}, [el("td", {colspan:String(tr.children.length)}, [holder])]);
+  tr.after(rr);
+  busyInto(holder, "Loading runs…", false);
+  try {
+    const d = await (await fetch("/track/runs?id=" + app.id)).json();
+    holder.innerHTML = "";
+    if (!d.runs || !d.runs.length) { holder.append(el("div", {class:"muted", text:"No runs recorded yet."})); return; }
+    d.runs.forEach(r => holder.append(runRow(r, app.id)));
+  } catch (e) {
+    holder.innerHTML = ""; holder.append(el("div", {class:"msg err", text:"Couldn't load runs: " + (e.message||e)}));
+  }
+}
+
+// One line in the run history: when it ran, the outcome, the fill summary, and a link to the
+// résumé that run used (served by /track/resume for the posting).
+function runRow(r, appId) {
+  const cls = "runoutcome st-" + (r.outcome || "").replace("-", "");
+  const kids = [
+    el("span", {class:"runwhen", text:(r.ran_at || "").replace("T", " ")}),
+    el("span", {class:cls, text:r.outcome || "run"}),
+    el("span", {class:"rundetail", text:r.detail || ""}),
+  ];
+  if (r.resume_path)
+    kids.push(el("a", {class:"reslink", href:"/track/resume?id=" + appId, target:"_blank",
+      title:r.resume_path, text:"résumé ↗"}));
+  return el("div", {class:"runline"}, kids);
 }
 
 // Drag a column's right edge to resize it; persist the new width.

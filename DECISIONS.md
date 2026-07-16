@@ -11,6 +11,10 @@
 
 | # | Date | Decision | Status |
 |---|------|----------|--------|
+| 084 | 2026-07-16 | **Track tab: the "Dry-run" date shows the LATEST run, and each posting expands to a per-run history log.** Follow-up to decision 083. Two changes. (1) **Latest, not first**: `apply.py._record_run`'s update path (a re-run of an already-tracked posting keeps status `dry-run`, so the tracker's stamp-once auto-stamp never fires) now explicitly sets `date_dry_run = today` on every dry-run outcome — so the column reflects when the posting was *last* dry-run filled; a plain field edit still never moves it (rejected surfacing `updated_at` for exactly that drift, 083). (2) **Per-run history**: a new append-only `application_runs` table (one row per apply run: `application_id`, denormalized company/role/portal/source_url, `outcome` dry-run/blocked/applied, `resume_path`, `detail`, `ran_at` datetime) records every `_record_run`; the `applications` table stays one-row-per-posting (dedup/funnel/ready-to-apply loop unchanged — the user chose this over one-Track-row-per-run, which would inflate the funnel and duplicate postings). Track shows a "Runs" column with an "N runs ▾" toggle that lazy-loads `/track/runs?id=` into an inline sub-row (timestamp · outcome · fill summary · résumé link); 0 runs → "—". `delete_application` cascades to the run log; a one-time migration seeds one run per pre-existing dry-run posting from `created_at`+`notes` (defensive SELECT: references only columns an old schema actually has, so it can't fail on a partially-migrated DB — the bug the parking migration test caught). **Verified end-to-end**: temp-DB insert+re-run logs 2 runs on 1 posting and refreshes the date, notes byte-identical; real DB seeded 17 runs (prefix normalized); `/track` returns `run_count`, `/track/runs` returns the log; drove the Track tab headless (Chromium) — "Runs" column renders, "1 run ▾" expands to `2026-07-16 11:29:29 · dry-run · 26 field(s) filled… · résumé ↗`, re-click collapses; page JS `node --check` clean; 356 passed, only the 2 pre-existing `test_parking.py` bot_wall failures (confirmed identical on a `git stash` clean tree) + the unrelated nav_recipes collection error | Accepted |
+| 083 | 2026-07-16 | **Track tab shows when each dry run ran via a dedicated `date_dry_run` column, not the generic `updated_at`.** The user wanted to see when dry runs happened; the DB stored the time only in `created_at`/`updated_at`, neither surfaced. A dry-run row leaves `date_applied` blank and `date_discovered` only marks when the posting was found — so nothing on the Track tab said when the form was actually dry-run filled. Fix mirrors the existing `date_applied` precedent: new `date_dry_run` column auto-stamped `date.today()` whenever a row's status is/becomes `dry-run` (in `tracker.add_application` + `update_application`), a Track-tab "Dry-run" column (between Discovered and Applied) rendered as an editable date input like the others, and a one-time migration that ALTERs the column in and **backfills** existing dry-run rows from `substr(created_at,1,10)` so the 17 pre-existing dry-run rows show a real date, not a blank. Chosen over surfacing `updated_at` (rejected: it's bumped by any field edit, so it drifts from the true dry-run time). Shows the **latest** dry-run (per the user's follow-up, decision 084 wires the re-run refresh in `apply.py`); a plain field edit never moves it. No new-code path in apply.py for the first stamp — dry-run rows are created via `add_application`, which now stamps. **Verified**: fresh dry-run insert, discovered→dry-run flip, and applied-row (no stamp) all correct on a temp DB; real DB migrated + all 17 dry-run rows backfilled (Stripe 2026-07-16, Ramp 2026-07-14, …), 0 blank; `/track` API returns the field; funnel/calibration/runner/web-CSRF suites (50) green (2 pre-existing `test_parking.py` bot_wall failures + nav_recipes collection error unrelated) | Accepted |
+| 082 | 2026-07-16 | **The tailoring reuse-stamp must include the tailoring LOGIC (prompt + PDF layout), not just the data — otherwise prompt/layout changes silently no-op.** Surfaced by decision 081: after changing the tailoring prompt and PDF margins, a Stripe dry run showed an unchanged résumé in the tracker. Root cause: a dry run reuses the stored per-posting PDF (`profile/tailored/<…>.pdf`) whenever its `.stamp` sidecar matches (`pipeline.run_testing_mode`, decision 069), skipping the Claude tailor call AND the PDF render. But `pipeline.tailor_stamp` hashed only résumé + profile links + JD — NOT the prompt or the renderer — so a logic change left the stamp identical and served the stale PDF. Fix: fold `backends.SYSTEM_PROMPT` and a new `pdf.LAYOUT_VERSION` constant (bumped on any layout change; started at 2 for the 081 margin/header change) into the stamp payload, so any prompt or layout edit invalidates every cached PDF automatically and the next dry run re-tailors — no manual "Re-tailor from scratch" checkbox needed. Prompt is hashed by content (auto-invalidates on edit); layout uses a hand-bumped version (renderer code can't be content-hashed cheaply). A real armed submit already always re-tailors, so submissions never rode on a stale artifact — this only affected the dry-run preview. Immediate unblock that already existed: the loop panel's "Re-tailor from scratch" checkbox (`force_retailor`). **Verified**: toggling either `SYSTEM_PROMPT` or `LAYOUT_VERSION` changes the stamp hash; pipeline/stamp/store suites green (11 passed); full suite 357 passed (2 pre-existing `test_parking.py` bot_wall failures + nav_recipes collection error unrelated, confirmed failing on a clean tree) | Accepted |
+| 081 | 2026-07-16 | **Tighten résumé tailoring: preserve existing metrics + slightly narrower margins.** The user reported "not seeing enough quantifiable metrics" in tailored résumés. Root cause is NOT a thin source — the base résumé is dense with real figures (1M+ transactions, ~70% latency cut, 5× latency, 618 postings/0 errors, 40+ screening questions, etc.); tailoring was dropping/softening them. Since numbers can only be fabricated at the cost of truthfulness (Guideline #7 / safety), the fix strengthens **preservation**, not the anti-fabrication guard: the `SYSTEM_PROMPT` QUANTIFY rule now makes keeping a base bullet's number the model's FIRST duty (rephrase words freely, never drop the metric), and directs it to lead each entry with its most-quantified job-relevant bullet and prefer metric-bearing bullets when the length budget forces a cut — the "use only base-résumé numbers, truthful-no-metric beats fabricated" guard is kept intact. **Experience ordering** is now explicitly relevance-first with recency as the tiebreak: the prompt directs the model to rank experience by relation to the posting (a matching domain outranks an unrelated one regardless of dates — a software role above tutoring/retail for an SWE job) and only break ties among comparably-relevant entries by recency (most recent nearer the top); same rule for projects/activities. Formatting: PDF page margins reduced 42/40/42 → 34/34/34 pt (`pdf._Resume`, epw 528→544pt) for a slightly wider text column; `LengthBudget.line_chars` default 100 → 103 to match the wider column so "fill the line" guidance stays accurate (bullets don't leave a ~3% sliver empty). **Header overflow fixed**: the contact name/details were rendered with a fixed-size `cell`, which neither wraps nor shrinks — a contact line wider than the column (sample = 610pt vs 544pt usable) overprinted ~33pt past each page edge. New `pdf._fit_font` picks the largest Helvetica size that fits the content width (name 20→floor 12pt, contact 9→floor 6.5pt), so the header can never spill past the margins. No schema/interface change. **Verified**: sample résumé renders 1 page at the new margins with the contact line shrunk 9→8pt to fit (542≤544pt) and name held at 20pt; profile résumé unchanged (contact already fit at 9pt); prompt/budget wiring confirmed (line_chars=103, preserve-metrics + relevance-first-experience blocks present); 23 pdf/tailor/length/render tests green | Accepted |
 | 080 | 2026-07-16 | **A searchable combobox the batch declined still gets its round-2 typeahead Claude pick — so the school picker prefers the MAIN campus, not a branch (decision-033/079 follow-up).** After decision 079 fixed School submitting empty, it committed via the `substring` fallback (first fuzzy match) rather than the Claude pick that's meant to prefer the primary campus. Root cause, found by driving the live SpaceX Greenhouse form: the School react-select is an **async search** whose OPEN list is the **first 60 schools alphabetically** (Acadia, Adamson… — never the applicant's), and typing `Pennsylvania State` returns `Pennsylvania State University` **and** `…- Schuylkill Campus`. Round 1 defers a batch pick over the alphabetical open list; the batch (correctly) declines it — but `_resolve_pending` marked the label `picks_done`, and `picks_done` gated **both** Phase 1's static open-list pick **and** Phase 2b's article-stripped typeahead pick. So round 2 skipped Phase 2b (the one built for async school pickers, told to prefer the main campus) and fell through to Phase 2c's substring fallback, which takes the first fuzzy match — a branch campus if the async lists it first. Fix: split the gate — Phase 2b now runs on `gen_on` (generation + a value), **not** `use_claude` (which still respects `picks_done`), because Phase 2b's options come from the per-query async results, not the open list the batch already saw. Phase 1's static re-ask stays suppressed (no wasted calls); a genuinely static undecidable dropdown types to zero options in Phase 2b and makes no extra call. Rejected freeing `picks_done` wholesale (would re-ask Phase 1's static pick every round 2). **Verified live on SpaceX**: School commits `Pennsylvania State University` (main) via the Claude typeahead. New async-picker fixture + two-pass test lists the branch campus first and fails without the fix (`'…- Schuylkill Campus'`, `source=substring`), passes with it (`main`, `source=option:claude`); combobox/two-pass/required-dropdown/multipage/fillability/lever/determinism suites green | Accepted |
 | 079 | 2026-07-16 | **Skip `aria-hidden` inputs when filling — react-select's requiredInput mirror was hijacking its own dropdown (School submitted empty).** A SpaceX dry run left the Greenhouse **School** field on `Select…` while Degree/Discipline filled — yet the report logged School as *filled* (`source=resolver`, plain text). Root-caused by driving the real form: Greenhouse renders each react-select as **two** inputs sharing one label — the real combobox (`role=combobox`) and an **`aria-hidden="true"` `requiredInput` shadow** (empty `type`, `tabindex=-1`) used only for HTML required-validation. When the résumé value (`The Pennsylvania State University`) doesn't literally match an option on open — the decision-033 article-prefix case — the combobox **defers** its pick to the batched Claude decision and returns via a `continue` that **doesn't mark the label done**. The loop then reaches the mirror, whose empty `type ∈ _TEXTLIKE` and `role != combobox` classify it as **free text**, so it's `.fill()`'d — writing into an invisible input, but **marking "School" done**. Round 2 then skips the label, so the real dropdown is never committed → submits empty, while the report falsely reads filled. Fix is one guard in `_fill_all_fields`: **skip any `aria-hidden="true"` input** (never a field a user fills), so the mirror can't claim the label and round 2 recommits the actual selection. General across every react-select field/ATS, not SpaceX-specific. Rejected marking the label `done` on defer (breaks round 2's recommit, which relies on the label staying open). **Verified on the live SpaceX form**: School now commits through the combobox (`control=combobox`, a real Penn State option) instead of the phantom text fill; Degree/Discipline unchanged. New fixture reproduces the dual-input structure and the regression test fails without the guard (`FilledField(control='text', source='resolver')`) and passes with it; related fill suites (combobox, two-pass, multipage, fillability, lever, corpus) green | Accepted |
 | 078 | 2026-07-15 | **The tracker's Source URL is the link itself; editing moves behind an ✎ toggle.** The cell rendered as a text `<input>` with a 12px `↗` beside it, so the URL *looked* like plain text and the only clickable target was the glyph — the obvious affordance did nothing (UI Principle #1). The URL is now an `<a>` whose text is the URL (`target=_blank`, `rel=noopener noreferrer`); an `✎` swaps in the same input, and committing it saves via the existing `saveCell` and returns to the link. Editing is **kept**, not dropped: the cell has always been editable and a manually-added row needs a way to set its URL (Guideline #7). The link renders only for `http(s)` — anything else (empty, or a stored `javascript:`/`data:` string) falls back to the input, a guard inherited unchanged from the `↗`. Only the **cell** re-renders on save, never the row: `saveCell` writes "Saved ✓" after its `await`, so replacing the row would land the confirmation on a detached node (UI Principle #5). **Surfaced a real layout bug**: a long URL is unbreakable text, so as a link it inflated the column to **583px** — past the 220px default and the resize handle — squeezing every other column (Company → 83px); an `<input>` never did this because its intrinsic width is small. `contain:inline-size` on the link keeps its text out of the table's intrinsic width so `table-layout:fixed` honours the `<col>` again, **reproducing the baseline geometry exactly** (measured against a `git stash` baseline: table 1370px, Source URL 98px, all 16 columns identical). **Verified in the real UI on the real tracker**: 18/18 rows render as links with correct hrefs and zero inputs; a full `✎` → edit → `Saved ✓` → link-with-new-href round trip on live row 21, with the original value written back so `applications.db` is untouched. Suite **375/375**. Known gap: the column is 98px, so links show truncated (`https://j…`) with the full URL on hover — the input truncated identically and the squeeze is pre-existing (`width:auto` + `table-layout:fixed` ignores the 220px default even at baseline); widening it, or shortening the label to `smartrecruiters.com/…/87644936`, is a separate change | Accepted |
@@ -3744,6 +3748,208 @@ than the Claude pick (the batched pick didn't literally match, so Phase 2c's sub
 landed "Pennsylvania State University"). That still commits a *real* option (not plain text), so the
 field submits validly; tightening the async school picker to prefer the main-campus option every
 time is the separate decision-033 follow-up, not folded in here.
+
+---
+
+## 082 — The reuse-stamp must include the tailoring logic (prompt + PDF layout), not just the data
+
+**Context.** After decision 081 changed the tailoring prompt and PDF margins, a Stripe dry run showed
+the **same résumé** in the tracker — the changes appeared to have no effect. They weren't broken; the
+tailoring never re-ran.
+
+A dry run reuses a posting's already-tailored PDF (`profile/tailored/<company>-<role>-<hash>.pdf`)
+when the `.stamp` sidecar beside it still matches (`pipeline.run_testing_mode`, decision 069) —
+skipping both the Claude tailor call and the PDF render, so a rescan of unchanged postings spends zero
+tokens. The stamp is computed by `pipeline.tailor_stamp`, which hashed only:
+
+    resume.model_dump()  +  [linkedin, github, portfolio]  +  jd.body
+
+i.e. only the **data**. The tailoring **logic** — the Claude prompt and the PDF renderer — was absent.
+So editing the prompt or the layout left the stamp byte-identical, the stored PDF matched, and the
+dry run served the stale artifact. Every future prompt/layout tweak would have silently no-op'd the
+same way until the résumé or JD changed.
+
+**Decision.** Fold the logic into the stamp payload:
+- `backends.SYSTEM_PROMPT` — the tailoring prompt, hashed by content, so ANY prompt edit invalidates
+  every cached PDF automatically (no manual bump).
+- `pdf.LAYOUT_VERSION` — a new integer constant, hand-bumped whenever the PDF layout changes (margins,
+  fonts, header, spacing). Started at `2` to invalidate PDFs built under the 081 margin/header change.
+  (Renderer code can't be content-hashed as cheaply as a string constant; a version int is the
+  low-friction equivalent.)
+
+Now any change to how a résumé is tailored or rendered changes the stamp, so the next dry run
+re-tailors on its own — the user never has to remember the "Re-tailor from scratch" checkbox after a
+logic change.
+
+**Scope / safety.** This only affects the **dry-run preview** reuse path. A real armed submit already
+always re-tailors (decision 069), so no submission ever rode on a stale artifact. The existing
+`force_retailor` escape hatch (loop panel checkbox, `web.py`) is unchanged and remains the way to force
+a regenerate when the *data* is identical but you want a fresh Claude pass anyway.
+
+**Rejected.** (1) Leaving the stamp as-is and relying on the checkbox — puts the burden on the user to
+remember after every prompt tweak, and silently produces wrong previews when they forget (the exact
+bug reported). (2) Deleting the whole `profile/tailored/` cache on every code change — throws away
+valid PDFs for postings whose data and logic are unchanged, defeating the zero-token rescan.
+
+**Verified.** Toggling either `SYSTEM_PROMPT` (append a char) or `LAYOUT_VERSION` (+1) changes the
+stamp hash while the data is held fixed; the stamp docstring/source now reference both. `pytest -k
+"pipeline or stamp or testing or resume_store"` = 11 passed. Full suite = 357 passed; the only failures
+(`test_parking.py` two `bot_wall` tests + `test_nav_recipes.py` collection error) are pre-existing and
+unrelated — confirmed identical on a `git stash` clean tree.
+
+---
+
+## 083 — Track tab shows when each dry run ran via a dedicated `date_dry_run` column
+
+**Context.** The user asked to see, on the Track tab, when they ran dry runs. The information was in
+the database — every row carries `created_at`/`updated_at` (ISO datetime, `tracker._now()`) — but
+neither is surfaced in the UI (`TRACK_COLS`, `web.py`). A dry-run row leaves `date_applied` blank (it
+is only stamped when status flips to `applied`) and `date_discovered` records only when the posting
+was *found*, not when its form was dry-run filled. So the Track tab had no answer to "when did I dry-run
+this?".
+
+**Decision.** Add a dedicated `date_dry_run` column, mirroring the existing `date_applied` mechanism
+exactly:
+- **Schema** (`tracker.py`): new `date_dry_run TEXT NOT NULL DEFAULT ''`, placed between
+  `date_discovered` and `date_applied`.
+- **Auto-stamp**: `add_application` stamps `date.today()` when the inserted status is `dry-run`;
+  `update_application` stamps it when a row's status *flips* to `dry-run` and the field is still blank
+  — the same first-time, stamp-once pattern `date_applied` uses. No `apply.py` change is needed: the
+  Apply stage records dry-runs via `add_application`, which now stamps.
+- **UI** (`web.py`): a "Dry-run" column in `TRACK_COLS` between Discovered and Applied, rendered as an
+  editable `<input type="date">` like the other two dates. The `/track` API already returns the field
+  (it does `SELECT *`).
+- **Migration + backfill**: the `_connect` migration ALTERs the column in for pre-existing DBs and,
+  on the same pass, backfills existing dry-run rows from `substr(created_at, 1, 10)` (the row's insert
+  time = when the dry-run was recorded), so history shows a real date, not a blank.
+
+**Semantics.** First-dry-run date, stamped once and stable — matches `date_applied` (which is the
+first-applied date). A re-run keeps the original dry-run date; editing other fields never moves it.
+
+**Rejected.** Surfacing the existing `updated_at` as the column (no schema change): rejected because
+`updated_at` is bumped by *any* field edit on the row, so it drifts away from the true dry-run time as
+soon as the user touches the row — it would answer "when did I last edit this", not "when did I dry-run
+this".
+
+**Verified.** On a temp DB: a fresh `dry-run` insert stamps today with `date_applied` blank; a
+`discovered`→`dry-run` flip stamps it; an `applied` insert leaves `date_dry_run` blank. On the real
+`applications.db`: the migration ran and backfilled all **17** existing dry-run rows from `created_at`
+(Stripe 2026-07-16, Ramp 2026-07-14, Whoop 2026-07-13, …), **0 left blank**; `tracker.list_applications`
+returns the `date_dry_run` key; the served page defines the "Dry-run" column and its date-input render
+branch. `pytest tests/test_funnel.py tests/test_calibration.py tests/test_runner.py
+tests/test_web_csrf.py tests/test_parking.py` = 50 passed, 2 failed — the 2 (`test_parking.py`
+`bot_wall`) are pre-existing and unrelated (a stale `ApplyReport(bot_wall=…)` kwarg the current class
+doesn't define), same family as the `test_nav_recipes.py` collection error; neither touches
+`tracker.py`/`web.py`.
+
+---
+
+## 084 — "Dry-run" date shows the latest run; each posting expands to a per-run history log
+
+**Context.** Follow-up to decision 083. The user wanted two refinements: (1) the "Dry-run" date should
+show when a posting was *last* dry-run filled, not the first time; (2) each dry run should be visible as
+"its own row."
+
+**(1) Latest, not first.** `apply.py._record_run` upserts a posting by source URL; on a re-run the row
+keeps `status='dry-run'`, so the tracker's stamp-once auto-stamp (which only fires when the status
+*flips* to dry-run) never updates the date. So the update path now explicitly sets
+`changes["date_dry_run"] = date.today()` on any dry-run outcome. A dry-run *event* is the only thing
+that moves the date; a plain field edit in the Track UI does not (this is exactly why 083 rejected
+surfacing `updated_at`, which any edit bumps).
+
+**(2) Per-run history — a separate log, not one Track row per run.** The user was offered two shapes
+and chose the log. The `applications` table stays **one row per posting** (its current state) — dedup
+(`find_by_source_url`/`seen_source_urls`), the discovery→offer funnel, and the "ready to apply" loop all
+depend on that invariant, and one-row-per-run would inflate the funnel's "Filled" count and scatter a
+posting across duplicate rows. Instead a new append-only `application_runs` table records one row per
+`_record_run` call:
+
+    id, application_id, source_url, company, role, portal, outcome (dry-run|blocked|applied),
+    resume_path, detail ("N field(s) filled (…); M need attention" + any blocker), ran_at (datetime)
+
+It is never edited or deduped — a pure audit trail, indexed by `application_id`. `_record_run` computes
+the fill summary once (reused for both the posting's `notes` and the run's `detail`) and appends a run
+in a best-effort `try/except` so a logging failure can never sink an otherwise-complete run.
+`delete_application` cascades to the log so no orphans linger.
+
+**UI.** Track gains a "Runs" column: `N runs ▾` toggles an inline sub-row that lazy-loads
+`/track/runs?id=` (timestamp · outcome badge · fill summary · résumé link), so the main table stays
+light and details load only on expand; a posting with no runs shows `—`. `/track` attaches a
+`run_count` per posting from a single `GROUP BY` (`tracker.run_counts`).
+
+**Migration.** One-time seed of one run per pre-existing dry-run posting from `created_at` + `notes`
+(prefix `"[auto] "` stripped so it reads like a live run). The seed `SELECT` references **only columns
+the applications table actually has** (`src(col) = col if present else ''`) — an old DB may predate
+`role`/`portal`/`notes`, and the parking migration test (a deliberately minimal old schema) caught the
+naïve version failing with `no such column: role`. The seed runs after the column migration and only
+when the runs table is first created.
+
+**Rejected.** One Track row per run (the other option shown): literal but breaks dedup, inflates the
+funnel, and clutters the table with duplicate postings.
+
+**Verified.** Temp DB: an insert + a re-run of the same posting log **2** runs against **1** posting and
+refresh `date_dry_run`, with the posting's `notes` byte-identical to before. Real `applications.db`:
+seeded 17 runs (one per dry-run posting), `"[auto] "` prefix normalized off. `/track` returns
+`run_count`; `/track/runs?id=` returns the newest-first log. Drove the Track tab headless (Chromium):
+the "Runs" column renders, `1 run ▾` expands to `2026-07-16 11:29:29 · dry-run · 26 field(s) filled (1
+native, 0 AI-drafted); 1 need attention · résumé ↗`, and a second click collapses it. Page JS passes
+`node --check`. Full suite (minus the unrelated `test_nav_recipes.py` collection error) = **356 passed**;
+the only failures are the 2 pre-existing `test_parking.py` `bot_wall` tests, confirmed identical on a
+`git stash` clean tree.
+
+---
+
+## 081 — Tighten résumé tailoring: preserve existing metrics + slightly narrower margins
+
+**Context.** The user reported the tailored résumés weren't surfacing enough quantifiable metrics,
+and asked for slightly tighter formatting (less margin). A grep of the base résumé
+(`profile/resume.yaml`, `examples/sample_resume.yaml`) showed the source is *not* the bottleneck: it
+is dense with real figures — `1M+ transactions`, `~70% latency cut (2 min → 35–40s)`, `5× latency`,
+`618 postings / 0 errors`, `40+ screening questions`, `30+ students`, `97% analysis-time cut`, etc.
+So tailoring was dropping or softening numbers that already exist, not lacking raw material.
+
+**Options considered.**
+1. Loosen the anti-fabrication guard so the model can estimate/round numbers — **rejected**: violates
+   Guideline #7 (truthfulness) and Agent Guideline #5/#3 safety posture; a fabricated metric on a real
+   application is worse than a missing one.
+2. Strengthen *preservation* of metrics already in the base résumé, leaving the "use only base numbers"
+   guard intact — **chosen**.
+
+**Decision.**
+- `backends.SYSTEM_PROMPT`, QUANTIFY rule: the model's FIRST duty on every bullet is now to PRESERVE a
+  base bullet's number (rephrase the words freely, never drop the figure). It's told to lead each entry
+  with its most-quantified, job-relevant bullet, and — when the length budget forces a cut — to prefer
+  metric-bearing bullets over metric-less ones. The prior guard is kept verbatim: use only numbers
+  present in / safely implied by the base résumé; a truthful bullet with no metric beats a fabricated
+  figure; never silently strip a metric the base résumé supports.
+- `backends.SYSTEM_PROMPT`, ordering rule: experience is ordered by **relevance to the posting first**,
+  not chronologically — a role whose domain matches the job outranks an unrelated one regardless of
+  dates (the user's example: for a software-engineering job, a software role must sit above a tutoring
+  role even if the tutoring role is more recent). Recency is only the **tiebreak** among
+  comparably-relevant entries (most recent nearer the top); the same rule is stated for projects and
+  activities. (The `RulesBackend` already sorts entries by relevance score with base-résumé order —
+  conventionally reverse-chronological — as the index tiebreak, so it needed no change.)
+- `pdf._Resume` margins reduced 42/40/42 → 34/34/34 pt (auto-page-break margin 40 → 34), widening the
+  text column epw 528 → 544 pt.
+- `LengthBudget.line_chars` default 100 → 103 to track the wider column, so the "fill the line, don't
+  leave it half empty" instruction stays accurate (usable bullet width 516 → 532 pt, ~3% more).
+- `pdf._fit_font` (new helper) fixes the **header spilling past the page sides**: `_contact` rendered
+  the name and the `location | email | phone | links` line with a fixed-size `cell`, which neither
+  wraps nor shrinks — when that line is wider than the column (sample résumé = 610pt vs 544pt usable)
+  fpdf overprints it ~33pt past each page edge. `_fit_font` now picks the largest Helvetica size that
+  fits the content width before drawing (name 20pt → floor 12pt, contact 9pt → floor 6.5pt).
+
+No schema, interface, or module-boundary change — prompt text + three constants + one render helper.
+
+**Verified.** Rendered `examples/sample_resume.yaml` and `profile/resume.yaml` through the PDF path:
+sample renders 1 page at the new margins (`l/t/r = 34`, `epw = 544`) with the contact line auto-shrunk
+9 → 8pt so it fits (542 ≤ 544pt) and the name held at 20pt; the profile contact already fit and stays
+9pt. Confirmed wiring: `LengthBudget().line_chars == 103` and the budget prompt now says "one line
+holds about 103 characters"; `SYSTEM_PROMPT` carries both the preserve-metrics and relevance-first
+experience-ordering blocks. `pytest -k "pdf or tailor or length or render or contact or backend"` =
+23 passed (nav-recipes module has a pre-existing unrelated collection error, ignored). The
+metric-density and ordering improvements are prompt-quality changes observable on the next live
+tailoring run, not unit-testable.
 
 ---
 

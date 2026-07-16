@@ -2451,6 +2451,15 @@ def _record_run(report: ApplyReport, resume_pdf: str, role: str, company: str,
     # Key the tracker on the POSTING url (for dedup), not the ATS form/embed url.
     source_url = (m.get("source_url") or report.url or "").strip()
 
+    # This run's one-line summary, reused for both the posting's `notes` and its run-log entry.
+    native = sum(1 for f in report.filled if f.source == "native")
+    drafted = sum(1 for f in report.filled if f.source == "generated")
+    what = "Submitted" if report.submitted else "Dry-run"
+    blocked = f" BLOCKED: {report.blockers[0]}" if report.blockers else ""
+    detail = (f"{what}: {len(report.filled)} field(s) filled "
+              f"({native} native, {drafted} AI-drafted); {len(report.skipped)} need attention."
+              + blocked)
+
     existing = tracker.find_by_source_url(source_url)
     if existing:
         # Runner-owned refresh; fill any basic-info field only if it was never set (don't
@@ -2463,6 +2472,12 @@ def _record_run(report: ApplyReport, resume_pdf: str, role: str, company: str,
         # clobber a user-set outcome status (rejected/interview/…) — only machine states flip.
         changes["blocked_kind"] = reason.kind if reason else ""
         changes["blocked_detail"] = reason.detail if reason else ""
+        if status == "dry-run":
+            # Refresh the dry-run date to THIS run (the tracker only auto-stamps on the first
+            # dry-run; a re-run keeps status='dry-run' so it must be stamped explicitly here) —
+            # so the Track tab's "Dry-run" column shows when the posting was LAST dry-run filled.
+            from datetime import date
+            changes["date_dry_run"] = date.today().isoformat()
         if report.submitted:
             changes["status"] = "applied"
         elif status == "blocked" and existing.get("status") in ("discovered", "tailored", "dry-run", "blocked"):
@@ -2471,25 +2486,32 @@ def _record_run(report: ApplyReport, resume_pdf: str, role: str, company: str,
                          ("remote", remote), ("pay", pay)):
             if val and not existing.get(col):
                 changes[col] = val
-        tracker.update_application(int(existing["id"]), changes)
-        return int(existing["id"]), "updated"
+        app_id, outcome = int(existing["id"]), "updated"
+        tracker.update_application(app_id, changes)
+    else:
+        app_id = tracker.add_application({
+            "company": company, "role": role, "location": location, "remote": remote, "pay": pay,
+            "portal": report.ats, "method": method, "status": status,
+            "fit_score": m.get("fit_score"),
+            "blocked_kind": reason.kind if reason else "",
+            "blocked_detail": reason.detail if reason else "",
+            "source_url": source_url, "resume_path": resume_pdf,
+            "notes": f"[auto] {detail}",
+        })
+        outcome = "recorded"
 
-    native = sum(1 for f in report.filled if f.source == "native")
-    drafted = sum(1 for f in report.filled if f.source == "generated")
-    what = "Submitted" if report.submitted else "Dry-run"
-    blocked = f" BLOCKED: {report.blockers[0]}" if report.blockers else ""
-    app_id = tracker.add_application({
-        "company": company, "role": role, "location": location, "remote": remote, "pay": pay,
-        "portal": report.ats, "method": method, "status": status,
-        "fit_score": m.get("fit_score"),
-        "blocked_kind": reason.kind if reason else "",
-        "blocked_detail": reason.detail if reason else "",
-        "source_url": source_url, "resume_path": resume_pdf,
-        "notes": f"[auto] {what}: {len(report.filled)} field(s) filled "
-                 f"({native} native, {drafted} AI-drafted); {len(report.skipped)} need attention."
-                 + blocked,
-    })
-    return app_id, "recorded"
+    # Append this run to the history log (decision 084) — one entry per run, never deduped, so
+    # the Track tab can expand a posting to show every dry-run/blocked/submitted attempt with its
+    # own timestamp. Best-effort: a logging failure must never sink an otherwise-complete run.
+    try:
+        tracker.record_run({
+            "application_id": app_id, "source_url": source_url,
+            "company": company, "role": role, "portal": report.ats,
+            "outcome": status, "resume_path": resume_pdf, "detail": detail,
+        })
+    except Exception:
+        pass
+    return app_id, outcome
 
 
 def run_apply(

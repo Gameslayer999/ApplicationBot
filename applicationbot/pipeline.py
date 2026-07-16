@@ -347,16 +347,23 @@ def pick_top(matches: list[Match], *, min_fit: int) -> Match | None:
 
 def tailor_stamp(resume: Resume, profile: ApplicationProfile, jd) -> str:
     """A content hash of everything that determines a posting's tailored PDF: the résumé, the
-    profile links flowed onto the header (LinkedIn/GitHub/portfolio), and the JD the résumé is
-    tailored to. Stamped beside the PDF so a re-prepare can reuse it when nothing that affects
-    it changed — deliberately ignores the rest of the profile (e.g. learned screening answers),
-    which the fill re-reads fresh but which never change the PDF."""
+    profile links flowed onto the header (LinkedIn/GitHub/portfolio), the JD the résumé is
+    tailored to, AND the tailoring logic itself — the Claude prompt (`backends.SYSTEM_PROMPT`)
+    and the PDF layout (`pdf.LAYOUT_VERSION`). Including the logic means a prompt or layout
+    change invalidates cached PDFs automatically, so a dry run re-tailors instead of silently
+    reusing a PDF built by the old prompt/layout. Stamped beside the PDF so a re-prepare can
+    reuse it when nothing that affects it changed — deliberately ignores the rest of the profile
+    (e.g. learned screening answers), which the fill re-reads fresh but never change the PDF."""
     import hashlib
     import json
+
+    from . import pdf as _pdf
     payload = {
         "resume": resume.model_dump(),
         "links": [profile.linkedin_url, profile.github_url, profile.portfolio_url],
         "jd": jd.body or "",
+        "prompt": backends.SYSTEM_PROMPT,
+        "layout": _pdf.LAYOUT_VERSION,
     }
     return hashlib.sha1(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()
 
