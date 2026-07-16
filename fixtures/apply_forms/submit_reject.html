@@ -1,0 +1,30 @@
+<!doctype html>
+<html>
+<head><title>Software Engineer application — Fixture Co</title></head>
+<body>
+<h1>Apply for this job</h1>
+<form id="application" onsubmit="return submitApp(event)">
+  <div><label for="first_name">First Name *</label>
+    <input id="first_name" name="first_name" type="text"></div>
+  <div><label for="last_name">Last Name *</label>
+    <input id="last_name" name="last_name" type="text"></div>
+  <div><label for="email">Email *</label>
+    <input id="email" name="email" type="email"></div>
+  <div><label for="phone">Phone</label>
+    <input id="phone" name="phone" type="tel"></div>
+  <button type="submit">Submit application</button>
+</form>
+<script>
+function submitApp(e) {
+  e.preventDefault();
+  if (!document.querySelector('.error')) {
+    const d = document.createElement('div');
+    d.className = 'error';
+    d.textContent = 'Please complete all required fields before submitting.';
+    document.body.insertBefore(d, document.getElementById('application'));
+  }
+  return false;
+}
+</script>
+</body>
+</html>

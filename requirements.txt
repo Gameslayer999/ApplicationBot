@@ -5,4 +5,8 @@
 pydantic>=2
 PyYAML>=6
 fpdf2>=2.7   # pure-Python PDF export (no Chromium / system libraries)
+pypdf>=4     # pure-Python PDF text extraction — the ATS text-layer check (decision 043)
 playwright>=1.40   # Apply-stage form automation; run `playwright install chromium` once
+keyring>=24        # OS-keychain store for account-gated portal logins (Workday) — never plaintext YAML
+google-auth>=2          # Gmail one-click connect (decision 065): OAuth token refresh (read-only scope)
+google-auth-oauthlib>=1 # Gmail one-click connect: the loopback "Sign in with Google" consent flow

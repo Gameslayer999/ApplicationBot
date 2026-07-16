@@ -1,0 +1,16 @@
+<!doctype html>
+<!-- PII-free reproduction of the SmartRecruiters posting page that broke a real dry-run
+     (jobs.smartrecruiters.com/Consultadd4/87644936, tracker row 21: 0 fields filled).
+     The load-bearing detail: the control that opens the form says "I'm interested", NOT "Apply",
+     so the old /\bapply\b/i reveal never fired and the poll timed out on this page.
+     "Not interested" is here on purpose — the reveal must never match it. -->
+<html>
+<head><title>Python Developer - Consultadd</title></head>
+<body>
+  <h1>Python Developer</h1>
+  <p>Company Description: we build things.</p>
+  <p>Job Description: you will write Python.</p>
+  <a href="smartrecruiters_apply.html" id="interested">I'm interested</a>
+  <button id="decline">Not interested</button>
+</body>
+</html>

@@ -75,10 +75,21 @@ def main(argv: list[str] | None = None) -> int:
         quality=args.quality,
     )
     print(f"Backend: {result.backend} · target {result.pages:g} page(s)", file=sys.stderr)
+    # Show the applicant's links (LinkedIn/GitHub/portfolio) from the apply profile when the résumé
+    # header itself has none, so the rendered output carries them. Best-effort (profile may not exist).
+    try:
+        from .apply_profile import load_profile, resume_with_profile_links
+        resume = resume_with_profile_links(resume, load_profile())
+    except Exception:
+        pass
     if args.out and args.out.lower().endswith(".pdf"):
+        from .ats_check import verify_pdf
         from .pdf import render_pdf
-        Path(args.out).write_bytes(render_pdf(resume, result.tailored))
+        pdf_bytes = render_pdf(resume, result.tailored)
+        Path(args.out).write_bytes(pdf_bytes)
         print(f"Wrote {args.out}", file=sys.stderr)
+        for note in verify_pdf(pdf_bytes, resume, jd.body or None).notes():
+            print(f"  {note}", file=sys.stderr)
     elif args.out:
         Path(args.out).write_text(render_markdown(resume, result.tailored), encoding="utf-8")
         print(f"Wrote {args.out}", file=sys.stderr)

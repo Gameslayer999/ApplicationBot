@@ -1,0 +1,76 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Required-dropdown fixture — unmapped required select/combobox</title></head>
+<body>
+<h1>Required dropdowns with no mapped answer</h1>
+<p>Exercises the weak-model "choose an offered option" path: required dropdowns the resolver,
+semantic classify, and hints all miss. The team/product questions are answerable from the résumé;
+the clearance (enumerated fact) and gender (demographic) ones must be REFUSED and left for the user.</p>
+
+<form>
+  <!-- Native <select>, required, novel question the resolver can't map — should be chosen. -->
+  <div class="field">
+    <label for="team">Which team are you most interested in joining? *</label>
+    <select id="team" name="team" required>
+      <option value="">Select…</option>
+      <option value="eng">Engineering</option>
+      <option value="sales">Sales</option>
+      <option value="mkt">Marketing</option>
+    </select>
+  </div>
+
+  <!-- Required combobox, novel question — should be chosen. -->
+  <div class="field">
+    <label for="prod">Which product area excites you most? *</label>
+    <div class="select__control"><input id="prod" role="combobox" required autocomplete="off"></div>
+    <div class="menu" id="menu-prod" hidden>
+      <div class="select__option">Developer tools</div>
+      <div class="select__option">Consumer app</div>
+      <div class="select__option">Payments infrastructure</div>
+    </div>
+  </div>
+
+  <!-- Required ENUMERATED fact — must be refused (never guess a clearance) → captured. -->
+  <div class="field">
+    <label for="clearance">What is your current security clearance level? *</label>
+    <select id="clearance" name="clearance" required>
+      <option value="">Select…</option>
+      <option value="none">None</option>
+      <option value="secret">Secret</option>
+      <option value="ts">Top Secret</option>
+    </select>
+  </div>
+
+  <!-- Required DEMOGRAPHIC — must be refused → captured (EEO is the applicant's to state). -->
+  <div class="field">
+    <label for="gender">Gender *</label>
+    <select id="gender" name="gender" required>
+      <option value="">Select…</option>
+      <option value="m">Male</option>
+      <option value="f">Female</option>
+      <option value="d">Decline to self-identify</option>
+    </select>
+  </div>
+</form>
+
+<script>
+document.querySelectorAll('.select__control').forEach(ctrl => {
+  const input = ctrl.querySelector('input');
+  const menu = document.getElementById('menu-' + input.id);
+  const options = Array.from(menu.querySelectorAll('.select__option'));
+  const filter = () => {
+    const q = input.value.toLowerCase();
+    options.forEach(o => { o.style.display = o.textContent.toLowerCase().includes(q) ? '' : 'none'; });
+  };
+  ctrl.addEventListener('click', () => { menu.hidden = false; filter(); });
+  input.addEventListener('input', filter);
+  input.addEventListener('keydown', e => { if (e.key === 'Escape') menu.hidden = true; });
+  options.forEach(o => o.addEventListener('click', () => {
+    input.value = o.textContent;
+    input.dataset.committed = o.textContent;
+    menu.hidden = true;
+  }));
+});
+</script>
+</body>
+</html>

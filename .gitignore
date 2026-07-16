@@ -34,6 +34,11 @@ tracker.db
 apply_review*.png
 *.review.png
 
+# Playwright-MCP page snapshots, written into the repo by the agentic workers (decisions
+# 061/063/076). They dump the live page's accessibility tree — on a Workday agentic FILL that is
+# the applicant's name/email/phone as typed into the form. Never commit.
+.playwright-mcp/
+
 # Credentials & secrets
 .env
 .env.*

@@ -1,0 +1,63 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Combobox fixture — react-select-shaped widgets</title></head>
+<body>
+<h1>Combobox fixture</h1>
+<p>Mimics react-select enough for apply.py's combobox driver: a `.select__control`
+wrapper opens a menu of `.select__option` divs on click, typing filters them,
+Escape closes, clicking an option commits it to the input.</p>
+
+<div class="field">
+  <label for="cb1">Country</label>
+  <div class="select__control"><input id="cb1" role="combobox" autocomplete="off"></div>
+  <div class="menu" id="menu-cb1" hidden>
+    <div class="select__option">Australia</div>
+    <div class="select__option">Japan</div>
+    <div class="select__option">United States</div>
+  </div>
+</div>
+
+<div class="field">
+  <label for="cb2">Are you legally authorized to work in the United States?</label>
+  <div class="select__control"><input id="cb2" role="combobox" autocomplete="off"></div>
+  <div class="menu" id="menu-cb2" hidden>
+    <div class="select__option">I am authorized to work in the United States for any employer</div>
+    <div class="select__option">I require sponsorship to work in the United States</div>
+    <div class="select__option">I am not authorized to work in the United States</div>
+  </div>
+</div>
+
+<div class="field">
+  <label for="cb3">School</label>
+  <div class="select__control"><input id="cb3" role="combobox" autocomplete="off"></div>
+  <div class="menu" id="menu-cb3" hidden>
+    <div class="select__option">Harvard University</div>
+    <div class="select__option">Pennsylvania State University-Main Campus</div>
+    <div class="select__option">Pennsylvania State University-Erie, The Behrend College</div>
+    <div class="select__option">Stanford University</div>
+  </div>
+</div>
+
+<script>
+document.querySelectorAll('.select__control').forEach(ctrl => {
+  const input = ctrl.querySelector('input');
+  const menu = document.getElementById('menu-' + input.id);
+  const options = Array.from(menu.querySelectorAll('.select__option'));
+  const filter = () => {
+    const q = input.value.toLowerCase();
+    options.forEach(o => {
+      o.style.display = o.textContent.toLowerCase().includes(q) ? '' : 'none';
+    });
+  };
+  ctrl.addEventListener('click', () => { menu.hidden = false; filter(); });
+  input.addEventListener('input', filter);
+  input.addEventListener('keydown', e => { if (e.key === 'Escape') menu.hidden = true; });
+  options.forEach(o => o.addEventListener('click', () => {
+    input.value = o.textContent;
+    input.dataset.committed = o.textContent;
+    menu.hidden = true;
+  }));
+});
+</script>
+</body>
+</html>

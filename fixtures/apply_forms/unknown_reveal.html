@@ -1,0 +1,17 @@
+<!doctype html>
+<!-- A posting whose reveal control uses wording the deterministic path does NOT know
+     ("Join our team" — no "apply", no "I'm interested"). This is the case the agentic nav
+     fallback exists for: an agent finds the form once, we distil the label into a nav recipe,
+     and every later posting on this host replays it with no Claude.
+     The decoy exercises the verb filter in `_distil_nav`: it vanishes when the banner is
+     dismissed, but must never be learned as a reveal control. -->
+<html>
+<head><title>Backend Engineer - Example</title></head>
+<body>
+  <h1>Backend Engineer</h1>
+  <div id="banner">
+    <button id="dismiss" onclick="document.getElementById('banner').remove()">Accept cookies</button>
+  </div>
+  <a href="unknown_reveal_form.html" id="reveal">Join our team</a>
+</body>
+</html>

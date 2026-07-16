@@ -52,3 +52,30 @@ def load_job_description(path: str | Path) -> JobDescription:
                 meta = parsed
 
     return JobDescription(body=body.strip(), meta=meta, source_path=str(path))
+
+
+# Trailing legal/EEO boilerplate markers — these sections close out a posting and carry no
+# tailoring signal. Searched only in the LAST 40% of the text, so a requirements section that
+# happens to mention accommodation or benefits early is never cut.
+_BOILERPLATE_MARKERS = (
+    "equal opportunity employer", "equal employment opportunity", "eeo is the law",
+    "we are an equal opportunity", "equal opportunity workplace", "affirmative action",
+    "e-verify", "reasonable accommodation", "privacy policy", "privacy notice",
+    "applicant privacy", "fair chance", "criminal histories", "pay transparency nondiscrimination",
+)
+
+
+def trim_for_prompt(body: str, cap: int = 8000) -> str:
+    """The JD as sent to an LLM prompt: trailing boilerplate stripped and hard-capped at `cap`
+    characters on a paragraph boundary. The stored JD is untouched (pay-band parsing and the
+    fit judge read the full body)."""
+    text = body or ""
+    low = text.lower()
+    tail = int(len(text) * 0.6)
+    cuts = [p for m in _BOILERPLATE_MARKERS if (p := low.find(m, tail)) != -1]
+    if cuts:
+        text = text[: min(cuts)].rstrip()
+    if len(text) > cap:
+        nl = text.rfind("\n\n", 0, cap)
+        text = text[: nl if nl > cap // 2 else cap].rstrip()
+    return text

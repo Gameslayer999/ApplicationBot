@@ -1,0 +1,65 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Two-pass fill fixture — deferred batch decisions</title></head>
+<body>
+<h1>Two-pass fixture</h1>
+<p>One deterministic field plus four fields the keyword rules can't answer directly:
+a classify case (text), a bank-match case (text), a static combobox needing a Claude
+pick, and a radio group needing classification.</p>
+
+<form>
+  <div class="field">
+    <label for="first">First Name</label>
+    <input id="first" type="text">
+  </div>
+
+  <div class="field">
+    <label for="onsite">Are you comfortable working onsite three days each week?</label>
+    <input id="onsite" type="text">
+  </div>
+
+  <div class="field">
+    <label for="travel">How much travel can you commit to annually?</label>
+    <input id="travel" type="text">
+  </div>
+
+  <div class="field">
+    <label for="wa">Work Authorization Status</label>
+    <div class="select__control"><input id="wa" role="combobox" autocomplete="off"></div>
+    <div class="menu" id="menu-wa" hidden>
+      <div class="select__option">Permitted to accept employment without restriction</div>
+      <div class="select__option">Employment requires visa sponsorship now or later</div>
+      <div class="select__option">Not permitted to accept employment</div>
+    </div>
+  </div>
+
+  <fieldset>
+    <legend>Will your employment require us to file immigration paperwork on your behalf?</legend>
+    <label><input type="radio" name="immig" value="yes"> Yes</label>
+    <label><input type="radio" name="immig" value="no"> No</label>
+  </fieldset>
+</form>
+
+<script>
+document.querySelectorAll('.select__control').forEach(ctrl => {
+  const input = ctrl.querySelector('input');
+  const menu = document.getElementById('menu-' + input.id);
+  const options = Array.from(menu.querySelectorAll('.select__option'));
+  const filter = () => {
+    const q = input.value.toLowerCase();
+    options.forEach(o => {
+      o.style.display = o.textContent.toLowerCase().includes(q) ? '' : 'none';
+    });
+  };
+  ctrl.addEventListener('click', () => { menu.hidden = false; filter(); });
+  input.addEventListener('input', filter);
+  input.addEventListener('keydown', e => { if (e.key === 'Escape') menu.hidden = true; });
+  options.forEach(o => o.addEventListener('click', () => {
+    input.value = o.textContent;
+    input.dataset.committed = o.textContent;
+    menu.hidden = true;
+  }));
+});
+</script>
+</body>
+</html>

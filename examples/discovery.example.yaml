@@ -5,14 +5,22 @@
 #
 # `boards` are specific companies whose public ATS board you want polled. Read each token
 # off the careers-page URL:
-#   Greenhouse: boards.greenhouse.io/<token>       -> {ats: greenhouse, token: <token>}
-#   Lever:      jobs.lever.co/<slug>               -> {ats: lever,      token: <slug>}
-#   Ashby:      jobs.ashbyhq.com/<name>            -> {ats: ashby,      token: <name>}
+#   Greenhouse:      boards.greenhouse.io/<token>        -> {ats: greenhouse,      token: <token>}
+#   Lever:           jobs.lever.co/<slug>                -> {ats: lever,           token: <slug>}
+#   Ashby:           jobs.ashbyhq.com/<name>             -> {ats: ashby,           token: <name>}
+#   SmartRecruiters: jobs.smartrecruiters.com/<Company>  -> {ats: smartrecruiters, token: <Company>}
+#   Recruitee:       <company>.recruitee.com             -> {ats: recruitee,       token: <company>}
+#   Workable:        apply.workable.com/<account>        -> {ats: workable,        token: <account>}
+# SmartRecruiters + Recruitee + Workable are distinct form systems — great for testing the
+# autofill on new ATS layouts, not just Greenhouse/Lever/Ashby.
 
 boards:
   - {ats: greenhouse, token: stripe}
   - {ats: lever, token: cin7}
   - {ats: ashby, token: Ramp}
+  - {ats: smartrecruiters, token: Visa}
+  - {ats: recruitee, token: bunq}
+  - {ats: workable, token: mlabs}
 
 remote_only: false        # drop non-remote postings when true
 min_salary: 0             # annual floor; 0 = no floor. Postings with no stated pay are kept.
@@ -21,7 +29,33 @@ title_exclude:            # cheap title gate before the matcher
   - recruiter
   - account executive
 
+experience_levels: []     # keep only these levels (detected from the title); empty = no gate.
+                          # valid: internship, new_grad, junior, mid, senior, staff, manager
+                          # lenient — a title naming a DIFFERENT level is dropped; a title with
+                          # no clear level passes to the matcher. e.g. early-career only:
+                          #   - internship
+                          #   - new_grad
+
 min_skills: 2             # keyword pre-filter floor (raise to cut common-word matches)
 top_n: 10                 # how many keyword-ranked survivors Claude judges for true fit
+min_fit: 50               # only follow through (dry-run/apply) on matches Claude scores >= this
+                          # (0-100). Raise toward 70-80 to apply only to close-fit roles.
 
 # keywords: []            # optional aggregator search terms; empty = derive from your résumé
+
+# Early-career feeds (GitHub job boards: SimplifyJobs new-grad + internship lists) — great when
+# your target boards are senior-heavy. Off by default. Only roles on an ATS we can both fetch a
+# full description from AND fill are used (Greenhouse/Lever/Ashby/Workday/SmartRecruiters).
+early_career:
+  enabled: false          # set true to include curated new-grad / internship roles
+  kinds: [new-grad, intern]
+  max_resolve: 40         # how many top title-relevant listings to pull full descriptions for
+  # Drop in any GitHub board publishing the SimplifyJobs listings.json schema — just paste the
+  # raw URL. Ranking and max_resolve apply across all feeds jointly, so adding boards widens the
+  # candidate pool without multiplying per-run cost. A feed that 404s or has the wrong schema
+  # fails loudly, naming the feed, rather than silently shrinking your results.
+  feeds: []
+  # feeds:
+  #   - https://raw.githubusercontent.com/vanshb03/New-Grad-2026/dev/.github/scripts/listings.json
+  #   - name: my-board    # optional explicit name (defaults to "<owner>/<repo>")
+  #     url: https://raw.githubusercontent.com/foo/bar/main/listings.json

@@ -1,0 +1,45 @@
+<!doctype html>
+<!-- Workday-shaped "My Information" page: real data-automation-id attributes, mixing
+     wrapped inputs (id on a container div) and a direct input (id on the <input>), plus a
+     custom button-dropdown (country) that this brick deliberately does NOT fill — dropdowns
+     are the next increment. Used by tests/test_workday.py (headless, no tokens). -->
+<html>
+<head><meta charset="utf-8"><title>Application — My Information</title></head>
+<body>
+  <h1>My Information</h1>
+
+  <div data-automation-id="legalNameSection">
+    <div data-automation-id="legalNameSection_firstName">
+      <label>First Name *</label><input type="text" aria-label="First Name">
+    </div>
+    <div data-automation-id="legalNameSection_lastName">
+      <label>Last Name *</label><input type="text" aria-label="Last Name">
+    </div>
+  </div>
+
+  <div data-automation-id="addressSection">
+    <div data-automation-id="addressSection_addressLine1">
+      <label>Address Line 1</label><input type="text" aria-label="Address Line 1">
+    </div>
+    <div data-automation-id="addressSection_city">
+      <label>City</label><input type="text" aria-label="City">
+    </div>
+    <!-- Custom Workday dropdown — a button that opens a listbox, NOT a native select.
+         Left unfilled by this brick on purpose. -->
+    <div data-automation-id="addressSection_countryRegion">
+      <label>State</label>
+      <button type="button" aria-haspopup="listbox">Select One</button>
+    </div>
+  </div>
+
+  <!-- Direct input: the automation id is on the <input> itself. -->
+  <input data-automation-id="email" type="email" aria-label="Email">
+
+  <div data-automation-id="phone-number-wrapper">
+    <label>Phone Number</label>
+    <input data-automation-id="phone-number" type="tel" aria-label="Phone Number">
+  </div>
+
+  <button data-automation-id="pageFooterNextButton" type="button">Next</button>
+</body>
+</html>

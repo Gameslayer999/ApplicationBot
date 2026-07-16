@@ -4,9 +4,11 @@ Split into two layers:
   * AnswerResolver — pure, fully testable: given a form field's label, returns the value
     from the résumé contact + apply profile + saved answer bank (or None = "can't answer",
     a logged exception rather than a blocking prompt — decision 016).
-  * run_greenhouse — a thin, defensive Playwright driver. DRY-RUN by default: it fills the
-    form, uploads the PDF, screenshots it, and PAUSES for review — it never clicks submit
-    (Guideline #3: never submit against a real posting in development).
+  * run_apply — a thin, defensive Playwright driver. DRY-RUN by default: it fills the
+    form, uploads the PDF, screenshots it, and PAUSES for review — it clicks submit ONLY
+    when passed an armed SafetyGate (profile/safety.yaml + no KILL file, decision 035)
+    and every REQUIRED field resolved (Guideline #3: never submit against a real posting
+    in development).
 
 The Playwright browser (Chromium) is a separate one-time install: `playwright install
 chromium`. The resolver needs no browser.
@@ -18,7 +20,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Optional
 
-from . import answer_bank
+from . import answer_bank, salary
 from .apply_profile import QA, ApplicationProfile, load_profile
 from .models import Resume
 
@@ -31,7 +33,9 @@ class FilledField:
     label: str
     value: str
     control: str = "text"  # text | select | combobox | radio | file
-    source: str = "resolver"  # resolver | native (ATS autofill) | generated (Claude draft)
+    source: str = "resolver"  # resolver | native (ATS autofill) | generated (Claude draft) |
+    #                           option:<tier> (combobox: literal/learned/hint/claude/substring —
+    #                           how the option matched, the determinism audit trail)
 
 
 @dataclass
@@ -40,15 +44,34 @@ class ApplyReport:
     ats: str = "greenhouse"
     filled: list[FilledField] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)  # fields we couldn't answer
+    captured: dict = field(default_factory=dict)  # question -> {kind, options}, so the UI can
+    #                                               recreate an unanswered field as its real control
     errors: list[str] = field(default_factory=list)
     screenshot: Optional[str] = None
     submitted: bool = False
+    # Armed-run outcome (decision 035): dry-run (never attempted) | blocked (armed but
+    # withheld — see `blockers`) | submitted (confirmation seen) | unconfirmed (form gone
+    # after the click but no explicit confirmation — treat as submitted, verify manually).
+    submit_state: str = "dry-run"
+    blockers: list[str] = field(default_factory=list)
+    confirmation: str = ""  # the evidence a submission went through (url / page text)
+    pages: int = 1  # form pages walked (1 = single-page form)
+    submit_probe: str = ""  # dry-run only: the submit control we WOULD click (live selector check)
     native_autofill: Optional[str] = None  # which native autofill ran (e.g. "greenhouse: MyGreenhouse")
 
     def summary(self) -> str:
         native = sum(1 for f in self.filled if f.source == "native")
         generated = sum(1 for f in self.filled if f.source == "generated")
-        lines = [f"Apply report — {self.ats} — {self.url}", f"  submitted: {self.submitted}"]
+        state = f" ({self.submit_state})" if self.submit_state != "dry-run" else ""
+        lines = [f"Apply report — {self.ats} — {self.url}", f"  submitted: {self.submitted}{state}"]
+        if self.confirmation:
+            lines.append(f"  confirmation: {self.confirmation}")
+        if self.blockers:
+            lines.append(f"  blocked: {'; '.join(self.blockers)}")
+        if self.pages > 1:
+            lines.append(f"  form pages walked: {self.pages}")
+        if self.submit_probe:
+            lines.append(f"  submit control (not clicked): {self.submit_probe}")
         if self.native_autofill:
             lines.append(f"  native autofill: {self.native_autofill} — {native} field(s) prefilled")
         breakdown = f"{native} native, {generated} AI-drafted, {len(self.filled) - native - generated} banked/direct"
@@ -84,6 +107,72 @@ def _link(links: list[str], host: str) -> Optional[str]:
     return next((l for l in links if host in l.lower()), None)
 
 
+# Words that mark a "work in <X>" reference as VAGUE (not a concrete country we can adjudicate) —
+# e.g. "the location(s) you selected", "the country in which you are applying", "this role". When
+# the place is vague we fall back to the applicant's general work-auth/sponsorship flag.
+_VAGUE_PLACE = (
+    "location", "country", "countries", "office", "region", "area", "role", "position",
+    "selected", "this", "these", "those", "your", "our", "above", "below", "previous",
+    "listed", "applying", "applied", "jurisdiction", "place", "where", "here", "any",
+)
+
+
+def _degree_hints(degree_text: str) -> Optional[list[str]]:
+    """Map a verbose résumé degree ("Bachelor of Science in Computer Science, …") to the
+    standard option texts a degree dropdown uses, most-specific first, so the combobox/select
+    can match a level even though the résumé string never appears verbatim."""
+    d = (degree_text or "").lower()
+    if not d:
+        return None
+    if any(t in d for t in ("ph.d", "phd", "doctor of philosophy", "doctorate", "doctoral")):
+        return ["Doctor of Philosophy (Ph.D.)", "Doctorate", "Ph.D.", "PhD", "Doctoral Degree"]
+    if "juris doctor" in d or "j.d" in d:
+        return ["Juris Doctor (J.D.)", "J.D.", "Law Degree"]
+    if "doctor of medicine" in d or "m.d" in d:
+        return ["Doctor of Medicine (M.D.)", "M.D."]
+    if "mba" in d or "m.b.a" in d or "business administration" in d:
+        return ["Master of Business Administration (M.B.A.)", "MBA", "Master's Degree"]
+    if any(t in d for t in ("master", "m.s.", "m.a.", "msc", "m.eng", "graduate degree")):
+        return ["Master's Degree", "Master's", "Masters", "Master", "Graduate Degree"]
+    if any(t in d for t in ("bachelor", "b.s.", "b.a.", "bsc", "b.eng", "undergrad", "baccalaureate")):
+        return ["Bachelor's Degree", "Bachelor's", "Bachelors", "Bachelor", "Undergraduate Degree"]
+    if "associate" in d or "a.a." in d or "a.s." in d:
+        return ["Associate's Degree", "Associate's", "Associate"]
+    if any(t in d for t in ("high school", "secondary school", "diploma", "ged")):
+        return ["High School", "High School Diploma", "Secondary School", "GED"]
+    return None
+
+
+@dataclass
+class PendingDecisions:
+    """Unresolved decisions collected during round 1 of a page fill (the deterministic pass).
+    Between rounds they are adjudicated by at most 3 BATCHED Claude calls (classify,
+    bank-match, dropdown picks) instead of one CLI spawn per field; round 2 is the same
+    deterministic loop, now resolving from the injected results."""
+    questions: dict = field(default_factory=dict)  # label -> {"kind": str, "options": [str]}
+    picks: dict = field(default_factory=dict)      # label -> (value, [option texts shown])
+
+    def defer_question(self, label: str) -> None:
+        self.questions.setdefault(label, {"kind": "", "options": []})
+
+    def enrich(self, label: str, kind: str, options: Optional[list] = None) -> None:
+        """Attach the control's kind/options to a deferred question — a classified dropdown
+        whose answer doesn't literally match its options can then join the pick batch."""
+        q = self.questions.get(label)
+        if q is not None:
+            q["kind"] = q["kind"] or kind
+            q["options"] = q["options"] or [o for o in (options or []) if o]
+
+    def defer_pick(self, label: str, value: str, options: list) -> None:
+        self.picks.setdefault(label, (value, [o for o in options if o]))
+
+    def has(self, label: str) -> bool:
+        return label in self.questions or label in self.picks
+
+    def __bool__(self) -> bool:
+        return bool(self.questions or self.picks)
+
+
 @dataclass
 class AnswerResolver:
     resume: Resume
@@ -92,12 +181,186 @@ class AnswerResolver:
     enable_generation: bool = False
     company: Optional[str] = None
     jd: Optional[str] = None
+    pay: Optional[str] = None  # the posting's advertised compensation string, if any
+    market_salary: Optional[str] = None  # dynamic estimate used when no band is advertised (decision 039)
     model: Optional[str] = None
     learned: list = field(default_factory=list)  # generated Q&A to persist after the run
+    learned_options: dict = field(default_factory=dict)  # value -> [option texts] learned this run
+    # Two-pass batching state (decision 041). `pending` is set only during round 1 of a page
+    # fill: semantic/pick decisions are DEFERRED into it instead of spawning Claude per field.
+    pending: Optional[PendingDecisions] = None
+    semantic_done: set = field(default_factory=set)  # labels the batch already adjudicated
+    picks_done: set = field(default_factory=set)     # dropdown labels the batch already adjudicated
+    decided_options: dict = field(default_factory=dict)  # label -> batch-picked option text
+
+    def learned_option_hints(self, value: Optional[str]) -> list[str]:
+        """Dropdown options this value has matched before (learned across runs), so a repeat
+        encounter matches instantly without another Claude call (decision 033)."""
+        if not value:
+            return []
+        key = " ".join(value.lower().split())
+        return list(self.profile.dropdown_aliases.get(key, [])) + list(self.learned_options.get(key, []))
+
+    def learn_option(self, value: Optional[str], chosen: str) -> None:
+        """Record that `value` matched dropdown option `chosen` (persisted after the run).
+        Generic boolean values are NEVER learned: aliases are keyed by value alone, so a
+        "yes" → "I am authorized to work … for any employer" mapping learned on one question
+        would become a match candidate for EVERY future Yes/No dropdown. Descriptive boolean
+        dropdowns are covered per-question by option_hints instead."""
+        if not (value and chosen):
+            return
+        key = " ".join(value.lower().split())
+        if key in ("yes", "no", "true", "false"):
+            return
+        opts = self.learned_options.setdefault(key, [])
+        if chosen not in opts:
+            opts.append(chosen)
 
     def _name_parts(self) -> tuple[str, str]:
         parts = (self.resume.contact.name or "").split()
         return (parts[0] if parts else ""), (parts[-1] if len(parts) > 1 else "")
+
+    def _current_experience(self):
+        """The applicant's CURRENT role — the ongoing one (end says Present/Current), else the
+        first listed. Résumés aren't always ordered most-recent-first, so experience[0] can be a
+        past job; this picks the actually-current one for "current employer / title" questions."""
+        exps = self.resume.experience
+        if not exps:
+            return None
+        for e in exps:
+            if re.search(r"\b(present|current|now|ongoing|to date)\b", e.end or "", re.I):
+                return e
+        return exps[0]
+
+    def _field_of_study(self) -> Optional[str]:
+        """The academic field/major/discipline for a 'Discipline'/'Field of study' field. The
+        résumé stores it inside the degree string ("Bachelor of Science in Computer Science,
+        Minor in …"), with no separate field, so parse the phrase after "in" up to the first comma."""
+        edu = self.resume.education[0] if self.resume.education else None
+        if not edu:
+            return None
+        m = re.search(r"\bin\s+(.+)", edu.degree or "", re.I)
+        return (m.group(1).split(",")[0].strip() or None) if m else None
+
+    def _salary_expectation(self) -> Optional[str]:
+        """Salary-expectation answer, most-grounded source first:
+          1. the posting's advertised pay band → its midpoint (decision 038);
+          2. else the pre-computed market estimate for this posting (decision 039), injected
+             by the pipeline when the posting advertises nothing;
+          3. else the profile's stored desired_salary."""
+        band = salary.advertised_band(self.pay, self.jd)
+        if band:
+            return str((band[0] + band[1]) // 2)
+        return self.market_salary or self.profile.desired_salary or None
+
+    def _place_matches_applicant(self, place: str) -> bool:
+        """True if `place` (a country/region named in a Yes/No "are you located in X?" question)
+        is where the applicant actually is — compared against their country and location, with the
+        US spelled its many ways and state abbreviations expanded (NJ → new jersey)."""
+        place = re.sub(r"^the\b", "", place.strip().lower()).strip(" .?,")
+        if not place:
+            return False
+        US = {"united states", "united states of america", "usa", "us", "u s", "u s a", "america"}
+        mine: set = set()
+        country = (self.profile.country or "").strip().lower()
+        if country:
+            mine.add(country)
+            if country in US:
+                mine |= US
+        loc = (self.profile.location or self.resume.contact.location or "").lower()
+        for tok in re.split(r"[,\s]+", loc):
+            if tok:
+                mine.add(_US_STATES.get(tok, tok))
+        return any(place == m or (len(place) > 2 and place in m) or (len(m) > 2 and m in place)
+                   for m in mine)
+
+    def _authorized_countries(self) -> set:
+        """Countries the applicant can work in without sponsorship — their own country (spelled the
+        US's many ways when applicable). No per-country data model today; the home country is the
+        honest default. A dual-national with extra authorizations is a documented follow-up."""
+        US = {"united states", "united states of america", "usa", "us", "u s", "u s a", "america"}
+        out: set = set()
+        c = (self.profile.country or "").strip().lower()
+        if c:
+            out.add(c)
+            if c in US:
+                out |= US
+        return out
+
+    def _named_foreign_country(self, n: str) -> Optional[str]:
+        """If the question names a CONCRETE country the applicant is NOT authorized in (e.g.
+        "…work in Japan…" for a US applicant), return that place; None if there's no "work in <X>"
+        clause, the place is vague ("the location(s) you selected"), or it IS their own country.
+        This is the only case where the generic work-auth/sponsorship flag gives a wrong answer."""
+        m = re.search(r"\b(?:work|employed|employment|permit)\s+in\s+(.+?)(?:\s+for\b|$)", n)
+        if not m:
+            return None
+        place = m.group(1).strip()
+        if any(w in place for w in _VAGUE_PLACE):
+            return None
+        p = re.sub(r"^the\b", "", place).strip(" .?,")
+        if not p:
+            return None
+        auth = self._authorized_countries()
+        if any(a == p or (len(p) > 2 and p in a) or (len(a) > 2 and a in p) for a in auth):
+            return None  # their own/authorized country — the generic flag (authorized) is correct
+        return p
+
+    def _state_from_location(self) -> Optional[str]:
+        """The US state (full name) from the applicant's location, for a "state/province" field.
+        "Edison, NJ" → "New Jersey"; "San Francisco, California" → "California"."""
+        loc = (self.profile.location or self.resume.contact.location or "").strip()
+        for tok in re.split(r"[,\s]+", loc):
+            t = tok.strip().lower()
+            if t in _US_STATES:
+                return _US_STATES[t].title()
+            if t in _US_STATES.values():
+                return t.title()
+        low = loc.lower()  # multi-word states ("new jersey") don't survive the token split
+        for full in _US_STATES.values():
+            if full in low:
+                return full.title()
+        return None
+
+    def _office_prefs(self) -> list[str]:
+        """Ranked office-location candidates for a "preferred office location" dropdown: the explicit
+        preferred_locations first, then Remote (if open to it), then the home city as a last resort."""
+        out = [x.strip() for x in (self.profile.preferred_locations or []) if x and x.strip()]
+        if self.profile.open_to_remote and not any("remote" in x.lower() for x in out):
+            out.append("Remote")
+        home = (self.profile.location or self.resume.contact.location or "").strip()
+        if home and home not in out:
+            out.append(home)
+        return out
+
+    def _office_hints(self) -> Optional[list[str]]:
+        """The ranked office prefs, each expanded with its city-only form ("New York, NY" → also
+        "New York"), so the combobox matches whether a form's option is the bare city or has a
+        suffix ("New York (HQ)"). Order = rank, so the highest-ranked offered option wins."""
+        hints: list[str] = []
+        for p in self._office_prefs():
+            hints.append(p)
+            city = p.split(",")[0].strip()
+            if city and city.lower() != p.lower():
+                hints.append(city)
+        seen, out = set(), []
+        for h in hints:
+            if h.lower() not in seen:
+                seen.add(h.lower())
+                out.append(h)
+        return out or None
+
+    def _pronouns(self) -> Optional[str]:
+        """The explicit pronouns field if set; otherwise derived from the stored gender, for a
+        "preferred pronouns" field. None for an unset/non-binary gender — never guess pronouns."""
+        if (self.profile.pronouns or "").strip():
+            return self.profile.pronouns.strip()
+        g = (self.profile.gender or "").strip().lower()
+        if g in ("male", "man", "m"):
+            return "He/Him"
+        if g in ("female", "woman", "f"):
+            return "She/Her"
+        return None
 
     def resolve(self, label: str) -> Optional[str]:
         """Return the answer for a field labelled `label`, or None if we can't answer it."""
@@ -115,6 +378,11 @@ class AnswerResolver:
             return p.last_name or last or None
         if _has(n, "full name") or n in ("name", "your name", "legal name"):
             return c.name or None
+        # "What's the name you'd prefer us to use?" / "preferred name" → the first name.
+        if _has(n, "preferred name", "preferred first name", "what should we call you",
+                "name you go by", "goes by") or ("prefer" in n and "name" in n) \
+                or ("name" in n and _has(n, "like us to use", "want us to use", "call you")):
+            return p.first_name or first or None
         if _has(n, "email"):
             return p.email or c.email or None
         if _has(n, "phone", "mobile", "telephone"):
@@ -125,16 +393,40 @@ class AnswerResolver:
             return p.github_url or _link(c.links, "github")
         if _has(n, "portfolio", "website", "personal site", "personal website"):
             return p.portfolio_url or None
-        if _has(n, "location", "city", "current location", "where are you based"):
-            return p.location or c.location or None
-        if _has(n, "country"):
-            return p.country or None
 
-        # Work eligibility (Yes/No)
-        if _has(n, "authorized to work", "legally authorized", "work authorization", "eligible to work"):
+        # Work eligibility (Yes/No) — checked BEFORE location/country, because questions like
+        # "Are you authorized to work in the location(s) you selected?" or "…sponsor you for the
+        # location(s)…" contain "location"/"country" and must NOT be answered with a place.
+        if _has(n, "authorized to work", "legally authorized", "work authorization",
+                "eligible to work", "entitled to work", "right to work"):
+            # A US applicant's generic work-auth flag says "authorized" — but that's WRONG for a
+            # posting that asks about a specific foreign country ("…authorized to work in Japan?").
+            # Override to No only when a concrete non-home country is named; else use the flag.
+            if p.work_authorized is True and self._named_foreign_country(n):
+                return "No"
             return _yn(p.work_authorized)
-        if _has(n, "sponsorship", "require sponsorship", "visa sponsorship", "need sponsorship"):
+        if _has(n, "sponsor", "sponsorship", "require sponsorship", "visa sponsorship", "need sponsorship"):
+            # Symmetric: someone who needs no sponsorship at home WOULD need it for a foreign
+            # country ("…require sponsorship to work in Japan?" → Yes), so override in that case.
+            if p.requires_sponsorship is False and self._named_foreign_country(n):
+                return "Yes"
             return _yn(p.requires_sponsorship)
+        # ITAR / export-control gates — a U.S. citizen is a "U.S. person" under ITAR, so the
+        # gate is met. Checked BEFORE the citizen rule so the long blurb form ("applicant must
+        # be a (i) U.S. citizen or national, (ii) …green card holder…") resolves as ITAR. A
+        # non-citizen falls THROUGH (not return None) so a banked answer can still apply —
+        # a green-card holder also qualifies, which the profile can't derive. NB: "itar" must
+        # be a whole word — as a substring it hits "mil-ITAR-y status".
+        if (re.search(r"\bitar\b", n)
+                or _has(n, "export control", "export regulation", "us person", "u s person")) \
+                and p.us_citizen is True:
+            return "Yes"
+        # Security-clearance ELIGIBILITY (citizens are eligible to apply) — distinct from
+        # HAVING a clearance, which stays captured for the user (pinned null in the corpus).
+        if "clearance" in n and _has(n, "eligible", "eligibility", "ability to obtain",
+                                     "able to obtain", "can you obtain", "willing to obtain") \
+                and p.us_citizen is True:
+            return "Yes"
         # Citizenship — also answers "confirm you are a US citizen located in the US" gates,
         # since those are Yes/No and citizenship is the binding requirement.
         if _has(n, "citizen"):
@@ -144,23 +436,136 @@ class AnswerResolver:
         if _has(n, "remote", "work remotely"):
             return _yn(p.open_to_remote)
 
+        # Prior relationship with the HIRING company (worked/interned/consulted/interviewed there).
+        # Honest default for a fresh applicant is "No". Gated on the company actually being named,
+        # so "have you worked with <technology>?" is never caught (and product-use like "have you
+        # used Robinhood?" isn't, since "used" isn't an employment/interview verb).
+        if self.company:
+            cn = _norm(self.company)
+            if cn and cn in n and _has(n, "worked", "work for", "employed", "employee",
+                                       "employment", "intern", "consult", "interviewed", "contractor"):
+                return "No"
+
+        # "Are you currently located in <place>?" / "Do you live in <place>?" — a Yes/No, answered
+        # by comparing the named place to where the applicant IS (country + location); NOT a place
+        # to enter. Before the location/country rules so it isn't answered with the applicant's own
+        # city/country (e.g. "located in Japan?" was wrongly answered "United States").
+        mloc = re.search(r"\b(?:located|based|residing|reside|living|live)\s+in\s+(.+)$", n)
+        if mloc and re.match(r"(are|do|does|will|is|have|currently)\b", n):
+            return "Yes" if self._place_matches_applicant(mloc.group(1)) else "No"
+
+        # "Which state/province do you live in?" — answered from the location's state, not the
+        # full "City, ST". Guarded so the verb "state" ("please state your salary") never triggers
+        # it. Before the location rule so a state field isn't answered with the whole city.
+        if ("province" in n or re.search(r"\bstate\b", n)) and _has(
+                n, "province", "reside", "residence", "live", "located", "which state",
+                "home state", "current state", "state of", "your state"):
+            st = self._state_from_location()
+            if st:
+                return st
+
+        # "What is your preferred office location?" — pick the highest-ranked office the form offers
+        # from the applicant's ranked preferences. NOT a Yes/No like "willing to work from the
+        # office" (guarded), and distinct from the home-location rule below (which excludes "office").
+        if _has(n, "office") and _has(n, "preferred", "which", "select", "location", "prefer",
+                                      "choose", "primary") \
+                and not _has(n, "willing", "days per week", "days a week", "commute", "able to"):
+            prefs = self._office_prefs()
+            return prefs[0] if prefs else None
+
+        # Location / country — after work-eligibility so a Yes/No question that merely mentions
+        # "location"/"country" isn't answered with a place. "Country" is checked first so a
+        # "country where you reside" question resolves to the country, not the city.
+        if _has(n, "country"):
+            return p.country or None
+        # NOTE: match "city" only as a whole word — as a bare substring it hits "ethni-CITY"
+        # (and "simpli-city"), which wrongly answered "Race/Ethnicity" with the applicant's city.
+        # NB: exclude "office" — "preferred office location" asks which COMPANY office you'd work
+        # from (from the job's office list), not where you live; answering it with the home city is
+        # wrong, so leave it for the user.
+        if (_has(n, "location", "current location", "where are you based", "reside", "residence",
+                 "where do you live", "where you live", "based out of")
+                or re.search(r"\b(city|live)\b", n)) and not _has(n, "office"):
+            return p.location or c.location or None
+
         # Logistics
         if _has(n, "salary", "compensation expectation", "desired pay", "expected compensation"):
-            return p.desired_salary or None
-        if _has(n, "start date", "available to start", "notice period", "when can you start"):
+            # No advertised band, no market estimate, no stored figure → fall THROUGH (don't
+            # return None) so a user-entered banked answer below can still answer it. A live
+            # AppLovin dry-run hit this: the early return skipped the bank and the field fell
+            # to the drafting path, which fabricated a salary.
+            sal = self._salary_expectation()
+            if sal is not None:
+                return sal
+        if _has(n, "start date", "available to start", "notice period", "when can you start",
+                "earliest", "start working", "want to start", "like to start", "when would you start",
+                "when could you start", "availability to start", "available start"):
             return p.earliest_start_date or None
         if _has(n, "years of experience", "years experience"):
             return p.years_experience or None
+        # ADA: "Can you perform the essential functions of this role, with or without reasonable
+        # accommodation?" — answered Yes (the applicant can do the job); a standard required Yes/No.
+        if _has(n, "essential functions", "perform the essential", "essential function",
+                "perform the duties of", "perform the job duties"):
+            return "Yes"
+        # Readiness/commitment closers — "Are you up for it?", "Are you ready?", "Does this
+        # sound like you?" — ask for a commitment to the described role, not a fact; applying
+        # IS that commitment, so answer Yes. Guarded so logistical "ready" questions (start
+        # date, relocation, remote/onsite, travel) still resolve from their profile rules
+        # above or are captured for the user, never blanket-answered Yes.
+        if _has(n, "are you up for", "up for it", "up for the challenge", "up to the challenge",
+                "ready for the challenge", "ready to take on", "sound like you",
+                "are you ready") \
+                and not _has(n, "start", "relocate", "remote", "onsite", "on site", "travel",
+                             "commute", "when"):
+            return "Yes"
 
         # Voluntary EEO
+        # Pronouns before gender: "What gender pronouns do you prefer?" contains "gender" but wants
+        # pronouns ("He/Him"), not "Male".
+        if _has(n, "pronoun"):
+            return self._pronouns()
         if _has(n, "gender"):
             return p.gender or None
-        if _has(n, "race", "ethnicity"):
+        # "Are you Hispanic/Latino?" is a Yes/No derived from the stored race/ethnicity, which
+        # may not contain the word "race"/"ethnicity" — handle it before the generic check.
+        if _has(n, "hispanic", "latino", "latinx", "latin"):
+            if not p.race_ethnicity:
+                return None
+            rl = p.race_ethnicity.lower()
+            is_hisp = any(t in rl for t in ("hispanic", "latino", "latinx", "latin")) \
+                and "not hispanic" not in rl and "non-hispanic" not in rl
+            return "Yes" if is_hisp else "No"
+        if _has(n, "race", "ethnicity", "ethnic"):
             return p.race_ethnicity or None
-        if _has(n, "veteran"):
+        if _has(n, "veteran", "military"):
             return p.veteran_status or None
         if _has(n, "disability"):
             return p.disability_status or None
+
+        # Facts derivable from the résumé — answer them instead of capturing them blank for
+        # the user (they were showing up as "needs your answer" despite being on the résumé).
+        recent = self._current_experience()
+        edu = self.resume.education[0] if self.resume.education else None
+        if recent and _has(n, "current employer", "previous employer", "current company",
+                           "recent employer", "name of your employer", "current or previous employer") \
+                and not _has(n, "subject to", "agreement", "restriction", "non-compete", "noncompete",
+                             "obligation", "worked for", "worked at"):
+            return recent.organization or None
+        if recent and _has(n, "current title", "job title", "current position", "recent title",
+                           "current or previous job title", "your title", "current role"):
+            return recent.role or None
+        if edu and _has(n, "most recent degree", "highest degree", "degree obtained",
+                        "degree earned", "level of education", "education level") or (edu and n == "degree"):
+            return edu.degree or None
+        if edu and _has(n, "school", "university", "college", "institution", "alma mater"):
+            return edu.school or None
+        if edu and _has(n, "field of study", "major", "area of study", "course of study",
+                        "discipline", "concentration"):
+            return self._field_of_study() or edu.degree or None
+        if edu and _has(n, "graduation", "grad year", "graduated", "year of graduation",
+                        "expected graduation"):
+            return edu.graduation or None
 
         # "How did you hear about this job?" — default reflects our online-search discovery.
         if _has(n, "how did you hear", "how did you find", "where did you hear",
@@ -173,13 +578,85 @@ class AnswerResolver:
                 _has(n, "complete", "fill", "assist", "generate", "used", "use", "help"):
             return "Yes"
 
-        # Saved answer bank for custom screening questions (conservative match)
+        # Saved answer bank for custom screening questions (conservative match). An entry with
+        # `maps_to` was Claude-classified onto a structured field — answer it LIVE from that
+        # field so it stays correct if the profile changes.
         for qa in p.custom_answers:
             qn = _norm(qa.question)
             if qn and (qn == n or (len(qn) > 15 and (qn in n or n in qn))):
-                return qa.answer or None
+                mt = getattr(qa, "maps_to", "")
+                return self.answer_for_type(mt) if mt else (qa.answer or None)
 
         return None
+
+    def answer_for_type(self, key: str) -> Optional[str]:
+        """The live answer for a classified question type (a key of
+        answer_bank.CLASSIFIABLE_TYPES), read from the current profile/résumé."""
+        p, c = self.profile, self.resume.contact
+        return {
+            "work_authorized": _yn(p.work_authorized),
+            "requires_sponsorship": _yn(p.requires_sponsorship),
+            "us_citizen": _yn(p.us_citizen),
+            "willing_to_relocate": _yn(p.willing_to_relocate),
+            "open_to_remote": _yn(p.open_to_remote),
+            "desired_salary": self._salary_expectation(),
+            "earliest_start_date": p.earliest_start_date or None,
+            "years_experience": p.years_experience or None,
+            "itar_us_person": "Yes" if p.us_citizen is True else None,
+            "role_commitment": "Yes",
+            "how_heard": p.how_heard or None,
+            "location": p.location or c.location or None,
+            "country": p.country or None,
+        }.get(key)
+
+    def resolve_semantic(self, label: str) -> Optional[str]:
+        """Keyword-resolve first; on a miss, use Claude to CLASSIFY the question onto a known
+        structured type (catching semantic variants the keyword rules miss, e.g. "willing to
+        work from our office 3 days/week?" → open_to_remote), answer from that field, and cache
+        the mapping so it's learned. Best-effort: no Claude / no match → None (caller falls back
+        to the drafting/needs-attention path)."""
+        value = self.resolve(label)
+        if value is not None:
+            return value
+        if not self.enable_generation:
+            return None
+        if self.pending is not None:  # round 1 of a two-pass fill — defer to the batch
+            if label not in self.semantic_done:
+                self.pending.defer_question(label)
+            return None
+        if label in self.semantic_done:
+            return None  # the batch already adjudicated this label — never re-ask per-field
+        key = answer_bank.classify_question(label, model=self.model)
+        if key:
+            ans = self.answer_for_type(key)
+            if ans is not None:
+                self.learned.append(QA(question=label, answer="", maps_to=key, generated=True))
+                return ans
+        # Not a structured type (or its profile field is unset) — the question may still be a
+        # REPHRASING of a custom question already answered in the bank.
+        return self._bank_semantic(label)
+
+    def _bank_semantic(self, label: str) -> Optional[str]:
+        """On a literal bank miss, Claude-match `label` against the banked Q&A — a saved answer
+        should be reused for any rewording of its question, not only the exact phrasing it was
+        saved under. On a hit, the answer is returned and the new phrasing is cached as a bank
+        alias so the next encounter matches literally (no Claude call)."""
+        cands: list[tuple[QA, str]] = []
+        for qa in self.profile.custom_answers:
+            mt = getattr(qa, "maps_to", "")
+            ans = self.answer_for_type(mt) if mt else (qa.answer or "").strip()
+            if (qa.question or "").strip() and ans:
+                cands.append((qa, ans))
+        if not cands:
+            return None
+        idx = answer_bank.match_banked_question(
+            label, [(qa.question, ans) for qa, ans in cands], model=self.model)
+        if idx is None:
+            return None
+        qa, ans = cands[idx]
+        self.learned.append(QA(question=label, answer="" if qa.maps_to else qa.answer,
+                               maps_to=qa.maps_to, generated=True))
+        return ans
 
     def option_hints(self, label: str) -> Optional[list[str]]:
         """Ranked substrings to match against a dropdown's options when the free-text answer
@@ -187,20 +664,139 @@ class AnswerResolver:
         options vary by company — since we discover roles via online search, prefer
         online/job-board/company-site options, then a generic bucket."""
         n = _norm(label)
+        # Preferred office location: the ranked office prefs (city-expanded), so the highest-ranked
+        # option the form actually offers is the one that matches.
+        if _has(n, "office") and _has(n, "preferred", "which", "select", "location", "prefer",
+                                      "choose", "primary") \
+                and not _has(n, "willing", "days per week", "days a week", "commute", "able to"):
+            return self._office_hints()
+        # Work-authorization dropdowns sometimes use DESCRIPTIVE options ("I am authorized to work
+        # in the United States for any employer") instead of Yes/No — map from the profile. Hints
+        # are specific enough not to substring-match the negative option ("for any employer" only
+        # appears in the positive one; bare "authorized to work" would also hit "NOT authorized").
+        if _has(n, "authorized to work", "legally authorized", "work authorization",
+                "eligible to work", "entitled to work", "right to work") \
+                and not self._named_foreign_country(n):
+            if self.profile.work_authorized is True:
+                return (["I require sponsorship to work", "require sponsorship", "Yes"]
+                        if self.profile.requires_sponsorship else
+                        ["authorized to work in the United States for any employer",
+                         "for any employer", "Yes"])
+            if self.profile.work_authorized is False:
+                return ["I am not authorized to work", "not authorized to work", "No"]
+        # ITAR/export-control dropdowns list the qualifying statuses — a citizen picks the
+        # citizen/national option. Before the citizen hints so ITAR blurbs naming several
+        # statuses get these; same hint texts, plus the "U.S. person" phrasing ITAR forms use.
+        if (re.search(r"\bitar\b", n)
+                or _has(n, "export control", "export regulation", "us person", "u s person")) \
+                and self.profile.us_citizen is True:
+            return ["U.S. citizen or national", "U.S. citizen", "US citizen", "U.S. Person",
+                    "US Person", "Yes"]
+        # Citizenship-status dropdowns list statuses ("(a) U.S. citizen or national…"), not Yes/No.
+        if _has(n, "citizen"):
+            if self.profile.us_citizen is True:
+                return ["U.S. citizen or national", "U.S. citizen", "US citizen",
+                        "citizen or national of the United States", "Yes"]
+            if self.profile.us_citizen is False:
+                return ["No"]
         if _has(n, "how did you hear", "how did you find", "where did you hear",
                 "referral source", "how were you referred"):
             return ["job board", "online", "search", "company website", "website",
                     "google", "linkedin", "indeed", "glassdoor", "other"]
+        # Country dropdowns spell "United States" many ways ("United States", "US", "USA", …).
+        # Offer full forms first, then the abbreviations — these are now SAFE to include because
+        # _matches whole-words short values, so "US" matches the option "US" but not "Australia".
+        if _has(n, "country") and (self.profile.country or "").strip().lower() in (
+                "united states", "usa", "us", "u.s.", "united states of america"):
+            return ["United States", "United States of America", "United States (USA)",
+                    "USA", "US", "U.S.A.", "America"]
+        # Degree dropdowns list standard levels ("Bachelor's Degree", "Master's Degree", …) but the
+        # résumé stores a verbose degree ("Bachelor of Science in Computer Science, …"). Map it to
+        # the level so the dropdown can match.
+        edu = self.resume.education[0] if self.resume.education else None
+        if edu and (n == "degree" or _has(n, "degree", "level of education", "education level")):
+            hints = _degree_hints(edu.degree)
+            if hints:
+                return hints
+        # Gender-identity dropdowns often list "Man"/"Woman" rather than "Male"/"Female".
+        g = (self.profile.gender or "").strip().lower()
+        if _has(n, "pronoun"):
+            pr = self._pronouns()
+            if pr == "He/Him":
+                return ["He/Him", "He/Him/His", "He", "Him"]
+            if pr == "She/Her":
+                return ["She/Her", "She/Her/Hers", "She", "Her"]
+        if _has(n, "gender") and g:
+            if g in ("male", "man"):
+                return ["Male", "Man"]
+            if g in ("female", "woman"):
+                return ["Female", "Woman"]
+        # Veteran & disability self-ID: the SAME three choices are worded differently per ATS
+        # (Greenhouse "I am not a protected veteran" vs Lever "I am not a veteran"), so the stored
+        # value rarely matches an option verbatim. Map the applicant's intent to exact option
+        # strings (tried exact-first) plus negation-safe fuzzy tokens — never a bare "veteran",
+        # which would substring-match BOTH the "am a" and "am not a" options.
+        decline_kw = ("decline", "wish not", "not to answer", "prefer not", "don't wish",
+                      "do not wish", "choose not", "don't want", "do not want")
+        vet = (self.profile.veteran_status or "").strip().lower()
+        if _has(n, "veteran", "military") and vet:
+            if any(t in vet for t in decline_kw):
+                return ["Decline to self-identify", "I don't wish to answer",
+                        "I do not wish to answer", "I choose not to disclose"]
+            if "not a" in vet or re.match(r"\s*no\b", vet):
+                return ["I am not a protected veteran", "I am not a veteran", "Not a Veteran",
+                        "not a protected veteran", "not a veteran"]
+            return ["I identify as one or more of the classifications of protected veteran",
+                    "I am a protected veteran", "I am a veteran", "Protected Veteran",
+                    "identify as one or more"]
+        dis = (self.profile.disability_status or "").strip().lower()
+        if _has(n, "disability") and dis:
+            if any(t in dis for t in decline_kw):
+                return ["I do not want to answer", "I don't wish to answer",
+                        "Decline to self-identify", "I choose not to disclose"]
+            if re.match(r"\s*no\b", dis) or "do not have a disability" in dis \
+                    or "not have a disability" in dis:
+                return ["No, I do not have a disability and have not had one in the past",
+                        "No, I do not have a disability", "do not have a disability",
+                        "I don't have a disability"]
+            return ["Yes, I have a disability, or have had one in the past",
+                    "Yes, I have a disability", "have a disability"]
+        # State/province dropdowns: offer the full name, then the abbreviation.
+        if ("province" in n or re.search(r"\bstate\b", n)) and _has(
+                n, "province", "reside", "residence", "live", "located", "which state",
+                "home state", "current state", "state of", "your state"):
+            st = self._state_from_location()
+            if st:
+                abbr = next((a.upper() for a, full in _US_STATES.items() if full == st.lower()), None)
+                return [st] + ([abbr] if abbr else [])
         return None
 
-    def freetext_answer(self, label: str, is_textarea: bool = False) -> tuple[Optional[str], str]:
-        """Answer a free-text field. Banked/structured answer first; else, for open-ended
-        questions, a grounded Claude draft (cached for reuse unless company-specific). Returns
+    def freetext_answer(self, label: str, is_textarea: bool = False,
+                        required: bool = False) -> tuple[Optional[str], str]:
+        """Answer a free-text field. Banked/structured answer first; else a grounded Claude draft
+        for open-ended questions, OR for any REQUIRED field (which must be filled to submit) that
+        isn't a numeric-fact/demographic question we must never fabricate. Returns
         (answer, source) where source is 'resolver' | 'generated' | '' (couldn't answer)."""
         value = self.resolve(label)
         if value is not None:
             return value, "resolver"
-        if not self.enable_generation or not answer_bank.is_open_ended(label, is_textarea):
+        if not self.enable_generation:
+            return None, ""
+        if self.pending is not None and label not in self.semantic_done:
+            # Round 1 of a two-pass fill — classify/bank-match (and any drafting) wait for
+            # round 2; "pending" tells the caller not to capture/skip the field yet.
+            self.pending.defer_question(label)
+            return None, "pending"
+        # A reworded banked question beats drafting a fresh answer (and covers short text
+        # fields, which never reach resolve_semantic). Skipped when the batch already checked.
+        banked = None if label in self.semantic_done else self._bank_semantic(label)
+        if banked is not None:
+            return banked, "resolver"
+        # Draft when the question invites prose, OR it's a required field that must be filled to
+        # submit — the latter is why an oddly-phrased required question ("Why WHOOP?" as a short
+        # input) still gets an answer instead of blocking the submit.
+        if not (answer_bank.is_open_ended(label, is_textarea)
+                or (required and answer_bank.is_draftable_required(label))):
             return None, ""
         company_specific = answer_bank.is_company_specific(label)
         if company_specific and not (self.company or self.jd):
@@ -213,6 +809,17 @@ class AnswerResolver:
             self.learned.append(QA(question=label, answer=ans, generated=True))
         return ans, "generated"
 
+    def choose_option(self, label: str, options: list[str]) -> Optional[str]:
+        """For a REQUIRED dropdown/select we couldn't map (resolve, semantic classify, and hints
+        all missed), let the weak model pick the best-fitting OFFERED option so the field doesn't
+        block the submit. Returns an option verbatim, or None when generation is off, the question
+        is one we must not guess (demographic / fact the applicant owns), or nothing honestly fits.
+        Never invents an option — only chooses among those offered."""
+        if not self.enable_generation:
+            return None
+        return answer_bank.choose_required_option(
+            label, options, self.resume, company=self.company, jd=self.jd, model=self.model)
+
 
 # --------------------------------------------------------------- Greenhouse (Playwright)
 #
@@ -224,7 +831,7 @@ class AnswerResolver:
 # JS run in the page to derive a control's human question label (aria-label → aria-labelledby
 # → <label for> → wrapping <label> → nearest ancestor label/legend → placeholder/name).
 _LABEL_JS = r"""(el) => {
-  const clean = s => (s || '').replace(/\s+/g, ' ').replace(/\*/g, '').trim();
+  const clean = s => (s || '').replace(/\s+/g, ' ').replace(/[*✱★]/g, '').trim();
   if (el.getAttribute('aria-label')) return clean(el.getAttribute('aria-label'));
   const lb = el.getAttribute('aria-labelledby');
   if (lb) {
@@ -238,12 +845,24 @@ _LABEL_JS = r"""(el) => {
     const l = document.querySelector('label[for="' + sel + '"]');
     if (l) return clean(l.innerText);
   }
+  // A radio/checkbox OPTION is wrapped in its own <label> ("Yes"/"No") — return that so option
+  // matching works. An EEO <select> is ALSO wrapped in a <label>, but that wrapper nests a
+  // <div class="application-label"> (the question) and its innerText folds in every <option>
+  // ("Veteran status Select ... I am a veteran I am not a veteran …"); detect that nested label
+  // and skip to the card lookup below instead of returning the polluted wrapper text.
   const wrap = el.closest('label');
+  if (wrap && !wrap.querySelector('.application-label')) return clean(wrap.innerText);
+  // Lever renders a card's question in a <div class="application-label"> (not a real <label>).
+  const card = el.closest('.application-question');
+  if (card) {
+    const ql = card.querySelector('.application-label .text, .application-label');
+    if (ql && clean(ql.innerText)) return clean(ql.innerText);
+  }
   if (wrap) return clean(wrap.innerText);
   let node = el;
   for (let i = 0; i < 5 && node.parentElement; i++) {
     node = node.parentElement;
-    const l = node.querySelector('label, legend');
+    const l = node.querySelector('label, legend, .application-label');
     if (l && clean(l.innerText)) return clean(l.innerText);
   }
   return clean(el.getAttribute('placeholder') || el.getAttribute('name') || '');
@@ -251,13 +870,17 @@ _LABEL_JS = r"""(el) => {
 
 # JS: for a radio, the group's QUESTION (its own label is just the option, e.g. "Yes").
 _GROUP_QUESTION_JS = r"""(el) => {
-  const clean = s => (s || '').replace(/\s+/g, ' ').replace(/\*/g, '').trim();
+  const clean = s => (s || '').replace(/\s+/g, ' ').replace(/[*✱★]/g, '').trim();
   const fs = el.closest('fieldset');
   if (fs) { const lg = fs.querySelector('legend'); if (lg && clean(lg.innerText)) return clean(lg.innerText); }
+  // Lever puts the group's question in a <div class="application-label"> on the enclosing
+  // .application-question card; the option <label>s only hold "Yes"/"No" (too short to win below).
+  const card = el.closest('.application-question');
+  if (card) { const ql = card.querySelector('.application-label .text, .application-label'); if (ql && clean(ql.innerText)) return clean(ql.innerText); }
   let node = el;
   for (let i = 0; i < 6 && node.parentElement; i++) {
     node = node.parentElement;
-    const long = Array.from(node.querySelectorAll('label, legend'))
+    const long = Array.from(node.querySelectorAll('label, legend, .application-label'))
       .map(l => clean(l.innerText)).filter(t => t.length > 12);
     if (long.length) return long.sort((a, b) => b.length - a.length)[0];
   }
@@ -265,10 +888,12 @@ _GROUP_QUESTION_JS = r"""(el) => {
 }"""
 
 # JS: every required field's label text (Greenhouse marks required with "*").
-_REQUIRED_LABELS_JS = r"""() => {
+_REQUIRED_LABELS_JS = r"""(scope) => {
   const clean = s => (s || '').replace(/\s+/g, ' ').replace(/\*/g, '').trim();
   const out = [];
-  document.querySelectorAll('form label, form legend').forEach(l => {
+  document.querySelectorAll(scope + 'label, ' + scope + 'legend').forEach(l => {
+    const r = l.getBoundingClientRect();
+    if (!(r.width && r.height)) return;  // hidden (e.g. a wizard's other steps) don't count
     if ((l.innerText || '').includes('*')) {
       const c = clean(l.innerText);
       if (c && !out.includes(c)) out.push(c);
@@ -277,12 +902,43 @@ _REQUIRED_LABELS_JS = r"""() => {
   return out;
 }"""
 
+# JS: is THIS control required? Element flag (required / aria-required), or its label/card
+# marked with a required glyph ("*"/"✱"/"★") or the word "required" (Greenhouse marks label
+# text with "*"; Lever uses "✱" in the .application-label card).
+_IS_REQUIRED_JS = r"""(el) => {
+  const marks = t => /[*✱★]/.test(t || '') || /\brequired\b/i.test(t || '');
+  if (el.required || el.getAttribute('aria-required') === 'true') return true;
+  if (el.id) {
+    const sel = (window.CSS && CSS.escape) ? CSS.escape(el.id) : el.id;
+    const l = document.querySelector('label[for="' + sel + '"]');
+    if (l && marks(l.innerText)) return true;
+  }
+  const wrap = el.closest('label');
+  if (wrap && marks(wrap.innerText)) return true;
+  const card = el.closest('.application-question, fieldset');
+  if (card) {
+    const q = card.querySelector('.application-label, label, legend');
+    if (q && marks(q.innerText)) return true;
+  }
+  return false;
+}"""
+
+
+def _is_required(loc) -> bool:
+    """True if this control is required (element attr, or its label/card marks it). Used to force
+    a weak-model draft for an unmapped required free-text field so an armed submit isn't blocked."""
+    try:
+        return bool(loc.evaluate(_IS_REQUIRED_JS))
+    except Exception:
+        return False
+
+
 _TEXTLIKE = {"", "text", "email", "tel", "url", "number", "search"}
 
 # JS: inventory every form control with its derived label + kind + visibility (diagnostics).
 _DUMP_JS = (
-    "() => { const labelOf = " + _LABEL_JS + ";"
-    " const els = document.querySelectorAll('form input, form textarea, form select, form [role=combobox]');"
+    "(scope) => { const labelOf = " + _LABEL_JS + ";"
+    " const els = document.querySelectorAll(scope+'input, '+scope+'textarea, '+scope+'select, '+scope+'[role=combobox]');"
     " return Array.from(els).map(el => { const r = el.getBoundingClientRect(); return {"
     " tag: el.tagName.toLowerCase(), type: (el.getAttribute('type')||'').toLowerCase(),"
     " role: (el.getAttribute('role')||'').toLowerCase(), cls: (el.getAttribute('class')||'').slice(0, 40),"
@@ -295,7 +951,7 @@ def _dump_fields(page) -> None:
     a live run reveals the real DOM when a field won't fill."""
     import sys
     try:
-        rows = page.evaluate(_DUMP_JS)
+        rows = page.evaluate(_DUMP_JS, _scope_prefix(page))
     except Exception as e:
         print(f"[debug] field dump failed: {e}", file=sys.stderr)
         return
@@ -342,17 +998,18 @@ _VALUE_JS = r"""(el) => {
 _NATIVE_AUTOFILL_BUTTONS = (r"autofill with resume", r"autofill from resume", r"^\s*autofill")
 
 
-def _trigger_native_autofill(page, ats: str, report: "ApplyReport") -> None:
+def _trigger_native_autofill(frame, ats: str, report: "ApplyReport") -> None:
     """Click the ATS's resume-parse autofill button if it exposes one (e.g. Workday's "Autofill
     with Resume"). Lever/Ashby parse on upload and need no click — the resume upload already
-    happened, so their fields populate on their own before our only-empty pass."""
+    happened, so their fields populate on their own before our only-empty pass. `frame` is the
+    form's frame (main page or embedded iframe)."""
     for pat in _NATIVE_AUTOFILL_BUTTONS:
         try:
-            btn = page.get_by_role("button", name=re.compile(pat, re.I)).first
+            btn = frame.get_by_role("button", name=re.compile(pat, re.I)).first
             if btn.count() and btn.is_visible():
                 btn.click(timeout=4000)
                 report.native_autofill = f"{ats}: {pat.strip('^\\s*')} button"
-                page.wait_for_timeout(2500)  # let the parse populate fields
+                frame.page.wait_for_timeout(2500)  # let the parse populate fields
                 return
         except Exception:
             continue
@@ -365,8 +1022,8 @@ def _greenhouse_native_autofill(page, ctx, profile, report: "ApplyReport") -> No
 
     NOTE: this drives the real my.greenhouse.io sign-in; it is best-effort and UNVERIFIED
     against a live account (needs a real MyGreenhouse login to confirm the exact flow)."""
-    email = (getattr(profile, "greenhouse_email", "") or "").strip()
-    pw = (getattr(profile, "greenhouse_password", "") or "").strip()
+    from . import apply_profile
+    email, pw = apply_profile.greenhouse_credentials(profile)  # password from the OS keychain
     if not (email and pw):
         return
     try:
@@ -399,15 +1056,117 @@ def _greenhouse_native_autofill(page, ctx, profile, report: "ApplyReport") -> No
         report.errors.append(f"MyGreenhouse autofill (falling back to our autofill): {type(e).__name__}: {e}")
 
 
-def _upload_resume(page, resume_pdf: str, report: "ApplyReport") -> None:
+# A visible field that reliably signals the real application form has rendered. ATS forms
+# mount their inputs via JS after domcontentloaded, so we must wait for one of these before
+# filling — otherwise the field scan runs against an empty DOM and fills nothing.
+_FORM_FIELD_SIGNAL = (
+    'input[type="email"], input[name*="email" i], input[id*="email" i], '
+    'input[name*="first" i], input[id*="first" i], input[autocomplete="given-name"], '
+    'textarea[name], form input[type="text"]'
+)
+
+
+# Frame URLs that are never the application form — skip them when hunting for the form frame.
+_NON_FORM_FRAME = ("recaptcha", "captcha", "googletagmanager", "google-analytics", "doubleclick",
+                   "/gtm", "privacycompliance", "content.googleapis", "hcaptcha")
+
+
+def _count_fields(frame) -> int:
+    """Number of real (non-hidden) form controls in a frame."""
+    try:
+        return frame.evaluate(
+            "() => document.querySelectorAll("
+            "'input:not([type=hidden]):not([type=submit]):not([type=button]), textarea, select'"
+            ").length"
+        )
+    except Exception:
+        return 0
+
+
+def _find_form_frame(page):
+    """Return (frame, field_count) for the frame that actually holds the application form.
+    ATS forms are frequently embedded in an IFRAME — e.g. Greenhouse's job_app embed on a
+    company's own careers site (stripe.com → job-boards.greenhouse.io/embed/job_app). Our
+    locators don't cross frames, so we must pick the frame with the fields, not just the main
+    page. Returns the richest non-chrome frame."""
+    best, best_n = page.main_frame, _count_fields(page.main_frame)
+    for fr in page.frames:
+        if fr is page.main_frame:
+            continue
+        if any(s in (fr.url or "").lower() for s in _NON_FORM_FRAME):
+            continue
+        n = _count_fields(fr)
+        if n > best_n:
+            best, best_n = fr, n
+    return best, best_n
+
+
+def _ats_from_frame(frame, fallback: str) -> str:
+    """Re-derive the ATS from the frame that holds the form. A Greenhouse form embedded on a
+    company domain (stripe.com) is detected as 'generic' from the outer URL but is really
+    greenhouse — the embed frame URL reveals it."""
+    u = (getattr(frame, "url", "") or "").lower()
+    for name in ("greenhouse", "lever", "ashby", "workday", "icims"):
+        if name in u:
+            return "greenhouse" if name == "greenhouse" else name
+    return fallback
+
+
+def _open_application_form(page, ats: str, report: "ApplyReport", timeout_ms: int = 25000):
+    """Reveal the application form (click an Apply control if needed) and WAIT until it has
+    actually rendered — IN WHICHEVER FRAME it lives (main page or an embedded iframe). Returns
+    (loaded, frame, ats): the frame to fill and the ATS re-derived from that frame. On failure
+    returns (False, main_frame, ats) with an actionable error, and the caller must not fill.
+    This is what makes 'verify the application loaded before filling' true rather than assumed."""
+    import time
+
+    # Poll every frame until one holds a real form (covers navigation + async/iframe mounts).
+    # If no form is visible yet, keep trying to reveal it via an "Apply" control on EACH pass:
+    # SPA ATS pages (e.g. Ashby, whose form lives at <posting>/application) mount the Apply
+    # button after domcontentloaded, so a single pre-loop click fires before the button exists
+    # and never navigates — the poll then just watches an empty posting page until it times out.
+    deadline = time.time() + timeout_ms / 1000
+    revealed = False
+    while time.time() < deadline:
+        frame, n = _find_form_frame(page)
+        if n >= 2:
+            # Settle: wait for a labelled field to be visible in that frame, then a beat for the rest.
+            try:
+                frame.wait_for_selector(_FORM_FIELD_SIGNAL, state="visible", timeout=4000)
+            except Exception:
+                pass
+            page.wait_for_timeout(600)
+            return True, frame, _ats_from_frame(frame, ats)
+        if not revealed:
+            for role in ("link", "button"):
+                try:
+                    btn = page.get_by_role(role, name=re.compile(r"\bapply\b", re.I)).first
+                    if btn.count() and btn.is_visible():
+                        btn.click(timeout=4000)
+                        revealed = True
+                        break
+                except Exception:
+                    continue
+        page.wait_for_timeout(500)
+
+    report.errors.append(
+        f"Application form did not load within {timeout_ms // 1000}s at {page.url}. "
+        "The page may require sign-in, redirect to an external application portal, or use a "
+        "form ApplicationBot doesn't support yet — so no fields were filled. Open the URL to check."
+    )
+    return False, page.main_frame, ats
+
+
+def _upload_resume(frame, resume_pdf: str, report: "ApplyReport") -> None:
     """Attach the résumé. Prefer Greenhouse's own "Attach" button through the file chooser —
     poking the raw hidden <input type=file> makes the site's onchange handler throw
-    "Cannot read properties of undefined (reading 'uploadFile')"."""
+    "Cannot read properties of undefined (reading 'uploadFile')". `frame` is the form's frame
+    (main page or an embedded iframe); the file chooser is captured at the page level."""
     for name in (r"attach", r"upload"):
         try:
-            btn = page.get_by_role("button", name=re.compile(name, re.I)).first
+            btn = frame.get_by_role("button", name=re.compile(name, re.I)).first
             if btn.count() and btn.is_visible():
-                with page.expect_file_chooser(timeout=4000) as fc:
+                with frame.page.expect_file_chooser(timeout=4000) as fc:
                     btn.click()
                 fc.value.set_files(resume_pdf)
                 report.filled.append(FilledField("Resume", resume_pdf, "file"))
@@ -415,17 +1174,29 @@ def _upload_resume(page, resume_pdf: str, report: "ApplyReport") -> None:
         except Exception:
             continue
     try:  # classic/older forms expose a direct file input
-        page.locator('input[type="file"]').first.set_input_files(resume_pdf)
-        report.filled.append(FilledField("Resume", resume_pdf, "file"))
+        fi = frame.locator('input[type="file"]')
+        if fi.count():
+            fi.first.set_input_files(resume_pdf)
+            report.filled.append(FilledField("Resume", resume_pdf, "file"))
+        # No upload control on this page: a wizard may expose it on a later step — the
+        # page walker retries there, and flags it if the whole walk ends without one.
     except Exception as e:
         report.errors.append(f"resume upload: {type(e).__name__}: {e}")
 
 
 def _matches(option: str, want: str) -> bool:
     """Case-insensitive: option equals/contains `want`, or (for non-tiny option text) is
-    contained by it — so "online" matches both an "Online" option and a longer sentence."""
+    contained by it — so "online" matches both an "Online" option and a longer sentence.
+    A very short `want` (≤3 chars, e.g. "US", "No") must match the WHOLE option, never as a
+    substring — otherwise "US" matched "A-US-tralia" and answered a country with "Australia"."""
     o, w = option.strip().lower(), want.strip().lower()
-    return bool(o) and bool(w) and (o == w or w in o or (len(o) >= 3 and o in w))
+    if not (o and w):
+        return False
+    if len(w) <= 3:
+        # Whole-word match: "Yes" matches "Yes, I am authorized" but "US" does NOT match
+        # "A-US-tralia" and "No" does NOT match "Norway".
+        return re.search(r"\b" + re.escape(w) + r"\b", o) is not None
+    return o == w or w in o or (len(o) >= 3 and o in w)
 
 
 def _fill_select(loc, value: Optional[str], hints: Optional[list[str]] = None) -> str:
@@ -538,9 +1309,9 @@ def _pick_from_open(page, want: str, want_full: Optional[str] = None) -> Optiona
     if bi >= 0 and score > 0:
         opts.nth(bi).click(timeout=4000)
         return texts[bi]
-    if count > 3:  # 3) async search top suggestion
-        opts.first.click(timeout=4000)
-        return texts[0]
+    # No option fuzzy-matches or shares a token with what we wanted. Do NOT blind-pick the first
+    # option — that committed a wrong value (e.g. answering "country: United States" with
+    # "Australia"). Leave it unselected so it surfaces for review instead of a confident-wrong fill.
     return None
 
 
@@ -572,14 +1343,224 @@ def _combo_try(page, loc, text: str) -> Optional[str]:
     return None
 
 
-def _fill_combobox(page, loc, value: Optional[str], hints: Optional[list[str]] = None) -> Optional[str]:
-    """react-select combobox: try the answer, then each ranked hint; return the committed option
-    text, or None. Never leaves uncommitted typed text (which would look filled but submit as an
-    invalid/empty selection) — clears the field if nothing could be selected."""
-    for want in ([value] if value else []) + (hints or []):
+def _open_options_and_texts(page):
+    """Open the menu's options and return (locator, texts) TOGETHER so a match can be clicked
+    by index on the same locator — re-querying options separately to click is flaky."""
+    opts = _open_options(page)
+    if opts is None:
+        return None, []
+    n = min(opts.count(), 60)
+    return opts, [(opts.nth(i).inner_text() or "").strip() for i in range(n)]
+
+
+def _record_capture(report: "ApplyReport", question: str, kind: str, options=None) -> None:
+    """Remember an unanswered field's control TYPE and options so the Profile UI can recreate it
+    faithfully (a dropdown question becomes a dropdown, not a free-text box)."""
+    report.captured[question] = {"kind": kind, "options": [o for o in (options or []) if o][:40]}
+
+
+def _selectable_options(loc, fallback: list[str]) -> list[str]:
+    """A native <select>'s REAL choices — its options with a non-empty value, so a model pick never
+    lands on a "Select…" placeholder (value="") that would commit an empty selection. Falls back to
+    `fallback` (all option texts) on any error."""
+    try:
+        return [o.strip() for o in loc.evaluate(
+            "el => Array.from(el.options).filter(o => o.value !== '')"
+            ".map(o => (o.textContent||'').trim())") if (o or "").strip()] or fallback
+    except Exception:
+        return fallback
+
+
+def _field_options(page, loc, tag: str, role: str) -> list[str]:
+    """Selectable option texts for a native <select> or a react-select combobox, for recreating the
+    field. Empty for a text input or a searchable typeahead with nothing shown (falls back to text).
+    Best-effort; opens then closes a combobox menu."""
+    try:
+        if tag == "select":
+            return [o.strip() for o in loc.evaluate(
+                "el => Array.from(el.options).map(o => (o.textContent||'').trim())") if (o or "").strip()]
+        if role == "combobox" and _open_combobox(page, loc):
+            page.wait_for_timeout(300)
+            _, texts = _open_options_and_texts(page)
+            try:
+                loc.press("Escape")
+            except Exception:
+                pass
+            return [t for t in texts if t]
+    except Exception:
+        pass
+    return []
+
+
+def _commit_option_text(page, loc, chosen: str, query: Optional[str] = None) -> bool:
+    """Reopen the combobox (retyping `query` first for a searchable list) and click the option
+    whose text is exactly `chosen`. Deciding an option (a Claude call can take tens of seconds)
+    happens with the menu CLOSED — holding a react-select popup open across a subprocess call
+    is a staleness race (the menu re-renders, indexes shift, options detach). This re-derives
+    the same option list and commits deterministically by exact text."""
+    if not _open_combobox(page, loc):
+        return False
+    if query is not None:
+        try:
+            loc.fill(query, timeout=4000)
+        except Exception:
+            return False
+        page.wait_for_timeout(900)
+    else:
+        page.wait_for_timeout(250)
+    opts, texts = _open_options_and_texts(page)
+    for i, t in enumerate(texts):
+        if t == chosen:
+            try:
+                opts.nth(i).click(timeout=4000)
+                return True
+            except Exception:
+                return False
+    try:
+        loc.press("Escape")  # option no longer offered — close cleanly, caller falls through
+    except Exception:
+        pass
+    return False
+
+
+def _search_queries(value: str) -> list[str]:
+    """Progressive typeahead search queries for an async combobox, longest→shortest, with any
+    leading article stripped. A prefix-indexed list (e.g. a school picker that stores Penn State
+    as "Pennsylvania State University-Main Campus") returns NOTHING for the full résumé value
+    "The Pennsylvania State University" or its first word "The" — so also try the article-stripped
+    form and its leading words, then let token/Claude matching pick the right option from whatever
+    those retrieve. Root cause of the school dropdown never filling (decision 033 follow-up)."""
+    v = " ".join((value or "").split())
+    if not v:
+        return []
+    out = [v]
+    low = v.lower()
+    for art in ("the ", "a ", "an "):
+        if low.startswith(art):
+            out.append(v[len(art):].strip())
+            break
+    words = out[-1].split()
+    for k in (3, 2):  # distinctive leading prefixes; 1 word is usually too broad to match on
+        if len(words) > k:
+            out.append(" ".join(words[:k]))
+    seen, uniq = set(), []
+    for q in out:
+        ql = q.lower()
+        if q and ql not in seen:
+            seen.add(ql)
+            uniq.append(q)
+    return uniq
+
+
+def _fill_combobox(page, loc, value: Optional[str], hints: Optional[list[str]] = None,
+                   resolver=None, label: str = "") -> Optional[tuple[str, str]]:
+    """react-select combobox: commit the option matching the answer (or a ranked hint). Returns
+    (committed option text, matched tier) — tier ∈ literal | learned | hint | claude | substring,
+    recorded on the fill report so every dropdown fill is auditable — or None. Never leaves
+    uncommitted typed text (which would look filled but submit as an invalid/empty selection) —
+    clears the field if nothing selected.
+
+    (1) On the FIRST open, literal-match any candidate (answer + hints + LEARNED aliases). If no
+    match and it's a static list (options already shown), CLOSE the menu, let Claude pick from
+    those options, then recommit by exact text (a Claude call takes seconds-to-minutes — deciding
+    never happens with the menu open) and LEARN it.
+    (2) Otherwise type each candidate to filter a searchable list; if a typed filter yields
+    options but none literally match, same closed-menu Claude pick over them. Learned mappings
+    make the same value match instantly next time without another Claude call (decision 033)."""
+    learned = resolver.learned_option_hints(value) if resolver is not None else []
+    # A batch-decided pick for THIS label leads the candidates: committed by exact text in
+    # round 2 of a two-pass fill, reported as tier "claude" (Claude decided it, batched).
+    decided = resolver.decided_options.get(label) if resolver is not None else None
+    pending = resolver.pending if resolver is not None else None
+    picks_done = resolver.picks_done if resolver is not None else set()
+    candidates = ([(decided, "claude")] if decided else []) \
+        + ([(value, "literal")] if value else []) \
+        + [(h, "hint") for h in (hints or []) if h] \
+        + [(l, "learned") for l in learned if l]
+    gen_on = resolver is not None and getattr(resolver, "enable_generation", False) and bool(value)
+    # Phase 1's static open-list pick (and the round-1 batch defer) is asked ONCE per label —
+    # `picks_done` suppresses re-asking it in round 2. Phase 2b's typeahead pick is deliberately
+    # NOT suppressed: its options come from what the async search returns per query, not the open
+    # list the batch already declined. A searchable picker's open list is unrelated to the answer
+    # (a school picker shows the first 60 schools ALPHABETICALLY — never the applicant's), so the
+    # batch always declines it; without the exemption round 2 fell through to the substring
+    # fallback, which takes the first fuzzy match and can land on a branch campus instead of the
+    # main one (decision 080, follow-up to 033/079).
+    use_claude = gen_on and label not in picks_done
+
+    # Phase 1 — literal match on the options shown on open; then Claude-pick for static lists.
+    if _open_combobox(page, loc):
+        page.wait_for_timeout(250)
+        opts, texts = _open_options_and_texts(page)
+        for want, tier in candidates:
+            for i, t in enumerate(texts):
+                if _matches(t, want):
+                    opts.nth(i).click(timeout=4000)
+                    if tier == "claude":
+                        resolver.learn_option(value, t)  # a committed batch pick is learned too
+                    return t, tier
+        try:
+            loc.press("Escape")  # close before any Claude call / Phase 2 typing
+        except Exception:
+            pass
+        if use_claude and len(texts) >= 3:  # static list fully shown — pick before pollution
+            if pending is not None:
+                # Round 1 of a two-pass fill: the pick joins ONE batched call between rounds;
+                # round 2 recommits the decided text. Skip the remaining phases — filling by
+                # substring now would preempt the vetted batch decision.
+                pending.defer_pick(label, value, texts)
+                return None
+            chosen = answer_bank.pick_dropdown_option(label, value, texts, model=resolver.model)
+            if chosen and _commit_option_text(page, loc, chosen):
+                resolver.learn_option(value, chosen)
+                return chosen, "claude"
+
+    # Phase 2 — type each candidate to filter a searchable list (literal match).
+    for want, tier in candidates:
         chosen = _combo_try(page, loc, want)
         if chosen:
-            return chosen
+            if tier == "claude" and resolver is not None:
+                resolver.learn_option(value, chosen)
+            return chosen, tier
+
+    # Phase 2b — searchable list, no literal match on the full value: type progressively-shorter,
+    # article-stripped queries (a school picker indexes "The Pennsylvania State University" under
+    # "Pennsylvania State University-…", so the full value retrieves nothing) and let Claude pick
+    # the best option from the results — it's told to prefer the primary/main campus. Claude runs
+    # BEFORE the non-Claude substring fallback so an ambiguous multi-campus list resolves to the
+    # main campus, not whichever campus appears first. Learns the vetted mapping for next time.
+    # Gated on `gen_on`, NOT `use_claude`: a searchable picker the batch already declined (from its
+    # unrelated open list) must still get this per-query pick in round 2 (decision 080).
+    if gen_on:
+        for q in _search_queries(value):
+            if not _open_combobox(page, loc):
+                break
+            try:
+                loc.fill(q, timeout=4000)
+            except Exception:
+                continue
+            page.wait_for_timeout(900)
+            _, texts = _open_options_and_texts(page)
+            try:
+                loc.press("Escape")  # decide with the menu closed; recommit retypes the query
+            except Exception:
+                pass
+            chosen = answer_bank.pick_dropdown_option(label, value, texts, model=resolver.model) \
+                if texts else None
+            if chosen and _commit_option_text(page, loc, chosen, query=q):
+                resolver.learn_option(value, chosen)
+                return chosen, "claude"
+
+    # Phase 2c — no Claude (or it declined): best-effort substring match on the shortened queries
+    # for a comma-free name value (e.g. a school), so the field still fills when generation is off.
+    # NOT learned — this is an unvetted first-substring pick (it can land on a non-primary campus),
+    # not a confirmed mapping, so we don't persist it.
+    if value and "," not in value:
+        for q in _search_queries(value)[1:]:  # [0] == value, already tried in Phase 2
+            chosen = _combo_try(page, loc, q)
+            if chosen:
+                return chosen, "substring"
+
     try:
         loc.fill("", timeout=2000)  # discard any typed-but-uncommitted text
     except Exception:
@@ -587,9 +1568,20 @@ def _fill_combobox(page, loc, value: Optional[str], hints: Optional[list[str]] =
     return None
 
 
+def _scope_prefix(page) -> str:
+    """Return "form " when the page wraps its fields in a <form> (Greenhouse/Lever), else ""
+    to scan page-wide. Ashby renders its application fields OUTSIDE any <form>, so a
+    form-scoped selector matches nothing — this is why only the résumé filled before."""
+    try:
+        return "form " if page.locator("form").count() > 0 else ""
+    except Exception:
+        return ""
+
+
 def _fill_all_fields(page, resolver: AnswerResolver, report: "ApplyReport", done: set,
                      only_empty: bool = True) -> None:
-    controls = page.locator("form input, form textarea, form select")
+    sp = _scope_prefix(page)
+    controls = page.locator(f"{sp}input, {sp}textarea, {sp}select")
     try:
         count = controls.count()
     except Exception:
@@ -600,13 +1592,24 @@ def _fill_all_fields(page, resolver: AnswerResolver, report: "ApplyReport", done
             k = loc.evaluate(
                 "el => ({tag: el.tagName.toLowerCase(), "
                 "type: (el.getAttribute('type')||'').toLowerCase(), "
-                "role: (el.getAttribute('role')||'').toLowerCase()})"
+                "role: (el.getAttribute('role')||'').toLowerCase(), "
+                "ariaHidden: (el.getAttribute('aria-hidden')||'').toLowerCase() === 'true', "
+                "chrome: !!el.closest('nav,header,footer,[role=search],[role=navigation]')})"
             )
         except Exception:
             continue
         tag, typ, role = k["tag"], k["type"], k["role"]
-        if typ in ("hidden", "submit", "button", "file", "checkbox", "radio"):
-            continue  # radios are handled as groups below
+        if typ in ("hidden", "submit", "button", "file", "checkbox", "radio", "search"):
+            continue  # radios handled as groups below; search boxes aren't application fields
+        # react-select renders a second, aria-hidden requiredInput next to its real combobox
+        # input, sharing the field's label. Its empty type reads as free text, so without this
+        # skip it gets .fill()'d — writing nothing visible but claiming the label as "done",
+        # which suppresses round 2's recommit of the actual dropdown (School submitted empty on
+        # a SpaceX dry run — decision 079). An aria-hidden input is never a field a user fills.
+        if k.get("ariaHidden"):
+            continue
+        if k.get("chrome"):
+            continue  # page nav/header/footer/search chrome, not the application form
         # react-select combobox inputs are often 1px / opacity:0 — don't skip them on
         # visibility; we open them via their (visible) control container.
         try:
@@ -636,7 +1639,46 @@ def _fill_all_fields(page, resolver: AnswerResolver, report: "ApplyReport", done
         value = resolver.resolve(label)
         hints = resolver.option_hints(label)
         is_free = (tag == "textarea" or typ in _TEXTLIKE) and role != "combobox"
-        if value is None and not hints and not is_free:
+        # For structured (non-open-ended) fields the keyword rules missed, ask Claude to
+        # classify the question onto a known type (e.g. an office-days phrasing → remote) and
+        # answer from the profile. Open-ended text goes to the drafting path instead.
+        if value is None and not is_free:
+            value = resolver.resolve_semantic(label)
+        # No mapped answer and no hints. Dropdowns/selects are included even though a native
+        # <select> reads as is_free (it has no type attribute) — a required one must still fill.
+        if value is None and not hints and (role == "combobox" or tag == "select" or not is_free):
+            kind = "select" if tag == "select" else ("dropdown" if role == "combobox" else "text")
+            options = _field_options(page, loc, tag, role)
+            if resolver.pending is not None:
+                # Round 1 of a two-pass fill — defer to the batched decision step; round 2 (where
+                # a model call is allowed) revisits it. Record the control's kind/options so a
+                # classified dropdown can join the pick batch. Idempotent for already-deferred labels.
+                resolver.pending.defer_question(label)
+                resolver.pending.enrich(label, kind, options)
+                continue
+            # Round 2 / single pass: a REQUIRED dropdown/select we still couldn't map would block an
+            # armed submit. Let the weak model choose the best-fitting OFFERED option (it never
+            # invents one; demographic / fact-owning questions are refused → captured for the user).
+            if kind in ("dropdown", "select") and _is_required(loc):
+                pickable = _selectable_options(loc, options) if tag == "select" else options
+                picked = resolver.choose_option(label, pickable)
+                if picked:
+                    try:
+                        if role == "combobox":
+                            resolver.decided_options[label] = picked  # commit + learn as tier claude
+                            got = _fill_combobox(page, loc, picked, None,
+                                                 resolver=resolver, label=label)
+                            text = got[0] if got else None
+                        else:
+                            text = _fill_select(loc, picked)
+                    except Exception as e:
+                        text = None
+                        report.errors.append(f"{label}: {type(e).__name__}: {e}")
+                    if text:
+                        report.filled.append(FilledField(label, text, kind, source="option:claude"))
+                        done.add(label)
+                        continue
+            _record_capture(report, label, kind, options)
             report.skipped.append(f"{label} — no saved answer")
             done.add(label)
             continue
@@ -644,17 +1686,40 @@ def _fill_all_fields(page, resolver: AnswerResolver, report: "ApplyReport", done
             # Same question can be a dropdown or a text box depending on the company —
             # dispatch on the control type discovered live.
             if role == "combobox":
-                chosen = _fill_combobox(page, loc, value, hints)
-                if chosen:
-                    report.filled.append(FilledField(label, chosen, "combobox"))
+                got = _fill_combobox(page, loc, value, hints, resolver=resolver, label=label)
+                if got:
+                    text, tier = got
+                    # source records HOW the option matched (option:literal | option:learned |
+                    # option:hint | option:claude | option:substring) — the determinism audit
+                    # trail: anything but option:claude was resolved without a model call.
+                    report.filled.append(FilledField(label, text, "combobox", source=f"option:{tier}"))
+                elif resolver.pending is not None and resolver.pending.has(label):
+                    continue  # pick deferred to the batch — round 2 recommits by exact text
                 else:
                     report.skipped.append(f"{label} — no dropdown option matched {value!r}")
             elif tag == "select":
-                report.filled.append(FilledField(label, _fill_select(loc, value, hints), "select"))
+                try:
+                    report.filled.append(FilledField(label, _fill_select(loc, value, hints), "select"))
+                except Exception:
+                    # No <option> matched the answer. Parity with the combobox path: let the model
+                    # map the answer onto an offered option before giving up (then it's captured).
+                    opts = _field_options(page, loc, tag, role)
+                    chosen = (answer_bank.pick_dropdown_option(label, value, opts, model=resolver.model)
+                              if resolver.enable_generation and value else None)
+                    if chosen:
+                        report.filled.append(FilledField(
+                            label, _fill_select(loc, chosen), "select", source="option:claude"))
+                    else:
+                        report.skipped.append(f"{label} — no <option> matched {value!r}")
             elif is_free:
-                # Banked/structured answer, else a grounded Claude draft for open-ended questions.
-                ans, source = resolver.freetext_answer(label, is_textarea=(tag == "textarea"))
+                # Banked/structured answer, else a grounded Claude draft for open-ended questions
+                # (and any required field, so a required unmapped question doesn't block submit).
+                ans, source = resolver.freetext_answer(
+                    label, is_textarea=(tag == "textarea"), required=_is_required(loc))
+                if source == "pending":
+                    continue  # deferred to the batch — round 2 revisits
                 if ans is None:
+                    _record_capture(report, label, "textarea" if tag == "textarea" else "text")
                     report.skipped.append(f"{label} — no saved answer")
                 else:
                     loc.fill(ans, timeout=5000)
@@ -666,8 +1731,31 @@ def _fill_all_fields(page, resolver: AnswerResolver, report: "ApplyReport", done
         done.add(label)
 
 
+def _check_radio(loc) -> bool:
+    """Select a radio, resilient to an overlay that intercepts the real click — Lever embeds an
+    hCaptcha whose invisible enclave iframe sits over the form and swallows pointer events. Try a
+    normal check, then a forced check, then set `.checked` directly and fire input/change so any
+    listener notices. Returns True once the input reads as checked. NOT captcha circumvention: the
+    CAPTCHA widget is never touched and still gates submission (dry-run never submits anyway)."""
+    for attempt in (lambda: loc.check(timeout=4000),
+                    lambda: loc.check(force=True, timeout=2000)):
+        try:
+            attempt()
+            if loc.is_checked():
+                return True
+        except Exception:
+            pass
+    try:
+        loc.evaluate("el => { el.checked = true; "
+                     "el.dispatchEvent(new Event('input', {bubbles: true})); "
+                     "el.dispatchEvent(new Event('change', {bubbles: true})); }")
+        return bool(loc.is_checked())
+    except Exception:
+        return False
+
+
 def _fill_radio_groups(page, resolver: AnswerResolver, report: "ApplyReport", done: set) -> None:
-    radios = page.locator('form input[type="radio"]')
+    radios = page.locator(f'{_scope_prefix(page)}input[type="radio"]')
     try:
         n = radios.count()
     except Exception:
@@ -687,7 +1775,21 @@ def _fill_radio_groups(page, resolver: AnswerResolver, report: "ApplyReport", do
         if not q or q in done:
             continue
         value = resolver.resolve(q)
+        if value is None:  # semantic classify onto a known type (batched/cached) on a miss
+            value = resolver.resolve_semantic(q)
         if value is None:
+            labels = []
+            for i in idxs:
+                try:
+                    lb = (radios.nth(i).evaluate(_LABEL_JS) or "").strip()
+                except Exception:
+                    lb = ""
+                if lb:
+                    labels.append(lb)
+            if resolver.pending is not None and resolver.pending.has(q):
+                resolver.pending.enrich(q, "radio", labels)
+                continue  # deferred to the batched decision step — round 2 revisits
+            _record_capture(report, q, "radio", labels)
             report.skipped.append(f"{q} — no saved answer")
             done.add(q)
             continue
@@ -699,22 +1801,133 @@ def _fill_radio_groups(page, resolver: AnswerResolver, report: "ApplyReport", do
             except Exception:
                 opt = ""
             if opt and (opt == v or v in opt):
-                try:
-                    radios.nth(i).check(timeout=4000)
+                if _check_radio(radios.nth(i)):
                     report.filled.append(FilledField(q, value, "radio"))
                     picked = True
-                except Exception as e:
-                    report.errors.append(f"{q}: {type(e).__name__}: {e}")
+                else:
+                    report.errors.append(f"{q}: could not check option {opt!r} "
+                                         "(click intercepted by an overlay?)")
                 break
         if not picked:
             report.skipped.append(f"{q} — no radio option matching {value!r}")
         done.add(q)
 
 
+# Checkbox classification. Agreements/consents/certifications gate submission and are inherent to
+# applying (checking them is what the armed user authorized; dry-run never submits regardless).
+# Optional opt-ins (marketing, talent community, SMS) must never be auto-checked.
+_AGREEMENT_KW = (
+    "agree", "consent", "certify", "acknowledge", "authorize", "confirm", "i attest",
+    "i have read", "read and understood", "i understand", "by checking", "by submitting",
+    "terms", "privacy", "true and accurate", "accurate and complete", "acknowledgment",
+)
+_OPTIN_KW = (
+    "marketing", "newsletter", "promotional", "subscribe", "talent community", "talent pool",
+    "talent network", "future opportunit", "other opportunit", "other roles", "keep me informed",
+    "keep me updated", "receive updates", "contact me about", "opt in", "opt-in", "text message",
+    "sms", "phone call",
+)
+
+
+def _is_agreement(n: str) -> bool:
+    return any(k in n for k in _AGREEMENT_KW)
+
+
+def _is_optional_optin(n: str) -> bool:
+    return any(k in n for k in _OPTIN_KW)
+
+
+def _fill_checkboxes(page, resolver: AnswerResolver, report: "ApplyReport", done: set) -> None:
+    """Two checkbox cases the field/radio passes skip: (1) multi-select GROUPS — several checkboxes
+    under one question ("race — check all that apply") — check the option(s) matching the resolved
+    answer; (2) standalone AGREEMENT/consent/certification checkboxes — check them (required to
+    submit; the armed user authorized applying, and dry-run never submits). Optional opt-ins
+    (marketing/talent-community/SMS) are always left unchecked."""
+    boxes = page.locator(f'{_scope_prefix(page)}input[type="checkbox"]')
+    try:
+        n = boxes.count()
+    except Exception:
+        return
+    info: list = []
+    groups: dict[str, list[int]] = {}
+    for i in range(n):
+        b = boxes.nth(i)
+        try:
+            d = b.evaluate(
+                "el => ({chrome: !!el.closest('nav,header,footer,[role=search],[role=navigation]'),"
+                " checked: !!el.checked, disabled: !!el.disabled})")
+            lbl = (b.evaluate(_LABEL_JS) or "").strip()
+            q = (b.evaluate(_GROUP_QUESTION_JS) or "").strip()
+        except Exception:
+            info.append(None)
+            continue
+        if d["chrome"] or d["disabled"]:
+            info.append(None)
+            continue
+        info.append({"lbl": lbl, "q": q, "checked": d["checked"]})
+        if q:
+            groups.setdefault(q, []).append(i)
+
+    handled: set = set()
+    # (1) Multi-select groups: a question shared by >1 checkbox → check options matching the answer.
+    for q, idxs in groups.items():
+        if len(idxs) < 2 or q in done:
+            continue
+        for i in idxs:
+            handled.add(i)
+        value = resolver.resolve(q) or resolver.resolve_semantic(q)
+        # Also consult option_hints — e.g. a "US" checkbox vs our "United States" value (Stripe's
+        # country list uses abbreviations UAE/UK/US), matched via the country aliases.
+        candidates = [c for c in ([value] if value else []) + (resolver.option_hints(q) or []) if c]
+        if not candidates and resolver.pending is not None and resolver.pending.has(q):
+            resolver.pending.enrich(q, "checkbox", [info[i]["lbl"] for i in idxs])
+            continue  # deferred to the batched decision step — round 2 revisits
+        done.add(q)
+        if not candidates:
+            _record_capture(report, q, "checkbox", [info[i]["lbl"] for i in idxs])
+            report.skipped.append(f"{q} — no saved answer")
+            continue
+        matched = False
+        for i in idxs:
+            opt = info[i]["lbl"]
+            if opt and any(_matches(opt, c) for c in candidates):
+                if not info[i]["checked"]:
+                    try:
+                        boxes.nth(i).check(timeout=4000)
+                    except Exception as e:
+                        report.errors.append(f"{q}: {type(e).__name__}: {e}")
+                        continue
+                report.filled.append(FilledField(q, opt, "checkbox"))
+                matched = True
+        if not matched:
+            report.skipped.append(f"{q} — no checkbox option matching {value!r}")
+
+    # (2) Standalone agreement/consent checkboxes.
+    for i in range(n):
+        if info[i] is None or i in handled:
+            continue
+        lbl = info[i]["lbl"]
+        if not lbl or lbl in done:
+            continue
+        if info[i]["checked"]:
+            report.filled.append(FilledField(lbl, "checked", "checkbox", source="native"))
+            done.add(lbl)
+            continue
+        nlbl = _norm(lbl)
+        if _is_optional_optin(nlbl) or not _is_agreement(nlbl):
+            continue  # optional opt-in, or a checkbox we can't confidently classify — leave it
+        try:
+            boxes.nth(i).check(timeout=4000)
+            report.filled.append(FilledField(lbl, "checked", "checkbox"))
+            done.add(lbl)
+        except Exception as e:
+            report.errors.append(f"{lbl[:40]}: {type(e).__name__}: {e}")
+
+
 def _flag_missing_required(page, report: "ApplyReport", done: set) -> None:
     """Report required fields we never filled — the safety net against silent gaps."""
     try:
-        required = page.evaluate(_REQUIRED_LABELS_JS)
+        required = page.evaluate(_REQUIRED_LABELS_JS, _scope_prefix(page))
     except Exception:
         return
     filled = {f.label for f in report.filled}
@@ -724,27 +1937,424 @@ def _flag_missing_required(page, report: "ApplyReport", done: set) -> None:
         report.skipped.append(f"{r} — REQUIRED, not filled (no matching answer or unsupported field)")
 
 
-def _show_done_banner(page, report: "ApplyReport") -> None:
-    """Inject a fixed overlay into the page so the watching user gets a clear, visible "done
-    filling" signal — with counts and an unmistakable DRY-RUN / not-submitted notice."""
+# ------------------------------------------------------------- multi-page navigation
+
+# Buttons that advance a multi-step wizard (Workday-style). Anchored so they can NEVER
+# match a submit control ("Submit application") or an auth control ("Continue with
+# Google") — advancing pages is fill work, not submission, so it is dry-run-safe.
+_NEXT_PATTERNS = (r"^next$", r"^next step$", r"^continue$", r"^save (?:and|&) continue$")
+
+_MAX_FORM_PAGES = 8  # runaway-wizard backstop
+
+
+def _find_next_button(frame):
+    for pat in _NEXT_PATTERNS:
+        try:
+            btn = frame.get_by_role("button", name=re.compile(pat, re.I)).first
+            if btn.count() and btn.is_visible():
+                return btn
+        except Exception:
+            continue
+    return None
+
+
+def _page_signature(frame) -> str:
+    """Cheap fingerprint of the VISIBLE form controls, used to detect that a wizard
+    actually advanced (name/id sets differ between steps; hidden steps don't count)."""
+    return frame.evaluate(
+        """() => {
+          const els = Array.from(document.querySelectorAll(
+            'input:not([type=hidden]), textarea, select, [role=combobox]'
+          )).filter(e => { const r = e.getBoundingClientRect(); return r.width && r.height; });
+          return els.length + ':' + els.slice(0, 40).map(e => e.name || e.id || '').join(',');
+        }"""
+    )
+
+
+def _advance_page(page, frame, nxt, report: "ApplyReport"):
+    """Click a next/continue control and wait for the form to actually change. Returns
+    (advanced, frame) — the frame is re-located because a step change can remount or
+    navigate it. No change = the wizard rejected the advance (client-side validation);
+    that's recorded and the caller stops walking."""
+    import time
+
+    try:
+        before = _page_signature(frame)
+    except Exception:
+        before = ""
+    try:
+        nxt.click(timeout=4000)
+    except Exception as e:
+        report.errors.append(f"next-step click failed: {type(e).__name__}: {e}")
+        return False, frame
+
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        page.wait_for_timeout(400)
+        try:
+            cur, n = _find_form_frame(page)
+            sig = _page_signature(cur) if n else ""
+        except Exception:
+            continue  # frame detached mid-navigation — keep polling
+        if sig and sig != before:
+            page.wait_for_timeout(400)  # settle the newly-mounted step
+            return True, cur
+
+    try:
+        errs = [t for t in frame.evaluate(_VALIDATION_JS) if t]
+    except Exception:
+        errs = []
+    report.errors.append(
+        "could not advance to the next form page — "
+        + ("validation: " + "; ".join(errs[:5]) if errs
+           else "no change after clicking next (fields on later pages were not reached)")
+    )
+    return False, frame
+
+
+def _resolve_pending(resolver: AnswerResolver, pending: PendingDecisions) -> None:
+    """Adjudicate round 1's deferred decisions with at most 3 BATCHED Claude calls, then inject
+    the results so round 2 (the same deterministic loop) fills without any per-field call:
+      1. classify — novel questions → structured types, answered live from the profile;
+      2. bank-match — the rest → a reworded saved answer;
+         both injected as in-memory bank entries (resolve() hits them in round 2; persistence
+         still goes through remember_answers' valid_mapping gate);
+      3. dropdown picks — the deferred static-list picks, plus any just-classified dropdown
+         whose new answer doesn't literally match its recorded options → decided_options,
+         recommitted by exact text in round 2.
+    Every deferred label is marked adjudicated regardless of outcome, so round 2 captures the
+    leftovers for the user instead of falling back to per-field Claude calls."""
+    labels = list(pending.questions)
+    types = answer_bank.classify_questions(labels, model=resolver.model) if labels else {}
+    unresolved = []
+    for label in labels:
+        key = types.get(label)
+        ans = resolver.answer_for_type(key) if key else None
+        if key and ans is not None:
+            qa = QA(question=label, answer="", maps_to=key, generated=True)
+            resolver.learned.append(qa)
+            resolver.profile.custom_answers.append(qa)
+        else:
+            unresolved.append(label)
+    if unresolved:
+        cands = []
+        for qa in resolver.profile.custom_answers:
+            mt = getattr(qa, "maps_to", "")
+            ans = resolver.answer_for_type(mt) if mt else (qa.answer or "").strip()
+            if (qa.question or "").strip() and ans:
+                cands.append((qa, ans))
+        if cands:
+            matches = answer_bank.match_banked_questions(
+                unresolved, [(qa.question, ans) for qa, ans in cands], model=resolver.model)
+            for label in unresolved:
+                idx = matches.get(label)
+                if idx is None:
+                    continue
+                qa, _ = cands[idx]
+                alias = QA(question=label, answer="" if qa.maps_to else qa.answer,
+                           maps_to=qa.maps_to, generated=True)
+                resolver.learned.append(alias)
+                resolver.profile.custom_answers.append(alias)
+    resolver.semantic_done.update(labels)
+
+    items = [(label, value, opts) for label, (value, opts) in pending.picks.items()]
+    for label, meta in pending.questions.items():
+        if meta.get("kind") != "dropdown" or len(meta.get("options") or []) < 3:
+            continue
+        value = resolver.resolve(label)  # the just-injected answer, if any
+        if not value:
+            continue
+        wants = [value] + (resolver.option_hints(label) or []) + resolver.learned_option_hints(value)
+        if any(_matches(o, w) for w in wants for o in meta["options"]):
+            continue  # round 2 matches it deterministically — no pick needed
+        items.append((label, value, meta["options"]))
+    if items:
+        for (label, value, _), chosen in zip(items, answer_bank.pick_dropdown_options(
+                items, model=resolver.model)):
+            if chosen:
+                resolver.decided_options[label] = chosen
+    resolver.picks_done.update(label for label, _, _ in items)
+
+
+def _fill_page(frame, resolver: AnswerResolver, report: "ApplyReport", done: set) -> None:
+    """Fill one form page in two deterministic passes with ONE batched decision step between
+    them (decision 041). Round 1 fills everything the rules/bank/hints/aliases resolve and
+    DEFERS the unresolved decisions; ≤3 batched Claude calls adjudicate them all; round 2
+    re-runs the same loop, which now fills from the injected results. Claude cost is per PAGE,
+    not per field — and no model call ever runs while a menu is open (decision 040). Typeahead
+    searches stay inline (their options only exist as you type). With generation disabled the
+    first pass is the only pass, exactly as before."""
+    resolver.pending = PendingDecisions() if resolver.enable_generation else None
+    try:
+        _fill_all_fields(frame, resolver, report, done, only_empty=True)
+        _fill_radio_groups(frame, resolver, report, done)
+        _fill_checkboxes(frame, resolver, report, done)
+    finally:
+        pending, resolver.pending = resolver.pending, None
+    if pending:
+        _resolve_pending(resolver, pending)
+        _fill_all_fields(frame, resolver, report, done, only_empty=True)
+        _fill_radio_groups(frame, resolver, report, done)
+        _fill_checkboxes(frame, resolver, report, done)
+
+
+def _fill_all_pages(page, frame, resolver: AnswerResolver, report: "ApplyReport", done: set,
+                    resume_pdf: str = ""):
+    """Fill EVERY page of the form: fill the current page's fields, flag its unmet REQUIRED
+    fields (they're invisible once we advance), then walk Next/Continue until the final
+    page. Single-page forms take one pass and find no next button — behaviour unchanged.
+    Returns the frame holding the FINAL page (where the submit control lives)."""
+    for step in range(1, _MAX_FORM_PAGES + 1):
+        # A wizard may put the résumé upload on a later step — attach once, wherever it is.
+        if step > 1 and resume_pdf and not any(f.control == "file" for f in report.filled):
+            try:
+                if frame.locator('input[type="file"]').count():
+                    _upload_resume(frame, resume_pdf, report)
+            except Exception:
+                pass
+        _fill_page(frame, resolver, report, done)
+        _flag_missing_required(frame, report, done)
+
+        nxt = _find_next_button(frame)
+        advanced = False
+        if nxt is not None:
+            advanced, frame = _advance_page(page, frame, nxt, report)
+        if not advanced:
+            report.pages = step
+            break
+    else:
+        report.errors.append(f"stopped after {_MAX_FORM_PAGES} form pages — wizard longer than expected")
+        report.pages = _MAX_FORM_PAGES
+
+    if resume_pdf and not any(f.control == "file" for f in report.filled):
+        report.skipped.append("Resume upload — no upload field found on any form page")
+    return frame
+
+
+# ------------------------------------------------------------------ submit (armed only)
+
+# Submit-control names, most specific first. GH/Lever/Ashby all label theirs
+# "Submit application"; a bare "apply" button is deliberately NOT matched — that's the
+# control that *opens* a form, not the one that sends it.
+_SUBMIT_PATTERNS = (r"^submit\s+(?:your\s+)?application$", r"^submit$", r"^send\s+application$")
+
+_CONFIRMATION_RX = re.compile(
+    r"thank you for applying|thanks for applying|application (?:has been |was )?(?:submitted|received)"
+    r"|we(?:'|’)?ve received your application|successfully submitted"
+    r"|your application has been received",
+    re.I,
+)
+
+# Visible required labels whose control is still EMPTY in the DOM (label→control via
+# for=/descendant/fieldset; value read like _VALUE_JS incl. react-select's single-value).
+_UNMET_REQUIRED_JS = r"""(scope) => {
+  const clean = s => (s || '').replace(/\s+/g, ' ').replace(/\*/g, '').trim();
+  const out = [];
+  document.querySelectorAll(scope + 'label, ' + scope + 'legend').forEach(l => {
+    const r = l.getBoundingClientRect();
+    if (!(r.width && r.height)) return;
+    if (!(l.innerText || '').includes('*')) return;
+    const name = clean(l.innerText);
+    if (!name) return;
+    let filled = null;  // null = couldn't tie the label to a control
+    if (l.tagName === 'LEGEND') {
+      const fs = l.closest('fieldset');
+      if (fs) filled = !!(fs.querySelector('input:checked')
+        || Array.from(fs.querySelectorAll('input, textarea, select'))
+             .some(e => (e.value || '').trim()));
+    } else {
+      let el = null;
+      const forId = l.getAttribute('for');
+      if (forId) el = document.getElementById(forId);
+      if (!el) el = l.querySelector('input, textarea, select');
+      if (el) {
+        if (el.type === 'checkbox' || el.type === 'radio') {
+          filled = el.checked || !!(el.name && document.querySelector(
+            'input[name="' + el.name.replace(/"/g, '\\"') + '"]:checked'));
+        } else {
+          let v = (el.value || '').trim();
+          if (!v) {
+            const ctl = el.closest('[class*="control"]');
+            const sv = ctl && ctl.querySelector('[class*="single-value"], [class*="multi-value__label"]');
+            if (sv) v = (sv.innerText || '').trim();
+          }
+          filled = !!v;
+        }
+      }
+    }
+    if (filled === true) return;
+    if (!out.includes(name)) out.push(name);
+  });
+  return out;
+}"""
+
+# Visible client-side validation messages after a rejected submit.
+_VALIDATION_JS = """() => Array.from(document.querySelectorAll(
+    '[class*="error" i]:not(input):not(textarea), [role="alert"]'))
+    .map(e => (e.innerText || '').replace(/\\s+/g, ' ').trim())
+    .filter(t => t && t.length < 200).slice(0, 10)"""
+
+
+def _find_submit_button(frame):
+    for pat in _SUBMIT_PATTERNS:
+        try:
+            btn = frame.get_by_role("button", name=re.compile(pat, re.I)).first
+            if btn.count() and btn.is_visible():
+                return btn
+        except Exception:
+            continue
+    try:  # classic forms: <input type=submit>
+        btn = frame.locator('input[type="submit"], button[type="submit"]').first
+        if btn.count() and btn.is_visible():
+            return btn
+    except Exception:
+        pass
+    return None
+
+
+def _confirmation_evidence(page, frame) -> str:
+    """Non-empty evidence string when the page shows a submission confirmation."""
+    try:
+        u = page.url or ""
+        if re.search(r"confirmation|/thank", u, re.I):
+            return f"url: {u}"
+    except Exception:
+        pass
+    for fr in (frame, page.main_frame):  # the form frame may have navigated/detached
+        try:
+            text = fr.evaluate("() => document.body ? document.body.innerText : ''") or ""
+            m = _CONFIRMATION_RX.search(text)
+            if m:
+                return f"page text: {m.group(0)!r}"
+        except Exception:
+            continue
+    return ""
+
+
+def _attempt_submit(page, frame, report: "ApplyReport", gate, solve_captcha=None) -> None:
+    """The armed submit path (decision 035). Pre-submit gate: every REQUIRED field must be
+    filled AND the SafetyGate must allow it (armed + no profile/KILL file + under the
+    per-run cap, re-checked immediately before the click). On any doubt the application is
+    left UNSUBMITTED with the reason in `report.blockers` — a blocked outcome to record,
+    never a prompt (decision 016's exception-queue model)."""
+    import time
+
+    missing = [s.split(" — ")[0] for s in report.skipped if "REQUIRED" in s]
+    if frame is not None:
+        # Belt and braces: live-scan the visible required labels whose controls are still
+        # EMPTY in the DOM — catches a required field that was captured as "no saved
+        # answer" (never REQUIRED-tagged) before we click anything. A label we filled by
+        # record (report.filled) is trusted even if its widget hides the committed value.
+        try:
+            filled = {f.label for f in report.filled}
+            for r in frame.evaluate(_UNMET_REQUIRED_JS, _scope_prefix(frame)):
+                if r not in missing and not any(r == f or r in f for f in filled):
+                    missing.append(r)
+        except Exception:
+            pass
+    if missing:
+        report.submit_state = "blocked"
+        report.blockers = ["unresolved required field(s): " + "; ".join(missing)]
+        return
+    ok, reason = gate.may_submit()  # kill switch / cap checked at the last possible moment
+    if not ok:
+        report.submit_state = "blocked"
+        report.blockers = [reason]
+        return
+    if solve_captcha is not None:
+        # Reached only when armed (decision 049): if a CAPTCHA stands between us and submit,
+        # auto-solve it when enabled + site-allowlisted + keyed, else block with the fix.
+        handled, detail = solve_captcha(frame)
+        if not handled:
+            report.submit_state = "blocked"
+            report.blockers = [detail]
+            return
+    btn = _find_submit_button(frame)
+    if btn is None:
+        report.submit_state = "blocked"
+        report.blockers = ["no submit button found on the form"]
+        return
+    try:
+        btn.click(timeout=5000)
+    except Exception as e:
+        report.submit_state = "blocked"
+        report.blockers = [f"submit click failed: {type(e).__name__}: {e}"]
+        return
+    gate.record_submission()  # count the click, not the confirmation — conservative vs. the cap
+
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        evidence = _confirmation_evidence(page, frame)
+        if evidence:
+            report.submitted = True
+            report.submit_state = "submitted"
+            report.confirmation = evidence
+            return
+        try:
+            errs = [t for t in frame.evaluate(_VALIDATION_JS) if t]
+        except Exception:
+            errs = []
+        if errs:
+            report.submit_state = "blocked"
+            report.blockers = ["form rejected the submit: " + "; ".join(errs[:5])]
+            return
+        page.wait_for_timeout(500)
+
+    # No confirmation text and no rejection. If the form is gone (or its frame detached on a
+    # navigation), the submit almost certainly went through — mark it submitted-but-unconfirmed
+    # so we NEVER risk a double submission. A form still sitting there means the click had no
+    # observable effect: treat as not submitted.
+    try:
+        still_there = _count_fields(frame) >= 2
+    except Exception:
+        still_there = False
+    if still_there:
+        report.submit_state = "blocked"
+        report.blockers = ["submit clicked but the form is still showing with no confirmation — "
+                          "treated as NOT submitted; verify manually"]
+    else:
+        report.submitted = True
+        report.submit_state = "unconfirmed"
+        report.confirmation = ("form disappeared after the submit click; no explicit confirmation "
+                               "text found — verify via the confirmation email")
+
+
+def _show_done_banner(page, report: "ApplyReport", ok: bool = True) -> None:
+    """Inject a fixed overlay so the watching user gets a clear, visible signal — green when
+    fields were filled, red when the form didn't load or nothing filled (with the reason)."""
     attention = len(report.skipped) + len(report.errors)
-    msg = (f"ApplicationBot finished filling — {len(report.filled)} field(s) filled"
-           + (f", {attention} need your attention" if attention else "")
-           + ". DRY RUN — nothing submitted. Review here, then press Enter in the terminal.")
+    failed = (not ok) or len(report.filled) == 0
+    if failed:
+        reason = report.errors[0] if report.errors else "No fillable fields were found on the page."
+        mark, color = "⚠", "#b21f2d"
+        msg = f"ApplicationBot could not fill this application. {reason} DRY RUN — nothing submitted."
+    elif report.submitted:
+        mark, color = "✓", "#0b7a3b"
+        msg = (f"ApplicationBot SUBMITTED this application ({report.submit_state}). "
+               f"{report.confirmation}")
+    elif report.submit_state == "blocked":
+        mark, color = "⚠", "#a05a00"
+        msg = ("Armed, but NOT submitted — "
+               + (report.blockers[0] if report.blockers else "blocked") )
+    else:
+        mark, color = "✓", "#0b7a3b"
+        msg = (f"ApplicationBot finished filling — {len(report.filled)} field(s) filled"
+               + (f", {attention} need your attention" if attention else "")
+               + ". DRY RUN — nothing submitted. Review here, then finish.")
     try:
         page.evaluate(
-            """(msg) => {
+            """([msg, mark, color]) => {
               document.getElementById('applicationbot-banner')?.remove();
               const b = document.createElement('div');
               b.id = 'applicationbot-banner';
-              b.textContent = '✓ ' + msg;
+              b.textContent = mark + ' ' + msg;
               b.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:2147483647;'
-                + 'background:#0b7a3b;color:#fff;font:600 15px/1.5 system-ui,sans-serif;'
+                + 'background:' + color + ';color:#fff;font:600 15px/1.5 system-ui,sans-serif;'
                 + 'padding:12px 18px;text-align:center;box-shadow:0 2px 8px rgba(0,0,0,.3)';
               document.body.appendChild(b);
               document.body.style.scrollMarginTop = '48px';
             }""",
-            msg,
+            [msg, mark, color],
         )
     except Exception:
         pass  # a cosmetic banner must never break the run
@@ -754,19 +2364,31 @@ def _persist_learning(resolver: AnswerResolver, report: "ApplyReport", profile_p
     """Save AI-drafted answers and capture new reusable questions to the answer bank."""
     from . import apply_profile
     saved = apply_profile.remember_answers(resolver.learned, profile_path) if resolver.learned else 0
-    # New questions we couldn't answer — capture the reusable (non-company-specific) ones so the
-    # user fills each once. Labels come off the "needs attention" list (strip the " — reason").
+    # Persist dropdown option mappings Claude resolved this run, so the same value matches
+    # instantly next time without another Claude call (decision 033).
+    aliased = apply_profile.remember_dropdown_aliases(resolver.learned_options, profile_path)
+    # Capture new REUSABLE questions we genuinely couldn't answer, so the user fills each once.
+    # Only "no saved answer" gaps qualify — a "no dropdown option matched" / "unsupported field"
+    # gap means we HAD an answer, so capturing it blank would be wrong. Skip company-specific,
+    # demographic, and anything that names the company (that answer doesn't generalize).
+    company = (resolver.company or "").strip().lower()
     pending = []
     for s in report.skipped:
-        q = s.split(" — ")[0].strip()
-        if (len(q) > 12 and not answer_bank.is_company_specific(q)
-                and not answer_bank.is_demographic(q)):
-            pending.append(q)
-    captured = apply_profile.capture_questions(pending, profile_path) if pending else 0
-    if saved or captured:
+        parts = s.split(" — ", 1)
+        q = parts[0].strip()
+        reason = parts[1].strip().lower() if len(parts) > 1 else ""
+        if not reason.startswith("no saved answer"):
+            continue
+        if len(q) <= 12 or answer_bank.is_company_specific(q) or answer_bank.is_demographic(q):
+            continue
+        if company and company in q.lower():
+            continue
+        pending.append(q)
+    captured = apply_profile.capture_questions(pending, profile_path, meta=report.captured) if pending else 0
+    if saved or captured or aliased:
         report.skipped.append(
-            f"[answer bank] saved {saved} AI-drafted answer(s), captured {captured} new "
-            f"question(s) for you to answer once in the Apply-profile tab")
+            f"[answer bank] saved {saved} AI-drafted answer(s), learned {aliased} dropdown "
+            f"mapping(s), captured {captured} new question(s) for you to answer once in the Apply-profile tab")
 
 
 def _title_role_company(title: str) -> tuple[str, str]:
@@ -781,34 +2403,115 @@ def _title_role_company(title: str) -> tuple[str, str]:
     return m.group(1).strip(), m.group(2).strip()
 
 
-def _record_dry_run(report: ApplyReport, resume_pdf: str, role: str, company: str) -> tuple[int, str]:
-    """Record this dry-run in the tracker (decision 024) — the Track stage's 'record what it
-    WOULD submit'. Upserts by source URL so re-running a posting updates its row instead of
-    duplicating it, and never clobbers user-owned fields (status/notes/pay) on a re-run.
-    Returns (application_id, 'recorded' | 'updated')."""
-    from . import tracker  # lazy — keep apply.py importable without touching the DB
+def _report_snapshot(report: ApplyReport) -> dict:
+    """The fill outcome as plain data, for the per-application archive (decision 043)."""
+    from datetime import datetime
+    return {
+        "when": datetime.now().isoformat(timespec="seconds"),
+        "url": report.url, "ats": report.ats,
+        "submitted": report.submitted, "submit_state": report.submit_state,
+        "confirmation": report.confirmation, "blockers": report.blockers,
+        "pages": report.pages,
+        "filled": [{"label": f.label, "value": f.value, "source": f.source}
+                   for f in report.filled],
+        "skipped": report.skipped,
+        "errors": report.errors,
+    }
 
-    existing = tracker.find_by_source_url(report.url)
-    if existing:
-        # Runner-owned refresh only; fill role/company just if they were never set.
-        changes: dict = {"resume_path": resume_pdf, "portal": report.ats, "method": "dry-run"}
-        if not existing.get("company") and company:
-            changes["company"] = company
-        if not existing.get("role") and role:
-            changes["role"] = role
-        tracker.update_application(int(existing["id"]), changes)
-        return int(existing["id"]), "updated"
 
+def _record_run(report: ApplyReport, resume_pdf: str, role: str, company: str,
+                meta: Optional[dict] = None) -> tuple[int, str]:
+    """Record this run in the tracker (decision 024): a real submission becomes an `applied`
+    row (method `auto`; tracker stamps date_applied), everything else stays the Track stage's
+    'record what it WOULD submit' `dry-run` row. Basic info (company, role, location, remote,
+    pay, source URL) comes from the discovered posting via `meta` when available — the reliable
+    source — falling back to the page-title-derived role/company for a bare CLI run against a
+    URL. Upserts by source URL so re-running a posting updates its row instead of duplicating
+    it, and never clobbers user-owned fields (status/notes) on a re-run — except upgrading
+    status to `applied` when we really submitted. Returns (id, 'recorded' | 'updated')."""
+    from . import parking, tracker  # lazy — keep apply.py importable without touching the DB
+
+    # Park a user-resolvable block: an armed run that filled the form but withheld the submit
+    # becomes a `blocked` row (not a silent `dry-run`), carrying the reason so the UI can offer
+    # a one-click Resolve. A clean dry-run, or a genuine site failure, classifies to None here.
+    reason = parking.classify(report)
+    if report.submitted:
+        status = "applied"
+    elif report.submit_state == "blocked":
+        status = "blocked"
+    else:
+        status = "dry-run"
+    method = "auto" if report.submitted else "dry-run"
+    m = meta or {}
+    company = (m.get("company") or company or "").strip()
+    role = (m.get("role") or role or "").strip()
+    location = (m.get("location") or "").strip()
+    remote = (m.get("remote") or "").strip()
+    pay = (m.get("pay") or "").strip()
+    # Key the tracker on the POSTING url (for dedup), not the ATS form/embed url.
+    source_url = (m.get("source_url") or report.url or "").strip()
+
+    # This run's one-line summary, reused for both the posting's `notes` and its run-log entry.
     native = sum(1 for f in report.filled if f.source == "native")
     drafted = sum(1 for f in report.filled if f.source == "generated")
-    app_id = tracker.add_application({
-        "company": company, "role": role,
-        "portal": report.ats, "method": "dry-run", "status": "dry-run",
-        "source_url": report.url, "resume_path": resume_pdf,
-        "notes": f"[auto] Dry-run: {len(report.filled)} field(s) filled "
-                 f"({native} native, {drafted} AI-drafted); {len(report.skipped)} need attention.",
-    })
-    return app_id, "recorded"
+    what = "Submitted" if report.submitted else "Dry-run"
+    blocked = f" BLOCKED: {report.blockers[0]}" if report.blockers else ""
+    detail = (f"{what}: {len(report.filled)} field(s) filled "
+              f"({native} native, {drafted} AI-drafted); {len(report.skipped)} need attention."
+              + blocked)
+
+    existing = tracker.find_by_source_url(source_url)
+    if existing:
+        # Runner-owned refresh; fill any basic-info field only if it was never set (don't
+        # clobber user edits). A real submission DOES upgrade the status — that's runner-owned
+        # truth, not a user edit (tracker stamps date_applied on the flip).
+        changes: dict = {"resume_path": resume_pdf, "portal": report.ats, "method": method}
+        if m.get("fit_score") is not None:
+            changes["fit_score"] = m["fit_score"]  # runner-owned: this run's judge verdict
+        # Refresh the parked reason to this run's truth (a resolved re-run clears it); never
+        # clobber a user-set outcome status (rejected/interview/…) — only machine states flip.
+        changes["blocked_kind"] = reason.kind if reason else ""
+        changes["blocked_detail"] = reason.detail if reason else ""
+        if status == "dry-run":
+            # Refresh the dry-run date to THIS run (the tracker only auto-stamps on the first
+            # dry-run; a re-run keeps status='dry-run' so it must be stamped explicitly here) —
+            # so the Track tab's "Dry-run" column shows when the posting was LAST dry-run filled.
+            from datetime import date
+            changes["date_dry_run"] = date.today().isoformat()
+        if report.submitted:
+            changes["status"] = "applied"
+        elif status == "blocked" and existing.get("status") in ("discovered", "tailored", "dry-run", "blocked"):
+            changes["status"] = "blocked"
+        for col, val in (("company", company), ("role", role), ("location", location),
+                         ("remote", remote), ("pay", pay)):
+            if val and not existing.get(col):
+                changes[col] = val
+        app_id, outcome = int(existing["id"]), "updated"
+        tracker.update_application(app_id, changes)
+    else:
+        app_id = tracker.add_application({
+            "company": company, "role": role, "location": location, "remote": remote, "pay": pay,
+            "portal": report.ats, "method": method, "status": status,
+            "fit_score": m.get("fit_score"),
+            "blocked_kind": reason.kind if reason else "",
+            "blocked_detail": reason.detail if reason else "",
+            "source_url": source_url, "resume_path": resume_pdf,
+            "notes": f"[auto] {detail}",
+        })
+        outcome = "recorded"
+
+    # Append this run to the history log (decision 084) — one entry per run, never deduped, so
+    # the Track tab can expand a posting to show every dry-run/blocked/submitted attempt with its
+    # own timestamp. Best-effort: a logging failure must never sink an otherwise-complete run.
+    try:
+        tracker.record_run({
+            "application_id": app_id, "source_url": source_url,
+            "company": company, "role": role, "portal": report.ats,
+            "outcome": status, "resume_path": resume_pdf, "detail": detail,
+        })
+    except Exception:
+        pass
+    return app_id, outcome
 
 
 def run_apply(
@@ -825,8 +2528,17 @@ def run_apply(
     profile_path: str = "profile/application_profile.yaml",
     learn: bool = True,
     record: bool = True,
+    hold: "object | None" = None,
+    on_filled: "object | None" = None,
+    meta: Optional[dict] = None,
+    gate: "object | None" = None,
 ) -> ApplyReport:
-    """DRY-RUN fill an application form. Never submits.
+    """Fill an application form; DRY-RUN unless an armed SafetyGate is passed.
+
+    `gate` (applicationbot.safety.SafetyGate, decision 035) is the ONLY path to a real
+    submission: when armed and allowed (no kill file, under the per-run cap) and every
+    REQUIRED field resolved, the driver clicks submit and verifies the confirmation.
+    Without a gate — or armed-but-blocked — behaviour is the dry-run below.
 
     Native-first: uploads the résumé, triggers the ATS's own autofill (MyGreenhouse with stored
     credentials; resume-parse on Lever/Ashby/Workday), then our resolver fills only the fields
@@ -842,9 +2554,21 @@ def run_apply(
     report = ApplyReport(url=url, ats=ats)
     done: set = set()  # labels already handled — dedupe across passes + required scan
 
+    # The Workday agentic fallback (decision 061) needs the browser to expose a CDP endpoint the
+    # Playwright-MCP worker attaches to. Only opened for a Workday run with the fallback armed
+    # (`workday_agentic: true` in profile/safety.yaml); recipe replay works without it.
+    wd_agentic = False
+    if ats == "workday":
+        from . import workday as _workday
+        wd_agentic = _workday.agentic_enabled()
+    cdp_port = _workday._free_port() if wd_agentic else None
+
     with sync_playwright() as pw:
+        launch_kwargs = {"headless": not headed, "slow_mo": slow_mo}
+        if cdp_port:
+            launch_kwargs["args"] = [f"--remote-debugging-port={cdp_port}"]
         try:
-            browser = pw.chromium.launch(headless=not headed, slow_mo=slow_mo)
+            browser = pw.chromium.launch(**launch_kwargs)
         except Exception as e:
             raise RuntimeError(
                 "Could not launch Chromium. Install it once with: playwright install chromium\n"
@@ -855,44 +2579,85 @@ def run_apply(
         page.set_default_timeout(timeout_ms)
         try:
             page.goto(url, wait_until="domcontentloaded")
-            # Some pages need the application form revealed first.
-            try:
-                btn = page.get_by_role("link", name=re.compile(r"apply", re.I)).first
-                if btn.is_visible(timeout=2000):
-                    btn.click()
-            except PWTimeout:
-                pass
-            except Exception:
-                pass
 
-            # Role + company from the page title: grounds Claude-drafted answers AND labels
-            # the tracker row.
-            role, company = "", ""
-            try:
-                role, company = _title_role_company(page.title())
-            except Exception:
-                pass
-            if resolver.enable_generation and not resolver.company:
-                resolver.company = company or None
+            # Verify the application form has actually loaded before touching anything — ATS
+            # forms render their fields via JS after domcontentloaded (and are often inside an
+            # embedded iframe), so filling too early or on the wrong frame fills nothing. This
+            # reveals the form, waits for it, and returns the FRAME it lives in + the ATS
+            # re-derived from that frame (e.g. a Greenhouse form embedded on stripe.com).
+            if ats == "workday":
+                # Workday hybrid (decision 059): the account gate + custom-widget DOM need their
+                # own navigation/fill path, not `_open_application_form` + `_fill_all_pages`.
+                # `apply_workday` owns the whole flow incl. its own armed submit (M3, decision 064),
+                # so the gate is passed in and the generic `_attempt_submit` branch below is skipped.
+                report.ats = "workday"
+                role, company = "", ""
+                try:
+                    role, company = _title_role_company(page.title())
+                except Exception:
+                    pass
+                if resolver.enable_generation and not resolver.company:
+                    resolver.company = company or None
+                from . import mailbox
+                from . import workday as _workday
+                form_loaded = _workday.apply_workday(
+                    page, url, resolver.resume, resolver.profile, report,
+                    resume_pdf=resume_pdf, mailbox_config=mailbox.load_config(),
+                    resolver=resolver, agentic=wd_agentic, cdp_port=cdp_port, gate=gate)
+            else:
+                form_loaded, frame, ats = _open_application_form(page, ats, report)
+                report.ats = ats  # re-derived from the form's frame (e.g. greenhouse embedded on stripe.com)
 
-            if debug:
-                _dump_fields(page)
+                # Role + company from the page title: grounds Claude-drafted answers AND labels
+                # the tracker row.
+                role, company = "", ""
+                try:
+                    role, company = _title_role_company(page.title())
+                except Exception:
+                    pass
+                if resolver.enable_generation and not resolver.company:
+                    resolver.company = company or None
 
-            _upload_resume(page, resume_pdf, report)
+                if debug:
+                    _dump_fields(frame)
 
-            # ---- native autofill FIRST (decision 017) ----
-            if ats == "greenhouse":
-                _greenhouse_native_autofill(page, ctx, resolver.profile, report)
-            _trigger_native_autofill(page, ats, report)  # resume-parse button (Workday etc.)
-            page.wait_for_timeout(1500)  # let any parse-on-upload settle
+                if form_loaded:
+                    _upload_resume(frame, resume_pdf, report)
 
-            # ---- our resolver fills only what's still empty ----
-            _fill_all_fields(page, resolver, report, done, only_empty=True)
-            _fill_radio_groups(page, resolver, report, done)
-            _flag_missing_required(page, report, done)
+                    # ---- native autofill FIRST (decision 017) ----
+                    if ats == "greenhouse":
+                        _greenhouse_native_autofill(page, ctx, resolver.profile, report)
+                    _trigger_native_autofill(frame, ats, report)  # resume-parse button (Workday etc.)
+                    page.wait_for_timeout(1500)  # let any parse-on-upload settle
 
-            report.submitted = False  # DRY-RUN — never submit in dev (Guideline #3)
-            _show_done_banner(page, report)  # visible "done filling" signal in the browser
+                    # ---- our resolver fills only what's still empty, page by page, in the
+                    # form's frame — walks Next/Continue wizards to the final page ----
+                    frame = _fill_all_pages(page, frame, resolver, report, done, resume_pdf)
+                # else: report carries an actionable "form did not load" error; skip filling.
+
+                if form_loaded and gate is not None and getattr(gate, "armed", False):
+                    # ARMED (decision 035): pre-submit gate + kill-switch check + submit +
+                    # confirmation detection. Any doubt leaves report.submitted False with the
+                    # reason in report.blockers. The captcha hook (decision 049) auto-solves a
+                    # blocking CAPTCHA only when enabled + site-allowlisted in profile/safety.yaml
+                    # (off by default); otherwise it records a blocked outcome with the fix.
+                    from . import captcha
+                    hook = captcha.build_submit_hook(captcha.load_config(), url)
+                    _attempt_submit(page, frame, report, gate, solve_captcha=hook)
+                else:
+                    report.submitted = False  # DRY-RUN — the default (Guideline #3)
+                    if form_loaded:
+                        # Probe (never click) the submit control so every dry-run live-validates
+                        # the armed path's selectors for free — no tokens, no risk.
+                        try:
+                            btn = _find_submit_button(frame)
+                            report.submit_probe = (
+                                "found: " + repr((btn.evaluate("el => el.innerText || el.value || ''")
+                                                  or "").strip()) if btn is not None
+                                else "NOT FOUND — an armed run could not submit this form")
+                        except Exception:
+                            pass
+            _show_done_banner(page, report, ok=form_loaded)  # visible signal in the browser
 
             try:
                 page.screenshot(path=screenshot, full_page=True)
@@ -909,24 +2674,69 @@ def run_apply(
             # a tracker failure must not break the fill run.
             if record:
                 try:
-                    rid, action = _record_dry_run(report, resume_pdf, role, company)
-                    print(f"Tracked: {action} application #{rid} (dry-run) — open the Track tab to view/edit.")
+                    rid, action = _record_run(report, resume_pdf, role, company, meta)
+                    kind = "applied" if report.submitted else "dry-run"
+                    print(f"Tracked: {action} application #{rid} ({kind}) — open the Track tab to view/edit.")
                 except Exception as e:
                     report.errors.append(f"tracker: {type(e).__name__}: {e}")
                     print(f"Note: could not record to tracker ({type(e).__name__}: {e}).")
+                # Archive the run (decision 043): posting text + exact PDF + fill outcome,
+                # frozen on a real submission. Best-effort, like the tracker.
+                try:
+                    from . import archive
+                    m = meta or {}
+                    path = archive.archive_run(
+                        m.get("company") or company, m.get("role") or role, m,
+                        jd_text=m.get("jd_body", ""), pdf_path=resume_pdf,
+                        report_data=_report_snapshot(report), submitted=report.submitted)
+                    print(f"Archived: {path}")
+                except Exception as e:
+                    report.errors.append(f"archive: {type(e).__name__}: {e}")
+                    print(f"Note: could not archive the run ({type(e).__name__}: {e}).")
 
             # Show the result in the terminal the moment filling finishes, before the pause.
             print("\n" + report.summary())
+            if on_filled is not None:
+                try:
+                    on_filled(report)  # let a UI surface the result before we hold/close
+                except Exception:
+                    pass
 
             if pause:
-                try:
-                    input("\n✓ Done filling (DRY RUN — not submitted). Review the browser, "
-                          "then press Enter to close… ")
-                except EOFError:
-                    pass
+                if hold is not None:
+                    # Web-driven: release when the caller (e.g. a "Finish" button) sets `hold`
+                    # OR when the user closes the browser window themselves. Poll instead of a
+                    # bare hold.wait(): a manually-closed window never sets `hold`, so a blocking
+                    # wait would leave this thread stuck forever, never reaching the `finally`
+                    # below — and the Playwright driver + Chromium helper processes would keep
+                    # running after the window is gone.
+                    while not hold.is_set():
+                        try:
+                            page.wait_for_timeout(400)  # pumps events; raises once the browser closes
+                        except Exception:
+                            break
+                        if not browser.is_connected():
+                            break
+                else:
+                    done_note = ("SUBMITTED" if report.submitted
+                                 else "DRY RUN — not submitted")
+                    try:
+                        input(f"\n✓ Done ({done_note}). Review the browser, "
+                              "then press Enter to close… ")
+                    except EOFError:
+                        pass
         finally:
-            ctx.close()
-            browser.close()
+            # Best-effort: the user may have already closed the window, so these can raise
+            # "Target/Browser closed" — swallow it so cleanup always completes and
+            # sync_playwright() exits, tearing down the driver + Chromium helper processes.
+            try:
+                ctx.close()
+            except Exception:
+                pass
+            try:
+                browser.close()
+            except Exception:
+                pass
 
     return report
 
@@ -962,10 +2772,20 @@ def main(argv: list[str] | None = None) -> int:
                         help="Don't save new answers/questions to the answer bank.")
     parser.add_argument("--no-record", action="store_true",
                         help="Don't record this dry-run in the tracker (applications.db).")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Force dry-run even if profile/safety.yaml is armed.")
     args = parser.parse_args(argv)
 
     ats = detect_ats(args.url)
     print(f"ATS: {ats}" + ("" if ats != "generic" else " (unrecognized — using generic autofill)"))
+
+    # Safety switch (decision 035): armed state comes from profile/safety.yaml; the KILL
+    # file halts submission; --dry-run overrides both to disarmed.
+    from .safety import load_gate
+    gate = None if args.dry_run else load_gate()
+    if gate is not None and gate.armed:
+        print("⚠ ARMED (profile/safety.yaml) — this run WILL SUBMIT if all required fields "
+              "resolve. Create profile/KILL or pass --dry-run to stop.")
 
     from . import backends
     generate = not args.no_generate and backends.claude_code_available()
@@ -984,6 +2804,7 @@ def main(argv: list[str] | None = None) -> int:
         headed=not args.headless, pause=not args.no_pause,
         slow_mo=args.slow_mo, screenshot=args.screenshot, debug=args.debug,
         profile_path=profile_path, learn=not args.no_learn, record=not args.no_record,
+        gate=gate,
     )
     return 0
 

@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<!--
+  Minimal, PII-free reproduction of a Lever (jobs.lever.co/.../apply) form.
+  Faithful to the live DOM confirmed 2026-07-13 on the WHOOP posting: a card's question lives
+  in a <div class="application-label"><div class="text"> — NOT a <label>/<legend> — while each
+  radio OPTION is wrapped in its own <label> holding only "Yes"/"No". Before the label-derivation
+  fix this made text fields report the raw cards[uuid][fieldN] name and radio groups report an
+  empty question, so the resolver never saw "Are you legally authorized…" / the real "Why…" text.
+-->
+<html>
+<head><meta charset="utf-8"><title>Lever custom cards</title></head>
+<body>
+<form>
+  <!-- Standard Lever fields: these DO wrap the input in a <label>, and always worked. -->
+  <ul class="application-fields">
+    <li class="application-question">
+      <label class="application-label">Full name<span class="required">✱</span>
+        <input type="text" name="name" required="required" />
+      </label>
+    </li>
+    <li class="application-question">
+      <label class="application-label">Current company
+        <input type="text" name="org" />
+      </label>
+    </li>
+  </ul>
+
+  <!-- Custom-question cards: question in a <div class="application-label"><div class="text">. -->
+  <ul class="application-additional">
+    <!-- Free-text card -->
+    <li class="application-question custom-question">
+      <div>
+        <div class="application-label full-width">
+          <div class="text">Why are you interested in working at WHOOP?<span class="required">✱</span></div>
+        </div>
+        <div class="application-field full-width required-field">
+          <input type="text" name="cards[2690853c-4731-41b0-a871-687f8f7b351d][field0]" required="required" />
+        </div>
+      </div>
+    </li>
+
+    <!-- Yes/No radio card: work authorization -->
+    <li class="application-question custom-question">
+      <div>
+        <div class="application-label full-width multiple-choice">
+          <div class="text">Are you legally authorized to work in the United States?<span class="required">✱</span></div>
+        </div>
+        <div class="application-field full-width required-field">
+          <ul data-qa="multiple-choice">
+            <li><label><input type="radio" name="cards[6c5926d5][field0]" value="Yes" required="required" /><span class="application-answer-alternative">Yes</span></label></li>
+            <li><label><input type="radio" name="cards[6c5926d5][field0]" value="No" required="required" /><span class="application-answer-alternative">No</span></label></li>
+          </ul>
+        </div>
+      </div>
+    </li>
+
+    <!-- Yes/No radio card: visa sponsorship -->
+    <li class="application-question custom-question">
+      <div>
+        <div class="application-label full-width multiple-choice">
+          <div class="text">Will you now or in the future require visa sponsorship for employment at WHOOP?<span class="required">✱</span></div>
+        </div>
+        <div class="application-field full-width required-field">
+          <ul data-qa="multiple-choice">
+            <li><label><input type="radio" name="cards[22aa53c9][field0]" value="Yes" required="required" /><span class="application-answer-alternative">Yes</span></label></li>
+            <li><label><input type="radio" name="cards[22aa53c9][field0]" value="No" required="required" /><span class="application-answer-alternative">No</span></label></li>
+          </ul>
+        </div>
+      </div>
+    </li>
+  </ul>
+
+  <!-- Voluntary EEO block: native <select>s WRAPPED in a <label>, so the label's innerText folds
+       in every option ("Veteran status Select ... I am a veteran I am not a veteran …") unless the
+       inner .application-label is preferred. Veteran options use Lever's wording, which differs from
+       the Greenhouse phrasing the profile stores. -->
+  <div class="eeo">
+    <div class="application-question">
+      <label>
+        <div class="application-label">Gender</div>
+        <div class="application-field"><div class="application-dropdown">
+          <select name="eeo[gender]">
+            <option value="">Select ...</option>
+            <option value="Male">Male</option>
+            <option value="Female">Female</option>
+            <option value="Decline to self-identify">Decline to self-identify</option>
+          </select>
+        </div></div>
+      </label>
+    </div>
+    <div class="application-question">
+      <label>
+        <div class="application-label">Race</div>
+        <div class="application-field"><div class="application-dropdown">
+          <select name="eeo[race]">
+            <option value="">Select ...</option>
+            <option value="Hispanic or Latino">Hispanic or Latino</option>
+            <option value="White (Not Hispanic or Latino)">White (Not Hispanic or Latino)</option>
+            <option value="Asian (Not Hispanic or Latino)">Asian (Not Hispanic or Latino)</option>
+            <option value="Two or More Races (Not Hispanic or Latino)">Two or More Races (Not Hispanic or Latino)</option>
+            <option value="Decline to self-identify">Decline to self-identify</option>
+          </select>
+        </div></div>
+      </label>
+    </div>
+    <div class="application-question">
+      <label>
+        <div class="application-label">Veteran status</div>
+        <div class="application-field"><div class="application-dropdown">
+          <select name="eeo[veteran]">
+            <option value="">Select ...</option>
+            <option value="I am a veteran">I am a veteran</option>
+            <option value="I am not a veteran">I am not a veteran</option>
+            <option value="Decline to self-identify">Decline to self-identify</option>
+          </select>
+        </div></div>
+      </label>
+    </div>
+  </div>
+</form>
+</body>
+</html>

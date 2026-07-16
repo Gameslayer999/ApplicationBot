@@ -1,0 +1,104 @@
+<!doctype html>
+<!-- Workday-shaped 3-page application wizard for tests/test_workday.py (headless, no tokens):
+     My Information (text inputs + country/state custom dropdowns) → Voluntary Disclosures
+     (gender/veteran custom dropdowns) → Review (Submit control the adapter must NOT click).
+     A persistent footer holds Next (hidden on Review) and Submit (shown only on Review).
+     Dropdowns are button + hidden role=listbox, opened on click — like real Workday, NOT a
+     native <select>. -->
+<html>
+<head><meta charset="utf-8"><title>Application</title>
+<style>.hidden{display:none}</style></head>
+<body>
+
+  <section id="page1">
+    <h1>My Information</h1>
+    <div data-automation-id="legalNameSection_firstName"><label>First Name *</label><input type="text"></div>
+    <div data-automation-id="legalNameSection_lastName"><label>Last Name *</label><input type="text"></div>
+    <div data-automation-id="addressSection_city"><label>City</label><input type="text"></div>
+    <input data-automation-id="email" type="email" aria-label="Email">
+    <input data-automation-id="phone-number" type="tel" aria-label="Phone Number">
+
+    <div class="wd-dropdown" data-automation-id="addressSection_countryRegion">
+      <label>Country</label>
+      <button type="button" aria-haspopup="listbox">Select One</button>
+      <ul role="listbox" class="hidden">
+        <li role="option">United States of America</li>
+        <li role="option">Canada</li>
+        <li role="option">United Kingdom</li>
+      </ul>
+    </div>
+
+    <div class="wd-dropdown" data-automation-id="addressSection_countryRegionSubdivision1">
+      <label>State</label>
+      <button type="button" aria-haspopup="listbox">Select One</button>
+      <ul role="listbox" class="hidden">
+        <li role="option">New Jersey</li>
+        <li role="option">New York</li>
+        <li role="option">California</li>
+      </ul>
+    </div>
+  </section>
+
+  <section id="page2" class="hidden">
+    <h1>Voluntary Disclosures</h1>
+    <div class="wd-dropdown" data-automation-id="gender">
+      <label>Gender</label>
+      <button type="button" aria-haspopup="listbox">Select One</button>
+      <ul role="listbox" class="hidden">
+        <li role="option">Man</li>
+        <li role="option">Woman</li>
+        <li role="option">Non-binary</li>
+        <li role="option">I do not wish to answer</li>
+      </ul>
+    </div>
+    <div class="wd-dropdown" data-automation-id="veteranStatus">
+      <label>Veteran Status</label>
+      <button type="button" aria-haspopup="listbox">Select One</button>
+      <ul role="listbox" class="hidden">
+        <li role="option">I am not a protected veteran</li>
+        <li role="option">I identify as one or more of the classifications of protected veteran</li>
+        <li role="option">I do not wish to answer</li>
+      </ul>
+    </div>
+  </section>
+
+  <section id="page3" class="hidden">
+    <h1>Review</h1>
+    <p data-automation-id="reviewSummary">Please review your application before submitting.</p>
+  </section>
+
+  <footer>
+    <button data-automation-id="pageFooterNextButton" type="button">Next</button>
+    <button data-automation-id="pageFooterSubmitButton" type="button" class="hidden">Submit</button>
+  </footer>
+
+  <script>
+    // --- custom dropdowns: open on button click, pick sets the button text + closes ---
+    document.querySelectorAll('.wd-dropdown').forEach(dd => {
+      const btn = dd.querySelector('button');
+      const list = dd.querySelector('ul[role=listbox]');
+      btn.addEventListener('click', () => list.classList.toggle('hidden'));
+      list.querySelectorAll('[role=option]').forEach(opt => {
+        opt.addEventListener('click', () => { btn.textContent = opt.textContent; list.classList.add('hidden'); });
+      });
+    });
+
+    // --- wizard paging: Next advances; Submit appears only on the final (Review) page ---
+    let current = 1;
+    const pages = [null, page1, page2, page3];
+    const next = document.querySelector('[data-automation-id=pageFooterNextButton]');
+    const submit = document.querySelector('[data-automation-id=pageFooterSubmitButton]');
+    let submitClicked = false;
+    submit.addEventListener('click', () => { submitClicked = true; document.title = 'SUBMITTED'; });
+    window.__submitClicked = () => submitClicked;
+    function show(n) {
+      pages.forEach((p, i) => { if (p) p.classList.toggle('hidden', i !== n); });
+      const last = n === pages.length - 1;
+      next.classList.toggle('hidden', last);
+      submit.classList.toggle('hidden', !last);
+    }
+    next.addEventListener('click', () => { if (current < pages.length - 1) { current++; show(current); } });
+    show(1);
+  </script>
+</body>
+</html>

@@ -24,16 +24,24 @@ future work; this is the seed the discovery loop needs today.
 from __future__ import annotations
 
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 import os
 
 from .apply_profile import ApplicationProfile
-from .discovery import AdzunaSource, Source, build_source
+from .discovery import (
+    _BUILTIN_FEEDS,
+    AdzunaSource,
+    CareerSiteSource,
+    CuratedListSource,
+    Source,
+    build_source,
+)
 from .models import Resume
 
 DEFAULT_PATH = "profile/discovery.yaml"
@@ -46,8 +54,8 @@ _HEADER = (
 
 
 class Board(BaseModel):
-    ats: str  # greenhouse | lever | ashby
-    token: str  # the board token/slug read off the careers URL (e.g. 'stripe')
+    ats: str  # greenhouse | lever | ashby | smartrecruiters | recruitee | workable
+    token: str  # the board token/company slug read off the careers URL (e.g. 'stripe', 'Visa', 'bunq', 'mlabs')
 
 
 class AdzunaConfig(BaseModel):
@@ -60,8 +68,87 @@ class AdzunaConfig(BaseModel):
     max_pages: int = 1  # 50 results/page; raise for more breadth
 
 
+class FeedSpec(BaseModel):
+    """One GitHub job board. Written in YAML as either a bare string — a built-in name
+    ("new-grad") or a raw listings.json URL — or as an explicit {name, url} pair."""
+
+    name: str = ""
+    url: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce(cls, v):
+        if not isinstance(v, str):
+            return v
+        s = v.strip()
+        if not s.startswith(("http://", "https://")):
+            return {"name": s, "url": _BUILTIN_FEEDS.get(s, "")}
+        # Name a dropped-in feed after its repo, so it reads as "vanshb03/New-Grad-2026" in
+        # logs and the discovery-cache fingerprint rather than a 100-char URL.
+        m = re.search(r"githubusercontent\.com/([^/]+)/([^/]+)/", s)
+        return {"name": f"{m.group(1)}/{m.group(2)}" if m else s, "url": s}
+
+
+class EarlyCareerConfig(BaseModel):
+    """Discover from community new-grad/internship JSON feeds — early-career by construction,
+    no company list needed. Off by default (DECISIONS.md #031). `feeds` accepts any GitHub repo
+    publishing the SimplifyJobs listings.json schema (DECISIONS.md #073)."""
+
+    enabled: bool = False
+    kinds: list[str] = Field(default_factory=lambda: ["new-grad", "intern"])  # new-grad | intern
+    max_resolve: int = 40  # how many top title-relevant listings to resolve full JD for + judge
+    feeds: list[FeedSpec] = Field(default_factory=list)  # extra boards; built-in name or raw URL
+
+    @field_validator("feeds")
+    @classmethod
+    def _known(cls, v: list[FeedSpec]) -> list[FeedSpec]:
+        for f in v:
+            if not f.url:
+                raise ValueError(
+                    f"early_career.feeds: '{f.name}' is not a built-in feed "
+                    f"({', '.join(_BUILTIN_FEEDS)}). Use a built-in name, or give the raw "
+                    f"listings.json URL of a GitHub job board."
+                )
+        return v
+
+
+# Experience-level taxonomy (Configure/Discover gate). Each level maps to a regex matched
+# against the posting TITLE — where seniority reliably appears (same signal as title_exclude).
+# Word-boundaried so "intern" doesn't hit "international", "lead" doesn't hit "leading", etc.
+_LEVEL_PATTERNS: dict[str, str] = {
+    "internship": r"\bintern(?:s|ship)?\b|\bco-?op\b",
+    "new_grad": (
+        r"\bnew[\s-]*grad(?:uate)?s?\b|\brecent[\s-]*grad(?:uate)?s?\b|"
+        r"\bentry[\s-]*level\b|\bearly[\s-]*career\b|\buniversity[\s-]*grad(?:uate)?\b|\bcampus\b"
+    ),
+    "junior": r"\bjunior\b|\bjr\.?\b",
+    "mid": r"\bmid[\s-]*(?:level|senior)?\b",
+    "senior": r"\bsenior\b|\bsr\.?\b",
+    "staff": r"\bstaff\b|\bprincipal\b|\bdistinguished\b",
+    "manager": r"\bmanager\b|\bdirector\b|\bhead\s+of\b|\bvp\b|\bvice\s+president\b|\blead\b",
+}
+EXPERIENCE_LEVELS: list[str] = list(_LEVEL_PATTERNS)  # valid values, for config/UI/docs
+_LEVEL_RE = {lvl: re.compile(pat, re.IGNORECASE) for lvl, pat in _LEVEL_PATTERNS.items()}
+
+
+def _norm_level(s: str) -> str:
+    """Normalize a user-written level ('New Grad', 'new-grad') to a taxonomy key ('new_grad')."""
+    return re.sub(r"[\s-]+", "_", s.strip().lower())
+
+
+def detect_levels(title: str) -> set[str]:
+    """Experience levels named in a posting title (may be empty, or more than one)."""
+    return {lvl for lvl, rx in _LEVEL_RE.items() if rx.search(title)}
+
+
 class DiscoveryFilters(BaseModel):
     boards: list[Board] = Field(default_factory=list)
+    career_sites: list[str] = Field(
+        default_factory=list,
+        description="Career/posting page URLs to discover from via schema.org JobPosting "
+        "(JSON-LD) structured data, with a CSS/DOM fallback — full JD, no scraping grey "
+        "area. Point at posting pages or listing pages that embed JobPosting JSON-LD.",
+    )
     remote_only: bool = False
     min_salary: int = 0  # annual, in the profile's currency; 0 = no floor
     title_exclude: list[str] = Field(
@@ -69,13 +156,30 @@ class DiscoveryFilters(BaseModel):
         description="Drop postings whose TITLE contains any of these (case-insensitive), "
         "e.g. 'sales', 'recruiter' — a cheap gate before the matcher.",
     )
+    experience_levels: list[str] = Field(
+        default_factory=list,
+        description="Keep only postings at these experience levels, detected from the TITLE: "
+        + ", ".join(EXPERIENCE_LEVELS)
+        + ". Empty = no level gate. Lenient: a posting whose title clearly names a "
+        "DIFFERENT level is dropped; a title with no clear level passes to the matcher.",
+    )
     keywords: list[str] = Field(
         default_factory=list,
         description="Optional aggregator search terms. Empty = derive from the résumé.",
     )
     min_skills: int = 2  # keyword pre-filter floor (raise to cut common-word false positives)
-    top_n: int = 10  # how many keyword-ranked survivors Claude judges
+    top_n: int = 20  # how many keyword-ranked survivors Claude judges (more = more chances to clear min_fit)
+    min_fit: int = 50  # only follow through (dry-run/apply) on matches Claude scores ≥ this (0-100)
+    calibrate_min_fit: bool = True  # auto-raise min_fit above a fit band your recorded outcomes prove dead (decision 043)
+    skip_seen: bool = True  # drop postings already in the tracker (don't re-apply to the same role)
+    cache_ttl_hours: float = 12  # reuse the last discovery snapshot (skip board search + Claude judge) if younger than this; 0 disables
+    max_posting_age_days: Optional[int] = Field(
+        default=None,
+        description="Drop postings whose updated_at is older than this many days. "
+        "None (default) = no age gate. Missing/unparseable dates pass.",
+    )
     adzuna: AdzunaConfig = Field(default_factory=AdzunaConfig)
+    early_career: EarlyCareerConfig = Field(default_factory=EarlyCareerConfig)
 
 
 def load_filters(path: str | Path = DEFAULT_PATH) -> DiscoveryFilters:
@@ -100,9 +204,18 @@ def build_sources(
     (per-company, full JD) plus the broad aggregator when it's configured and we have a
     résumé to derive search keywords from. The aggregator gracefully self-skips if no key."""
     sources: list[Source] = [build_source(b.ats, b.token) for b in filters.boards]
+    if filters.career_sites:
+        sources.append(CareerSiteSource(filters.career_sites))
     agg = build_aggregator(filters, resume, profile)
     if agg is not None:
         sources.append(agg)
+    # Early-career curated feeds (needs the résumé to rank listings by title-relevance).
+    if filters.early_career.enabled and resume is not None:
+        sources.append(CuratedListSource(
+            resume, kinds=tuple(filters.early_career.kinds or ["new-grad", "intern"]),
+            max_resolve=filters.early_career.max_resolve,
+            feeds={f.name: f.url for f in filters.early_career.feeds},
+        ))
     return sources
 
 
@@ -169,20 +282,58 @@ def _annual_salary(comp: str) -> Optional[int]:
     return max(nums) if nums else None
 
 
+def _posting_datetime(raw) -> Optional[datetime]:
+    """Best-effort parse of a posting timestamp for the staleness gate: ISO-8601-ish strings
+    (trailing 'Z' or offset ok) and epoch-milliseconds ints/digit-strings (> 10^11 — Lever's
+    createdAt). Returns None when missing/unparseable (the gate then keeps the posting)."""
+    if raw is None or raw == "":
+        return None
+    if isinstance(raw, (int, float)) or (isinstance(raw, str) and raw.strip().isdigit()):
+        n = float(raw)
+        if n > 1e11:  # milliseconds since epoch
+            try:
+                return datetime.fromtimestamp(n / 1000, tz=timezone.utc)
+            except (OverflowError, OSError, ValueError):
+                return None
+        return None
+    s = str(raw).strip()
+    if s.endswith("Z"):
+        s = s[:-1]
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
 def apply_gates(postings, filters: DiscoveryFilters):
-    """Cheap pre-matcher gates from the filter config: remote_only, title_exclude, and a
-    salary floor when the posting states pay. Returns the kept postings. Postings with no
-    stated salary pass the salary gate (we don't drop for missing data)."""
+    """Cheap pre-matcher gates from the filter config: remote_only, title_exclude, a salary
+    floor when the posting states pay, an experience-level gate (by title), and — when
+    max_posting_age_days is set — a staleness gate on updated_at. Returns the kept postings.
+    Postings with no stated salary, no detectable level, or a missing/unparseable
+    updated_at pass their gate (we don't drop for missing data)."""
     excl = [t.lower() for t in filters.title_exclude]
+    want_levels = {_norm_level(l) for l in filters.experience_levels} & set(EXPERIENCE_LEVELS)
+    now = datetime.now(timezone.utc)
     kept = []
     for p in postings:
         if filters.remote_only and p.remote is False:
             continue
         if excl and any(x in p.title.lower() for x in excl):
             continue
+        if want_levels:
+            # Lenient: drop only when the title clearly names a level and none is wanted;
+            # a title with no detectable level passes through to the matcher.
+            detected = detect_levels(p.title)
+            if detected and detected.isdisjoint(want_levels):
+                continue
         if filters.min_salary:
             sal = _annual_salary(p.compensation)
             if sal is not None and sal < filters.min_salary:
+                continue
+        if filters.max_posting_age_days is not None:
+            dt = _posting_datetime(p.updated_at)
+            if dt is not None and (now - dt).days > filters.max_posting_age_days:
                 continue
         kept.append(p)
     return kept

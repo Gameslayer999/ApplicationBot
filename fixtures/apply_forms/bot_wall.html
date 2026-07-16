@@ -1,0 +1,12 @@
+<!doctype html>
+<!-- What jobs.smartrecruiters.com ACTUALLY served when a live dry-run reached the application page
+     (HTTP 403). Structure verified live and reproduced faithfully: the host page's body is EMPTY
+     and the block is rendered by a bot-detection vendor (DataDome) inside an IFRAME — which is why
+     a main-frame-only text scan saw nothing and the run misreported it as "form did not load".
+     The run must report this as a REFUSAL and must never hand it to the agentic fallback. No PII. -->
+<html>
+<head><title>smartrecruiters.com</title></head>
+<body>
+  <iframe src="bot_wall_frame.html" width="100%" height="400"></iframe>
+</body>
+</html>

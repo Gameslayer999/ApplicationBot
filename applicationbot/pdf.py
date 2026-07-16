@@ -23,6 +23,11 @@ from .models import (
 
 DEFAULT_ORDER = list(SECTION_KEYS)
 
+# Bump when the PDF layout changes (margins, fonts, header, spacing). Folded into the
+# tailoring stamp (pipeline.tailor_stamp) so a layout change invalidates cached PDFs and a
+# dry run re-renders instead of reusing a PDF built by the old layout.
+LAYOUT_VERSION = 2
+
 # Core-font PDFs use latin-1; map common unicode punctuation, replace the rest.
 _REPL = {
     "–": "-", "—": "-", "•": "-", "·": "-", "→": "->",
@@ -44,8 +49,8 @@ def _t(s: object) -> str:
 class _Resume(FPDF):
     def __init__(self):
         super().__init__(orientation="P", unit="pt", format="letter")
-        self.set_margins(42, 40, 42)
-        self.set_auto_page_break(True, margin=40)
+        self.set_margins(34, 34, 34)
+        self.set_auto_page_break(True, margin=34)
         self.add_page()
 
     def _two_col(self, left: str, right: str, lfont, rfont, gap: float = 2):
@@ -81,14 +86,27 @@ class _Resume(FPDF):
         self.ln(5)
 
 
+def _fit_font(pdf: _Resume, text: str, style: str, size: float, floor: float):
+    """Set Helvetica/`style` at the largest size <= `size` (down to `floor`) at which `text`
+    fits the content width — so a long name or contact line can never spill past the margins
+    (a plain `cell` doesn't wrap or shrink; it just overprints past the page edge)."""
+    while size > floor:
+        pdf.set_font("Helvetica", style, size)
+        if pdf.get_string_width(text) <= pdf.epw:
+            return
+        size -= 0.5
+    pdf.set_font("Helvetica", style, floor)
+
+
 def _contact(pdf: _Resume, c: Contact):
-    pdf.set_font("Helvetica", "B", 20)
+    _fit_font(pdf, _t(c.name), "B", 20, 12)
     pdf.cell(0, 24, _t(c.name), align="C", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     bits = [b for b in (c.location, c.email, c.phone) if b] + list(c.links)
     if bits:
-        pdf.set_font("Helvetica", "", 9)
+        line = _t("  |  ".join(bits))
+        _fit_font(pdf, line, "", 9, 6.5)
         pdf.set_text_color(*MUTED)
-        pdf.cell(0, 13, _t("  |  ".join(bits)), align="C", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.cell(0, 13, line, align="C", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         pdf.set_text_color(*INK)
 
 
@@ -118,8 +136,8 @@ def _skills(pdf: _Resume, skills: list[SkillCategory]):
         pdf.multi_cell(0, 13, _t(", ".join(cat.items)), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
 
-def render_pdf(base: Resume, tailored: TailoredResume) -> bytes:
-    """Render the tailored résumé to PDF bytes."""
+def _build(base: Resume, tailored: TailoredResume) -> _Resume:
+    """Lay out the tailored résumé and return the FPDF object (for bytes or a page count)."""
     pdf = _Resume()
     _contact(pdf, base.contact)
 
@@ -152,4 +170,68 @@ def render_pdf(base: Resume, tailored: TailoredResume) -> bytes:
             pdf.set_font("Helvetica", "", 9.5)
             pdf.multi_cell(0, 12, _t(", ".join(tailored.certifications)), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
-    return bytes(pdf.output())
+    return pdf
+
+
+def render_pdf(base: Resume, tailored: TailoredResume) -> bytes:
+    """Render the tailored résumé to PDF bytes."""
+    return bytes(_build(base, tailored).output())
+
+
+def page_count(base: Resume, tailored: TailoredResume) -> int:
+    """How many pages the résumé actually renders to — measured, not estimated."""
+    return _build(base, tailored).page_no()
+
+
+_MIN_BULLETS = 2  # never trim an entry below this many bullets; drop whole entries instead
+
+
+def _trim_once(t: TailoredResume, cut_entries: list[str]) -> bool:
+    """Remove the least-relevant piece of content: one bullet from the LAST entry (entries are
+    ordered most-relevant first) of the least-important section that still has more than
+    _MIN_BULLETS; else a whole trailing entry (activities → projects → experience, keeping at
+    least one experience). Returns False when nothing safe is left to trim."""
+    for entries in (t.activities, t.projects, t.experience):
+        for e in reversed(entries):
+            if len(e.bullets) > _MIN_BULLETS:
+                e.bullets.pop()
+                return True
+    if t.activities:
+        e = t.activities.pop()
+        cut_entries.append(f"{e.role} ({e.organization})")
+        return True
+    if t.projects:
+        p = t.projects.pop()
+        cut_entries.append(p.name)
+        return True
+    if len(t.experience) > 1:
+        e = t.experience.pop()
+        cut_entries.append(f"{e.role} at {e.organization}")
+        return True
+    return False
+
+
+def fit_to_pages(base: Resume, tailored: TailoredResume,
+                 max_pages: int = 1) -> tuple[TailoredResume, list[str]]:
+    """GUARANTEE the rendered PDF fits `max_pages` by measuring it: render, count pages, trim
+    the least-relevant content, re-render — zero tokens, deterministic. The count-based budget
+    caps are heuristics; long bullets/skills can still spill, and auto page-break would spill
+    SILENTLY to page 2. Returns (tailored, user-facing notes saying exactly what was dropped —
+    silence would read as \"ignored my input\")."""
+    if page_count(base, tailored) <= max_pages:
+        return tailored, []
+    bullets_cut, cut_entries = 0, []
+    while page_count(base, tailored) > max_pages:
+        before = len(cut_entries)
+        if not _trim_once(tailored, cut_entries):
+            return tailored, [
+                f"Still over {max_pages} page(s) after trimming all entries/bullets — "
+                "shorten the summary, skills, or education details to fit."]
+        if len(cut_entries) == before:
+            bullets_cut += 1
+    dropped = ([f"{bullets_cut} bullet(s)"] if bullets_cut else []) \
+        + ([f"{len(cut_entries)} entr{'y' if len(cut_entries) == 1 else 'ies'} "
+            f"({', '.join(cut_entries)})"] if cut_entries else [])
+    return tailored, [
+        f"Trimmed to fit {max_pages} page(s) — dropped the least job-relevant "
+        f"{' and '.join(dropped)}. Increase Length to include more."]

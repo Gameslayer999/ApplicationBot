@@ -1,0 +1,58 @@
+<!doctype html>
+<html>
+<head><title>Software Engineer application — Fixture Co (3-step wizard)</title></head>
+<body>
+<h1>Apply for this job</h1>
+
+<div id="step1" class="step">
+  <div><label for="first_name">First Name *</label>
+    <input id="first_name" name="first_name" type="text"></div>
+  <div><label for="last_name">Last Name *</label>
+    <input id="last_name" name="last_name" type="text"></div>
+  <div><label for="email">Email *</label>
+    <input id="email" name="email" type="email"></div>
+  <button type="button" onclick="advance(1)">Next</button>
+</div>
+
+<div id="step2" class="step" style="display:none">
+  <div><label for="phone">Phone</label>
+    <input id="phone" name="phone" type="tel"></div>
+  <div><label for="motivation">Why do you want to work here?</label>
+    <textarea id="motivation" name="motivation"></textarea></div>
+  <div><label for="resume">Resume/CV</label>
+    <input id="resume" name="resume" type="file"></div>
+  <button type="button" onclick="advance(2)">Continue</button>
+</div>
+
+<div id="step3" class="step" style="display:none">
+  <h2>Review your application</h2>
+  <div><label for="confirm_email">Confirm Email *</label>
+    <input id="confirm_email" name="confirm_email" type="email"></div>
+  <button type="button" onclick="finish()">Submit application</button>
+</div>
+
+<script>
+function required(step) {
+  const map = {1: ['first_name', 'last_name', 'email'], 3: ['confirm_email']};
+  return (map[step] || []).every(id => document.getElementById(id).value.trim());
+}
+function advance(step) {
+  document.querySelector('.error')?.remove();
+  if (!required(step)) {
+    const d = document.createElement('div');
+    d.className = 'error';
+    d.textContent = 'Please complete all required fields on this step.';
+    document.getElementById('step' + step).prepend(d);
+    return;
+  }
+  document.getElementById('step' + step).style.display = 'none';
+  document.getElementById('step' + (step + 1)).style.display = '';
+}
+function finish() {
+  if (!required(3)) return;
+  document.body.innerHTML =
+    '<h1>Thank you for applying!</h1><p>Your application has been received.</p>';
+}
+</script>
+</body>
+</html>
