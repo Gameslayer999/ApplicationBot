@@ -9,14 +9,17 @@ Two engines implement the same interface (see DECISIONS.md #011):
   skills, experience, projects, and activities by relevance. Zero deps, no account, no
   network, deterministic, never invents — but can't reword prose.
 
-`select_backend("auto")` uses Claude Code if the `claude` CLI is present, else rules.
+- AnthropicAPIBackend — the **fallback** engine (decision 111). Tailors via the metered
+  Anthropic **API** (`anthropic` SDK) using the user's own key from the OS keychain. Billed
+  pay-per-token to their API account, NOT their subscription. Used only when Claude Code
+  isn't available — because Anthropic restricts subscription OAuth to Claude Code/Claude.ai,
+  a third-party app cannot use the subscription except by shelling out to Claude Code.
 
-Both take a `LengthBudget`; the Claude engine is instructed to fit it, and it's hard-
+`select_backend("auto")` prefers Claude Code (subscription); if it's absent it uses the
+Anthropic API key when one is set; else the no-account rules engine.
+
+Both take a `LengthBudget`; the Claude engines are instructed to fit it, and it's hard-
 enforced afterward in `tailor.py`.
-
-Note: we deliberately do NOT call the `anthropic` SDK / `api.anthropic.com` — that would
-bill the API. Subscription usage is only available through Claude's own tooling, so the
-Claude path shells out to Claude Code.
 """
 
 from __future__ import annotations
@@ -47,6 +50,11 @@ QUALITY_TIERS: dict[str, tuple[str, bool]] = {
     "max": ("opus", True),         # ~115s — Opus with thinking (the previous default)
 }
 DEFAULT_QUALITY = "balanced"
+
+# Map the CLI quality-tier model aliases ("sonnet"/"opus") to Anthropic API model IDs for the
+# API-key fallback backend (decision 111). The subscription path passes the alias to `claude
+# --model`; the API path needs the full ID.
+_API_MODELS = {"sonnet": "claude-sonnet-5", "opus": "claude-opus-4-8"}
 
 SYSTEM_PROMPT = """\
 You are a resume-tailoring assistant. You are given a candidate's BASE RESUME (the \
@@ -336,6 +344,62 @@ def run_claude_cli(prompt: str, *, cli: str = CLAUDE_CLI,
     return proc.stdout
 
 
+def run_anthropic_api(prompt: str, *, api_key: str, model: Optional[str] = None,
+                      timeout: int = 300, system: Optional[str] = None,
+                      activity: Optional[str] = None) -> str:
+    """Run one prompt through the metered Anthropic **API** (the fallback engine, decision 111)
+    with the user's own key, and return the model's text. Raises the same taxonomy as
+    run_claude_cli — ClaudeAuthError / ClaudeRateLimitError / ClaudeUnavailableError — so
+    callers handle either engine identically. Billed pay-per-token to the key's API account,
+    NOT the Claude subscription (that path is Claude Code only). Thinking is left off: this is a
+    structured-JSON task, and the 'respond with ONLY JSON' instruction + retry loop cover it."""
+    try:
+        import anthropic
+    except ImportError as e:
+        raise ClaudeUnavailableError(
+            "The 'anthropic' package isn't installed. Reinstall dependencies "
+            "(pip install -r requirements.txt) to use the API-key fallback."
+        ) from e
+    client = anthropic.Anthropic(api_key=api_key, timeout=timeout, max_retries=1)
+    model_id = _API_MODELS.get((model or "opus").lower(), _API_MODELS["opus"])
+    try:
+        resp = client.messages.create(
+            model=model_id, max_tokens=16000,
+            system=system or "You are a helpful assistant.",
+            messages=[{"role": "user", "content": prompt}],
+        )
+    except anthropic.AuthenticationError as e:
+        raise ClaudeAuthError(
+            "Anthropic API key was rejected (401). Re-connect the key in the account panel. "
+            f"Detail: {e}"
+        ) from e
+    except anthropic.RateLimitError as e:
+        raise ClaudeRateLimitError(
+            "Anthropic API rate limit / quota hit. Wait and retry, or check your API account's "
+            f"credit balance. Detail: {e}"
+        ) from e
+    except anthropic.APIStatusError as e:
+        raise ClaudeUnavailableError(f"Anthropic API error (HTTP {e.status_code}). Detail: {e}") from e
+    except Exception as e:
+        raise ClaudeUnavailableError(f"Anthropic API call failed: {e}") from e
+    # Token accounting (decision 095), best-effort — mirror the CLI envelope shape.
+    try:
+        from . import usage
+        u = resp.usage
+        usage.record({
+            "usage": {
+                "input_tokens": getattr(u, "input_tokens", 0),
+                "output_tokens": getattr(u, "output_tokens", 0),
+                "cache_read_input_tokens": getattr(u, "cache_read_input_tokens", 0),
+                "cache_creation_input_tokens": getattr(u, "cache_creation_input_tokens", 0),
+            },
+            "modelUsage": {model_id: {}},
+        }, activity=activity)
+    except Exception:
+        pass
+    return "".join(b.text for b in resp.content if getattr(b, "type", None) == "text")
+
+
 def _extract_json(text: str) -> str:
     """Pull the JSON object out of a model reply (tolerates fences / stray prose)."""
     text = text.strip()
@@ -386,6 +450,37 @@ class ClaudeCodeBackend:
         return run_claude_cli(prompt, cli=self.cli, model=self.model, think=self.think,
                               system=SYSTEM_PROMPT, activity="tailoring",
                               json_schema=TailorDelta.model_json_schema())
+
+
+class AnthropicAPIBackend:
+    """Fallback: tailor via the metered Anthropic API with the user's key (decision 111)."""
+
+    name = "anthropic-api"
+
+    def __init__(self, api_key: str, model: Optional[str] = None):
+        self.api_key = api_key
+        self.model = model  # a "sonnet"/"opus" alias; mapped to an API id in run_anthropic_api
+
+    def tailor(self, resume: Resume, jd: JobDescription, budget: LengthBudget,
+               emphasis: Optional[list[str]] = None) -> TailoredResume:
+        base = (
+            _user_message(resume, jd, budget, emphasis)
+            + "\n\nOutput format: respond with ONLY a single JSON object for the tailoring "
+            "plan — no explanation, no markdown code fences."
+        )
+        last_err: Optional[Exception] = None
+        for attempt in range(2):
+            prompt = base if attempt == 0 else (
+                base + "\n\nYour previous reply was not a valid tailoring plan. Return ONLY the JSON object."
+            )
+            raw = run_anthropic_api(prompt, api_key=self.api_key, model=self.model,
+                                    system=SYSTEM_PROMPT, activity="tailoring")
+            try:
+                delta = TailorDelta.model_validate_json(_extract_json(raw))
+                return _delta_to_tailored(resume, delta)
+            except Exception as e:  # includes pydantic + json errors
+                last_err = e
+        raise RuntimeError(f"Anthropic API did not return a valid tailoring plan: {last_err}")
 
 
 # --------------------------------------------------------------------------- Rules
@@ -479,17 +574,29 @@ def claude_code_available() -> bool:
 def select_backend(name: str = "auto", quality: str = DEFAULT_QUALITY) -> TailorBackend:
     """Return a backend by name, or the best available one for `auto`.
 
-    `auto` uses Claude Code (subscription) when the `claude` CLI is present, else the
-    no-account rules engine. `quality` (fast|balanced|max) picks the Claude speed/quality
-    tier — model + whether extended thinking is on; it has no effect on the rules engine.
+    `auto` prefers Claude Code (subscription — PRIMARY); if it's absent it uses the Anthropic
+    API key (FALLBACK) when one is stored; else the no-account rules engine (decision 111).
+    `quality` (fast|balanced|max) picks the Claude speed/quality tier — model + whether extended
+    thinking is on (thinking applies to the Claude Code path only); no effect on rules.
     """
+    from . import auth  # lazy: reads the keychain-stored fallback API key
     name = name.lower()
     model, think = QUALITY_TIERS.get(quality, QUALITY_TIERS[DEFAULT_QUALITY])
     if name in ("claude-code", "claude"):
         return ClaudeCodeBackend(model=model, think=think)
+    if name in ("anthropic-api", "api"):
+        key = auth.get_api_key()
+        if not key:
+            raise ValueError("No Anthropic API key is set. Add one in the account panel, or "
+                             "install Claude Code to use your subscription.")
+        return AnthropicAPIBackend(api_key=key, model=model)
     if name == "rules":
         return RulesBackend()
     if name == "auto":
-        return (ClaudeCodeBackend(model=model, think=think)
-                if claude_code_available() else RulesBackend())
-    raise ValueError(f"Unknown backend {name!r} (use claude-code|rules|auto).")
+        if claude_code_available():
+            return ClaudeCodeBackend(model=model, think=think)      # PRIMARY: subscription
+        key = auth.get_api_key()
+        if key:
+            return AnthropicAPIBackend(api_key=key, model=model)    # FALLBACK: metered API
+        return RulesBackend()                                       # last resort: no account
+    raise ValueError(f"Unknown backend {name!r} (use claude-code|anthropic-api|rules|auto).")

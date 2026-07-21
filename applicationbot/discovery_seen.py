@@ -30,8 +30,8 @@ from typing import Iterable
 
 from .discovery import canonical_url
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_PATH = REPO_ROOT / "profile" / "discovery_seen.json"
+from .paths import DATA_ROOT
+DEFAULT_PATH = DATA_ROOT / "profile" / "discovery_seen.json"
 
 # Bump when the on-disk shape changes so an old ledger is ignored rather than misread.
 _SCHEMA_VERSION = 1

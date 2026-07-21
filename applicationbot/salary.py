@@ -28,8 +28,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_CACHE_PATH = REPO_ROOT / "profile" / "salary_cache.json"
+from .paths import DATA_ROOT
+DEFAULT_CACHE_PATH = DATA_ROOT / "profile" / "salary_cache.json"
 
 TTL_DAYS = 30.0            # a cached estimate is refreshed after this many days
 AGREE_TOLERANCE = 0.20    # ≤20% apart = the two sources "agree"; wider = take the lower

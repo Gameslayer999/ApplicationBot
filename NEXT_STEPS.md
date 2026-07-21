@@ -556,9 +556,14 @@ value ÷ effort:
 
 Posted to the agent bus 2026-07-06; independent of the engine work above.
 
-- [ ] **First-run onboarding** — guided setup that creates `profile/resume.yaml`,
-      `application_profile.yaml`, and `discovery.yaml`; a real PDF/LinkedIn→YAML resume
-      import (the generator `profile/README.md` promises does not exist in code).
+- [~] **First-run onboarding** — **reworked (2026-07-21, decision 104):** the up-front chore
+      checklist is replaced by a **spotlight tour** (highlights each nav tab in turn with a
+      one-line "what it does", auto-runs once per browser, reopenable via nav "Take the tour")
+      plus **first-visit nudges** on Profile ("import your résumé → it fills your details") and
+      Discover ("choose what jobs to find"), each shown once and only while that section is still
+      incomplete. *Remaining:* the guided-setup path that actually *creates* `profile/resume.yaml`
+      / `application_profile.yaml` / `discovery.yaml` on a fresh clone (LinkedIn→YAML import
+      exists; a PDF→YAML import + seeding empty configs still don't).
 - [ ] **Never edit the committed example** — a fresh clone's Profile tab currently
       round-trips edits into `examples/sample_resume.yaml` (PII-into-git risk); create
       `profile/resume.yaml` instead.
@@ -639,6 +644,135 @@ Posted to the agent bus 2026-07-06; independent of the engine work above.
 
 ## Recently added (this session, latest first)
 
+- 2026-07-21 — **Sidebar logomark + browser-tab favicon; logomark unified into one `--lm` var.**
+  Replaced the sidebar `📄` emoji with the real logomark (`<span class="brand-logo">`) and added a
+  favicon (`<link rel="icon">` + `apple-touch-icon`, from `assets/app-icon-blue.png` @64px — the
+  blue-background icon reads on any tab color). Refactored the top-right mark from two `<img>` tags
+  to a single theme-aware CSS variable **`--lm`** (`--lm-dark` / `--lm-light` defined once each in
+  `:root`, switched by `prefers-color-scheme` + `[data-theme]`); the sidebar mark and top-right mark
+  both use `background:var(--lm)`. All base64-embedded (no file route / bundle change). Verified both
+  marks + favicon in light and dark. **This clears the follow-up on the top-right-logo entry below.**
+
+- 2026-07-21 — **Brand logomark in the top-right of every page.** Added a persistent, theme-aware
+  brand mark (`.brandmark`, top-right of `main`): the navy logomark on light theme, the white one
+  on dark, toggled by the same `prefers-color-scheme` + `[data-theme]` pattern as the tokens. Built
+  from `assets/logomark-{dark,light}.png` resized to 96px and **embedded as base64 data URIs**
+  (~15KB each) — no static-file route, no bundle change, works in browser + native window + frozen
+  app. `pointer-events:none` + `aria-hidden` (decorative; the name is in the sidebar). Verified in
+  both themes at normal + wide widths (no collision with page headers or toolbars). The sidebar
+  brand is still the `📄` emoji — **follow-up:** swap it for the logomark too, and add a favicon.
+
+- 2026-07-21 — **All tabs now fill the available width.** Removed the content-container width caps
+  that left the right half of wide screens empty: `.editor` (was `max-width:640px`, capped Discover
+  panels) and `#view-profile .editor` (was `1040px`) are now `max-width:none`; Track was already
+  uncapped. Effect: Review's control bar fits on one row instead of wrapping, Discover panels and the
+  Profile form span the content area. **Deliberate exception:** the Review résumé preview (`.resume`)
+  stays a centered ~820px document — it's a printed-page/PDF preview, so full width would give absurd
+  line lengths and misrepresent the 1-page output (the why-panel sits beside it). Header leads
+  (`.page-sub`) also keep a ~66ch measure for readability. This overrides the old "content max ~1200px"
+  note in the UI guidelines — full-width is now intended. Verified with Playwright at 1680px, all tabs.
+
+- 2026-07-21 — **Page headers on all four tabs + reusable pattern.** The views opened with no
+  title — just full-width gray intro paragraphs (Profile's ran to the right edge and clipped under
+  the sticky section-jump nav). Added a reusable header pattern — CSS `.page-head` / `.page-title`
+  / `.page-sub` (by the `.editing` rule): a bold `h2` title over a width-constrained (`~66ch`) lead,
+  inline `code` paths as subtle chips. Applied to every tab: **Review & tailor**, **Discover &
+  apply**, **Your details & résumé** (Profile), **Application tracker** (Track). `.page-head`
+  defaults to a 20px bottom margin; `#view-profile .page-head` overrides to 34px to clear the
+  `.pnav::before` 28px mask. Verified with Playwright across all four tabs in light + dark.
+
+- 2026-07-21 — **UI now passes WCAG AA — success-green fill/text split (decision 105).** Audited
+  `web.py` against the new `UI_UX_GUIDELINES.md` with the repo's contrast checker. Everything already
+  conformed except the success color: `--ok` was used as foreground text at **3.5:1** (below 4.5).
+  Added **`--ok-text`** (`#127a3e` light / `#4cc282` dark) for `color:` uses — mirroring the existing
+  `--accent`/`--accent-text` split — and repointed all foreground `--ok` (`.msg.ok`, `.rowsaved`,
+  `.st-responded`, `.fn-conv`, `.tstep.done`, `.tjscore`, inline qa/mailbox status). `--ok` stays the
+  fill/dot green. Also tokenized `#fff`→`--accent-ink` and `#dl-pdf` `#111`→`--btn-dark`. Verified:
+  every pair now ≥4.5 (dots ≥3:1), parses, Playwright light+dark screenshots clean. Color tokens only,
+  no markup/logic changed. **Follow-up:** the `.pk-submit`/`.loop-apply` real-submit red (`#b3261e`) is
+  still a hardcoded, theme-constant hex — passes AA (6.54:1) and left intentionally as a danger signal,
+  but note if a design token is ever wanted for it.
+
+- 2026-07-21 — **`UI_UX_GUIDELINES.md`** — ported the design-vocabulary doc to this repo (kept every
+  industry best-practice reference — Apple HIG / Figma / Material 3 / Fluent 2 / WCAG / NN/g — and
+  swapped all brand-specific content for ApplicationBot's real tokens/shell). Complements `ui.md`
+  (this = vocabulary, ui.md = implementation). Untracked.
+
+- 2026-07-21 — **App icon** (blue document-and-robot). Logo art in `assets/`:
+  `app-icon-blue/dark.png` + `logomark-light/dark.png` — the **borderless** set (the first batch had
+  a gray backdrop that looked bad as an icon; replaced). `assets/icon-master-1024.png` is derived
+  from `app-icon-blue.png` (keys the thin near-white backdrop to transparent so macOS supplies its
+  own shadow); `scripts/make_icon.sh` compiles the `.icns` (sips + iconutil); `build_macapp.sh`
+  regenerates it and passes `--icon`. Verified embedded + rendered + installed. Master PNG committed;
+  `.icns` git-ignored. **Follow-up:** use `logomark-light/dark.png` for the in-app header (currently
+  a 📄 emoji) and a favicon.
+
+- 2026-07-21 — **Self-contained, drag-to-Applications macOS app (decision 103).** `ApplicationBot.app`
+  now bundles its own Python + deps + code via PyInstaller (~190 MB) — drag to /Applications,
+  double-click, no Python/venv/setup and no permission prompts (reads nothing from ~/Documents).
+  User data lives in `~/Library/Application Support/ApplicationBot` (new `applicationbot/paths.py`
+  `DATA_ROOT`; 8 data-path modules retargeted; frozen app serves in-thread). Chromium auto-installs
+  in the background on first launch. It's a production snapshot; dev stays on localhost
+  (`dev.sh`/`run.sh --window`). **Verified** launching from /tmp with no repo nearby (serves 200,
+  fresh-install walkthrough, writes applications.db to Application Support, Chromium install
+  finished); 389 tests pass after the data-dir refactor. Supersedes the venv-based .app of 102.
+  **Follow-ups:** notarization for distributing to other Macs (needs paid Apple account); the
+  walkthrough's "Install the apply browser" step is now redundant on the bundled app (auto-handled)
+  — could hide it there.
+
+- 2026-07-21 — **Standalone desktop app with its own native window (decision 102).** New
+  `applicationbot/app.py` runs the same UI in a pywebview window (WKWebView/WebView2; added
+  `pywebview` dep) — dark theme, walkthrough, and dev-reload all carry over. `scripts/build_macapp.sh`
+  hand-rolls + ad-hoc-signs `ApplicationBot.app` (double-click, own window, no Terminal);
+  `run.sh --window` (+ `--window --dev`) opens the window from any terminal. Forward-compat:
+  `scripts/_native.sh` guard refuses a Rosetta/x86_64 Python (machine is already arm64-native).
+  macOS TCC: the venv moved OUT of the repo to `~/Library/Application Support/ApplicationBot/venv`
+  (`scripts/_venv.sh`) so a Finder launch isn't blocked reading it under ~/Documents. **Verified**
+  from the Terminal path (window opens, server subprocess serves, support-dir venv). **Open item:**
+  the pure Finder double-click needs a one-time "allow Documents access" click that can't be
+  automated — **user to confirm** it launches; if a prompt-free experience is wanted, keep the clone
+  outside ~/Documents.
+
+- 2026-07-21 — **Dev auto-reload + one-command GitHub update (decision 101).** `scripts/dev.sh`
+  (= `run.sh --dev`) runs a stdlib supervisor (`scripts/dev_reload.py`) that restarts the server
+  whenever a file in `applicationbot/` changes, and the open page reloads itself (web.py serves a
+  `/dev/reload-token` heartbeat + injects a poller only when `APPLICATIONBOT_DEV=1`). `scripts/
+  update.sh` fast-forwards the clone from GitHub, reinstalls deps if they changed, and restarts
+  (or lets the reloader do it) — refusing on a dirty tree so it never overwrites local edits. No
+  new dependencies. Verified: edit → auto-restart (boot token changes) + browser self-refresh;
+  normal mode unaffected; update.sh refuses on the current dirty tree.
+
+- 2026-07-21 — **v0.1 release packaging + first-run walkthrough + a WCAG-AA UI pass (decisions
+  099, 100).** Bundling: `__version__="0.1.0"` + `--version`; `scripts/run.sh` is now a full
+  idempotent bootstrap (python check → venv → deps → `playwright install chromium` → non-fatal
+  `doctor` → open browser → serve); double-click launchers `ApplicationBot.command` (macOS) and
+  `ApplicationBot.bat` (Windows); `scripts/release.sh` (dry-run by default, `--publish` tags +
+  `gh release`s, with a PII guard); README "Quick start — download & run" section. Walkthrough: a
+  skippable `#setup-overlay` driven by new `GET /setup/status` (reuses `doctor.py` checks) — one
+  row per setup step, each deep-linking to its fix; auto-opens on a fresh/unfinished clone, reopen
+  from the nav's "✨ Finish setup". Accessibility: split accent into `--accent` (fills) +
+  `--accent-text` (text) so both pass 4.5:1; `:focus-visible` rings; `prefers-reduced-motion`
+  handling; ARIA dialog focus-trap/restore on the overlay; `--faint` documented as incidental-only.
+  Added **[ui.md](ui.md)** as the standing UI reference. Verified: launcher serves (GET / → 200,
+  doctor green), release dry-run is a no-op, walkthrough interactions pass in Playwright, contrast
+  checker shows all text pairs AA-clean, 18 doctor/web/tracker tests pass. **Not pushed/published
+  yet** — `release.sh --publish` is the user's call.
+
+- 2026-07-21 — **Dark mode reworked to a Google-style neutral gray + sticky-header gap fixed**
+  (CSS-only, `web.py` `<style>` — cosmetic, no decision logged). Two passes per user request:
+  first softened the old blue-tinted dark theme; then, on follow-up, moved it to Google's neutral
+  dark palette and desaturated the blue further. Final dark tokens: `--bg` `#202124` (main UI),
+  `--surface` `#2a2b2e`, `--surface-2` `#35373b`, and a new `--field` `#1b1c1f` (recessed
+  near-`#1E1E1E`) that dropdowns/inputs/textarea now use so menus read darker than their card —
+  all near-zero blue tint. `--accent` `#4b7bf5`→`#5b7fca` (HSL S89→~S50, muted blue — dialed back up from a first
+  too-gray `#5f7cae` pass per user feedback);
+  `--accent-weak`/`-weak-2`/`-tint`, `--line`, `--track`, `--btn-dark`, `--neutral-tint`
+  neutralised to gray. Light mode kept its blue; added `--field:#ffffff` there so inputs stay
+  white. Softening (both modes): `--radius` 12→14px, tab/input/button/card corners 8–9→10px,
+  lighter `--shadow`. Also fixed the sticky `.pnav` section-jump bar: it sticks at `top:0` inside
+  `main` (`padding-top:28px`), so scrolled content peeked through a 28px band above it — added
+  `.pnav::before` bleeding `var(--bg)` up over that gap. Verified via headless-Chromium dark-mode
+  screenshots (home, Profile, and Profile scrolled with the pnav locked to the top, no peek-through).
 - 2026-07-21 — **Form reveal now clicks "I'm interested", not just "Apply" (decision 098).** A live
   SmartRecruiters dry run timed out with "form did not load … 0 fields": decision 076 said it added a
   `_REVEAL_CONTROL` matching the "I'm interested" button, but that code was never committed — the
@@ -1825,6 +1959,81 @@ Record each decision in [DECISIONS.md](DECISIONS.md) once the user chooses.
 ---
 
 ## Recently completed
+
+- 2026-07-21 — **Hybrid Claude connection: subscription primary, API-key fallback** (decision
+  111). Verified (with sources) that a separate "log in with Claude" on the **subscription** is
+  impossible + ToS-banned for a third-party app — the Messages API rejects subscription OAuth and
+  Anthropic banned it (Feb 2026), so the only sanctioned subscription path is shelling out to the
+  real `claude` binary (as the app already does). Built the hybrid the user chose: `auto` resolves
+  **Claude Code (subscription) → Anthropic API key (fallback, keychain) → rules**. New
+  `AnthropicAPIBackend`/`run_anthropic_api()` (metered SDK, `anthropic>=0.40` added + bundled),
+  `auth.py` keychain key store + richer status, `/auth/apikey` (validates via `models.list()`
+  before storing) + `/auth/apikey/disconnect`. The bottom-left `#account` box is now a button
+  opening a **"Claude connection"** modal — subscription [Primary] over API key [Fallback] with
+  connect/disconnect + masked key + which-engine-is-active. README "Tailoring engines" and the
+  first-run walkthrough now state the subscription-primary/API-fallback priority explicitly.
+  Verified: imports, three-way `select_backend` states, 401→ClaudeAuthError, endpoints, Playwright
+  panel+modal — no console errors.
+
+- 2026-07-21 — **Desktop app finds the user's `claude` CLI (PATH fix)** (decision 110). A
+  Finder/launchd-launched `.app` inherits a minimal PATH (no `~/.local/bin`, Homebrew, npm, nvm), so
+  `shutil.which("claude")` returned `None` and the native app fell back to the no-account `rules`
+  engine even when Claude Code works in a terminal. New `_augment_path()` in `app.py` (called first
+  in `run()`) appends the well-known user tool dirs, and only if `claude` is still unresolved adopts
+  the login shell's `$PATH`. Additions appended (never shadow system bins); no-op from a terminal.
+  Verified: rebuilt/reinstalled the `.app`; its `desktop.log` now logs `claude found`. (Confirmed the
+  auth model: ApplicationBot stores no Claude creds — it uses the per-machine Claude Code login, so
+  each user installs Claude Code + `/login` themselves; nothing is shipped.)
+
+- 2026-07-21 — **Track rebuilt as an infra-console dashboard + Discover decluttered** (decision
+  109). Track now leads with **four hero scorecards** (Total processed / Applied / Blocked / Failed),
+  a **unified muted status system** (dot+badge, shared with the table: neutral=pending, blue=applied,
+  green=positive reply, amber+pulse=blocked, red=failed), and a **card feed** (company · role, tight
+  `•`-metadata, fit, status) behind a **Feed | Table** toggle — the full editable spreadsheet is kept
+  as Table view. Clicking a card slides out a **context drawer** (ARIA dialog: focus-trap, Esc/scrim
+  close) with actions (Open posting / View résumé / Re-run) and the **run-history terminal** (reusable
+  `.terminal` window, dim `›`-prompt timestamps, colour-coded levels). Funnel + token tiles collapsed
+  into a `<details>`. Discover: aligned `.panel-head` (button lined up with its title), walls of text
+  cut to 1–2 lines, the two loop options as concise **switch rows**, sources+fit-insights in a 2-col
+  grid, and **Discovery settings moved into a centered modal** (gear button / nudge). Fixed a latent
+  `.loopstat.hidden` display bug the terminal styling exposed. DOM + CSS + JS only, endpoints
+  unchanged; verified light+dark via Playwright, no console errors.
+
+- 2026-07-21 — **Tracker funnel + token spend → metric tiles; loop status + run history →
+  terminal-log streams** (decision 108, follow-ups #2/#3 from 107). `renderFunnel` now builds a KPI
+  row of bordered stat cards (`.mtile`) — big proportional count, mono "% of top · % conv" sub-line,
+  and an accent meter (on an `--accent-weak` track) that preserves the funnel drop-off — instead of
+  bar rows; discovery/judging token spend became a 3-tile cluster (Total/Input/Output) with the
+  per-activity breakdown behind a toggle. The auto-apply loop status (`.loopstat`, `›` prompt) and
+  the per-posting run-history sub-row (`.runsbox`/`.runline` — dim timestamp, colored outcome tag,
+  muted detail) are now recessed monospace terminal streams on `--field` (Railway/Apify live-run-log
+  look). New `mtile()` helper; dead `.fn-*` CSS removed; a latent `var(--text)` typo fixed to
+  `--muted`. DOM + CSS only — endpoints and expand/collapse behavior unchanged. Verified light + dark
+  via Playwright, no console errors; docs updated (`UI_UX_GUIDELINES.md` §9/§6).
+
+- 2026-07-21 — **UI restyled to a shadcn "zinc" aesthetic — near-black dark mode, crisp
+  borders-lead shape, lucide SVG chrome icons** (decision 107). Done at the token layer so the whole
+  app re-themes from `:root`: dark is now zinc-950/900/800 near-black (`--bg:#09090b`) instead of
+  Google-gray; light is shadcn light (zinc-50 page, white cards, zinc-200 borders); one restrained
+  blue accent (`--accent:#2563eb`). `--radius` 14→10px, controls 8px, `--shadow` collapsed to a
+  hairline (structure now reads from 1px borders). Added a `--mono` token. Nav/theme/tour chrome
+  emoji replaced with lucide-style inline SVG stroke icons (`currentColor`, text labels kept for
+  a11y). New dashboard components from the infra-console references (Apify/Railway/Zeabur):
+  on/off options render as **toggle switches** (restyled real checkbox, `.loop-rescan`), metrics use
+  monospace+tabular-nums (count pills, funnel, fit chart), and the dry-run progress panel is a
+  recessed **terminal-style run-log** stream. Palette pre-validated with the WCAG-AA contrast
+  checker (all read pairs ≥4.5:1); verified in light + dark across Review/Discover/Track via
+  Playwright with no console errors. Docs updated (`ui.md`, `UI_UX_GUIDELINES.md`). Tokens + chrome
+  markup + CSS only — behavior and copy unchanged.
+
+- 2026-07-21 — **Theme-matched brand logos + blue-app-icon favicon, embedded by a re-runnable
+  script** (decision 106). The sidebar `.brand-logo` now shows a mode-matched tile — `assets/logo-darkmode.png`
+  (dark-bg, white page) in dark mode, `assets/logo-lightmode.png` (light-bg, navy page) in light mode
+  — replacing the old contrast-swapped transparent cutouts; the tab favicon is always `assets/app-icon-blue.png`.
+  Base64 is generated, not hand-pasted: `scripts/embed_brand_assets.py` (PIL) resizes (logos 96px,
+  favicon 64px), encodes, and idempotently regex-injects into `web.py` — re-run it after swapping any
+  brand PNG. Verified: script + re-run both leave `web.py` parseable; decoded payloads confirm each
+  image landed in the right slot.
 
 - 2026-07-20 — **A submit the user clicks during the dry-run review pause is tracked as a real
   `applied` application** (decision 097). The user's rule: keep it a dry-run unless the bot *or a

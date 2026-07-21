@@ -20,8 +20,8 @@ import json
 import re
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-TAILORED_DIR = REPO_ROOT / "profile" / "tailored"
+from .paths import DATA_ROOT
+TAILORED_DIR = DATA_ROOT / "profile" / "tailored"
 
 # Backstop cap on the whole folder. At ~5 KB/PDF this is ~20k applications — far past
 # the upsert-by-URL count in practice; it only ever trips on pathological reuse.

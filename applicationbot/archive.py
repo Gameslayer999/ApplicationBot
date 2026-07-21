@@ -23,8 +23,8 @@ from pathlib import Path
 
 from .resume_store import _slug
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-ARCHIVE_DIR = REPO_ROOT / "profile" / "applications"
+from .paths import DATA_ROOT
+ARCHIVE_DIR = DATA_ROOT / "profile" / "applications"
 
 
 def dir_for(company: str, role: str, source_url: str) -> Path:
