@@ -16,6 +16,7 @@ Files are ~5 KB each, so the cap is a backstop, not an expected trigger.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from pathlib import Path
 
@@ -81,6 +82,40 @@ def write_stamp(pdf_path: str | Path, key: str) -> None:
         pass
 
 
+# --- job-description sidecar (decision 086) --------------------------------------------
+# A ``<pdf>.jd`` JSON sidecar holding the posting's job description (body + meta) that a PDF
+# was tailored to. Kept so a Track "Re-run → re-tailor" can regenerate the résumé offline —
+# against the saved JD + the user's *current* base résumé/prompt — without re-scraping the
+# posting. Written on every dry-run tailor (reuse or fresh); pruned/deleted with its PDF.
+
+def _jd_path(pdf_path: str | Path) -> Path:
+    return Path(str(pdf_path) + ".jd")
+
+
+def write_jd(pdf_path: str | Path, jd) -> None:
+    """Record the JobDescription (body + meta) beside ``pdf_path``. Best-effort."""
+    try:
+        _jd_path(pdf_path).write_text(
+            json.dumps({"body": jd.body, "meta": jd.meta}), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def read_jd(pdf_path: str | Path):
+    """The JobDescription saved beside ``pdf_path``, or None if absent/unreadable."""
+    from .job_description import JobDescription
+    try:
+        d = json.loads(_jd_path(pdf_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return JobDescription(body=d.get("body", ""), meta=d.get("meta") or {})
+
+
+def has_jd(pdf_path: str | Path) -> bool:
+    """True iff a JD sidecar exists for ``pdf_path`` — i.e. a re-tailor can run offline."""
+    return bool(pdf_path) and _jd_path(pdf_path).is_file()
+
+
 def is_managed(path: str | Path) -> bool:
     """True iff ``path`` lives under ``TAILORED_DIR`` — the guard that keeps cascade
     delete from ever removing a user-supplied résumé outside this folder."""
@@ -98,6 +133,7 @@ def delete_if_managed(path: str | Path) -> bool:
     try:
         Path(path).unlink(missing_ok=True)
         _stamp_path(path).unlink(missing_ok=True)
+        _jd_path(path).unlink(missing_ok=True)
         return True
     except OSError:
         return False
@@ -124,6 +160,7 @@ def prune(*, max_bytes: int = MAX_BYTES, keep: Path | None = None) -> int:
         try:
             f.unlink()
             _stamp_path(f).unlink(missing_ok=True)
+            _jd_path(f).unlink(missing_ok=True)
             total -= size
             removed += 1
         except OSError:

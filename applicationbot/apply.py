@@ -16,6 +16,7 @@ chromium`. The resolver needs no browser.
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 from typing import Optional
@@ -23,6 +24,8 @@ from typing import Optional
 from . import answer_bank, salary
 from .apply_profile import QA, ApplicationProfile, load_profile
 from .models import Resume
+
+_UNSET = object()  # sentinel: "not yet computed" (distinct from a computed None/False)
 
 
 # --------------------------------------------------------------------------- report
@@ -49,6 +52,10 @@ class ApplyReport:
     errors: list[str] = field(default_factory=list)
     screenshot: Optional[str] = None
     submitted: bool = False
+    # The user clicked the site's own Submit during the dry-run review pause (decision 097) —
+    # a real application to track as `applied`, method `manual`, not a dry-run. Distinct from
+    # `submitted` alone, which the bot-armed path (method `auto`) also sets.
+    manual_submit: bool = False
     # Armed-run outcome (decision 035): dry-run (never attempted) | blocked (armed but
     # withheld — see `blockers`) | submitted (confirmation seen) | unconfirmed (form gone
     # after the click but no explicit confirmation — treat as submitted, verify manually).
@@ -192,6 +199,7 @@ class AnswerResolver:
     semantic_done: set = field(default_factory=set)  # labels the batch already adjudicated
     picks_done: set = field(default_factory=set)     # dropdown labels the batch already adjudicated
     decided_options: dict = field(default_factory=dict)  # label -> batch-picked option text
+    _commute_cache: dict = field(default_factory=dict)  # posting commutability judged once (Claude)
 
     def learned_option_hints(self, value: Optional[str]) -> list[str]:
         """Dropdown options this value has matched before (learned across runs), so a repeat
@@ -324,14 +332,109 @@ class AnswerResolver:
 
     def _office_prefs(self) -> list[str]:
         """Ranked office-location candidates for a "preferred office location" dropdown: the explicit
-        preferred_locations first, then Remote (if open to it), then the home city as a last resort."""
+        preferred_locations first, then Remote (only when the arrangement preference actually leans
+        remote — never for an in-office/commutable preference), then the home city as a last resort.
+        Fixes the case where an empty preferred_locations + open_to_remote ranked Remote first even
+        for a commutable office (the reported dry-run bug)."""
         out = [x.strip() for x in (self.profile.preferred_locations or []) if x and x.strip()]
-        if self.profile.open_to_remote and not any("remote" in x.lower() for x in out):
-            out.append("Remote")
+        has_remote = any("remote" in x.lower() for x in out)
+        arr = self._preferred_arrangement()
+        if arr == "Remote" and not has_remote:
+            out.insert(0, "Remote")  # remote-leaning → Remote ranks first
+        elif arr is None and self.profile.open_to_remote and not has_remote:
+            out.append("Remote")     # no preference set → legacy behaviour (Remote as a fallback)
+        # arr in ("On-site", "Hybrid") → do NOT offer Remote: an office is preferred.
         home = (self.profile.location or self.resume.contact.location or "").strip()
         if home and home not in out:
             out.append(home)
         return out
+
+    # Preferred-arrangement wording the form-side dropdown matcher maps onto a posting's own option.
+    _ARRANGEMENT_HINTS = {
+        "On-site": ["On-site", "On site", "Onsite", "In office", "In-office", "In the office",
+                    "In person", "In-person", "Office"],
+        "Hybrid": ["Hybrid"],
+        "Remote": ["Remote", "Fully remote", "Work from home", "WFH"],
+    }
+
+    @staticmethod
+    def _is_arrangement_pref_q(n: str) -> bool:
+        """True if `n` (a normalized label) asks which work ARRANGEMENT the applicant PREFERS —
+        e.g. "Preferred work arrangement", "Do you prefer remote, hybrid, or on-site?", a
+        Remote/Hybrid/On-site select. Distinct from a bare yes/no "Are you open to remote?" (no
+        preference/selection word), which stays answered from open_to_remote."""
+        arrangement = _has(n, "remote", "hybrid", "on site", "on-site", "onsite", "in office",
+                           "in-office", "in person", "in-person", "work arrangement", "work model",
+                           "work setting", "work setup", "work style", "work location", "work mode",
+                           "work type")
+        if not arrangement:
+            return False
+        # "work arrangement/model/setup/mode" is inherently a preference question; otherwise require
+        # an explicit preference/selection cue so "are you open to remote?" doesn't get caught.
+        return _has(n, "work arrangement", "work model", "work setup", "work mode") or _has(
+            n, "prefer", "preference", "preferred", "ideal", "desired", "which", "select",
+            "choose", "arrangement")
+
+    def _preferred_arrangement(self) -> Optional[str]:
+        """The applicant's target work arrangement ("On-site" / "Hybrid" / "Remote") for a
+        preference question, from the profile's `work_arrangement` setting — or None when no
+        preference is set (fall back to legacy open_to_remote behaviour) or when a commutable
+        judgment is needed but unavailable. "in_office_if_commutable" asks Claude whether the
+        posting has a commutable office (cached per posting)."""
+        pref = (self.profile.work_arrangement or "").strip().lower()
+        if pref == "in_office":
+            return "On-site"
+        if pref == "hybrid":
+            return "Hybrid"
+        if pref == "remote":
+            return "Remote"
+        if pref == "in_office_if_commutable":
+            c = self._commutable_office()
+            return "On-site" if c is True else ("Remote" if c is False else None)
+        return None
+
+    def _commutable_office(self) -> Optional[bool]:
+        """Whether THIS posting offers an on-site/hybrid option at an office within the applicant's
+        commute radius of home — Claude-judged from the JD's office location(s) + home + radius.
+        Cached (one call per posting). None when it can't be judged (no home, no JD, generation off,
+        or Claude unavailable), so the caller falls back rather than guessing."""
+        cached = self._commute_cache.get("v", _UNSET)
+        if cached is not _UNSET:
+            return cached
+        result = self._judge_commutable()
+        self._commute_cache["v"] = result
+        return result
+
+    def _judge_commutable(self) -> Optional[bool]:
+        home = (self.profile.location or self.resume.contact.location or "").strip()
+        if not (home and self.jd and self.enable_generation):
+            return None
+        from . import backends  # lazy
+
+        miles = self.profile.max_commute_miles
+        radius = f"up to {miles} miles" if miles else "a reasonable daily commute"
+        prompt = (
+            f"The applicant lives in {home!r} and will commute {radius} for in-person work.\n\n"
+            f"JOB POSTING:\n{(self.jd or '')[:2000]}\n\n"
+            "Does this posting offer an ON-SITE or HYBRID option at an office within that "
+            "commuting distance of the applicant's home? Consider the office location(s) named "
+            "in the posting. A fully-remote-only role, or an office too far to commute to, is NOT "
+            "commutable.\n"
+            'Reply with JSON: {"commutable": true or false}.'
+        )
+        schema = {"type": "object",
+                  "properties": {"commutable": {"type": "boolean"}},
+                  "required": ["commutable"], "additionalProperties": False}
+        try:
+            out = backends.run_claude_cli(prompt, model=self.model, think=False, timeout=60,
+                                          json_schema=schema)
+        except Exception:
+            return None
+        try:
+            val = json.loads(out).get("commutable")
+        except Exception:
+            return None
+        return val if isinstance(val, bool) else None
 
     def _office_hints(self) -> Optional[list[str]]:
         """The ranked office prefs, each expanded with its city-only form ("New York, NY" → also
@@ -433,6 +536,14 @@ class AnswerResolver:
             return _yn(p.us_citizen)
         if _has(n, "relocate", "willing to relocate"):
             return _yn(p.willing_to_relocate)
+        # Preferred work ARRANGEMENT (remote/hybrid/on-site) — answered from the work_arrangement
+        # setting (Claude-judging commutability for "in_office_if_commutable"), so we don't signal
+        # remote for a job whose office the applicant would rather commute to. Checked BEFORE the
+        # bare remote yes/no so "which arrangement do you prefer?" isn't answered from open_to_remote.
+        if self._is_arrangement_pref_q(n):
+            arr = self._preferred_arrangement()
+            if arr:
+                return arr
         if _has(n, "remote", "work remotely"):
             return _yn(p.open_to_remote)
 
@@ -599,6 +710,7 @@ class AnswerResolver:
             "us_citizen": _yn(p.us_citizen),
             "willing_to_relocate": _yn(p.willing_to_relocate),
             "open_to_remote": _yn(p.open_to_remote),
+            "work_arrangement": self._preferred_arrangement(),
             "desired_salary": self._salary_expectation(),
             "earliest_start_date": p.earliest_start_date or None,
             "years_experience": p.years_experience or None,
@@ -664,6 +776,13 @@ class AnswerResolver:
         options vary by company — since we discover roles via online search, prefer
         online/job-board/company-site options, then a generic bucket."""
         n = _norm(label)
+        # Preferred work-arrangement select (Remote / Hybrid / On-site): map our target arrangement
+        # onto whatever wording the form uses. Before the office-location hints since an arrangement
+        # question ("Preferred work location: Remote/Hybrid/On-site") also mentions "location".
+        if self._is_arrangement_pref_q(n):
+            arr = self._preferred_arrangement()
+            if arr:
+                return list(self._ARRANGEMENT_HINTS.get(arr, [arr]))
         # Preferred office location: the ranked office prefs (city-expanded), so the highest-ranked
         # option the form actually offers is the one that matches.
         if _has(n, "office") and _has(n, "preferred", "which", "select", "location", "prefer",
@@ -1070,6 +1189,13 @@ _FORM_FIELD_SIGNAL = (
 _NON_FORM_FRAME = ("recaptcha", "captcha", "googletagmanager", "google-analytics", "doubleclick",
                    "/gtm", "privacycompliance", "content.googleapis", "hcaptcha")
 
+# Accessible name of a control that REVEALS the application form (decision 076). Many ATSs gate the
+# form behind a click: Greenhouse/Lever/Ashby say "Apply"; SmartRecruiters says "I'm interested".
+# `interested` is anchored with a negative lookbehind so a "Not interested" dismiss button can never
+# match. Without this the reveal only clicked "Apply", so a SmartRecruiters posting sat on the
+# posting page until the 25s form-load timeout ("did not load", 0 fields).
+_REVEAL_CONTROL = re.compile(r"\bapply\b|(?<!not )\binterested\b", re.I)
+
 
 def _count_fields(frame) -> int:
     """Number of real (non-hidden) form controls in a frame."""
@@ -1140,7 +1266,7 @@ def _open_application_form(page, ats: str, report: "ApplyReport", timeout_ms: in
         if not revealed:
             for role in ("link", "button"):
                 try:
-                    btn = page.get_by_role(role, name=re.compile(r"\bapply\b", re.I)).first
+                    btn = page.get_by_role(role, name=_REVEAL_CONTROL).first
                     if btn.count() and btn.is_visible():
                         btn.click(timeout=4000)
                         revealed = True
@@ -1397,29 +1523,47 @@ def _commit_option_text(page, loc, chosen: str, query: Optional[str] = None) -> 
     whose text is exactly `chosen`. Deciding an option (a Claude call can take tens of seconds)
     happens with the menu CLOSED — holding a react-select popup open across a subprocess call
     is a staleness race (the menu re-renders, indexes shift, options detach). This re-derives
-    the same option list and commits deterministically by exact text."""
-    if not _open_combobox(page, loc):
-        return False
-    if query is not None:
-        try:
-            loc.fill(query, timeout=4000)
-        except Exception:
+    the same option list and commits deterministically by exact text.
+
+    Then VERIFY the control actually rendered a value: an async list whose results arrive while
+    the click lands re-renders the option node under the cursor, so the click "succeeds" (hits
+    the coordinates) but react-select never registers the select — the field stays EMPTY while
+    we reported it filled (School on a SpaceX dry run: report said option:claude, browser showed
+    blank — decision 080 follow-up). Retry the whole open→type→click up to 3× until the single-
+    value shows; give up with False (caller records it unfilled) rather than claim a false fill."""
+    for _ in range(3):
+        if not _open_combobox(page, loc):
             return False
-        page.wait_for_timeout(900)
-    else:
-        page.wait_for_timeout(250)
-    opts, texts = _open_options_and_texts(page)
-    for i, t in enumerate(texts):
-        if t == chosen:
+        if query is not None:
             try:
-                opts.nth(i).click(timeout=4000)
-                return True
+                loc.fill(query, timeout=4000)
             except Exception:
                 return False
-    try:
-        loc.press("Escape")  # option no longer offered — close cleanly, caller falls through
-    except Exception:
-        pass
+            page.wait_for_timeout(900)
+        else:
+            page.wait_for_timeout(250)
+        opts, texts = _open_options_and_texts(page)
+        clicked = False
+        for i, t in enumerate(texts):
+            if t == chosen:
+                try:
+                    opts.nth(i).click(timeout=4000)
+                    clicked = True
+                except Exception:
+                    return False
+                break
+        if not clicked:
+            try:
+                loc.press("Escape")  # option no longer offered — close cleanly, caller falls through
+            except Exception:
+                pass
+            return False
+        page.wait_for_timeout(200)  # let react-select commit + render its single-value
+        try:
+            if (loc.evaluate(_VALUE_JS) or "").strip():
+                return True
+        except Exception:
+            return True  # can't read the value back — assume the click stuck, don't loop forever
     return False
 
 
@@ -2319,6 +2463,28 @@ def _attempt_submit(page, frame, report: "ApplyReport", gate, solve_captcha=None
                                "text found — verify via the confirmation email")
 
 
+def _detect_manual_submit(page, frame, report: "ApplyReport") -> bool:
+    """A dry-run leaves the filled form open for review; the user may click the site's own Submit
+    button themselves. Return True — and stamp the report as a manually-submitted application — the
+    first time a submission confirmation appears (the same URL/text evidence the armed path trusts,
+    `_confirmation_evidence`). Positive confirmation only, NEVER the weaker "form gone" heuristic,
+    so merely navigating away during review isn't mistaken for a submit. Idempotent: a no-op once
+    the report is already marked submitted (decision 097)."""
+    if report.submitted:
+        return False
+    try:
+        evidence = _confirmation_evidence(page, frame)
+    except Exception:
+        return False
+    if not evidence:
+        return False
+    report.submitted = True
+    report.manual_submit = True
+    report.submit_state = "submitted"
+    report.confirmation = evidence
+    return True
+
+
 def _show_done_banner(page, report: "ApplyReport", ok: bool = True) -> None:
     """Inject a fixed overlay so the watching user gets a clear, visible signal — green when
     fields were filled, red when the form didn't load or nothing filled (with the reason)."""
@@ -2441,7 +2607,9 @@ def _record_run(report: ApplyReport, resume_pdf: str, role: str, company: str,
         status = "blocked"
     else:
         status = "dry-run"
-    method = "auto" if report.submitted else "dry-run"
+    # `manual` = the user clicked Submit themselves during the dry-run review pause (decision 097);
+    # `auto` = the armed bot clicked it; `dry-run` = never submitted.
+    method = ("manual" if report.manual_submit else "auto") if report.submitted else "dry-run"
     m = meta or {}
     company = (m.get("company") or company or "").strip()
     role = (m.get("role") or role or "").strip()
@@ -2552,6 +2720,8 @@ def run_apply(
 
     ats = detect_ats(url)
     report = ApplyReport(url=url, ats=ats)
+    frame = None  # the form's frame — set once the form loads (None on Workday / an early-exit
+    #               path); referenced by the review-pause manual-submit check below.
     done: set = set()  # labels already handled — dedupe across passes + required scan
 
     # The Workday agentic fallback (decision 061) needs the browser to expose a CDP endpoint the
@@ -2577,6 +2747,11 @@ def run_apply(
         ctx = browser.new_context()
         page = ctx.new_page()
         page.set_default_timeout(timeout_ms)
+        # Attribute every Claude call in this fill (screening-question drafting) to this
+        # posting's application row, tagged form-entry, for the Track-tab token view (decision
+        # 087). Popped in the finally so a later call in this thread doesn't inherit it.
+        from . import usage
+        _usage_tok = usage.push_posting((meta or {}).get("source_url") or url, "form-entry")
         try:
             page.goto(url, wait_until="domcontentloaded")
 
@@ -2659,6 +2834,19 @@ def run_apply(
                             pass
             _show_done_banner(page, report, ok=form_loaded)  # visible signal in the browser
 
+            # Surface the filled result to the UI NOW — the moment filling finishes — before the
+            # full-page screenshot, answer-bank learning, tracker write, and archive below. On a
+            # long form those add many seconds (the full-page screenshot dominates), and firing
+            # after them left the "Filled — review" notification lagging well behind the fields
+            # visibly finishing. The web filled-panel shows only report.summary() text — no image
+            # — so moving the callback ahead of the screenshot loses nothing the user sees.
+            print("\n" + report.summary())
+            if on_filled is not None:
+                try:
+                    on_filled(report)  # let the UI surface the result before we hold/close
+                except Exception:
+                    pass
+
             try:
                 page.screenshot(path=screenshot, full_page=True)
                 report.screenshot = screenshot
@@ -2694,14 +2882,6 @@ def run_apply(
                     report.errors.append(f"archive: {type(e).__name__}: {e}")
                     print(f"Note: could not archive the run ({type(e).__name__}: {e}).")
 
-            # Show the result in the terminal the moment filling finishes, before the pause.
-            print("\n" + report.summary())
-            if on_filled is not None:
-                try:
-                    on_filled(report)  # let a UI surface the result before we hold/close
-                except Exception:
-                    pass
-
             if pause:
                 if hold is not None:
                     # Web-driven: release when the caller (e.g. a "Finish" button) sets `hold`
@@ -2717,6 +2897,8 @@ def run_apply(
                             break
                         if not browser.is_connected():
                             break
+                        # Catch a user who clicks the site's Submit while reviewing (decision 097).
+                        _detect_manual_submit(page, frame, report)
                 else:
                     done_note = ("SUBMITTED" if report.submitted
                                  else "DRY RUN — not submitted")
@@ -2725,7 +2907,24 @@ def run_apply(
                               "then press Enter to close… ")
                     except EOFError:
                         pass
+                    # They may have clicked the site's Submit before pressing Enter (decision 097).
+                    _detect_manual_submit(page, frame, report)
+
+            # If the user clicked the site's Submit during the review pause, this is no longer a
+            # dry-run — flip the pre-pause `dry-run` row to a real `applied` application (method
+            # `manual`) and append the submitted attempt to the run log (decision 097). Re-uses
+            # the same upsert `_record_run` did above. Best-effort: never sink an otherwise-complete
+            # run on a tracker error.
+            if record and report.manual_submit:
+                try:
+                    rid, action = _record_run(report, resume_pdf, role, company, meta)
+                    print(f"Tracked: you submitted this application manually — {action} #{rid} as APPLIED.")
+                except Exception as e:
+                    report.errors.append(f"tracker (manual submit): {type(e).__name__}: {e}")
+                    print(f"Note: could not record your manual submit to the tracker "
+                          f"({type(e).__name__}: {e}).")
         finally:
+            usage.pop_posting(_usage_tok)  # restore token attribution (decision 095)
             # Best-effort: the user may have already closed the window, so these can raise
             # "Target/Browser closed" — swallow it so cleanup always completes and
             # sync_playwright() exits, tearing down the driver + Chromium helper processes.

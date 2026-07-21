@@ -345,27 +345,90 @@ def pick_top(matches: list[Match], *, min_fit: int) -> Match | None:
     return matches[0] if matches else None
 
 
+def _tailoring_logic_fingerprint() -> str:
+    """SHA1 over the SOURCE of every module that determines a tailored PDF's content — the prompt
+    and reconstruction (`backends`), catalogue selection (`catalogue`), the length budget
+    (`length`), the tailor orchestration (`tailor`), and the PDF renderer (`pdf`). Any edit to any
+    of them changes this hash, so the reuse-stamp invalidates automatically on ANY tailoring
+    change — no hand-maintained version to forget to bump (the footgun a single `LAYOUT_VERSION`
+    int was). Pinned once at import to the code actually running: a source edit takes effect only
+    after the process restarts, and the fingerprint then reflects the new code, so a restart + a
+    re-prepare (rescan) always re-tailors seen postings with the new logic."""
+    import hashlib
+    from pathlib import Path
+
+    from . import catalogue, length, pdf, tailor
+    h = hashlib.sha1()
+    for mod in (backends, catalogue, length, pdf, tailor):
+        try:
+            h.update(Path(mod.__file__).read_bytes())
+        except OSError:
+            h.update(b"?")  # unreadable source → distinct-but-stable marker, never a crash
+    return h.hexdigest()
+
+
+# Computed once per process, against the loaded (running) tailoring code — see the docstring.
+_TAILORING_LOGIC = _tailoring_logic_fingerprint()
+
+
 def tailor_stamp(resume: Resume, profile: ApplicationProfile, jd) -> str:
     """A content hash of everything that determines a posting's tailored PDF: the résumé, the
     profile links flowed onto the header (LinkedIn/GitHub/portfolio), the JD the résumé is
-    tailored to, AND the tailoring logic itself — the Claude prompt (`backends.SYSTEM_PROMPT`)
-    and the PDF layout (`pdf.LAYOUT_VERSION`). Including the logic means a prompt or layout
-    change invalidates cached PDFs automatically, so a dry run re-tailors instead of silently
-    reusing a PDF built by the old prompt/layout. Stamped beside the PDF so a re-prepare can
-    reuse it when nothing that affects it changed — deliberately ignores the rest of the profile
-    (e.g. learned screening answers), which the fill re-reads fresh but never change the PDF."""
+    tailored to, AND the tailoring logic itself — a fingerprint of every tailoring module's
+    source (`_tailoring_logic_fingerprint`). Including the logic means ANY tailoring change (prompt,
+    selection, length budget, reconstruction, or PDF layout) invalidates cached PDFs automatically,
+    so a re-prepare re-tailors instead of silently reusing a PDF built by the old code. Stamped
+    beside the PDF so a re-prepare can reuse it when nothing that affects it changed — deliberately
+    ignores the rest of the profile (e.g. learned screening answers), which the fill re-reads fresh
+    but never change the PDF."""
     import hashlib
     import json
 
-    from . import pdf as _pdf
     payload = {
         "resume": resume.model_dump(),
         "links": [profile.linkedin_url, profile.github_url, profile.portfolio_url],
         "jd": jd.body or "",
-        "prompt": backends.SYSTEM_PROMPT,
-        "layout": _pdf.LAYOUT_VERSION,
+        "logic": _TAILORING_LOGIC,
     }
     return hashlib.sha1(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+
+def tailor_and_render(resume: Resume, profile: ApplicationProfile, jd, company: str, role: str,
+                      url: str, *, backend: str = "auto", status_cb=None) -> str:
+    """Tailor `resume` to `jd`, render the PDF, write it to the per-posting path with its reuse
+    stamp, run the ATS text-layer check, and return the PDF path. This is the tailor+render half
+    of `run_testing_mode`, extracted so the Track "Re-run → re-tailor" can regenerate a résumé
+    from the saved JD without re-scraping (decision 086). Does NOT write the JD sidecar — the
+    caller owns that (run_testing_mode stores it; a re-tailor already has it)."""
+    from . import usage
+    from .ats_check import verify_pdf
+    from .pdf import render_pdf
+    from .tailor import tailor_resume
+
+    def say(step, message):
+        print(message)
+        if status_cb is not None:
+            status_cb(step, message)
+
+    say("tailor", f"▶ Tailoring résumé for: {company} — {role}")
+    # Attribute this posting's tailoring tokens to its application row (decision 095). The
+    # Claude call inside is tagged activity="tailoring" by the backend.
+    with usage.for_posting(url):
+        result = tailor_resume(resume, jd, backend=backend)
+    print(f"  tailored via {result.backend}" + (f" — {'; '.join(result.warnings)}" if result.warnings else ""))
+    for note in result.tailored.relevance_notes:
+        print(f"  note: {note}")
+
+    say("pdf", "▶ Exporting tailored résumé to PDF…")
+    pdf_resume = resume_with_profile_links(resume, profile)
+    pdf_bytes = render_pdf(pdf_resume, result.tailored)
+    pdf_path = resume_store.write_pdf(pdf_bytes, company, role, url)
+    resume_store.write_stamp(pdf_path, tailor_stamp(resume, profile, jd))
+    print(f"  résumé PDF → {pdf_path}")
+
+    for note in verify_pdf(pdf_bytes, pdf_resume, jd.body or None).notes():
+        say("pdf", f"  {note}")
+    return pdf_path
 
 
 def run_testing_mode(
@@ -397,8 +460,6 @@ def run_testing_mode(
     overrides the reuse and regenerates the résumé even when the stamp matches (the user's
     "re-tailor anyway" escape hatch)."""
     from .apply import AnswerResolver, run_apply
-    from .pdf import render_pdf
-    from .tailor import tailor_resume
 
     def say(step, message):
         print(message)
@@ -422,26 +483,14 @@ def run_testing_mode(
         pdf_path = str(reuse_path)
         say("tailor", f"▶ Reusing tailored résumé (unchanged since last dry-run): {p.company} — {p.title}")
     else:
-        say("tailor", f"▶ Tailoring résumé for: {p.company} — {p.title}")
-        result = tailor_resume(resume, jd, backend=backend)
-        print(f"  tailored via {result.backend}" + (f" — {'; '.join(result.warnings)}" if result.warnings else ""))
-        for note in result.tailored.relevance_notes:
-            print(f"  note: {note}")
-
-        say("pdf", "▶ Exporting tailored résumé to PDF…")
         # Stable, git-ignored, per-posting path (decision 029) — not $TMPDIR, which macOS
-        # purges out from under the Track row's resume_path.
-        pdf_resume = resume_with_profile_links(resume, profile)
-        pdf_bytes = render_pdf(pdf_resume, result.tailored)
-        pdf_path = resume_store.write_pdf(pdf_bytes, p.company, p.title, p.url)
-        resume_store.write_stamp(pdf_path, stamp)
-        print(f"  résumé PDF → {pdf_path}")
-
-        # ATS text-layer check (decision 043): what an ATS parser would actually see in this
-        # PDF — readability of name/email/phone + which JD-requested skills survived tailoring.
-        from .ats_check import verify_pdf
-        for note in verify_pdf(pdf_bytes, pdf_resume, jd.body or None).notes():
-            say("pdf", f"  {note}")
+        # purges out from under the Track row's resume_path. The ATS text-layer check (decision
+        # 043) runs inside the helper.
+        pdf_path = tailor_and_render(resume, profile, jd, p.company, p.title, p.url,
+                                     backend=backend, status_cb=status_cb)
+    # Save the JD beside the PDF (both branches) so a later Track "Re-run → re-tailor" can
+    # regenerate offline against it (decision 086).
+    resume_store.write_jd(pdf_path, jd)
 
     apply_url = p.apply_url or p.url
     say("apply", f"▶ DRY-RUN apply (watch it fill; never submits): {apply_url}")
@@ -450,18 +499,21 @@ def run_testing_mode(
     # fills its midpoint (decision 038) and we opportunistically re-validate any cached estimate
     # for this role against that real band; otherwise pre-compute the dynamic market estimate
     # (Claude + Adzuna, cached) so the resolver never falls back to the static desired_salary.
-    from . import salary
+    from . import salary, usage
     band = salary.advertised_band(p.compensation or None, jd.body or None)
     market = None
     if band:
         salary.validate_against_band(p.title, p.location, band)
     else:
         say("apply", "  no pay band advertised — resolving market salary estimate…")
-        market = salary.estimate(
-            p.title, p.location, profile.years_experience,
-            app_id=os.environ.get("ADZUNA_APP_ID", ""),
-            app_key=os.environ.get("ADZUNA_APP_KEY", ""),
-        )
+        # Attribute the market-estimate Claude call to this posting (decision 095); it's tagged
+        # activity="salary" by salary.estimate.
+        with usage.for_posting(p.url):
+            market = salary.estimate(
+                p.title, p.location, profile.years_experience,
+                app_id=os.environ.get("ADZUNA_APP_ID", ""),
+                app_key=os.environ.get("ADZUNA_APP_KEY", ""),
+            )
         say("apply", f"  salary expectation → {market:,} (market estimate)" if market is not None
             else f"  salary expectation → {profile.desired_salary or 'unset'} (stored; no estimate available)")
     resolver = AnswerResolver(

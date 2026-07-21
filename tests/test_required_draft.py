@@ -30,6 +30,11 @@ def test_is_draftable_required_gates():
     assert not answer_bank.is_draftable_required("What is your expected salary?")
     assert not answer_bank.is_draftable_required("What is your GPA?")
     assert not answer_bank.is_draftable_required("What is your gender?")
+    # Years of experience is a numeric fact the applicant owns: never guessed from the résumé
+    # (a new grad with 0 full-time years was mis-answered "1-5" by counting internships/projects).
+    assert not answer_bank.is_draftable_required(
+        "How many years of experience full time, industry do you have as a software engineer? "
+        "(not counting internships or school work)")
     assert not answer_bank.is_draftable_required("")
 
 

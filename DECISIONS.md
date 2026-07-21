@@ -11,8 +11,22 @@
 
 | # | Date | Decision | Status |
 |---|------|----------|--------|
+| 098 | 2026-07-21 | **The form-reveal click now matches "I'm interested", not just "Apply" — SmartRecruiters postings no longer time out with 0 fields.** A live dry run on `jobs.smartrecruiters.com/Consultadd4/87644936` failed with "Application form did not load within 25s … so no fields were filled" — not the DataDome bot-wall refusal, so the page loaded fine; the form was simply gated behind a control the reveal never clicked. Root cause: decision **076 documented** adding a `_REVEAL_CONTROL` matching SmartRecruiters' **"I'm interested"** button (anchored so "Not interested" can't match), but that code was **never actually committed to `apply.py`** — it lived only in the unrelated in-progress branch that also carries `_bot_wall_evidence`/`_distil_nav` (the source of the standing `test_nav_recipes.py` collection error + `test_parking.py bot_wall` failures). The shipped `_open_application_form` still revealed the form only via `re.compile(r"\bapply\b", re.I)`, so on SmartRecruiters it clicked nothing and polled an empty posting page until the 25s timeout. Fix (surgical, `apply.py` only): a module-level `_REVEAL_CONTROL = re.compile(r"\bapply\b|(?<!not )\binterested\b", re.I)` used in the reveal loop instead of the inline apply-only regex. The negative lookbehind excludes a "Not interested" dismiss button; `\bapply\b` word-boundaries keep "Applied filters" from matching. Deliberately did **not** wire the full nav-recipes learn/replay machinery from 076 (nav_recipes.json is empty and learning needs the off-by-default agentic path) — the reveal-label breadth is the one change that unblocks the reported failure. Rejected special-casing SmartRecruiters (the fix is a general reveal-label, no ATS branch). **Verified**: regex unit-checked (matches Apply/Apply for this Job/I'm interested/I am interested/Interested/Apply now; rejects Not interested/I'm not interested/Applied filters/uninterested); 2 new `tests/test_open_application_form.py` cases (a fake that honors the name regex: "I'm interested" reveals the form and is clicked; "Not interested" is never clicked and times out) + the 2 pre-existing SPA-timing cases still green (4 passed); apply/fill/parking/required/submit suite 93 passed (only the 2 pre-existing `test_parking.py bot_wall` failures + the `test_nav_recipes.py` collection error from the unrelated in-progress branch remain, unchanged). Live end-to-end confirmation flagged for the user's next SmartRecruiters dry run (this environment's egress IP is the DataDome-named one from 076, so it can't drive the real page) | Accepted |
+| 097 | 2026-07-20 | **A submit the user clicks themselves during the dry-run review pause is now tracked as a real `applied` application (method `manual`), not left as a `dry-run` row.** The user's rule: keep it a dry-run *unless the bot or a human actually clicked Submit*, in which case track it as a regular application. The bot-armed click was already covered (`_attempt_submit` → `report.submitted` → `_record_run` writes `applied`). The gap was a **human** click: a dry-run fills the form and leaves the browser open for review; `_record_run` writes the `dry-run` row and the archive *before* the review pause, so a submit the user then clicks was never detected and the row stayed `dry-run`. Fix (surgical to `apply.py`): new `ApplyReport.manual_submit` flag + `_detect_manual_submit(page, frame, report)`, which flips the report to `submitted`/`submit_state="submitted"` the first time a submission confirmation appears — reusing the exact `_confirmation_evidence` (URL `confirmation`/`/thank` or body confirmation text) the armed path already trusts, **positive confirmation only** (never the weaker "form gone" heuristic, so navigating away mid-review is not mistaken for a submit; idempotent once submitted). It's polled every 400 ms inside the web `hold` review loop and once after the terminal review `input()`, so it catches the click regardless of how the user ends the session. After the pause, if `manual_submit`, `run_apply` re-calls `_record_run`, which **upserts the same posting row** (keyed by source URL) from `dry-run`→`applied` and appends the submitted attempt to the run log — the append-only history then shows both the dry-run fill and the manual submit. `_record_run`'s `method` now distinguishes `manual` (human) from `auto` (armed bot) from `dry-run`. `frame` is initialised to `None` up front so the Workday/early-exit paths can reach the pause check safely (`_confirmation_evidence` reads `page.url` regardless of frame). Web "done" message reflects the manual submit ("recorded as Applied") instead of always claiming a dry-run row. **Verified**: new `tests/test_manual_submit.py` (4 cases) — `_detect_manual_submit` flips on a real Chromium click of the local confirm fixture and is a no-op with no confirmation / once already submitted; a re-record after a manual click upserts the dry-run row to `applied`/`manual`, stamps `date_applied`, clears the parked block, and leaves both attempts in the run log; an armed-bot submit still records `method="auto"`. `test_submit.py` (7) green; broader apply/parking/multipage/runner/workday/calibration/usage suites pass (only the pre-existing `test_parking.py` `bot_wall` + `test_nav_recipes.py` failures from an unrelated in-progress branch remain, unrelated to this change). Detection relies on the site reaching a recognizable confirmation page — flagged for end-to-end confirmation on the next live dry run where the user hand-submits | Accepted |
+| 096 | 2026-07-17 | **A combobox commit is now verified to have actually stuck, and the "Filled — review" UI notification fires the moment filling finishes instead of after the screenshot/archive.** Two live-SpaceX (Greenhouse) dry-run bugs. (1) `report.json` recorded `School → "Pennsylvania State University" [option:claude]` but the browser field was blank: `_commit_option_text` clicked the exact-text option in the **async** School react-select (decision 080) and returned `True` on the click alone — but when the search XHR re-renders the option list *as* the click lands, the node is replaced under the cursor, the click "succeeds" at the coordinates yet react-select never fires its select handler, so the field stays empty and we reported a false success (Guideline #7/#11). Fix: after clicking, wait 200 ms and read the control's rendered value via `_VALUE_JS` (react-select `single-value`); empty ⇒ retry the whole open→type→click up to 3×; if it never renders, return `False` so the field is recorded **unfilled** for the user, not a fake `option:claude` fill (can't read the value back ⇒ assume stuck, don't loop). (2) The web "Filled — review" phase (`on_filled`) fired only after `page.screenshot(full_page=True)` + answer-bank learning + tracker write + archive; on a long form the full-page screenshot dominates (many seconds), so the notif trailed the visibly-filled fields by ~a minute. The filled-panel renders only `report.summary()` text (never the screenshot image), so `run_apply` now fires `on_filled` **right after the fill's in-browser done banner**, before those four steps (they still run, just after the UI is told). Cosmetic trade-off: the filled-panel summary loses the "[answer bank] saved…/learned…" line (`_persist_learning` now runs after the callback); the final "done" `_set` still carries the full summary. Surgical to `apply.py`; imports clean; apply/fill/parking/required/combobox suite 72 passed (only the pre-existing `test_parking.py` `bot_wall` + `test_nav_recipes.py` failures from an unrelated in-progress branch remain, failing identically on the clean tree). School-commit fix flagged for end-to-end confirmation on the next live dry run | Accepted |
+| 095 | 2026-07-17 | **The Track table now shows Claude token spend per application, split by activity, with batched-judge/discovery spend as one separate aggregate.** The user asked to see how many tokens each application cost so they can gauge how much Claude is doing (tailoring, form entry, etc.). Every Claude call already funnels through `backends.run_claude_cli`, whose `--output-format json` envelope carries a `usage` block (input/output/cache tokens) + `total_cost_usd` — previously discarded. New `usage.py` captures it via two contextvars: `activity` (WHAT — tailoring/form-entry/judging/enrichment/salary/impact, tagged at the call site or inherited from the block) and `for_posting(source_url)` (WHICH application — set around `pipeline.tailor_and_render` and inside `apply.run_apply`, both keyed on the same posting URL the tracker upserts on). `run_claude_cli` parses the envelope and best-effort writes one row to a new append-only `usage_events` table (`posting_key`, `activity`, in/out/cache tokens, cost) — a logging failure never sinks the Claude call. Attribution is honest: the **fit judge is one batched call over many candidates** (`matching.judge_fit_batch`), so it runs OUTSIDE any `for_posting` block → `posting_key=''` → reported as one separate "discovery & judging" all-time aggregate, **never divided across rows** (user's explicit choice over splitting it per-candidate). `tracker.usage_by_application()` groups events by source URL (with a per-activity sub-map + in/out/cost/calls); `usage_discovery_summary()` aggregates the unkeyed ones; deleting an application cascades its usage by URL so a re-discovered URL never inherits stale tokens. Track tab: a new **Tokens** column shows the compact total (e.g. "3.8k"); clicking it expands an inline sub-row with the in/out split and per-activity breakdown, and a one-line discovery aggregate sits above the table (click to expand its activities). No new dependency; additive schema (migration-free `CREATE TABLE IF NOT EXISTS`). **Verified**: one real `claude` call recorded 390 in/4 out attributed to a posting under `tailoring`; `tests/test_usage.py` (5 cases: activity routing, block-default inheritance, explicit-override, discovery bucket, no-usage no-op, delete-cascade) with synthetic envelopes; the live `/track` HTTP endpoint serves the per-app `tokens` + `usage_discovery` payload; served-page JS `node --check` clean; all touched-module imports + backend/matching/salary/enrich suites green (only the pre-existing `test_parking.py` bot_wall + `test_nav_recipes.py` failures from an unrelated in-progress branch remain) | Accepted |
+| 094 | 2026-07-17 | **Work-location answers are now preference- and commute-aware, driven by a new adjustable `work_arrangement` profile setting — not a single global `open_to_remote` boolean.** In a dry run the bot signalled it would work remotely for a company with NY offices the user is within the posting's 35-mile range of and would rather commute to. Root cause (traced): every work-location question resolved from one boolean — `AnswerResolver.resolve` returned `_yn(open_to_remote)` for anything matching "remote", and `_office_prefs` appended "Remote" whenever `open_to_remote` was set, so an empty `preferred_locations` + `open_to_remote=True` ranked **Remote first** even for a "preferred office location" dropdown on a commutable posting. The boolean can't distinguish *willingness* ("I'm open to remote") from *preference* ("I'd rather be in this office"). Per the user's answers to a design question: (1) make it an **adjustable Profile setting** — new `ApplicationProfile.work_arrangement` (`""`=no preference/legacy · `in_office_if_commutable` · `hybrid` · `in_office` · `remote`) + `max_commute_miles`, surfaced as a Profile-tab dropdown + miles field; (2) decide "commutable" by **Claude judging** the posting's office location(s) from the JD against the applicant's home + radius (`AnswerResolver._commutable_office`, one cached call per posting, best-effort → falls through when unavailable); (3) a bare yes/no "Are you open to remote?" **still answers Yes** (the applicant IS open) — the preference is expressed only on arrangement/preference questions and office-location dropdowns. New `_preferred_arrangement()` maps the setting (+ commutability for `in_office_if_commutable`) to a target arrangement ("On-site"/"Hybrid"/"Remote"); a new `resolve()` branch (guarded by `_is_arrangement_pref_q`, before the bare-remote yes/no) and an `option_hints` branch return it so the form-side dropdown matcher maps it onto the posting's own wording; `_office_prefs` no longer offers Remote for an in-office/commutable preference and ranks Remote first only for a remote preference. `answer_bank.CLASSIFIABLE_TYPES` gains `work_arrangement` (preference) and sharpens `open_to_remote` (willingness) so the semantic classifier separates them. **Verified**: 13 new tests in `tests/test_work_arrangement.py` (bare yes/no unchanged; each explicit preference; commutable→On-site / non-commutable→Remote via a patched Claude; one cached commutability call per posting; unknown→falls through; the office-dropdown Remote-ranking bug fixed) + profile save/load round-trip of the two new fields (int coercion, empty→None) + served-page JS `node --check` clean + `web.py` imports; related apply/answer suite green (only the pre-existing `test_parking.py` bot_wall failures + `test_nav_recipes.py` collection error, both from an unrelated in-progress branch change, remain) | Accepted |
+| 093 | 2026-07-16 | **Years-of-experience is a numeric fact the applicant owns — never guessed from the résumé; set the profile to reflect new-grad status.** In a dry run, a required dropdown "How many years of experience full time, industry… (not counting internships or school work)" was autofilled **"1 - 5 years"** for the user, a new grad with **0** full-time non-internship years. Root cause (traced, not guessed): the user's `profile/application_profile.yaml` had `years_experience: ''`, so `AnswerResolver.resolve` returned None; because the field is a **required** dropdown, the fallback `answer_bank.choose_required_option` asked the weak Claude model to pick the option "TRUE per the résumé" — and it counted résumé internships/projects as experience, picking 1-5 despite the question's explicit "not counting internships." This is exactly the confident-wrong-guess failure the codebase already blocks for salary/GPA/test-scores via `_NUMERIC_FACT`. Two complementary fixes: **(1) code** — added `"years of experience"`/`"years experience"` to `answer_bank._NUMERIC_FACT`, so `is_draftable_required` and `is_open_ended` return False and the field is **captured for the user** instead of guessed when the profile value is blank; the `valid_mapping`/classify path to the `years_experience` structured type is unaffected, so a *set* profile value still answers it. **(2) data** — set `years_experience: '0'` in the profile so `resolve` now returns `'0'` deterministically (→ maps to the "0-1 years"/"less than 1 year" option) and never reaches the guessing path. Chosen over leaving it blank-and-captured-only (the user shouldn't have to hand-answer every years question) and over drafting-from-résumé (fabrication of a fact the applicant owns). **Verified**: `is_draftable_required`/`is_open_ended` now False for the exact reported question while `valid_mapping(q,'years_experience')` stays True; `resolve` returns `'0'` with the set profile and `None` when blank; added a regression case to `tests/test_required_draft.py`; test_required_draft/test_required_dropdown/test_determinism_gates green (23 passed) | Accepted |
+| 092 | 2026-07-16 | **Tailoring now closes an ATS feedback loop: a deterministic "dummy ATS" built from the JD grades each draft, and drops are re-tailored back in (bounded).** The user asked to optimize tailoring for the posting's ATS and "test against a dummy ATS based on the job description we pulled." Evaluated the referenced repo `sauravhathi/atsresume` first: it is a Next.js résumé-builder UI whose "ATS scoring" is only an outbound link to resumego.net — no scoring logic to reuse, and its résumé schema/template we already cover (`models.py`, `render.py`, `pdf.py`, `ats_check.py`). We already had both halves of the ask: `ats_score.py` (deterministic 0–100 pre-score from the JD) and `ats_check.py` (post-export PDF text-layer keyword coverage). The **gap** was that tailoring was one-shot — the dropped-keyword signal only became an advisory note, never fed back. Chosen (user-approved from an options table): **deterministic** keyword+knockout extraction (no per-JD Claude call) + a **bounded retry** loop. New `ats_requirements.py`: `extract(resume, jd)` → required keywords (`relevance.skill_terms(base)` ∩ JD mentions — the same honest universe `ats_check` uses, so the loop can never chase a skill the candidate lacks) + knockouts (years/degree evaluated against the résumé via `ats_score` parsers; security-clearance / citizenship-or-no-sponsorship detected via conservative regex and flagged as unverifiable blockers). `grade(resume_text, requirements)` → `AtsGrade` (keyword score 0–100, present/missing, knockout verdicts; `passed` gates on any failed knockout, mirroring a real ATS auto-reject). `tailor_resume` now grades the rendered draft and, for non-deterministic backends only, re-tailors up to `_MAX_RETAILOR=2` times feeding the exact missing keywords back as backend `emphasis` — stopping the instant a pass fails to shrink the gap (never regresses, never wastes Claude calls). The rules engine is skipped (deterministic → a retry yields the same output). The grade is appended to `relevance_notes`, so CLI/web/pipeline all display it with no per-surface change; `TailorResult.ats_grade` carries the structured verdict. Grading targets the rendered résumé text (not a fresh PDF per pass) for speed; the existing `verify_pdf` stays as the final post-export text-layer safety check. Backend signature change: `tailor(..., emphasis=None)` on the Protocol + both backends (rules ignores it). **Verified**: new `tests/test_ats_requirements.py` (6 cases) + full offline end-to-end `tailor_resume` on the real xAI JD (grade 100/100, years knockout evaluated, grade note surfaced) + a stub-backend test proving the loop detects a dropped keyword, feeds it back as emphasis, adopts the improved draft, and reaches 100; 60 related tests (tailor/backend/ats/cli/web) pass, no regression | Accepted |
+| 091 | 2026-07-16 | **Track table columns are now drag-to-reorder, persisted per browser alongside the existing width/visibility prefs.** The user wanted to drag and reorder Track-table columns. The table already had per-browser column widths (`ab_track_colw`), show/hide (`ab_track_hidden`), and edge-drag resize; order was fixed by the `TRACK_COLS` array. Added a third localStorage pref `ab_track_order` (array of column keys) and an `orderedCols()` resolver that renders `TRACK_COLS` in the saved order, then appends any key not in that order in its canonical position — so a stale saved order can never drop or duplicate a column when `TRACK_COLS` changes (a newly added column just shows up at its default spot). `visibleCols()` now filters `orderedCols()` instead of raw `TRACK_COLS`, so order + hide compose. Each `<th>` is `draggable` (grab cursor; `.dragging` dims the source, `.dropto` shows an inset accent insertion bar on the target); HTML5 dragstart/dragover/drop handlers call `reorderCol(from,to)`, which moves the dragged key to sit directly before the drop target, saves, and re-renders. The resize handle's `mousedown` already `preventDefault()`s, which suppresses the native drag, so grabbing the right edge still resizes and never starts a reorder. "Reset columns" now also clears the order. All in `web.py`; no endpoint, schema, or data-flow change, no new dependency. **Verified**: `node --check` clean on the served page JS; unit-tested `orderedCols`/`reorderCol` in node — moves land correctly and a stale order referencing a removed key plus missing new keys yields no dupes, no drops, new columns appended in canonical position; `import applicationbot.web` clean; server boots and serves `/` 200 | Accepted |
+| 090 | 2026-07-16 | **Backfill the per-PDF JD sidecar for pre-existing tracked rows so the Track "Re-tailor ▶" button appears for them — resolving decision 088's "reuse-only until re-dry-run once" caveat.** The user reported they still couldn't find where to re-run a dry run with résumé retailoring. Root cause, confirmed against the real DB (not guessed): the Track "Re-tailor ▶" button (decision 088) is gated on `resume_store.has_jd(resume_path)`, and **all 17 dry-run rows had `has_jd=False`** — every one predates the JD sidecar (086/088), so only "Re-run ▶" (reuse) ever rendered. The CLI fallback `scripts/retailor_tracked.py` reads the JD from the rolling discovery cache, which had since rolled over: only **1 of 17** rows (id 22, Stripe) was still cache-fresh. So 16 rows had no reachable re-tailor path at all. The user chose backfilling sidecars (over always showing the button + re-fetching the JD live at re-tailor time) so the existing gate stays honest — the button appears only when a JD is truly on disk. Added `scripts/backfill_jd.py` (Guideline #8, idempotent): for each `dry-run`/`tailored`/`blocked` row **missing** a sidecar (per the user's explicit instruction, it fetches only when one doesn't already exist — never overwrites), it obtains the JD **cache-first** (`profile/discovery_cache.json`, no network, exact bytes) then falls back to a **live re-fetch** of `source_url` via `enrich.fetch_full_jd(url, llm=claude_llm_extractor)` (the same json-ld→css→llm cascade discovery uses), and writes it with `resume_store.write_jd`. A row whose JD can't be obtained either way is reported FAILED (posting removed / nothing extractable), never silently skipped. This does **no** tailoring and touches no résumé — it only attaches the JD so decision 088's button can light up. **Verified end-to-end on the real DB**: cache path (id 22, 4366 chars via cache) and live-fetch path (id 6 Stripe, 4446 chars via llm) both write a valid sidecar; re-running id 22 reports HAVE and leaves it untouched (idempotent); `--all` wrote 15, already-had 3, **failed 0** — every one of the 17 dry-run rows now has `has_jd=True`, so "Re-tailor ▶" now renders for all of them on the next `/track` load. **Flagged honestly:** one sidecar came back thin — MARGO (id 9, 93 chars) — too short to tailor meaningfully; re-tailoring that row will produce a weak résumé until a fuller JD is captured (the other 16 are 1.2k–13k chars). Complements `retailor_tracked.py`, which can now also use `read_jd` for any saved-JD row | Accepted |
+| 089 | 2026-07-16 | **Dashboard deslop pass driven by ibelick/ui-skills `baseline-ui` — Track table + Discover checkbox labels; behavior-preserving CSS/HTML in `web.py`.** The user asked to "install github.com/ibelick/ui-skills and use it to improve the dashboard." Clarified (told to user): `ui-skills` is an npm CLI (`npx ui-skills get <skill>`) that serves design-guidance skill docs to an AI agent — there is nothing to add as a runtime dependency to our zero-dep stdlib `http.server` UI; pulled ibelick's own `baseline-ui` "deslop" ruleset and applied it as an audit. Audited all four tabs live (Playwright screenshots, light + dark). **Review and Profile were already clean** (sentence-case field labels, empty states with a clear action) and were left untouched (Guideline #7 / Karpathy surgical — no manufactured churn). Two real `baseline-ui` violations fixed: **(1) Discover** — the auto-apply-loop "Re-prepare postings…" / "Re-tailor from scratch" checkboxes rendered as ALL-CAPS letter-spaced *paragraphs* because the global `label{text-transform:uppercase;letter-spacing:.03em}` bled onto the long descriptive `.loop-rescan` labels (unlike `.chkrow`/`.fld label`, which already opt out); fix = `.loop-rescan{text-transform:none;letter-spacing:normal;font-weight:400}` (baseline-ui: never uppercase body text). **(2) Track table** — `table-layout:fixed` + `width:auto` let the three native `<input type=date>` cells (hard ~138px min-width) hog space while text columns collapsed to 53–83px (`dr…`, `Te…`, `Consult…`). Three compounding fixes: (a) `.ttable{width:max-content}` so fixed layout honors each `<col>` width and overflows into the existing `.twrap` horizontal scroll instead of squeezing; (b) new `dateCell()` renders dates as plain tabular text (muted `—` when empty) and swaps in a real date input on click — saves on change, reverts on blur — mirroring the existing `urlCell` idiom; kills the empty-picker-in-every-row noise and reclaims ~300px (date col defaults 120→104); (c) status renders as a **badge** — `<select class="stcell st-*">` styled as a rounded pill tinted from its own status color via `color-mix(in srgb, currentColor 14%, transparent)`, still inline-editable; empty text cells get a `—` placeholder. No save endpoints, editability, or data flow changed; no new dependency. **Verified**: Playwright screenshots of all four tabs in light + dark — Track now shows full Company/Role/Location, colored status badges, and `—` for empties; 57 date buttons (19 rows × 3), 20 rendered as `—`, filled as MM/DD/YYYY, click swaps to a working date input; Discover checkboxes read as normal sentence case; `node --check` clean on the page JS | Accepted |
+| 088 | 2026-07-16 | **Track "Re-run" lets you choose reuse-résumé vs re-tailor; re-tailor regenerates from a saved per-PDF job-description sidecar — resolving decision 086's structural follow-up.** The user wanted to decide, per re-run, whether to reuse the stored résumé or regenerate it. Re-tailoring needs the JD, which wasn't persisted per posting (decision 086 point 3, whose follow-up asked exactly for this). Chosen over re-fetching the JD from the posting URL (network-dependent, can fail on expired/changed postings): each dry-run now saves the JD to a `<pdf>.jd` JSON sidecar beside the tailored PDF (`resume_store.write_jd/read_jd/has_jd`, mirroring the `.stamp` sidecar; pruned/deleted with its PDF). `run_testing_mode`'s tailor+render half is extracted to `pipeline.tailor_and_render(resume, profile, jd, company, role, url)` (behavior-preserving) and reused by the re-run path. Track shows "Re-run ▶" (reuse; fast, no Claude) always, plus "Re-tailor ▶" only when `has_jd` is true — `_reapply_worker(retailor=True)` reads the saved JD and re-tailors against the user's CURRENT base résumé/prompt/layout (picking up 087's logic fingerprint), writes a fresh PDF (overwriting per-posting path), then fills; the `/track/resume` `Cache-Control: no-store` from 086 makes the new PDF actually display. `has_jd` is surfaced per row in `/track`; `retailor` threads `/parked/reapply`→`start_reapply`→`_reapply_worker`. Caveat (told to user): the pre-existing dry-runs predate the sidecar so they show reuse-only until re-dry-run once; a re-tailor with no saved JD returns an actionable error. Complements cursor's `scripts/retailor_tracked.py`, which can now use `read_jd` to re-tailor ANY saved-JD row, not just cache-fresh ones. **Verified**: JD sidecar write/read/has_jd round-trip; `tailor_and_render` (Claude+render stubbed) writes PDF+stamp; `/track` returns `has_jd`; drove the Track tab headless — with one seeded JD, exactly one "Re-tailor ▶" renders (on that row, not on JD-less rows); page JS `node --check` clean; 357 passed, 2 pre-existing `test_parking.py` bot_wall failures unrelated (updated that file's `start_reapply` mock for the new `retailor` kwarg) | Accepted |
+| 087 | 2026-07-16 | **Guarantee tailoring changes always show after a restart+rerun: the reuse-stamp now fingerprints the tailoring code's SOURCE, not a hand-bumped version.** The user asked to be sure future résumé-tailoring changes show immediately on a rerun. Decision 082's stamp caught prompt edits (content-hashed `SYSTEM_PROMPT`) but gated layout on a manual `pdf.LAYOUT_VERSION` int (forget to bump it → stale résumé) and caught NOTHING in `length`/`catalogue`/`tailor` (e.g. a `line_chars` or selection-cap change silently no-op'd). Replaced both with `pipeline._tailoring_logic_fingerprint()` — a SHA1 over the source bytes of every module that determines a tailored PDF (`backends`, `catalogue`, `length`, `pdf`, `tailor`) — folded into `tailor_stamp` as one `logic` key. ANY edit to any of them changes the stamp, so a re-prepare re-tailors; nothing to remember. Computed once at import so it's pinned to the code actually running (Python needs a process restart for a source edit to take effect anyway), which is why the guarantee is precisely "restart the dashboard, then rerun". Over-invalidation (a comment-only edit forces a re-tailor) is the deliberate safe direction — the user prioritized "changes always show" over saving the occasional Claude call, and a real submit always re-tailors regardless. Removed the now-redundant `LAYOUT_VERSION`. **Caveat kept honest**: this makes the *reuse gate* re-tailor, but the normal loop still skips already-seen postings (`only_new=True`, decision 086) — seen postings refresh only via the "Re-prepare postings I've already seen" rescan (or `scripts/retailor_tracked.py`); NEW postings always get the current logic. **Verified**: the live fingerprint matches a hand-recomputed hash of the five module sources and changes on any source edit; the Stripe row 22 on-disk stamp no longer encodes the current logic → its reuse gate now re-tailors; 24 pipeline/pdf/tailor/length/web/track tests green | Accepted |
+| 085 | 2026-07-16 | **Keep one tailored résumé per posting (overwritten on re-tailor); do NOT snapshot a résumé per run.** Asked whether each dry run should preserve its own viewable résumé, the user chose to keep the current storage. The tailored PDF path is keyed on the posting URL only (`resume_store.path_for` = `sha1(source_url)[:8]`), so every run of a posting resolves to the same file and overwrites it. Consequence, accepted as fine: when a re-run reuses the cached PDF (decision 082 stamp matched — unchanged JD/prompt/layout) every run's résumé is byte-identical, so the run-history "résumé ↗" link (→ `/track/resume?id=`, the posting's current PDF) correctly shows what each run used; when a re-run re-tailored, the new PDF overwrites the old, so an older run's résumé is not recoverable. Rejected the alternative — content-addressed per-run snapshots (`<name>-<contentHash>.pdf`, identical runs dedup to one file, differing runs each keep their own) — because it grows disk (one PDF per distinct tailoring) for a case the user doesn't need to revisit. No code change: the run-log's `resume_path` and the résumé link already point at the single per-posting PDF | Accepted |
 | 084 | 2026-07-16 | **Track tab: the "Dry-run" date shows the LATEST run, and each posting expands to a per-run history log.** Follow-up to decision 083. Two changes. (1) **Latest, not first**: `apply.py._record_run`'s update path (a re-run of an already-tracked posting keeps status `dry-run`, so the tracker's stamp-once auto-stamp never fires) now explicitly sets `date_dry_run = today` on every dry-run outcome — so the column reflects when the posting was *last* dry-run filled; a plain field edit still never moves it (rejected surfacing `updated_at` for exactly that drift, 083). (2) **Per-run history**: a new append-only `application_runs` table (one row per apply run: `application_id`, denormalized company/role/portal/source_url, `outcome` dry-run/blocked/applied, `resume_path`, `detail`, `ran_at` datetime) records every `_record_run`; the `applications` table stays one-row-per-posting (dedup/funnel/ready-to-apply loop unchanged — the user chose this over one-Track-row-per-run, which would inflate the funnel and duplicate postings). Track shows a "Runs" column with an "N runs ▾" toggle that lazy-loads `/track/runs?id=` into an inline sub-row (timestamp · outcome · fill summary · résumé link); 0 runs → "—". `delete_application` cascades to the run log; a one-time migration seeds one run per pre-existing dry-run posting from `created_at`+`notes` (defensive SELECT: references only columns an old schema actually has, so it can't fail on a partially-migrated DB — the bug the parking migration test caught). **Verified end-to-end**: temp-DB insert+re-run logs 2 runs on 1 posting and refreshes the date, notes byte-identical; real DB seeded 17 runs (prefix normalized); `/track` returns `run_count`, `/track/runs` returns the log; drove the Track tab headless (Chromium) — "Runs" column renders, "1 run ▾" expands to `2026-07-16 11:29:29 · dry-run · 26 field(s) filled… · résumé ↗`, re-click collapses; page JS `node --check` clean; 356 passed, only the 2 pre-existing `test_parking.py` bot_wall failures (confirmed identical on a `git stash` clean tree) + the unrelated nav_recipes collection error | Accepted |
 | 083 | 2026-07-16 | **Track tab shows when each dry run ran via a dedicated `date_dry_run` column, not the generic `updated_at`.** The user wanted to see when dry runs happened; the DB stored the time only in `created_at`/`updated_at`, neither surfaced. A dry-run row leaves `date_applied` blank and `date_discovered` only marks when the posting was found — so nothing on the Track tab said when the form was actually dry-run filled. Fix mirrors the existing `date_applied` precedent: new `date_dry_run` column auto-stamped `date.today()` whenever a row's status is/becomes `dry-run` (in `tracker.add_application` + `update_application`), a Track-tab "Dry-run" column (between Discovered and Applied) rendered as an editable date input like the others, and a one-time migration that ALTERs the column in and **backfills** existing dry-run rows from `substr(created_at,1,10)` so the 17 pre-existing dry-run rows show a real date, not a blank. Chosen over surfacing `updated_at` (rejected: it's bumped by any field edit, so it drifts from the true dry-run time). Shows the **latest** dry-run (per the user's follow-up, decision 084 wires the re-run refresh in `apply.py`); a plain field edit never moves it. No new-code path in apply.py for the first stamp — dry-run rows are created via `add_application`, which now stamps. **Verified**: fresh dry-run insert, discovered→dry-run flip, and applied-row (no stamp) all correct on a temp DB; real DB migrated + all 17 dry-run rows backfilled (Stripe 2026-07-16, Ramp 2026-07-14, …), 0 blank; `/track` API returns the field; funnel/calibration/runner/web-CSRF suites (50) green (2 pre-existing `test_parking.py` bot_wall failures + nav_recipes collection error unrelated) | Accepted |
+| 086 | 2026-07-16 | **Why a re-tailor still showed the old résumé: the normal loop never revisits seen postings, `/track/resume` was browser-cacheable, and JDs aren't persisted per PDF — plus a re-tailor script.** After decisions 081/082 the user re-ran a Stripe dry run repeatedly and still saw the old résumé. Three separate causes, found by evidence not guessing: (1) **primary** — the normal loop calls `discover_and_match(only_new=True)` (`web.py` `_loop_worker`), which returns only postings never judged before, so an already-tracked posting is never re-processed and its PDF is never rewritten (proved: every stored Stripe PDF's mtime predated the code change; re-tailoring only happens on the opt-in **rescan** path); (2) **latent** — `/track/resume` streamed the PDF with no `Cache-Control`, and its URL is a stable `?id=<row>`, so even once a PDF is overwritten in place the browser's viewer serves the cached old bytes — fixed by adding `Cache-Control: no-store` to that response; (3) **structural** — the JD is not persisted per PDF/row, so only rows whose JD is still in the rolling discovery cache can be re-tailored offline (1 of 18 tracked rows here). Added `scripts/retailor_tracked.py` (Guideline #8): re-tailors tracked rows whose JD is still cached with the CURRENT code, overwriting the stored PDF + stamp in place; idempotent (skips when the stamp already matches unless `--force`); reports rows it can't re-tailor rather than silently skipping. **Verified end-to-end on the user's real Stripe posting** (row 22, Technical Support Engineer, `--backend auto`): regenerated via claude-code, and the new PDF's extracted text confirms all three earlier changes now render — experience order `Ninth Wave → Jaguar → Kumon` (software above tutoring), preserved metrics (`1M+ transactions/100% faster`, `618 postings/0 errors`, `~11,100 lines`, `$170K+ sales`, `20% wait-time cut`), 34pt margins, 1 page. Follow-up logged: persist each posting's JD (or the tailored structured data) beside its PDF so ANY tracked row can be re-rendered after a logic change, not just cache-fresh ones. Suites: web/pipeline/tracker/stamp 13 passed | Accepted |
 | 082 | 2026-07-16 | **The tailoring reuse-stamp must include the tailoring LOGIC (prompt + PDF layout), not just the data — otherwise prompt/layout changes silently no-op.** Surfaced by decision 081: after changing the tailoring prompt and PDF margins, a Stripe dry run showed an unchanged résumé in the tracker. Root cause: a dry run reuses the stored per-posting PDF (`profile/tailored/<…>.pdf`) whenever its `.stamp` sidecar matches (`pipeline.run_testing_mode`, decision 069), skipping the Claude tailor call AND the PDF render. But `pipeline.tailor_stamp` hashed only résumé + profile links + JD — NOT the prompt or the renderer — so a logic change left the stamp identical and served the stale PDF. Fix: fold `backends.SYSTEM_PROMPT` and a new `pdf.LAYOUT_VERSION` constant (bumped on any layout change; started at 2 for the 081 margin/header change) into the stamp payload, so any prompt or layout edit invalidates every cached PDF automatically and the next dry run re-tailors — no manual "Re-tailor from scratch" checkbox needed. Prompt is hashed by content (auto-invalidates on edit); layout uses a hand-bumped version (renderer code can't be content-hashed cheaply). A real armed submit already always re-tailors, so submissions never rode on a stale artifact — this only affected the dry-run preview. Immediate unblock that already existed: the loop panel's "Re-tailor from scratch" checkbox (`force_retailor`). **Verified**: toggling either `SYSTEM_PROMPT` or `LAYOUT_VERSION` changes the stamp hash; pipeline/stamp/store suites green (11 passed); full suite 357 passed (2 pre-existing `test_parking.py` bot_wall failures + nav_recipes collection error unrelated, confirmed failing on a clean tree) | Accepted |
 | 081 | 2026-07-16 | **Tighten résumé tailoring: preserve existing metrics + slightly narrower margins.** The user reported "not seeing enough quantifiable metrics" in tailored résumés. Root cause is NOT a thin source — the base résumé is dense with real figures (1M+ transactions, ~70% latency cut, 5× latency, 618 postings/0 errors, 40+ screening questions, etc.); tailoring was dropping/softening them. Since numbers can only be fabricated at the cost of truthfulness (Guideline #7 / safety), the fix strengthens **preservation**, not the anti-fabrication guard: the `SYSTEM_PROMPT` QUANTIFY rule now makes keeping a base bullet's number the model's FIRST duty (rephrase words freely, never drop the metric), and directs it to lead each entry with its most-quantified job-relevant bullet and prefer metric-bearing bullets when the length budget forces a cut — the "use only base-résumé numbers, truthful-no-metric beats fabricated" guard is kept intact. **Experience ordering** is now explicitly relevance-first with recency as the tiebreak: the prompt directs the model to rank experience by relation to the posting (a matching domain outranks an unrelated one regardless of dates — a software role above tutoring/retail for an SWE job) and only break ties among comparably-relevant entries by recency (most recent nearer the top); same rule for projects/activities. Formatting: PDF page margins reduced 42/40/42 → 34/34/34 pt (`pdf._Resume`, epw 528→544pt) for a slightly wider text column; `LengthBudget.line_chars` default 100 → 103 to match the wider column so "fill the line" guidance stays accurate (bullets don't leave a ~3% sliver empty). **Header overflow fixed**: the contact name/details were rendered with a fixed-size `cell`, which neither wraps nor shrinks — a contact line wider than the column (sample = 610pt vs 544pt usable) overprinted ~33pt past each page edge. New `pdf._fit_font` picks the largest Helvetica size that fits the content width (name 20→floor 12pt, contact 9→floor 6.5pt), so the header can never spill past the margins. No schema/interface change. **Verified**: sample résumé renders 1 page at the new margins with the contact line shrunk 9→8pt to fit (542≤544pt) and name held at 20pt; profile résumé unchanged (contact already fit at 9pt); prompt/budget wiring confirmed (line_chars=103, preserve-metrics + relevance-first-experience blocks present); 23 pdf/tailor/length/render tests green | Accepted |
 | 080 | 2026-07-16 | **A searchable combobox the batch declined still gets its round-2 typeahead Claude pick — so the school picker prefers the MAIN campus, not a branch (decision-033/079 follow-up).** After decision 079 fixed School submitting empty, it committed via the `substring` fallback (first fuzzy match) rather than the Claude pick that's meant to prefer the primary campus. Root cause, found by driving the live SpaceX Greenhouse form: the School react-select is an **async search** whose OPEN list is the **first 60 schools alphabetically** (Acadia, Adamson… — never the applicant's), and typing `Pennsylvania State` returns `Pennsylvania State University` **and** `…- Schuylkill Campus`. Round 1 defers a batch pick over the alphabetical open list; the batch (correctly) declines it — but `_resolve_pending` marked the label `picks_done`, and `picks_done` gated **both** Phase 1's static open-list pick **and** Phase 2b's article-stripped typeahead pick. So round 2 skipped Phase 2b (the one built for async school pickers, told to prefer the main campus) and fell through to Phase 2c's substring fallback, which takes the first fuzzy match — a branch campus if the async lists it first. Fix: split the gate — Phase 2b now runs on `gen_on` (generation + a value), **not** `use_claude` (which still respects `picks_done`), because Phase 2b's options come from the per-query async results, not the open list the batch already saw. Phase 1's static re-ask stays suppressed (no wasted calls); a genuinely static undecidable dropdown types to zero options in Phase 2b and makes no extra call. Rejected freeing `picks_done` wholesale (would re-ask Phase 1's static pick every round 2). **Verified live on SpaceX**: School commits `Pennsylvania State University` (main) via the Claude typeahead. New async-picker fixture + two-pass test lists the branch campus first and fails without the fix (`'…- Schuylkill Campus'`, `source=substring`), passes with it (`main`, `source=option:claude`); combobox/two-pass/required-dropdown/multipage/fillability/lever/determinism suites green | Accepted |
@@ -3751,6 +3765,153 @@ time is the separate decision-033 follow-up, not folded in here.
 
 ---
 
+## 088 — Track "Re-run": choose reuse vs re-tailor; re-tailor from a saved per-PDF JD sidecar
+
+**Context.** The user wanted, when re-running a dry run, to decide whether to **reuse** the stored
+résumé or **re-tailor** a fresh one. The Track "Re-run ▶" always reused (`_reapply_worker` re-drove the
+fill with `app['resume_path']`, never re-tailoring). Re-tailoring needs the job description — and the
+tracker never persisted it per posting. This is exactly the structural gap decision **086** identified
+(point 3) and whose follow-up asked to "persist each posting's JD beside its PDF"; this decision
+implements that.
+
+**JD source — saved sidecar, not re-fetch.** Offered the choice, the user picked saving the JD over
+re-fetching it from the posting URL (which re-scrapes and fails on expired/changed/blocked postings).
+Each dry-run now writes a `<pdf>.jd` JSON sidecar (`{body, meta}`) beside the tailored PDF —
+`resume_store.write_jd/read_jd/has_jd`, mirroring the existing `.stamp` sidecar and pruned/deleted with
+its PDF. `run_testing_mode` stores it in both the reuse and fresh branches, so even a reused-PDF posting
+gets its JD saved.
+
+**Shared tailor helper.** `run_testing_mode`'s tailor→render→write→stamp→ATS-check block is extracted
+verbatim to `pipeline.tailor_and_render(resume, profile, jd, company, role, url)` (returns the PDF path)
+so the re-run path can regenerate a résumé the same way the first dry-run did. The helper does not write
+the JD sidecar — its caller owns that (a re-tailor already has the JD).
+
+**Flow + UI.** `_reapply_worker(retailor=True)` reads the saved JD (`resume_store.read_jd`), calls
+`tailor_and_render` against the user's **current** base résumé/prompt/layout (so it picks up decision
+087's logic fingerprint), writes a fresh PDF at the per-posting path, then fills. `retailor` threads
+`/parked/reapply` → `start_reapply` → `_reapply_worker`. Track shows "Re-run ▶" (reuse; fast, no Claude)
+on every dry-run row, plus "Re-tailor ▶" **only when `has_jd`** is true (surfaced per row in `/track`),
+so the button appears only when it can run offline. Decision 086's `Cache-Control: no-store` on
+`/track/resume` is what makes the freshly-overwritten PDF actually display instead of a cached copy.
+
+**Rejected / caveats.** Re-fetching the JD (rejected, above). Pre-existing dry-runs have no sidecar (they
+predate it), so they show reuse-only until re-dry-run once; a re-tailor with no saved JD returns an
+actionable error, not a crash. Complements cursor's `scripts/retailor_tracked.py` — it can now read the
+sidecar to re-tailor ANY saved-JD row, not only rows whose JD is still in the rolling discovery cache.
+
+**Verified.** JD sidecar write/read/`has_jd` round-trip; `tailor_and_render` with `tailor_resume`+
+`render_pdf` stubbed writes the PDF + stamp and returns its path; `/track` returns `has_jd` per row
+(true only for a seeded posting). Drove the Track tab headless (Chromium): with one seeded JD sidecar,
+exactly one "Re-tailor ▶" button renders — on that row (id 22), not on JD-less rows (17 "Re-run"
+buttons, 1 "Re-tailor"). Page JS passes `node --check`. Full suite (minus the unrelated
+`test_nav_recipes.py` collection error) = **357 passed**; the only failures are the 2 pre-existing
+`test_parking.py` bot_wall tests. One test needed updating for the new kwarg — `test_parking.py`'s
+`start_reapply` mock lambda now accepts `retailor=False` (the endpoint passes it); the cross-origin
+behavior it checks is unchanged.
+
+---
+
+## 087 — Guarantee tailoring changes show after a restart+rerun: fingerprint the tailoring source
+
+**Context.** Follow-up to the user's request: make sure *future* résumé-tailoring changes show
+immediately on a rerun, not just this one. Decision 082 had folded the tailoring logic into the
+reuse-stamp, but partially: the Claude prompt was content-hashed (`backends.SYSTEM_PROMPT`, so prompt
+edits auto-invalidate), while the PDF layout was gated on a hand-bumped `pdf.LAYOUT_VERSION` integer,
+and changes to `length` (e.g. `line_chars`, the per-section caps), `catalogue` (selection), or
+`tailor` (orchestration) were not captured at all. Two live footguns: forget to bump `LAYOUT_VERSION`
+after a render change, or edit any of those other modules, and the stamp stays identical → the dry-run
+reuse gate serves the stale PDF — exactly the "nothing changed" symptom, re-armed.
+
+**Decision.** Replace the prompt-string + manual-int scheme with `pipeline._tailoring_logic_fingerprint()`:
+a SHA1 over the **source bytes** of every module that determines a tailored PDF's content —
+`backends`, `catalogue`, `length`, `pdf`, `tailor`. It is folded into `tailor_stamp` as a single
+`logic` key (alongside résumé/links/JD). Any edit to any of those modules changes the fingerprint, so
+the stamp changes, so a re-prepare re-tailors — with nothing to remember to bump. `LAYOUT_VERSION` is
+removed as redundant.
+
+**Why import-time, and what "immediately" means.** The fingerprint is computed once as a module-level
+constant, against the loaded (running) modules' source files. Python doesn't hot-reload edited source
+into a running process, so a tailoring change only takes effect after the dashboard restarts anyway;
+pinning the fingerprint at import keeps it consistent with the code that will actually run. So the
+precise guarantee is: **edit tailoring code → restart the dashboard → rerun**, and changed postings
+re-tailor. Computing per-call instead would risk a fingerprint that says "changed" while the process
+still runs the old code — a false signal — so import-time is deliberate.
+
+**The honest caveat.** This guarantees the *reuse gate* re-tailors; it does not change that the normal
+loop skips already-seen postings (`only_new=True`, decision 086). So after a logic change: NEW postings
+get the current logic automatically; already-tracked postings refresh via the "Re-prepare postings I've
+already seen" rescan (which now re-tailors on any logic change) or `scripts/retailor_tracked.py`. This
+is intentional — re-tailoring the whole backlog every run would blow the token budget `only_new` exists
+to protect.
+
+**Trade-off.** Fingerprinting whole module sources over-invalidates: a comment-only edit to any of the
+five modules forces a re-tailor on the next rescan. Accepted deliberately — the user prioritized
+"changes always show" over saving an occasional Claude call, under-invalidation is the dangerous
+direction (stale résumé), and a real armed submit always re-tailors regardless of the stamp.
+
+**Rejected.** (a) Keep hashing `SYSTEM_PROMPT` + bump `LAYOUT_VERSION` by hand — the footgun that
+caused this. (b) A curated list of specific constants (margins, `line_chars`, caps) instead of whole
+sources — precise but itself a list to keep in sync with every future change; source-hashing needs no
+maintenance.
+
+**Verified.** The live `_TAILORING_LOGIC` equals a hand-recomputed SHA1 of the five module source
+files, and appending any byte changes it; the covered set is exactly `[backends, catalogue, length,
+pdf, tailor]`. The Stripe row 22 on-disk stamp (written before this change) no longer encodes the
+current logic, so its reuse gate now re-tailors rather than reusing. `pytest -k "pipeline or stamp or
+pdf or tailor or length or web or track or resume_store"` = 24 passed.
+
+---
+
+## 086 — Why a re-tailor still showed the old résumé: seen-skip, browser cache, un-persisted JDs
+
+**Context.** After decisions 081/082, the user re-ran a Stripe dry run several times and restarted the
+dashboard, and the Track tab still showed the old résumé. Investigated by evidence, not guesswork —
+and it turned out to be **three independent causes** stacked on top of each other.
+
+**Cause 1 (primary) — the normal loop never revisits a seen posting.** `web.py._loop_worker`'s default
+path calls `pipeline.discover_and_match(..., only_new=True)`, which by design returns only postings
+never judged before (decisions 053/056 — spend judge tokens only on genuinely new openings). An
+already-tracked posting is therefore never re-processed, so `run_testing_mode` never runs for it and
+its stored PDF is never rewritten. Proof: every stored Stripe PDF's mtime (newest 11:24) predated the
+code change (11:56), despite the reruns. Re-tailoring a *seen* posting only happens on the opt-in
+**rescan** path (“Re-prepare postings I've already seen”), which with decision 082's stamp now
+re-tailors automatically when the logic changed. This is working-as-designed, not a bug — but it's the
+reason “just rerun” didn't help, so it's documented.
+
+**Cause 2 (latent bug, fixed) — `/track/resume` was browser-cacheable.** The endpoint streamed the PDF
+with a `Content-Disposition` but no `Cache-Control`, and its URL is a stable `?id=<row>`. When a
+posting is re-tailored the PDF is overwritten *in place* (same deterministic path, decision 029), so
+the URL is unchanged and the browser's PDF viewer serves the cached old bytes — a re-tailor looks like
+it did nothing. Fixed by adding `Cache-Control: no-store` to that one response.
+
+**Cause 3 (structural limitation) — JDs aren't persisted per PDF.** The tailored PDF and its stamp are
+stored per posting, but the job description that produced it is not. So a row can only be re-tailored
+offline while its JD is still in the rolling discovery cache — here just 1 of 18 tracked rows. Logged
+as a follow-up: persist each posting's JD (or the tailored structured `TailoredResume`) beside its PDF
+so ANY tracked row can be re-rendered after a future logic change, independent of cache freshness.
+
+**Decision / tooling.** Added `scripts/retailor_tracked.py` (Guideline #8 — the manual “delete the PDF
+and rerun” becomes one re-runnable command): re-tailors tracked rows whose JD is still cached using the
+CURRENT code, overwriting the stored PDF + stamp in place. Idempotent (skips a row whose stamp already
+matches unless `--force`); `--id` / `--company` / `--all`; `--backend` defaults to `auto` (the real
+Claude path) with `rules` for a free deterministic pass. Rows it can't re-tailor (JD rolled out of
+cache) are reported, never silently skipped (UI principle #3 / Guideline #11).
+
+**Verified end-to-end on the user's real Stripe posting** (row 22, Technical Support Engineer,
+`--backend auto`): regenerated via claude-code (3761 → 3791 bytes, 12:46). Extracted the new PDF's text
+— all three earlier changes now render: experience order `Ninth Wave → Jaguar → Kumon` (software above
+tutoring, decision 081 ordering), preserved metrics (`1M+ transactions / 100% faster`, `618 postings /
+0 errors`, `~11,100 lines`, `3 releases / ~3,500 lines`, `1000% more storage`, `$170K+ sales`,
+`20% wait-time cut`), 34pt margins, 1 page. `pytest -k "web or pipeline or track or resume_store or
+stamp"` = 13 passed.
+
+**Rejected.** (a) Making the normal loop re-tailor seen postings — would re-judge/re-tailor the entire
+backlog every run, blowing the token budget the `only_new` design exists to protect; rescan is the
+right opt-in. (b) Cache-busting the résumé URL with a query param instead of `no-store` — the file is
+tiny (~4 KB) and always local, so `no-store` is simpler and can't go stale.
+
+---
+
 ## 082 — The reuse-stamp must include the tailoring logic (prompt + PDF layout), not just the data
 
 **Context.** After decision 081 changed the tailoring prompt and PDF margins, a Stripe dry run showed
@@ -3899,6 +4060,32 @@ the only failures are the 2 pre-existing `test_parking.py` `bot_wall` tests, con
 
 ---
 
+## 085 — Keep one tailored résumé per posting; do not snapshot a résumé per run
+
+**Context.** Follow-up to decision 084's run history. The user asked whether each dry run saves its own
+résumé so it can be viewed per run — "unless they are the same".
+
+**Finding.** We save **one** tailored PDF per posting, not per run. `resume_store.path_for` keys the file
+on the posting URL alone (`sha1(source_url)[:8]`), so every run of a posting resolves to the same path
+and `write_pdf` overwrites it. So: a re-run that **reused** the cache (decision 082 stamp matched —
+unchanged JD/prompt/layout) produced a byte-identical résumé, and a re-run that **re-tailored**
+overwrote the previous PDF at that path.
+
+**Decision.** Keep this storage. Given the finding, the run-history "résumé ↗" link (→ `/track/resume?id=`,
+the posting's current PDF) already shows what each run used **whenever the runs matched** — the common
+reuse case, which is exactly the "unless they are the same" the user cared about. The only thing it can't
+show is an older résumé that a later re-tailor overwrote, and the user accepted that.
+
+**Rejected.** Content-addressed per-run snapshots — on each run, copy the résumé to
+`<name>-<sha1(bytes)>.pdf`, store that per-run path on the run row, and serve it from a per-run résumé
+endpoint. Identical résumés across runs would dedup to one file automatically (satisfying "unless they
+are the same" for free) and differing re-tailors would each stay viewable. Rejected because it grows
+`profile/tailored/` by one PDF per *distinct* tailoring per posting for a case the user doesn't need, and
+would interact with `prune()`'s size-cap eviction (a run's link could 404 after eviction). No code
+change: the run log's `resume_path` and the UI link already point at the single per-posting PDF.
+
+---
+
 ## 081 — Tighten résumé tailoring: preserve existing metrics + slightly narrower margins
 
 **Context.** The user reported the tailored résumés weren't surfacing enough quantifiable metrics,
@@ -4006,3 +4193,396 @@ article-stripped query returns the two campuses **with the branch listed first**
 `Pennsylvania State University - Schuylkill Campus` (`source=substring`, the wrong branch); with it,
 `Pennsylvania State University` (`source=option:claude`, the main campus). Regression suites green:
 combobox, two-pass, required-dropdown, multipage, fillability, lever-labels, determinism-gates.
+
+## 089 — Dashboard deslop pass (ibelick/ui-skills `baseline-ui`): Track table + Discover labels
+
+**Date:** 2026-07-16
+**Status:** Accepted
+
+**Context:** The user asked to "install github.com/ibelick/ui-skills and use it to improve
+our dashboard UI." `ui-skills` is an npm CLI (`npx ui-skills categories|list|get`) that serves
+design-guidance **skill docs** to an AI agent — not a code library. Our dashboard is hand-written
+HTML/CSS/JS embedded in a zero-dependency stdlib `http.server` app (`web.py`), so there is nothing
+to add as a runtime dependency. The useful move is to pull ibelick's own **`baseline-ui`** "deslop"
+ruleset (`npx ui-skills get baseline-ui`) and apply it as an audit against the live UI.
+
+**Method:** Launched the dashboard and captured all four tabs (Review, Discover, Profile, Track)
+in light **and** dark via Playwright, then graded each against `baseline-ui` (typography, hierarchy,
+consistent placeholders, badges over bare colored text, no uppercase body copy).
+
+**Findings & scope:**
+- **Review, Profile — already clean.** Sentence-case field labels, tidy forms, empty states with a
+  clear next action. Left untouched (Guideline #7 / Karpathy "surgical" — no drive-by churn just to
+  touch every tab).
+- **Discover — real violation.** The auto-apply-loop reuse/retailor checkboxes rendered as ALL-CAPS,
+  letter-spaced *paragraphs*: the global `label{text-transform:uppercase;letter-spacing:.03em}` bled
+  onto the long descriptive `.loop-rescan` labels (whereas `.chkrow` and `.fld label` already opt out).
+- **Track table — the worst slop.** `table-layout:fixed` + `width:auto` let the three native
+  `<input type=date>` cells (each with a hard ~138px min intrinsic width) hold their width while the
+  text columns were squeezed to 53–83px, truncating to `dr…` / `Te…` / `Consult…`. Status was bare
+  colored text; empty cells were blank; every row showed three empty native date pickers.
+
+**Changes (all in `web.py`, behavior-preserving CSS/HTML/JS):**
+1. `.loop-rescan{text-transform:none;letter-spacing:normal;font-weight:400}` — descriptive checkbox
+   labels now read as normal sentence text.
+2. `.ttable{width:max-content}` — fixed layout now honors each `<col>` width and overflows into the
+   existing `.twrap` horizontal scroll instead of squeezing text columns.
+3. New `dateCell(app,key)` — dates render as plain `tabular-nums` text (muted `—` when empty); a click
+   swaps in a real `<input type=date>` that saves on change and reverts on blur. Mirrors the existing
+   `urlCell` idiom; removes the empty-picker-in-every-row noise and reclaims ~300px. Date column
+   defaults trimmed 120→104.
+4. Status badge — `statusCell` selects now carry `class="stcell st-*"`; `.ttable select.stcell`
+   styles them as rounded pills tinted from their own status color via
+   `color-mix(in srgb, currentColor 14%, transparent)`, still inline-editable.
+5. Empty generic text cells get a `—` placeholder.
+6. **Columns show/hide menu fixes** (surfaced when the user asked to add column hiding — the feature
+   already existed but was half-broken). (a) The menu was anchored `left:0` from a button near the
+   viewport's right edge, so it opened off-screen and got clipped; re-anchored `right:0; left:auto`
+   so it opens inward. (b) Its checkboxes inherited `.trackbar input{flex:1;min-width:200px}` and
+   stretched to 229px, shoving each label to the far edge; `.colmenu .menu input{flex:0 0 auto;
+   min-width:0}` restores the natural 13px checkbox so label text sits beside it.
+
+No save endpoints, editability, or data flow changed; no new dependency; the column show/hide, resize,
+and reset machinery is otherwise untouched (each column already had a persist-per-browser visibility
+toggle — these were just display bugs in that menu).
+
+**Verified:** Playwright screenshots of all four tabs in light + dark. Track now shows full
+Company/Role/Location, colored status badges (`dry-run` amber, `blocked` grey, `applied` blue) that
+survive both themes, and `—` for empty cells. Programmatic check: 57 date buttons (19 rows × 3),
+20 rendered as `—`, filled ones as `MM/DD/YYYY`, and clicking a filled one swaps to a working
+`<input type=date>`. Discover checkboxes render as normal sentence case. Page JS `node --check` clean.
+
+---
+
+## 090 — Backfill the per-PDF JD sidecar so pre-existing rows show "Re-tailor ▶"
+
+**Date:** 2026-07-16
+**Status:** Accepted
+
+**Context:** The user said they still couldn't find where to re-run a dry run with résumé
+retailoring. The Track tab's "Re-tailor ▶" button (decision 088) renders per dry-run row only
+when `resume_store.has_jd(resume_path)` is true — i.e. a `<pdf>.jd` sidecar exists. Checked
+against the real `applications.db`: **all 17 dry-run rows had `has_jd=False`** (they predate the
+086/088 sidecar), so only "Re-run ▶" (reuse) ever drew — the button the user was looking for was
+never visible for any of their data. The CLI fallback `scripts/retailor_tracked.py` reads the JD
+from the rolling discovery cache, but the cache had rolled over: only **1 of 17** rows (id 22)
+was still cache-fresh. So 16 rows had no reachable re-tailor path.
+
+**Decision:** The user chose to **backfill the missing sidecars** rather than always show the
+button and re-fetch the JD live at re-tailor time — keeping the `has_jd` gate honest (button shows
+only when a JD is genuinely on disk). Per the user's explicit follow-up, the backfill fetches a JD
+**only when a sidecar doesn't already exist** (never overwrites an existing one).
+
+**Implementation — `scripts/backfill_jd.py` (Guideline #8, idempotent):** for each
+`dry-run`/`tailored`/`blocked` row missing a sidecar, obtain the JD **cache-first**
+(`profile/discovery_cache.json` — no network, exact bytes), else **live re-fetch** of `source_url`
+via `enrich.fetch_full_jd(url, llm=enrich.claude_llm_extractor)` (the same json-ld→css→llm cascade
+discovery uses), then `resume_store.write_jd(resume_path, jd)`. A row whose JD can't be obtained
+either way is reported **FAILED** (posting removed / nothing extractable), never silently skipped.
+It does **no** tailoring and rewrites no résumé — it only attaches the JD so decision 088's button
+can light up. `--id` / `--company` / `--all` select scope, mirroring `retailor_tracked.py`.
+
+**Verified end-to-end on the real DB:** cache path (id 22, 4366 chars via cache) and live-fetch
+path (id 6 Stripe, 4446 chars via `fetch:llm`) both write a valid sidecar; re-running id 22 reports
+HAVE and leaves it untouched (idempotent); `--all` wrote 15, already-had 3, **failed 0** — every one
+of the 17 dry-run rows now has `has_jd=True`, so "Re-tailor ▶" renders for all of them on the next
+`/track` load.
+
+**Flagged honestly:** one sidecar came back thin — MARGO (id 9, 93 chars) — too short to tailor
+meaningfully; re-tailoring that row will produce a weak résumé until a fuller JD is captured. The
+other 16 range 1.2k–13k chars. Complements `retailor_tracked.py`, which can now also use `read_jd`
+for any saved-JD row rather than only cache-fresh ones.
+
+---
+
+## 091 — Track table columns are drag-to-reorder (persisted per browser)
+
+**Date:** 2026-07-16
+**Status:** Accepted
+
+**Context:** The user asked to be able to drag and reorder the Track-table columns. The table
+already remembered per-browser column **widths** (`ab_track_colw`) and **visibility**
+(`ab_track_hidden`), and supported edge-drag **resize** and a show/hide menu — but column **order**
+was hard-coded by the `TRACK_COLS` array with no way to change it.
+
+**Change (all in `web.py`, no endpoint/schema/data change, no new dependency):**
+1. New localStorage pref `ab_track_order` — an array of column keys — with `saveOrder()`, mirroring
+   the existing width/hidden prefs.
+2. `orderedCols()` resolves render order: emit `TRACK_COLS` entries in the saved order, then append
+   any key not present in that order in its canonical `TRACK_COLS` position. This makes a stale saved
+   order self-healing — if a column is later added to or removed from `TRACK_COLS`, the saved order
+   can neither drop nor duplicate a column; an unknown saved key is ignored and a new column appears
+   at its default spot.
+3. `visibleCols()` now filters `orderedCols()` (was raw `TRACK_COLS`), so ordering and hiding compose.
+4. Each header `<th>` is `draggable="true"` with `cursor:grab`. `attachColDrag(th,key)` wires HTML5
+   `dragstart`/`dragover`/`dragleave`/`drop`/`dragend`; `.dragging` dims the grabbed header and
+   `.dropto` draws an inset accent insertion bar on the hovered target. `drop` calls `reorderCol(from,
+   to)`, which removes the dragged key and reinserts it directly before the drop-target key, saves,
+   and re-renders.
+5. "Reset columns" now also clears the order (`TRACK_ORDER=[]; saveOrder()`), alongside the existing
+   width/visibility reset.
+
+**Why drag doesn't fight resize:** the right-edge resize handle's `mousedown` already calls
+`preventDefault()`, which suppresses the browser's native drag start — so grabbing the edge resizes
+and never begins a column reorder, and grabbing anywhere else on the header reorders.
+
+**Verified:** `node --check` clean on the served page JS; `orderedCols`/`reorderCol` unit-tested in
+node — sequential moves land in the expected order, and a stale saved order (`["role","GONE","status"]`
+against a 5-column set) yields no dupes, no drops, with the unlisted columns appended in canonical
+position; `import applicationbot.web` clean; server boots and serves `/` HTTP 200.
+
+---
+
+## 092 — ATS feedback loop: grade each tailored draft against a JD-derived "dummy ATS", re-tailor the drops
+
+**Date:** 2026-07-16
+
+**Context:** The user pointed at `github.com/sauravhathi/atsresume` and asked whether tailoring
+should optimize for the posting's ATS — specifically to "tailor our resume and test against a dummy
+ATS based on the job description that we pulled."
+
+**What atsresume actually is (evaluated, not adopted):** a Next.js/Tailwind résumé-*builder* UI.
+Its "ATS scoring" is only an outbound link to resumego.net — **no scoring logic to reuse.** Its
+résumé JSON schema and single-column template we already cover with `models.py` / `render.py` /
+`pdf.py`, and `ats_check.py` already verifies our PDF's text layer is parseable. Nothing worth
+importing; pulling in a JS/Next stack would add a runtime we don't need.
+
+**The real gap:** we already had both halves of the ask — `ats_score.py` (deterministic 0–100
+pre-score from the JD, used to order the judge queue) and `ats_check.py` (post-export PDF
+keyword coverage) — but tailoring was **one-shot**: the dropped-keyword signal only became an
+advisory note, never fed back into a re-tailor. The loop was open.
+
+**Options put to the user (Agent Decision Framework #2 — affects how résumés are tailored):**
+
+| ATS fidelity | Loop |
+|---|---|
+| Reuse `ats_score` (deterministic) | Bounded retry on gaps |
+| Claude-extracted JD requirements (tokens/JD) | Always iterate to a target score |
+| Both, layered | Score-only, no auto-loop |
+
+**Chosen:** deterministic keyword+knockout extraction (no per-JD Claude call) + **bounded retry**.
+
+**Change:**
+1. New `applicationbot/ats_requirements.py` — the deterministic dummy ATS:
+   - `extract(resume, jd_text)` → `Requirements(keywords, knockouts)`. `keywords` =
+     `relevance.skill_terms(base)` ∩ JD mentions — the **same honest universe** `ats_check` uses,
+     so a "missing" keyword is always a skill the candidate genuinely has (the loop can never
+     invent one; true gaps stay the Claude fit judge's job). `knockouts` = years + degree
+     (evaluated against the résumé via `ats_score`'s existing parsers) plus security-clearance and
+     citizenship/no-sponsorship, detected with conservative regexes and flagged unverifiable.
+   - `grade(resume_text, requirements)` → `AtsGrade(keyword_score 0–100, present, missing,
+     knockouts)`; `passed` is False on any failed knockout, mirroring an ATS auto-reject.
+2. `tailor.py` — `tailor_resume` extracted its single pass into `_one_pass(emphasis)` (unchanged
+   length-enforce + `fit_to_pages` + notes), then grades the rendered draft and, **for
+   non-deterministic backends only**, re-tailors up to `_MAX_RETAILOR = 2` times feeding the exact
+   `missing` keywords back — breaking the instant a pass fails to shrink the gap (never regresses,
+   never wastes Claude calls). Grade notes are appended to `relevance_notes` (so CLI/web/pipeline
+   all show it with no per-surface change) and the structured verdict rides on
+   `TailorResult.ats_grade`.
+3. `backends.py` — `tailor(..., emphasis=None)` on the Protocol + both backends; `_user_message`
+   appends an ATS-screen instruction listing the dropped keywords when emphasis is set. The rules
+   engine accepts and ignores it (deterministic — a retry changes nothing).
+
+**Why grade the rendered text, not a fresh PDF each pass:** the dropped-keyword failure is a
+length-budget trim, which the rendered résumé text reflects exactly and far faster than a per-pass
+PDF export. The existing `verify_pdf` stays as the final post-export text-layer check (font
+mangling, readability) after export.
+
+**Verified:** `tests/test_ats_requirements.py` (6 cases: keyword universe is candidate-truthful,
+years/degree knockouts evaluate correctly, clearance/citizenship flagged unverifiable, grade scores
+coverage, `passed` gates on a failed knockout). Full offline end-to-end `tailor_resume` on the real
+xAI senior-data JD via the rules engine → grade 100/100, years knockout evaluated, grade note
+surfaced in `relevance_notes`. Stub-backend test of the loop itself: first pass drops the skills
+section, grader finds `SQL, REST APIs` genuinely missing (Python/Kafka counted present from summary
+text — the grader sees what the ATS sees), feeds exactly those back as emphasis, retry includes
+them, improved draft adopted → 100/100. 60 related tests (tailor/backend/ats/cli/web) pass, no
+regression. (Pre-existing unrelated collection error in `test_nav_recipes.py` from the in-progress
+`apply.py` edits — untouched here.)
+
+---
+
+## 095 — Track table shows Claude token spend per application, split by activity
+
+**Context.** The user asked: when filling out applications, show in the tracker table how many
+tokens (if any) each one used, so they can see how much Claude is doing for them — tailoring, form
+entry, etc. Nothing captured token usage before; the Claude CLI's `usage` data was discarded.
+
+**Where the data comes from.** Every Claude call in the pipeline funnels through the single choke
+point `backends.run_claude_cli`, which invokes the CLI with `--output-format json`. That envelope
+already carries `usage` (`input_tokens`, `output_tokens`, `cache_read_input_tokens`,
+`cache_creation_input_tokens`) and `total_cost_usd` — the function just returned `result` and threw
+the rest away. Confirmed against a live call before designing. So capture needed no new API,
+subprocess, or dependency — only to stop discarding what we already receive.
+
+**Two design decisions the user made** (asked before building, per the Agent Decision Framework —
+this touches data storage):
+1. *Judging tokens.* The fit judge is **one batched Claude call over many candidates**
+   (`matching.judge_fit_batch`), so its tokens are not cleanly per-application. The user chose to
+   keep the per-row table strictly per-application (tailoring + form-entry + per-posting
+   enrichment) and show batched judging/discovery spend as **one separate aggregate**, never
+   divided across rows.
+2. *Metric.* One row shows the total tokens; clicking it fans out into the input/output split and
+   the per-activity breakdown.
+
+**Mechanism (ambient attribution — no call-site signature churn).** New `usage.py` holds two
+context variables: `_activity` (WHAT the call is doing) and `_posting` (WHICH application it belongs
+to, its source URL). `run_claude_cli` gained an `activity=` arg (default None → inherit the ambient
+activity) and, after parsing the envelope, calls `usage.record(env, activity=...)`, which
+best-effort writes one row to a new append-only `usage_events` table. Attribution points are just
+two functions: `pipeline.tailor_and_render` wraps its tailoring call in `for_posting(url)` (the
+backend tags `activity="tailoring"`), and `apply.run_apply` pushes `for_posting(source_url,
+"form-entry")` across its fill (so the untagged answer-drafting calls inherit form-entry) — both
+keyed on the same posting URL the tracker upserts on. Enrichment/salary/impact calls are tagged
+explicitly. The batched judge runs during discovery, outside any `for_posting` block, so its events
+land with `posting_key=''` → the discovery aggregate. Best-effort throughout: a token-logging
+failure can never break a working Claude call.
+
+*Two follow-ups folded in same day:* (a) the **Workday agentic worker** runs Claude via a separate
+`--output-format stream-json` subprocess (not `run_claude_cli`); its final result line carries the
+same cumulative `usage`, so `workday._record_agent_usage` parses it and records under form-entry —
+it runs inside `run_apply`'s `for_posting`, so it attributes to the Workday posting. (b) the
+**salary market-estimate** call in `run_testing_mode` sits between tailor and apply, outside the two
+leaf wraps, so it was wrapped in `for_posting(p.url)` to attribute to the posting instead of the
+discovery bucket. The only remaining discovery-bucket-by-design per-app-untied Claude use is a
+standalone Tailor-tab/CLI tailor not tied to any application.
+
+**Storage + reads.** `usage_events` (id, posting_key, activity, model, the four token counts,
+cost_usd, ran_at) is additive and migration-free (`CREATE TABLE IF NOT EXISTS`).
+`tracker.usage_by_application()` groups by source URL into per-activity sub-maps + totals;
+`usage_discovery_summary()` aggregates the unkeyed events; `delete_application` cascades usage by the
+row's source URL so a re-discovered URL never inherits stale tokens.
+
+**UI.** The `/track` payload attaches each application's `tokens` (joined by source_url) and a
+top-level `usage_discovery`. Track tab: a new **Tokens** column shows the compact total (e.g.
+"3.8k"), and clicking expands an inline sub-row with the in/out split + per-activity table; a
+one-line "Discovery & judging (all-time)" figure sits above the table and expands to its activities.
+
+**Alternatives rejected.** Threading `(text, usage)` return values through ~15 call sites across 6
+modules (rejected — ambient contextvars touch nothing). Dividing judge tokens per-candidate
+(rejected by the user as a misleading estimate). Storing dollar cost as the headline metric
+(rejected — it's a subscription, so cost is an as-if-API estimate; tokens are the honest unit,
+though the cost is still captured in the events for reference).
+
+**Verified.** One real `claude` call recorded 390 in / 4 out attributed to a posting under
+`tailoring`. `tests/test_usage.py` (7 cases, synthetic envelopes): activity routing, block-default
+inheritance, explicit-override-wins, discovery bucket for unkeyed calls, no-usage/all-zero no-op,
+delete-cascade, and the Workday `stream-json` parser (records the result line under form-entry;
+no-result-line is a no-op). Workday + usage suites 39/39. The live `/track` HTTP endpoint serves the per-app `tokens` + `usage_discovery`
+payload. Served-page JS `node --check` clean; all touched-module imports + the
+backend/matching/salary/enrich suites green. (Pre-existing unrelated failures remain: the
+`test_parking.py` `bot_wall` cases and the `test_nav_recipes.py` collection error, both from an
+in-progress `apply.py` branch — fail identically on the clean tree.)
+
+## 096 — Verify a combobox commit actually stuck; fire the "filled" UI notification before the screenshot/archive
+
+**Context.** Two problems from a live SpaceX (Greenhouse) dry run:
+
+1. **School reported filled but was blank.** The run's `report.json` recorded
+   `School → "Pennsylvania State University" [option:claude]`, yet the browser field was empty.
+   So the decision-080 pipeline *chose* the right option, but the commit never landed — and we
+   reported a success that didn't happen (violates Guideline #7/#11: report what actually
+   happened).
+2. **The "Filled — review" notification lagged the fields by ~a minute.** All fields were
+   visibly populated long before the notif bar flipped.
+
+**Root causes (traced from `report.json` + the code path).**
+
+1. `_commit_option_text` reopens the async School combobox, retypes the query, waits 900 ms,
+   finds the option whose text is exactly the Claude pick, clicks it, and returns `True`. But
+   Greenhouse's School search is **async** (decision 080): its XHR results re-render the option
+   list. When results arrive *as* the click lands, the option node is replaced under the cursor —
+   Playwright's click still "succeeds" (it hit the coordinates) but react-select never fires its
+   select handler, so the field stays empty. The function returned `True` on the click alone,
+   never checking that a value rendered.
+2. `on_filled` (which drives the web "Filled — review" phase) fired only *after*
+   `page.screenshot(full_page=True)`, answer-bank learning, the tracker write, and the archive.
+   On a long form the **full-page screenshot dominates** (many seconds), so the notification
+   trailed the fields by the combined cost of all four. The web filled-panel renders only
+   `report.summary()` text — it never shows the screenshot image — so nothing the user sees
+   required the screenshot to run first.
+
+**Fix.**
+
+1. `_commit_option_text` now **verifies the commit**: after clicking the exact-text option it
+   waits 200 ms and reads the control's rendered value via `_VALUE_JS` (react-select
+   `single-value`). Empty ⇒ the click was swallowed ⇒ retry the whole open→type→click, up to 3×;
+   if it never renders a value, return `False` so the caller records the field **unfilled**
+   (surfaced for the user) instead of a false `option:claude` success. (If the value can't be
+   read back, assume the click stuck rather than loop forever.)
+2. `run_apply` now fires `print(report.summary())` + `on_filled(report)` **immediately after the
+   fill finishes** (right after the in-browser done banner), *before* the screenshot, learning,
+   tracker, and archive. Those still run — just after the UI has already been told "Filled —
+   review." One cosmetic trade-off: the filled-panel summary no longer includes the
+   "[answer bank] saved…/learned…" line (added by `_persist_learning`, which now runs after the
+   callback); the final "done" `_set` after the browser closes still carries the complete summary.
+
+**Verification.** Both changes are surgical to `apply.py`; `applicationbot.apply/web/pipeline`
+import clean; the apply/fill/parking/required/combobox suite is 72 passed (the only failures are
+the pre-existing `test_parking.py` `bot_wall` cases + `test_nav_recipes.py` collection error from
+an unrelated in-progress branch, which fail identically on the clean tree). The school-commit fix
+needs a live Greenhouse async School field to confirm end-to-end — flagged for the next real dry
+run.
+
+---
+
+## 097 — A user-clicked submit during the dry-run review pause is tracked as a real `applied` application
+
+**Context.** The user's rule, verbatim: *"keep as dry run unless bot or human clicked the submit
+button, in which case track it as a regular application."* A dry-run already records itself to the
+tracker (`_record_run`, decision 024) — but as a `dry-run` row, deliberately distinct from a real
+submission (Guideline #3: dry-run does everything *except* submit).
+
+The bot-armed click was already handled: when a `SafetyGate` is armed, `_attempt_submit` clicks
+Submit, sets `report.submitted`, and `_record_run` writes an `applied` row (method `auto`). The gap
+was the **human** click. A dry-run fills the form and leaves the browser open for review
+(`pause=True`, a web `hold` event or a terminal `input()`). `_record_run` and the archive run
+*before* that pause. So if the user reviewed the filled form and clicked the site's own Submit
+button, nothing re-checked the page — the row stayed `dry-run` and the real application went
+untracked.
+
+**Options considered.**
+
+| Option | Verdict |
+|---|---|
+| Count every "decided-to-apply" dry-run as `applied` | Rejected — a dry-run explicitly did **not** submit; calling it applied breaks the safety model and lies about outcomes. |
+| Add a `would-apply` marker distinct from `applied` | Rejected — the user's rule is specifically about a *click*, not a decision. |
+| Detect an actual submit (bot or human) and only then record `applied` | **Chosen** — matches the rule exactly; the bot half already worked, so only the human-in-the-pause half was new. |
+
+**Change (surgical to `apply.py`, one message tweak in `web.py`).**
+
+- New `ApplyReport.manual_submit` flag — distinguishes a human click (method `manual`) from the
+  armed bot (`auto`) and from a never-submitted dry-run.
+- New `_detect_manual_submit(page, frame, report)`: on the first appearance of a submission
+  confirmation it flips the report to `submitted` / `submit_state="submitted"` / `manual_submit`.
+  It reuses `_confirmation_evidence` — the same URL (`confirmation`/`/thank`) or body
+  confirmation-text signal the armed path trusts. **Positive confirmation only** — never the weaker
+  "form gone" heuristic — so merely navigating away during review can't be mistaken for a submit.
+  Idempotent: a no-op once the report is already submitted.
+- It's called **inside the web `hold` review loop** (every 400 ms) and **once after the terminal
+  review `input()`**, so a human submit is caught however the user ends the session.
+- After the pause, if `manual_submit`, `run_apply` re-calls `_record_run`. Because the tracker
+  upserts by source URL, this **flips the same posting row** `dry-run`→`applied` (method `manual`,
+  `date_applied` stamped, parked block cleared) and appends the submitted attempt to the
+  append-only run log (decision 084) — so the history shows both the dry-run fill and the manual
+  submit.
+- `frame` is initialised to `None` at the top of `run_apply` so the Workday / early-exit paths can
+  reach the pause check safely (`_confirmation_evidence` reads `page.url` regardless of frame).
+- `_record_run`'s `method` now resolves to `manual` (human) / `auto` (armed bot) / `dry-run`.
+- The web dry-run "done" message now says "you submitted this application manually; it's recorded
+  as Applied in Track" when `report.submitted`, instead of always claiming a dry-run row.
+
+The pre-pause `dry-run` record is kept as-is (so a run killed during the long review pause is still
+captured); the manual submit just re-records over it.
+
+**Verification.** New `tests/test_manual_submit.py` (4 cases): `_detect_manual_submit` returns False
+with the form still showing (no false positive), flips the report to submitted after a real
+headless-Chromium click of the local `submit_confirm.html` fixture (never a real posting —
+Guideline #3), and is a no-op once already submitted; a re-record after a manual click upserts the
+`dry-run` row to `applied`/`manual`, stamps `date_applied`, clears the parked block, and leaves both
+attempts (`dry-run` + `applied`) in the run log; an armed-bot submit (`manual_submit=False`) still
+records `method="auto"`. `test_submit.py` (7) green; the broader
+apply/parking/multipage/runner/workday/calibration/usage suites pass (only the pre-existing
+`test_parking.py` `bot_wall` + `test_nav_recipes.py` failures from an unrelated in-progress branch
+remain — they reference an `ApplyReport(bot_wall=…)` field absent on this tree). Detection depends on
+the site reaching a recognizable confirmation page after the user's click — flagged for end-to-end
+confirmation on the next live dry run where the user hand-submits.
