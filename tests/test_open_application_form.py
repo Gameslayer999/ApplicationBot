@@ -76,6 +76,43 @@ def test_reveal_click_is_retried_until_button_mounts():
     assert not report.errors
 
 
+class _FakeRevealPage(_FakePage):
+    """Models SmartRecruiters: the form is gated behind a control whose accessible name is
+    `button_label` (e.g. "I'm interested", not "Apply"). `get_by_role` honors the name regex the
+    caller passes, so a locator is "present" only when that regex matches the label — exactly how
+    Playwright resolves it. Proves `_REVEAL_CONTROL` clicks the real reveal button."""
+    def __init__(self, button_label):
+        super().__init__()
+        self.button_label = button_label
+
+    def _label_present(self, name):
+        return name is not None and bool(name.search(self.button_label))
+
+    def get_by_role(self, role, name=None):
+        return _FakeLocator(self, lambda: self._label_present(name))
+
+
+def test_smartrecruiters_interested_button_reveals_form():
+    """The reveal control says "I'm interested", not "Apply" — the old `\\bapply\\b`-only match
+    never clicked it and the form timed out. `_REVEAL_CONTROL` must click it and load the form."""
+    page = _FakeRevealPage("I'm interested")
+    report = ApplyReport(url="https://jobs.smartrecruiters.com/Consultadd4/87644936", ats="generic")
+    loaded, _, _ = _open_application_form(page, "generic", report, timeout_ms=25000)
+    assert loaded is True, f"'I'm interested' should reveal the form; errors={report.errors}"
+    assert page.clicked is True
+    assert not report.errors
+
+
+def test_not_interested_button_is_never_clicked():
+    """A "Not interested" dismiss control must never be treated as the reveal — the negative
+    lookbehind excludes it, so the form never loads via that button and the run times out."""
+    page = _FakeRevealPage("Not interested")
+    report = ApplyReport(url="https://jobs.smartrecruiters.com/X/1", ats="generic")
+    loaded, _, _ = _open_application_form(page, "generic", report, timeout_ms=200)
+    assert loaded is False
+    assert page.clicked is False, "must not click a 'Not interested' button"
+
+
 def test_form_already_present_needs_no_click():
     """When fields exist immediately, the reveal-click must not fire."""
     page = _FakePage()

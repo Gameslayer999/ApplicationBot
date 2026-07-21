@@ -18,11 +18,18 @@ import math
 from dataclasses import dataclass, field
 from typing import Optional
 
-from . import catalogue, pdf
+from . import ats_requirements, catalogue, pdf, render
+from .ats_requirements import AtsGrade
 from .backends import DEFAULT_QUALITY, TailorBackend, select_backend
 from .job_description import JobDescription
 from .length import LengthBudget
 from .models import Resume, TailoredResume
+
+# ATS retry loop (decision — see DECISIONS.md): after tailoring, grade the résumé against the
+# JD's deterministic "dummy ATS" (ats_requirements) and, when the target ATS screens for skills
+# the candidate HAS but tailoring dropped, re-tailor with those keywords fed back — at most this
+# many extra passes, and only while each pass strictly reduces the gap (no wasted Claude calls).
+_MAX_RETAILOR = 2
 
 
 @dataclass
@@ -31,6 +38,7 @@ class TailorResult:
     backend: str
     pages: float
     warnings: list[str] = field(default_factory=list)
+    ats_grade: Optional[AtsGrade] = None
 
 
 def tailor_resume(
@@ -51,38 +59,68 @@ def tailor_resume(
     engine = select_backend(backend, quality) if isinstance(backend, str) else backend
 
     subset = catalogue.select_relevant(resume, jd, budget)
-    tailored = engine.tailor(subset, jd, budget)
+    requirements = ats_requirements.extract(resume, jd.body or "")
 
-    # Hard-enforce the length budget, then tell the user if it dropped any entries — otherwise
-    # a newly-added experience that didn't make the cut looks like it was silently ignored.
-    before = (len(tailored.experience), len(tailored.projects), len(tailored.activities))
-    tailored = budget.enforce(tailored)
-    after = (len(tailored.experience), len(tailored.projects), len(tailored.activities))
-    names = (("experience entry", "experience entries"), ("project", "projects"), ("activity", "activities"))
-    omitted = [
-        f"{b - a} {singular if b - a == 1 else plural}"
-        for (singular, plural), b, a in zip(names, before, after)
-        if b > a
-    ]
-    if omitted:
-        tailored.relevance_notes = [
-            *tailored.relevance_notes,
-            f"Omitted {', '.join(omitted)} to fit {budget.pages:g} page(s) — "
-            "the least job-relevant were dropped. Increase Length to include more.",
+    def _one_pass(emphasis: Optional[list[str]]) -> TailoredResume:
+        """One full tailoring pass: backend → hard length enforce → guaranteed page fit,
+        carrying the same omitted-entry / fit notes the pipeline has always surfaced."""
+        tailored = engine.tailor(subset, jd, budget, emphasis=emphasis)
+
+        # Hard-enforce the length budget, then tell the user if it dropped any entries —
+        # otherwise a newly-added experience that didn't make the cut looks silently ignored.
+        before = (len(tailored.experience), len(tailored.projects), len(tailored.activities))
+        tailored = budget.enforce(tailored)
+        after = (len(tailored.experience), len(tailored.projects), len(tailored.activities))
+        names = (("experience entry", "experience entries"), ("project", "projects"),
+                 ("activity", "activities"))
+        omitted = [
+            f"{b - a} {singular if b - a == 1 else plural}"
+            for (singular, plural), b, a in zip(names, before, after)
+            if b > a
         ]
+        if omitted:
+            tailored.relevance_notes = [
+                *tailored.relevance_notes,
+                f"Omitted {', '.join(omitted)} to fit {budget.pages:g} page(s) — "
+                "the least job-relevant were dropped. Increase Length to include more.",
+            ]
 
-    # The count caps above are heuristics; now GUARANTEE the page budget by measuring the
-    # actual rendered PDF and trimming until it fits (decision 042). Applied here so the web
-    # preview, CLI, and pipeline all see the same guaranteed-fit content.
-    tailored, fit_notes = pdf.fit_to_pages(resume, tailored, max(1, math.ceil(budget.pages)))
-    if fit_notes:
-        tailored.relevance_notes = [*tailored.relevance_notes, *fit_notes]
+        # The count caps above are heuristics; now GUARANTEE the page budget by measuring the
+        # actual rendered PDF and trimming until it fits (decision 042). Applied here so the
+        # web preview, CLI, and pipeline all see the same guaranteed-fit content.
+        tailored, fit_notes = pdf.fit_to_pages(resume, tailored, max(1, math.ceil(budget.pages)))
+        if fit_notes:
+            tailored.relevance_notes = [*tailored.relevance_notes, *fit_notes]
+        return tailored
+
+    def _grade(t: TailoredResume) -> AtsGrade:
+        return ats_requirements.grade(render.render_markdown(resume, t), requirements)
+
+    tailored = _one_pass(None)
+    grade = _grade(tailored)
+
+    # Bounded ATS retry: re-tailor only when the target ATS screens for skills the candidate
+    # HAS but this draft dropped, and only while each pass strictly shrinks that gap. The rules
+    # engine is deterministic (a retry yields the same output), so it never loops.
+    if engine.name != "rules":
+        for _ in range(_MAX_RETAILOR):
+            if not grade.missing:
+                break
+            candidate = _one_pass(grade.missing)
+            cand_grade = _grade(candidate)
+            if len(cand_grade.missing) >= len(grade.missing):
+                break  # no improvement — keep the better prior draft, stop spending calls
+            tailored, grade = candidate, cand_grade
+
+    # Surface the ATS grade on every surface (CLI/web/pipeline all render relevance_notes).
+    tailored.relevance_notes = [*tailored.relevance_notes, *grade.notes()]
 
     return TailorResult(
         tailored=tailored,
         backend=engine.name,
         pages=budget.pages,
         warnings=check_factual_drift(resume, tailored),
+        ats_grade=grade,
     )
 
 

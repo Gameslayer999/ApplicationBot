@@ -61,7 +61,20 @@ class ApplicationProfile(BaseModel):
 
     # Logistics / preferences
     willing_to_relocate: Optional[bool] = None
-    open_to_remote: Optional[bool] = None
+    open_to_remote: Optional[bool] = None  # WILLINGNESS (yes/no) — are you open to remote at all.
+    # PREFERRED work arrangement, distinct from the yes/no willingness above. Drives how
+    # arrangement/preference questions and office-location dropdowns are answered so the bot
+    # doesn't signal remote for a job whose office you'd rather commute to. One of:
+    #   "" = no preference (legacy behaviour: answer purely from open_to_remote)
+    #   "in_office_if_commutable" = prefer on-site when the posting has an office within
+    #                               max_commute_miles of home (Claude-judged from the JD), else remote
+    #   "hybrid"     = prefer hybrid
+    #   "in_office"  = always prefer on-site
+    #   "remote"     = always prefer remote
+    work_arrangement: str = ""
+    # Home→office commute radius (miles) Claude uses to judge whether a posting's office is
+    # commutable for "in_office_if_commutable". None = let Claude use a reasonable daily-commute bar.
+    max_commute_miles: Optional[int] = None
     # Ranked office-location preferences (most-preferred first, e.g. ["New York, NY", "Remote"]).
     # An office-choice dropdown gets filled with the highest-ranked option the form actually offers.
     preferred_locations: list[str] = Field(default_factory=list)

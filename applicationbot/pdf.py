@@ -23,11 +23,6 @@ from .models import (
 
 DEFAULT_ORDER = list(SECTION_KEYS)
 
-# Bump when the PDF layout changes (margins, fonts, header, spacing). Folded into the
-# tailoring stamp (pipeline.tailor_stamp) so a layout change invalidates cached PDFs and a
-# dry run re-renders instead of reusing a PDF built by the old layout.
-LAYOUT_VERSION = 2
-
 # Core-font PDFs use latin-1; map common unicode punctuation, replace the rest.
 _REPL = {
     "–": "-", "—": "-", "•": "-", "·": "-", "→": "->",

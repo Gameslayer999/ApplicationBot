@@ -191,7 +191,7 @@ def judge_fit_batch(resume: Resume, postings: list[Posting], *, think: bool = Fa
         + f"\n\nJudge all {len(postings)} posting(s) now."
     )
     text = run_claude_cli(prompt, model=JUDGE_MODEL, think=think, timeout=timeout,
-                          system=_JUDGE_SYSTEM, json_schema=_JUDGE_SCHEMA)
+                          system=_JUDGE_SYSTEM, json_schema=_JUDGE_SCHEMA, activity="judging")
     data = json.loads(_extract_json(text))
     out: dict[int, dict] = {}
     for v in data.get("verdicts") or []:

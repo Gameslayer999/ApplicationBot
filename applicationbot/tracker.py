@@ -87,6 +87,26 @@ CREATE TABLE IF NOT EXISTS application_runs (
     ran_at          TEXT NOT NULL                    -- ISO datetime the run happened
 );
 CREATE INDEX IF NOT EXISTS idx_runs_app ON application_runs(application_id);
+
+-- Append-only Claude token log: one row per Claude CLI call (decision 095). `posting_key` is
+-- the source URL of the application the call was made for (joins to applications.source_url),
+-- or '' for discovery-phase calls not tied to one posting (the batched fit judge, enrichment
+-- of not-yet-selected postings). `activity` says WHAT Claude was doing (tailoring / form-entry
+-- / judging / …). Never edited or deduped — a pure usage trail so the Track tab can show how
+-- many tokens each application cost, split by activity, and the standalone discovery total.
+CREATE TABLE IF NOT EXISTS usage_events (
+    id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+    posting_key            TEXT NOT NULL DEFAULT '',   -- applications.source_url, or '' for discovery
+    activity               TEXT NOT NULL DEFAULT 'other',
+    model                  TEXT NOT NULL DEFAULT '',
+    input_tokens           INTEGER NOT NULL DEFAULT 0,
+    output_tokens          INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens      INTEGER NOT NULL DEFAULT 0,
+    cache_creation_tokens  INTEGER NOT NULL DEFAULT 0,
+    cost_usd               REAL NOT NULL DEFAULT 0,
+    ran_at                 TEXT NOT NULL               -- ISO datetime the call completed
+);
+CREATE INDEX IF NOT EXISTS idx_usage_posting ON usage_events(posting_key);
 """
 
 # Columns a caller may set when recording a run. `id`/`ran_at` are managed here.
@@ -203,12 +223,16 @@ def update_application(app_id: int, changes: dict[str, Any], *, path: str | Path
 def delete_application(app_id: int, *, path: str | Path = DEFAULT_DB) -> bool:
     with _connect(path) as conn:
         row = conn.execute(
-            "SELECT resume_path FROM applications WHERE id=?", (app_id,)
+            "SELECT resume_path, source_url FROM applications WHERE id=?", (app_id,)
         ).fetchone()
         cur = conn.execute("DELETE FROM applications WHERE id=?", (app_id,))
         deleted = cur.rowcount > 0
         if deleted:  # cascade: drop this posting's run history so no orphans linger
             conn.execute("DELETE FROM application_runs WHERE application_id=?", (app_id,))
+            # Cascade the token usage keyed on this posting's URL (decision 095) so a deleted
+            # application's tokens don't re-attach if the same URL is re-discovered later.
+            if row and row["source_url"]:
+                conn.execute("DELETE FROM usage_events WHERE posting_key=?", (row["source_url"],))
     # Cascade: remove the tailored PDF this row owned (decision 029) — but only if it's
     # a file we manage under profile/tailored/, never a user-supplied path.
     if deleted and row and row["resume_path"]:
@@ -270,6 +294,84 @@ def run_counts(*, path: str | Path = DEFAULT_DB) -> dict[int, int]:
             "SELECT application_id, COUNT(*) AS n FROM application_runs GROUP BY application_id"
         )
         return {int(r["application_id"]): int(r["n"]) for r in cur.fetchall()}
+
+
+# ---------------------------------------------------------------- token usage (decision 095)
+
+# Columns a caller may set when recording a Claude call. `id`/`ran_at` are managed here.
+USAGE_FIELDS = ["posting_key", "activity", "model", "input_tokens", "output_tokens",
+                "cache_read_tokens", "cache_creation_tokens", "cost_usd"]
+_USAGE_INT = {"input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens"}
+
+
+def record_usage_event(data: dict[str, Any], *, path: str | Path = DEFAULT_DB) -> int:
+    """Append one Claude call's token usage to the log; returns its new id (decision 095).
+    `ran_at` is stamped here. Called (best-effort) by usage.record after every Claude CLI call."""
+    row: dict[str, Any] = {}
+    for k in USAGE_FIELDS:
+        v = data.get(k)
+        if k in _USAGE_INT:
+            row[k] = int(v or 0)
+        elif k == "cost_usd":
+            row[k] = float(v or 0.0)
+        else:
+            row[k] = "" if v is None else str(v)
+    cols = USAGE_FIELDS + ["ran_at"]
+    vals = [row[k] for k in USAGE_FIELDS] + [_now()]
+    placeholders = ", ".join("?" for _ in cols)
+    with _connect(path) as conn:
+        cur = conn.execute(
+            f"INSERT INTO usage_events ({', '.join(cols)}) VALUES ({placeholders})", vals
+        )
+        return int(cur.lastrowid)
+
+
+def _usage_zero() -> dict[str, Any]:
+    return {"input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0,
+            "cache_creation_tokens": 0, "cost_usd": 0.0, "calls": 0,
+            "total_tokens": 0, "by_activity": {}}
+
+
+def _usage_add(acc: dict[str, Any], r: sqlite3.Row) -> None:
+    """Fold one usage_events row into an accumulator (with a per-activity sub-breakdown)."""
+    for k in _USAGE_INT:
+        acc[k] += r[k]
+    acc["cost_usd"] += r["cost_usd"]
+    acc["calls"] += 1
+    acc["total_tokens"] += r["input_tokens"] + r["output_tokens"]
+    act = acc["by_activity"].setdefault(
+        r["activity"] or "other",
+        {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0, "calls": 0, "total_tokens": 0})
+    act["input_tokens"] += r["input_tokens"]
+    act["output_tokens"] += r["output_tokens"]
+    act["cost_usd"] += r["cost_usd"]
+    act["calls"] += 1
+    act["total_tokens"] += r["input_tokens"] + r["output_tokens"]
+
+
+def usage_by_application(*, path: str | Path = DEFAULT_DB) -> dict[str, dict[str, Any]]:
+    """{source_url -> token totals} for every posting that spent Claude tokens (decision 095).
+    Each total carries input/output/cache counts, cost, call count, `total_tokens`
+    (input+output), and a `by_activity` sub-map (tailoring / form-entry / …). The Track tab
+    joins each application row to this by its source_url. Discovery calls (posting_key '') are
+    excluded here — see `usage_discovery_summary`."""
+    out: dict[str, dict[str, Any]] = {}
+    with _connect(path) as conn:
+        for r in conn.execute("SELECT * FROM usage_events WHERE posting_key != ''"):
+            acc = out.setdefault(r["posting_key"], _usage_zero())
+            _usage_add(acc, r)
+    return out
+
+
+def usage_discovery_summary(*, path: str | Path = DEFAULT_DB) -> dict[str, Any]:
+    """All-time token spend on discovery-phase Claude calls not tied to one application —
+    the batched fit judge and any pre-selection enrichment (decision 095). One aggregate with a
+    `by_activity` breakdown, shown on the Track tab separate from the per-application rows."""
+    acc = _usage_zero()
+    with _connect(path) as conn:
+        for r in conn.execute("SELECT * FROM usage_events WHERE posting_key = ''"):
+            _usage_add(acc, r)
+    return acc
 
 
 def seen_source_urls(*, statuses: Optional[list[str]] = None, path: str | Path = DEFAULT_DB) -> set[str]:

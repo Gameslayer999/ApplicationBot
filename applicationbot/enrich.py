@@ -301,7 +301,7 @@ def claude_llm_extractor(text: str, url: str) -> Optional[dict]:
     )
     try:
         out = run_claude_cli(
-            prompt, think=False, json_schema=schema,
+            prompt, think=False, json_schema=schema, activity="enrichment",
             system="You extract structured job-posting data from web pages. Return only the requested JSON.",
         )
     except ClaudeUnavailableError:

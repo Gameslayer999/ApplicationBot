@@ -107,7 +107,7 @@ def _claude_estimate(title: str, location: str, years: str, *,
         f"CANDIDATE{yrs}."
     )
     try:
-        raw = backends.run_claude_cli(prompt, model=model, think=False, timeout=60)
+        raw = backends.run_claude_cli(prompt, model=model, think=False, timeout=60, activity="salary")
         obj = json.loads(backends._extract_json(raw))
         lo, hi = int(obj["low"]), int(obj["high"])
     except Exception:

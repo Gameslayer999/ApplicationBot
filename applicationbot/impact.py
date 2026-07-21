@@ -89,7 +89,7 @@ def score_projects(resume: Resume, *, cli: str = CLAUDE_CLI, model: str | None =
         "a single JSON object, no markdown fences."
     )
     raw = run_claude_cli(
-        prompt, cli=cli, model=model, think=False, system=_SYSTEM,
+        prompt, cli=cli, model=model, think=False, system=_SYSTEM, activity="impact",
         json_schema=_Scores.model_json_schema(),
     )
     parsed = _Scores.model_validate_json(_extract_json(raw))

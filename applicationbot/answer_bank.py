@@ -82,11 +82,14 @@ def is_demographic(question: str) -> bool:
     return any(t in n for t in _DEMOGRAPHIC)
 
 
-# Questions asking for a NUMERIC FACT the applicant must own — drafting one fabricates data
-# (a live AppLovin dry-run drafted a salary figure grounded in nothing). They resolve from the
-# profile / the salary machinery (decisions 038/039) or are captured for the user — never drafted.
+# Questions asking for a NUMERIC FACT the applicant must own — drafting or option-picking one
+# fabricates data (a live AppLovin dry-run drafted a salary figure grounded in nothing; a dry-run
+# picked "1-5 years" for a new grad with 0 years full-time by counting résumé internships/projects,
+# despite the question saying "not counting internships"). They resolve from the profile / the
+# salary machinery (decisions 038/039), or are captured for the user — never guessed from the résumé.
 _NUMERIC_FACT = ("salary", "compensation expectation", "pay expectation", "desired pay",
-                 "expected compensation", "gpa", "test score")
+                 "expected compensation", "gpa", "test score",
+                 "years of experience", "years experience")
 
 
 def is_open_ended(question: str, is_textarea: bool = False) -> bool:
@@ -145,8 +148,13 @@ CLASSIFIABLE_TYPES: dict[str, str] = {
                             "future (yes/no). Distinct from already being authorized.",
     "us_citizen": "Is a citizen of the country (yes/no).",
     "willing_to_relocate": "Willing to relocate / move to a new city for the job (yes/no).",
-    "open_to_remote": "Willingness about WORK LOCATION/ARRANGEMENT — working remotely, hybrid, "
-                      "or in-person from a specific office some days per week (yes/no).",
+    "open_to_remote": "A yes/no WILLINGNESS question — are you open to / would you accept remote "
+                      "or hybrid work (yes/no). NOT a question that asks you to CHOOSE or STATE a "
+                      "preferred arrangement.",
+    "work_arrangement": "The PREFERRED work arrangement when asked to choose or state a preference "
+                        "among remote / hybrid / on-site / in-office (e.g. 'Preferred work "
+                        "arrangement?', 'Do you prefer remote, hybrid, or on-site?'). Answered as "
+                        "one arrangement, not yes/no.",
     "desired_salary": "Expected or desired salary / compensation.",
     "earliest_start_date": "When they can start / begin, their availability, or notice period.",
     "years_experience": "Total years of relevant professional experience.",

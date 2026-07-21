@@ -186,16 +186,30 @@ def _delta_to_tailored(base: Resume, delta: TailorDelta) -> TailoredResume:
     )
 
 
-def _user_message(resume: Resume, jd: JobDescription, budget: LengthBudget) -> str:
+def _user_message(resume: Resume, jd: JobDescription, budget: LengthBudget,
+                  emphasis: Optional[list[str]] = None) -> str:
     # Compact JSON (no indentation, null/empty fields dropped) — the résumé is the largest
     # prompt component and indent=2 was ~12% whitespace. The JD is boilerplate-trimmed.
+    # `emphasis` is the ATS retry loop's feedback (ats_requirements): keywords the target
+    # ATS screens for that the previous pass dropped — the candidate genuinely has them, so
+    # they must reappear verbatim without inventing anything.
+    emph = ""
+    if emphasis:
+        emph = (
+            "\n\nATS SCREEN — the target applicant-tracking system screens this posting for "
+            f"the following skills, which the candidate HAS but your previous draft omitted: "
+            f"{', '.join(emphasis)}. Make each appear verbatim in the tailored résumé (in the "
+            "skills list and, where truthful, a bullet). Do NOT invent experience — only "
+            "surface what the base résumé already supports.\n"
+        )
     return (
         "BASE RESUME (source of truth, JSON; reference entries by their 0-based index "
         "within each section):\n"
         f"{resume.model_dump_json(exclude_none=True, exclude_defaults=True)}\n\n"
         f"JOB DESCRIPTION — {jd.title} at {jd.company}:\n"
         f"{trim_for_prompt(jd.body)}\n\n"
-        f"{budget.prompt()}\n\n"
+        f"{budget.prompt()}"
+        f"{emph}\n\n"
         "Produce the tailoring plan now."
     )
 
@@ -204,7 +218,8 @@ class TailorBackend(Protocol):
     name: str
 
     def tailor(
-        self, resume: Resume, jd: JobDescription, budget: LengthBudget
+        self, resume: Resume, jd: JobDescription, budget: LengthBudget,
+        emphasis: Optional[list[str]] = None,
     ) -> TailoredResume: ...
 
 
@@ -249,7 +264,8 @@ def _classify_cli_failure(detail: str) -> type:
 def run_claude_cli(prompt: str, *, cli: str = CLAUDE_CLI,
                    model: Optional[str] = None, think: bool = True,
                    timeout: int = 300, system: Optional[str] = None,
-                   json_schema: Optional[dict] = None) -> str:
+                   json_schema: Optional[dict] = None,
+                   activity: Optional[str] = None) -> str:
     """Run one prompt through the Claude Code CLI (subscription billing, not the API) and
     return the model's text. Raises ClaudeAuthError (CLI missing / not signed in),
     ClaudeRateLimitError (usage cap / rate limit), or ClaudeUnavailableError (anything
@@ -262,7 +278,10 @@ def run_claude_cli(prompt: str, *, cli: str = CLAUDE_CLI,
     MCP servers, no settings/CLAUDE.md. A default headless session carries ~40k tokens of
     coding-agent context per call; stripped, the same call carries only the prompt itself
     (~74x less overhead measured — see DECISIONS.md #034). `system` replaces the (empty)
-    system prompt; `json_schema` makes the CLI enforce schema-valid JSON output."""
+    system prompt; `json_schema` makes the CLI enforce schema-valid JSON output.
+
+    `activity` labels this call's token usage (tailoring / form-entry / judging / …) for the
+    token accounting in `usage.record` (decision 095); it does not affect the call itself."""
     if shutil.which(cli) is None:
         raise ClaudeAuthError(
             "Claude Code CLI ('claude') not found. Install it and sign in to your Claude "
@@ -306,8 +325,12 @@ def run_claude_cli(prompt: str, *, cli: str = CLAUDE_CLI,
         )
     try:
         env = json.loads(proc.stdout)
-        if isinstance(env, dict) and isinstance(env.get("result"), str):
-            return env["result"]
+        if isinstance(env, dict):
+            # Capture this call's token usage (decision 095) before returning the text.
+            from . import usage
+            usage.record(env, activity=activity)
+            if isinstance(env.get("result"), str):
+                return env["result"]
     except json.JSONDecodeError:
         pass
     return proc.stdout
@@ -333,7 +356,8 @@ class ClaudeCodeBackend:
         self.model = model
         self.think = think
 
-    def tailor(self, resume: Resume, jd: JobDescription, budget: LengthBudget) -> TailoredResume:
+    def tailor(self, resume: Resume, jd: JobDescription, budget: LengthBudget,
+               emphasis: Optional[list[str]] = None) -> TailoredResume:
         if shutil.which(self.cli) is None:
             raise RuntimeError(
                 "Claude Code CLI ('claude') not found. Install it and sign in to your "
@@ -341,7 +365,7 @@ class ClaudeCodeBackend:
                 "'rules' engine."
             )
         base = (
-            _user_message(resume, jd, budget)
+            _user_message(resume, jd, budget, emphasis)
             + "\n\nOutput format: respond with ONLY a single JSON object for the tailoring "
             "plan — no explanation, no markdown code fences."
         )
@@ -360,7 +384,7 @@ class ClaudeCodeBackend:
 
     def _run(self, prompt: str) -> str:
         return run_claude_cli(prompt, cli=self.cli, model=self.model, think=self.think,
-                              system=SYSTEM_PROMPT,
+                              system=SYSTEM_PROMPT, activity="tailoring",
                               json_schema=TailorDelta.model_json_schema())
 
 
@@ -372,7 +396,10 @@ class RulesBackend:
 
     name = "rules"
 
-    def tailor(self, resume: Resume, jd: JobDescription, budget: LengthBudget) -> TailoredResume:
+    def tailor(self, resume: Resume, jd: JobDescription, budget: LengthBudget,
+               emphasis: Optional[list[str]] = None) -> TailoredResume:
+        # `emphasis` is ignored: this engine is deterministic and already surfaces every
+        # JD-mentioned skill it can, so re-running with feedback changes nothing.
         jd_lower = jd.body.lower()
         jd_tokens = relevance.tokens(jd.body)
         terms = relevance.skill_terms(resume)

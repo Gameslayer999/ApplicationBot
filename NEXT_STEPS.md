@@ -97,24 +97,30 @@ and free-form notes.
 
 ## Now
 
-### Confirm the SmartRecruiters fix from the user's own network (decision 076) — BLOCKED ON USER
+### Confirm the SmartRecruiters "I'm interested" reveal fix (decision 098) — BLOCKED ON USER
 
-The nav work is verified; **the SmartRecruiters posting that prompted it is not**. Every live
-attempt from the build environment is 403'd by DataDome, which named *this machine's* cloud egress
-IP — so the block may be about where the build runs, not about the user's home network.
+The user re-drove `jobs.smartrecruiters.com/Consultadd4/87644936` from their own network and got
+**"form did not load within 25s"** — **no** DataDome wall (the page loaded for them; the build
+environment's egress IP is the one DataDome named, so it still can't drive the real page). Diagnosed:
+decision **076 documented** a `_REVEAL_CONTROL` matching SmartRecruiters' **"I'm interested"** button
+but that code **was never committed** — the shipped reveal only clicked `\bapply\b`, so the form was
+never revealed. **Fixed in decision 098** (`apply.py` `_open_application_form` now matches
+"interested", anchored against "Not interested"). Unit + fake-page tests green; live confirmation
+still owed from the user's network.
 
-- [ ] **USER:** re-drive the reported posting from your own machine and report which happens:
+- [ ] **USER:** re-drive the same posting and report which happens:
   ```
   python -m applicationbot.apply "https://jobs.smartrecruiters.com/Consultadd4/87644936" \
       --pdf "<your résumé>.pdf" --resume profile/resume.yaml --headless --no-pause --no-record --dry-run
   ```
-  - **Fields fill** → causes 1+2 were the whole story; nothing further to do.
-  - **"blocked automated access"** → SmartRecruiters walls the user too. That is the site refusing
-    us, and the honest answer is to apply there by hand — **do not** build evasion (Guideline #4).
-    Consider instead **dropping SmartRecruiters from discovery** so the pipeline stops queueing
-    postings it can never submit (it contributed ~298 of the 074 unlock).
-  - **"form did not load"** (no wall) → a *fourth* cause past the `oneclick-ui` page; arm
-    `nav_agentic: true` and let the learner take it.
+  - **Fields fill** → decision 098 was the whole story; nothing further to do.
+  - **"form did not load" still** (no wall) → the reveal click landed but a *later* page gates the
+    form; arm `nav_agentic: true` and let the learner take it (note: the full nav-recipes learn/replay
+    machinery from 076 is still not committed to `apply.py` — see the standing `test_nav_recipes.py`
+    collection error).
+  - **"blocked automated access"** → SmartRecruiters walls the user too. Apply there by hand —
+    **do not** build evasion (Guideline #4). Consider **dropping SmartRecruiters from discovery** so
+    the pipeline stops queueing postings it can never submit (~298 of the 074 unlock).
 
 ### LinkedIn job alerts as a discovery source (decision 072) — BLOCKED ON USER
 
@@ -468,6 +474,15 @@ value ÷ effort:
 
 ## Next
 
+### Persist each posting's JD beside its tailored PDF (surfaced by decision 086)
+
+- [ ] Store the job description (or the tailored structured `TailoredResume`) next to each
+      `profile/tailored/<posting>.pdf`, keyed by the same posting hash. Today only the PDF + stamp are
+      kept, so after a tailoring-logic change a tracked row can be re-rendered offline only while its JD
+      is still in the rolling discovery cache (`scripts/retailor_tracked.py` re-tailored 1 of 18 rows
+      for this reason). With the JD persisted, `retailor_tracked` (and a future "re-tailor this row"
+      Track-tab button) could refresh ANY historical row against the current prompt/layout.
+
 ### Discovery funnel — surfaced by decisions 073/074 (2026-07-15)
 
 - [ ] **`max_resolve` is now the binding constraint on early-career discovery.** Measured:
@@ -624,6 +639,43 @@ Posted to the agent bus 2026-07-06; independent of the engine work above.
 
 ## Recently added (this session, latest first)
 
+- 2026-07-21 — **Form reveal now clicks "I'm interested", not just "Apply" (decision 098).** A live
+  SmartRecruiters dry run timed out with "form did not load … 0 fields": decision 076 said it added a
+  `_REVEAL_CONTROL` matching the "I'm interested" button, but that code was never committed — the
+  shipped reveal only matched `\bapply\b`. `apply.py` `_open_application_form` now uses
+  `_REVEAL_CONTROL = re.compile(r"\bapply\b|(?<!not )\binterested\b", re.I)` (anchored so "Not
+  interested" can't match). 2 new `test_open_application_form.py` cases; live confirmation owed (see Now).
+- 2026-07-17 — **Per-application Claude token spend in the Track table (decision 095).** The user
+  wanted to see how many tokens each application costs — how much Claude is doing (tailoring, form
+  entry, etc.). Every Claude call routes through `backends.run_claude_cli`, whose `--output-format
+  json` envelope already carries `usage` + `total_cost_usd` (previously discarded). New
+  [usage.py](applicationbot/usage.py) captures it via two contextvars — `activity` (WHAT: tailoring
+  / form-entry / judging / enrichment / salary / impact) and `for_posting(source_url)` (WHICH app,
+  set in `pipeline.tailor_and_render` + `apply.run_apply`) — and best-effort writes each call to a
+  new append-only `usage_events` table. The batched fit judge runs outside any `for_posting` block,
+  so its tokens are a **separate discovery aggregate**, never split across rows (the user's choice).
+  Track tab: a **Tokens** column (compact total) that expands to the in/out split + per-activity
+  breakdown, plus a one-line "Discovery & judging (all-time)" figure above the table.
+  `tracker.usage_by_application` / `usage_discovery_summary` do the reads; delete cascades usage by
+  URL. Now also meters the **Workday agentic `stream-json` worker** (`workday._record_agent_usage`
+  parses its final result line → form-entry, attributed to the posting) and the **salary
+  market-estimate** call in `run_testing_mode` (wrapped in `for_posting(p.url)`). Verified: a live
+  `claude` call attributed 390/4 tokens to a posting; `tests/test_usage.py` (7 cases incl. the
+  stream-json parser); live `/track` serves the payload; served JS `node --check` clean.
+  *By design in the discovery bucket, not per-app:* the standalone Tailor-tab/CLI tailor (not tied to
+  any application).
+
+- 2026-07-17 — **Preference- and commute-aware work-location answers (decision 094).** Fixes a
+  dry-run where the bot signalled it would work remotely for a commutable NY office. New
+  **adjustable Profile setting** `work_arrangement` (No preference / In-office when commutable /
+  Hybrid / Always in-office / Always remote) + `max_commute_miles`; commutability is **Claude-judged**
+  from the posting's office location(s) in the JD against the applicant's home + radius (one cached
+  call per posting). A bare "Are you open to remote?" yes/no still answers **Yes**; the preference is
+  expressed on arrangement questions and office-location dropdowns. `_office_prefs` no longer ranks
+  Remote first for an in-office/commutable preference (the specific reported bug). New
+  `tests/test_work_arrangement.py` (13). *Remaining live step:* watch one headed dry-run on a real
+  commutable posting to confirm the Claude commutability call + On-site dropdown pick behave (no
+  fixture covers the live JD → Claude path).
 - 2026-07-14 — **Auto-apply loop: prepare-then-prompt mode (decision 069).** The autonomous
   looping mode the user asked for — "look for as many matches as possible, then get started on
   them one by one and prompt me as it needs me to start applying." Sits between the two runner
@@ -1774,6 +1826,97 @@ Record each decision in [DECISIONS.md](DECISIONS.md) once the user chooses.
 
 ## Recently completed
 
+- 2026-07-20 — **A submit the user clicks during the dry-run review pause is tracked as a real
+  `applied` application** (decision 097). The user's rule: keep it a dry-run unless the bot *or a
+  human* clicked Submit. The bot-armed click already recorded `applied`; the gap was a human click —
+  a dry-run leaves the filled form open for review, and `_record_run` writes the `dry-run` row
+  *before* that pause, so a submit the user then clicked went untracked. Fix (surgical to
+  `apply.py`): new `ApplyReport.manual_submit` + `_detect_manual_submit`, which flips the report to
+  submitted on the first confirmation (reusing `_confirmation_evidence` — positive URL/text only,
+  never "form gone"), polled in the web `hold` loop and once after the terminal `input()`; after the
+  pause a re-record upserts the same posting row `dry-run`→`applied` (method `manual`, `date_applied`
+  stamped) and logs the submitted attempt. `method` now distinguishes `manual`/`auto`/`dry-run`; the
+  web "done" message reflects a manual submit. New `tests/test_manual_submit.py` (4) + `test_submit`
+  (7) green. **Needs a live dry run where the user hand-submits to confirm the confirmation-page
+  detection end-to-end.**
+- 2026-07-17 — **Combobox commits are verified; "Filled — review" notification fires immediately**
+  (decision 096). Two live-SpaceX dry-run bugs. (1) School reported `option:claude` in
+  `report.json` but the browser field was blank — `_commit_option_text` returned `True` on the
+  option-click without checking the value stuck, and Greenhouse's **async** School react-select
+  re-renders the list under the click, swallowing the select. Fix: after clicking, read the
+  rendered value via `_VALUE_JS` and retry the open→type→click up to 3×; give up with `False`
+  (field recorded unfilled for the user) instead of a false success. (2) The web notif lagged the
+  visibly-filled fields by ~a minute because `on_filled` fired only after the full-page screenshot
+  + learning + tracker + archive; moved it to fire right after the fill's done banner (the filled
+  panel shows only summary text, never the screenshot). Apply/fill/parking/required/combobox suite
+  72 passed. **School-commit fix still needs a live Greenhouse dry run to confirm end-to-end.**
+- 2026-07-16 — **Years-of-experience never guessed from the résumé** (decision 093). A dry run
+  autofilled "1 - 5 years" on a required "years full-time, not counting internships" dropdown for
+  the user, a new grad with 0 full-time years — the blank profile field let the required-dropdown
+  fallback (`choose_required_option`) have Claude count résumé internships/projects. Fix: added
+  `"years of experience"`/`"years experience"` to `answer_bank._NUMERIC_FACT` (so an unset value is
+  captured for the user, not guessed — same class as salary/GPA) **and** set `years_experience: '0'`
+  in `profile/application_profile.yaml` so it resolves deterministically to the "0-1 years" option.
+  Regression case added to `tests/test_required_draft.py`; 23 gate/dropdown/determinism tests green.
+- 2026-07-16 — **ATS feedback loop in tailoring** (decision 092). The user asked to optimize
+  tailoring for the posting's ATS and "test against a dummy ATS based on the JD we pulled" (was
+  looking at `sauravhathi/atsresume` — evaluated, nothing reusable: it's a Next.js résumé-builder
+  whose "ATS scoring" is just a link to resumego.net). New `applicationbot/ats_requirements.py`:
+  `extract(resume, jd)` builds a deterministic (zero-token) ATS profile — required **keywords**
+  (JD-demanded skills the candidate truthfully has) + **knockouts** (years/degree evaluated vs the
+  résumé, clearance/citizenship flagged) — and `grade(text, req)` scores a draft (0–100 + knockout
+  verdicts). `tailor_resume` now grades each draft and, for non-deterministic backends, re-tailors
+  up to 2× feeding the missing keywords back as backend `emphasis`, stopping when a pass stops
+  shrinking the gap; the grade is appended to `relevance_notes` (shows in CLI/web/pipeline) and on
+  `TailorResult.ats_grade`. Backend `tailor(..., emphasis=None)` added (rules ignores it). Verified:
+  `tests/test_ats_requirements.py` (6) + offline end-to-end on the real xAI JD (100/100) + stub
+  test proving the loop detects a drop, feeds it back, and recovers to 100; 60 related tests pass.
+  **Not yet done:** surface the ATS grade as a first-class UI element (badge/score) rather than a
+  note line, and record `ats_grade` on the tracker row; not yet exercised with a live Claude retry
+  (only the rules/stub paths ran offline — the retry only fires for the Claude backend).
+- 2026-07-16 — **Track table columns are drag-to-reorder** (decision 091). The user wanted to drag
+  and reorder the Track columns. Added a third per-browser pref `ab_track_order` alongside the
+  existing width/visibility prefs: `orderedCols()` renders `TRACK_COLS` in the saved order and
+  appends any unlisted key in its canonical spot (a stale order can't drop or dupe a column);
+  `visibleCols()` filters that, so order + hide compose. Each `<th>` is `draggable` (grab cursor,
+  `.dragging`/`.dropto` feedback); dropping calls `reorderCol()` → save → re-render. Resize still
+  works because the edge handle's `mousedown` `preventDefault()`s the native drag. "Reset columns"
+  also clears the order. All in `web.py`; no endpoint/schema/dep change. Verified: page JS
+  `node --check` clean; `orderedCols`/`reorderCol` unit-tested in node (moves + stale-order
+  resilience); server serves `/` 200.
+- 2026-07-16 — **Backfilled the per-PDF JD sidecar so "Re-tailor ▶" appears for pre-existing rows**
+  (decision 090). The user couldn't find where to re-run a dry run with retailoring: the Track
+  "Re-tailor ▶" button (088) is gated on `has_jd`, and **all 17 dry-run rows had `has_jd=False`**
+  (they predate the sidecar), so only "Re-run ▶" ever showed; the cache-based CLI fallback reached
+  only 1 of 17. Added `scripts/backfill_jd.py` (idempotent, Guideline #8): for each row **missing**
+  a sidecar, get the JD cache-first (`discovery_cache.json`) then live-fetch `source_url` via
+  `enrich.fetch_full_jd(..., llm=claude_llm_extractor)`, and `resume_store.write_jd` it — no
+  tailoring, only attaches the JD; unreachable rows are reported FAILED, never silently skipped.
+  Ran `--all`: wrote 15, already-had 3, **failed 0** → all 17 dry-run rows now show "Re-tailor ▶"
+  on the next `/track` load. Flagged: MARGO (id 9) came back thin (93 chars) — too short to tailor
+  well until a fuller JD is captured.
+- 2026-07-16 — **Dashboard deslop pass (ibelick/ui-skills `baseline-ui`)** (decision 089). Audited all
+  four tabs live (Playwright, light + dark) against ibelick's `baseline-ui` "deslop" ruleset. Review &
+  Profile were already clean → left untouched. Fixed two real violations in `web.py`, behavior-preserving:
+  (1) **Discover** — the auto-apply-loop reuse/retailor checkboxes rendered as ALL-CAPS letter-spaced
+  paragraphs (global `label{text-transform:uppercase}` bleeding onto `.loop-rescan`); now normal sentence
+  case. (2) **Track table** — native date pickers were hogging width and squeezing text columns to
+  `dr…`/`Te…`; now `.ttable{width:max-content}` (honors col widths + horizontal scroll), a new `dateCell`
+  renders dates as text/`—` and swaps to a picker on click (mirrors `urlCell`), status renders as a color
+  badge, empty cells show `—`. `ui-skills` is an agent skill-doc CLI, not a dependency — nothing added to
+  requirements. Verified via screenshots + a programmatic date-cell check; page JS `node --check` clean.
+- 2026-07-16 — **Track "Re-run": choose reuse vs re-tailor; re-tailor from a saved per-PDF JD sidecar**
+  (decision 088). Resolves decision 086's structural follow-up (persist the JD per posting). Each
+  dry-run now saves the JD to a `<pdf>.jd` sidecar (`resume_store.write_jd/read_jd/has_jd`); the
+  tailor+render half of `run_testing_mode` is extracted to `pipeline.tailor_and_render` and reused. Track
+  shows "Re-run ▶" (reuse, no Claude) always + "Re-tailor ▶" only when a saved JD lets it run offline
+  (`has_jd` per row in `/track`); `_reapply_worker(retailor=True)` re-tailors against the user's current
+  base résumé, writes a fresh PDF, then fills (086's `Cache-Control: no-store` makes it display). Older
+  dry-runs predate the sidecar → reuse-only until re-dry-run once. Verified incl. driving the Track tab
+  headless (exactly one "Re-tailor ▶" on the seeded row); 357 passed (2 pre-existing bot_wall failures).
+  Follow-up in the same session (also decision 089): the Track **Columns** show/hide menu already let
+  users pick which columns to see (persisted per browser), but was opening off-screen and its checkboxes
+  were stretched — fixed both (anchor `right:0`, checkbox `flex:0 0 auto`).
 - 2026-07-16 — **Track tab: "Dry-run" date shows the LATEST run + each posting expands to a per-run
   history log** (decision 084). Two follow-ups to 083: (1) `apply.py._record_run`'s update path now
   explicitly stamps `date_dry_run = today` on every dry-run re-run (the tracker only auto-stamps the
@@ -1795,6 +1938,27 @@ Record each decision in [DECISIONS.md](DECISIONS.md) once the user chooses.
   show a real date. No `apply.py` change (dry-runs record via `add_application`, which now stamps).
   Verified on temp + real DB (17/17 backfilled, 0 blank); funnel/calibration/runner/web-CSRF suites
   green (2 pre-existing `test_parking.py` bot_wall failures unrelated).
+- 2026-07-16 — **Tailor: made "changes always show after a restart+rerun" a real guarantee** (decision
+  087). Replaced decision 082's partial stamp (content-hashed prompt + hand-bumped `pdf.LAYOUT_VERSION`,
+  which missed `length`/`catalogue`/`tailor` edits and could be forgotten) with
+  `pipeline._tailoring_logic_fingerprint()` — a SHA1 over the source of every tailoring module
+  (`backends`, `catalogue`, `length`, `pdf`, `tailor`), folded into `tailor_stamp` as one `logic` key.
+  Any edit to any of them auto-invalidates cached PDFs; removed `LAYOUT_VERSION`. Pinned at import (a
+  source edit takes effect after a restart), so the guarantee is: edit tailoring code → restart the
+  dashboard → rerun. Caveat: the reuse gate re-tailors, but the normal loop still skips seen postings
+  (`only_new`); seen ones refresh via the rescan checkbox or `scripts/retailor_tracked.py`; new postings
+  always get the current logic. Verified: live fingerprint matches a hand-recomputed hash + changes on
+  any source edit; 24 tests pass.
+- 2026-07-16 — **Tailor: diagnosed why a re-tailor still showed the old résumé + a re-tailor script**
+  (decision 086). Three stacked causes: (1) the normal loop uses `only_new=True` so it never revisits a
+  seen posting → its PDF is never rewritten (rescan is the opt-in path; proved via PDF mtimes predating
+  the code change); (2) `/track/resume` had no `Cache-Control`, so the browser served the cached old PDF
+  at its stable `?id=` URL even after the file was overwritten — fixed with `Cache-Control: no-store`;
+  (3) JDs aren't persisted per PDF, so only cache-fresh rows can be re-tailored offline (1/18 here).
+  Added `scripts/retailor_tracked.py` (idempotent; `--id/--company/--all`, `--backend auto|rules`,
+  `--force`) that re-tailors tracked rows whose JD is still cached, overwriting the PDF + stamp in place.
+  Verified end-to-end on the real Stripe row 22 via claude-code: experience order Ninth Wave → Jaguar →
+  Kumon, metrics preserved, 34pt margins, 1 page. 13 web/pipeline/tracker tests pass.
 - 2026-07-16 — **Tailor: the reuse-stamp now tracks the tailoring LOGIC, not just the data — so
   prompt/layout changes stop silently no-op'ing on dry runs** (decision 082). A dry run reuses a
   posting's stored tailored PDF when its `.stamp` matches (skips the Claude call + render), but

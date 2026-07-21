@@ -301,7 +301,7 @@ def test_reapply_route_blocks_cross_origin(web_temp_db, monkeypatch):
 
     web, _ = web_temp_db
     started: list = []
-    monkeypatch.setattr(web, "start_reapply", lambda app_id, arm=False: started.append(arm) or {"ok": True})
+    monkeypatch.setattr(web, "start_reapply", lambda app_id, arm=False, retailor=False: started.append(arm) or {"ok": True})
 
     srv = ThreadingHTTPServer(("127.0.0.1", 0), web.Handler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()

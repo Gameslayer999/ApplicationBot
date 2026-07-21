@@ -694,6 +694,26 @@ def _agent_argv(mcp_config_path: str, model: str = _AGENT_MODEL) -> list[str]:
             "--permission-mode", "bypassPermissions", "--output-format", "stream-json", "--verbose", "-"]
 
 
+def _record_agent_usage(stdout: Optional[str]) -> None:
+    """Record the agentic worker's token spend from its `stream-json` stdout (decision 095).
+    That format emits one JSON object per line, ending in a `result` object carrying cumulative
+    `usage` + cost — the same shape the non-stream envelope has. Finds the last line with a `usage`
+    block and hands it to `usage.record`, attributed to the posting under form-entry (this runs
+    inside run_apply's `for_posting`). Best-effort: never raises."""
+    try:
+        from . import usage
+        for line in reversed((stdout or "").splitlines()):
+            try:
+                obj = json.loads(line.strip())
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if isinstance(obj, dict) and isinstance(obj.get("usage"), dict):
+                usage.record(obj, activity="form-entry")
+                return
+    except Exception:
+        pass
+
+
 def _spawn_claude_agent(page, fields, prompt, *, cdp_port, model, report) -> None:
     """Live agentic worker: launch Claude Code CLI with a Playwright MCP server bound to our
     browser's CDP endpoint; it fills the page's custom fields. The fill happens in the shared
@@ -711,6 +731,9 @@ def _spawn_claude_agent(page, fields, prompt, *, cdp_port, model, report) -> Non
     proc = subprocess.run(
         _agent_argv(cfg_path, model), input=prompt, capture_output=True, text=True, timeout=300,
         env={**os.environ, "CLAUDESTATUS_IGNORE": "1"})
+    # Meter the agentic worker's token spend (decision 095) — before the returncode check so a
+    # failed-but-spent run still counts.
+    _record_agent_usage(proc.stdout)
     if proc.returncode != 0:
         raise RuntimeError(f"claude agent exited {proc.returncode}: {(proc.stderr or '')[-300:]}")
 

@@ -162,8 +162,10 @@ def _test_worker(force_fresh: bool = False) -> None:
             backend="auto", headed=True, pause=True,
             status_cb=status_cb, hold=_TEST_HOLD, on_filled=on_filled,
         )
-        _set(phase="done", step="done",
-             message="Done — browser closed. A dry-run row was recorded in Track.",
+        done_msg = ("Done — you submitted this application manually; it's recorded as Applied in Track."
+                    if report.submitted else
+                    "Done — browser closed. A dry-run row was recorded in Track.")
+        _set(phase="done", step="done", message=done_msg,
              report={"summary": report.summary(), "submitted": report.submitted,
                      "url": report.url, "screenshot": report.screenshot})
     except Exception as e:
@@ -193,11 +195,16 @@ def _reapply_gate(arm: bool):
     return SafetyGate(armed=True, max_submissions_per_run=1, kill_file=DEFAULT_KILL)
 
 
-def _reapply_worker(app_id: int, *, arm: bool = False) -> None:
+def _reapply_worker(app_id: int, *, arm: bool = False, retailor: bool = False) -> None:
     """Resume a parked application (decision 049): re-drive the DETERMINISTIC fill on the same
     posting URL with the stored tailored PDF, now that the user has resolved the block (answered
-    the question, stored the login). No re-discovery, no re-tailoring — the answer/profile change
-    is all that's new, so the same form fills further.
+    the question, stored the login). No re-discovery — the answer/profile change is all that's
+    new, so the same form fills further.
+
+    `retailor=True` (decision 086) first regenerates the résumé from the posting's SAVED job
+    description (`resume_store.read_jd`) + the user's current base résumé/prompt/layout, then fills
+    with the fresh PDF — the Track "Re-run → re-tailor" choice. `retailor=False` reuses the stored
+    PDF as-is (the default, fast, no Claude call).
 
     `arm=False` (default) → DRY-RUN: fills, records, never submits. `arm=True` (decision 058) →
     a per-click armed submit: a one-shot `SafetyGate(armed=True, cap 1)` is passed to run_apply so
@@ -226,6 +233,23 @@ def _reapply_worker(app_id: int, *, arm: bool = False) -> None:
             return
 
         company, role = app.get("company", ""), app.get("role", "")
+
+        if retailor:
+            # Re-tailor from the SAVED job description (no re-scrape) + the user's current résumé.
+            from . import pipeline, resume_store
+            jd = resume_store.read_jd(pdf)
+            if jd is None:
+                _set(phase="error", errors=[
+                    "This posting has no saved job description, so it can't be re-tailored "
+                    "(it predates that feature). Run a fresh dry-run for it from Discovery, or "
+                    "re-run reusing the stored résumé instead."])
+                return
+            _set(step="tailor", message=f"Re-tailoring résumé for {company} — {role}…".strip(" —"),
+                 chosen={"company": company, "title": role, "url": url})
+            pdf = pipeline.tailor_and_render(
+                load_resume("profile/resume.yaml"), apply_profile.load_profile(), jd,
+                company, role, url, status_cb=lambda step, message: _set(step=step, message=message))
+
         verb = "Submitting" if arm else "Re-applying"
         _set(step="apply", message=f"{verb} to {company} — {role}…".strip(" —"),
              chosen={"company": company, "title": role, "url": url})
@@ -271,7 +295,7 @@ def _reapply_worker(app_id: int, *, arm: bool = False) -> None:
         _set(phase="error", errors=[f"{type(e).__name__}: {e}"])
 
 
-def start_reapply(app_id: int, *, arm: bool = False) -> dict:
+def start_reapply(app_id: int, *, arm: bool = False, retailor: bool = False) -> dict:
     if _loop_running():
         return {"ok": False, "error": "The auto-apply loop is running (it owns the browser). "
                 "Use its Apply buttons, or stop the loop first."}
@@ -280,7 +304,8 @@ def start_reapply(app_id: int, *, arm: bool = False) -> dict:
             return {"ok": False, "error": "A run is already in progress — let it finish first."}
         _TEST_STATE.clear()
         _TEST_STATE.update(_test_reset())
-    threading.Thread(target=_reapply_worker, kwargs={"app_id": app_id, "arm": arm},
+    threading.Thread(target=_reapply_worker,
+                     kwargs={"app_id": app_id, "arm": arm, "retailor": retailor},
                      daemon=True).start()
     return {"ok": True}
 
@@ -710,15 +735,27 @@ class Handler(BaseHTTPRequestHandler):
             )
             # Attach each posting's run count so the Track tab can show "N runs" without loading
             # every run up front (the runs themselves are fetched lazily on expand, /track/runs).
+            # `has_jd` gates the "Re-tailor" re-run option — true only when a saved JD lets it run
+            # offline (decision 086); postings that predate the JD sidecar show reuse-only.
+            from . import resume_store
             rc = tracker.run_counts()
+            # Claude token spend per posting, keyed by source URL (decision 095) — attached so the
+            # Track table can show a per-application Tokens column that expands to the in/out split
+            # and the per-activity breakdown (tailoring / form-entry / …).
+            usage_by = tracker.usage_by_application()
             for a in apps:
                 a["run_count"] = rc.get(a["id"], 0)
+                a["has_jd"] = resume_store.has_jd(a.get("resume_path", ""))
+                a["tokens"] = usage_by.get((a.get("source_url") or "").strip())
             self._json(200, {
                 "applications": apps,
                 "counts": tracker.status_counts(),
                 "funnel": tracker.funnel_report(),
                 "statuses": tracker.STATUSES,
                 "fields": tracker.EDITABLE,
+                # Batched-judge / discovery Claude spend not tied to one application (user's
+                # choice: shown as one separate aggregate, never divided across rows).
+                "usage_discovery": tracker.usage_discovery_summary(),
             })
             return
         if path == "/track/runs":
@@ -761,8 +798,13 @@ class Handler(BaseHTTPRequestHandler):
                     "No stored résumé for this application. It records one only after a "
                     "dry-run/apply that tailored a PDF."})
                 return
+            # no-store: the URL is keyed on the row id and stable, but the file it points at is
+            # overwritten in place when a posting is re-tailored (same path, new bytes). Without
+            # this the browser's PDF viewer serves the cached old résumé at the unchanged URL, so
+            # a re-tailor looks like it did nothing (the exact symptom this endpoint must avoid).
             self._send(200, f.read_bytes(), "application/pdf",
-                       {"Content-Disposition": 'inline; filename="' + f.name + '"'})
+                       {"Content-Disposition": 'inline; filename="' + f.name + '"',
+                        "Cache-Control": "no-store"})
             return
         if path == "/test-run/status":
             with _TEST_LOCK:
@@ -938,7 +980,8 @@ class Handler(BaseHTTPRequestHandler):
                 # Cross-origin already rejected by the do_POST origin guard (decision 062); an
                 # armed submit is doubly safe there.
                 p = json.loads(raw or b"{}")
-                self._json(200, start_reapply(int(p["id"]), arm=bool(p.get("arm"))))
+                self._json(200, start_reapply(int(p["id"]), arm=bool(p.get("arm")),
+                                              retailor=bool(p.get("retailor"))))
             elif path == "/test-run":
                 self._json(200, start_test_run(bool(json.loads(raw or b"{}").get("fresh"))))
             elif path == "/test-run/close":
@@ -1079,19 +1122,28 @@ INDEX_HTML = """<!doctype html>
   /* Track view uses the full screen width — no 640px editor cap. */
   .track-editor { max-width:none; }
   .track-editor .editing { max-width:820px; }
-  .ttable { width:auto; table-layout:fixed; border-collapse:collapse; background:var(--surface); border:1px solid var(--line); border-radius:8px; font-size:13px; }
-  .ttable th { position:relative; text-align:left; font-size:11px; text-transform:uppercase; letter-spacing:.03em; color:var(--muted); padding:8px 8px; border-bottom:1px solid var(--line); white-space:nowrap; overflow:hidden; }
+  /* width:max-content lets fixed-layout honor each <col>'s width and scroll in .twrap, instead of
+     squeezing text columns to nothing while native date inputs hog their min-width. */
+  .ttable { width:max-content; table-layout:fixed; border-collapse:collapse; background:var(--surface); border:1px solid var(--line); border-radius:8px; font-size:13px; }
+  .ttable th { position:relative; text-align:left; font-size:11px; text-transform:uppercase; letter-spacing:.03em; color:var(--muted); padding:8px 8px; border-bottom:1px solid var(--line); white-space:nowrap; overflow:hidden; cursor:grab; }
   .ttable th .lbl { display:block; overflow:hidden; text-overflow:ellipsis; padding-right:6px; }
+  /* Drag-to-reorder feedback: the grabbed header dims; the drop target shows a left insertion bar. */
+  .ttable th.dragging { opacity:.4; cursor:grabbing; }
+  .ttable th.dropto { box-shadow:inset 2px 0 0 0 var(--accent); }
   /* Spreadsheet-style drag-to-resize handle on each column's right edge. */
   .ttable th .rz { position:absolute; top:0; right:0; width:7px; height:100%; cursor:col-resize; user-select:none; }
   .ttable th .rz:hover, .ttable th.rzing .rz { background:var(--accent); opacity:.4; }
   body.rz-drag { cursor:col-resize; user-select:none; }
   /* Show/hide-columns menu */
   .colmenu { position:relative; }
-  .colmenu .menu { position:absolute; z-index:30; top:calc(100% + 4px); left:0; background:var(--surface); border:1px solid var(--line); border-radius:8px; box-shadow:0 6px 24px rgba(0,0,0,.12); padding:8px; min-width:190px; max-height:340px; overflow:auto; }
+  /* Anchor to the button's right edge (it sits near the viewport's right), so the menu opens inward
+     instead of overflowing off-screen and getting clipped. */
+  .colmenu .menu { position:absolute; z-index:30; top:calc(100% + 4px); right:0; left:auto; background:var(--surface); border:1px solid var(--line); border-radius:8px; box-shadow:0 6px 24px rgba(0,0,0,.12); padding:8px; min-width:210px; max-height:340px; overflow-y:auto; }
   .colmenu .menu label { display:flex; align-items:center; gap:8px; margin:2px 0; padding:2px; font-size:13px; font-weight:400; text-transform:none; letter-spacing:normal; color:var(--ink); cursor:pointer; }
   .colmenu .menu label:hover { background:var(--bg); border-radius:4px; }
-  .colmenu .menu input { width:auto; }
+  /* Keep the checkbox its natural size — .trackbar input's flex:1/min-width:200px would otherwise
+     stretch it across the row and shove the label text to the far edge. */
+  .colmenu .menu input { width:auto; flex:0 0 auto; min-width:0; }
   .colmenu .menu .rst { width:100%; margin:8px 0 0; padding:6px 10px; background:var(--accent-weak); color:var(--accent); font-size:12px; }
   .ttable td { padding:3px 4px; border-bottom:1px solid var(--line); vertical-align:middle; overflow:hidden; }
   .ttable tr:last-child td { border-bottom:0; }
@@ -1101,6 +1153,17 @@ INDEX_HTML = """<!doctype html>
   .ttable .st-dryrun { color:var(--warn); } .ttable .st-applied { color:var(--accent); }
   .ttable .st-responded { color:var(--ok); } .ttable .st-failed { color:var(--bad); }
   .ttable .st-discovered, .ttable .st-tailored { color:var(--muted); }
+  /* Status renders as a badge: the st-* class sets the color, the tint/border derive from it. */
+  .ttable select.stcell { font-weight:600; border-radius:99px; padding:4px 10px;
+                          border:1px solid transparent; background:color-mix(in srgb, currentColor 14%, transparent); }
+  .ttable select.stcell:hover { border-color:currentColor; background:color-mix(in srgb, currentColor 22%, transparent); }
+  .ttable select.stcell:focus { border-color:currentColor; background:color-mix(in srgb, currentColor 14%, transparent); }
+  /* Date cells: plain text until clicked (no native picker chrome in every row); "—" when empty. */
+  .ttable .datebtn { width:100%; margin:0; text-align:left; background:transparent; color:var(--ink);
+                     border:1px solid transparent; border-radius:4px; padding:5px 6px; font:inherit;
+                     font-variant-numeric:tabular-nums; cursor:pointer; }
+  .ttable .datebtn:hover { border-color:var(--line); }
+  .ttable .datebtn.empty { color:var(--faint); }
   .ttable .delrow { width:auto; margin:0; padding:4px 8px; background:var(--surface); color:var(--bad); border:1px solid var(--line); font-size:12px; }
   .ttable .rerun { width:auto; margin:0; padding:4px 8px; background:var(--surface); color:var(--accent); border:1px solid var(--line); font-size:12px; white-space:nowrap; }
   .ttable .rerun:disabled { opacity:.6; cursor:default; }
@@ -1134,6 +1197,30 @@ INDEX_HTML = """<!doctype html>
   .runline .runoutcome { font-weight:600; white-space:nowrap; }
   .runline .rundetail { color:var(--text); flex:1; min-width:0; }
   .runline .reslink { padding:0; }
+  /* Token breakdown sub-row (decision 095) — reuses the runsbtn trigger; its own compact table. */
+  .ttable tr.tokrow > td { padding:0; background:var(--track); }
+  .tokbox { padding:8px 12px; }
+  .toktable { border-collapse:collapse; font-size:12px; font-variant-numeric:tabular-nums; }
+  .toktable th, .toktable td { padding:3px 14px 3px 0; text-align:left; }
+  .toktable th { font-size:10.5px; text-transform:uppercase; letter-spacing:.03em; color:var(--muted); border-bottom:1px solid var(--line); }
+  .toktable .tok-num { text-align:right; }
+  .toktable .tok-act { color:var(--text); }
+  .toktable .tok-tot { font-weight:600; }
+  .toktable .tok-calls { color:var(--muted); }
+  .toktable tr.tok-total-row td { border-top:1px solid var(--line); font-weight:600; color:var(--text); }
+  /* Discovery/judging aggregate line above the table. */
+  .track-usage { margin:0 0 14px; }
+  .track-usage.hidden { display:none; }
+  .track-usage-line { width:auto; margin:0; padding:6px 10px; background:var(--surface); color:var(--text);
+    border:1px solid var(--line); border-radius:8px; font-size:12.5px; font-variant-numeric:tabular-nums; cursor:pointer; text-align:left; }
+  .track-usage-line:hover { border-color:var(--accent); filter:none; }
+  .track-usage-line .tu-label { color:var(--muted); }
+  .track-usage-line .caret { display:inline-block; transition:transform .12s; }
+  .track-usage-line.open .caret { transform:rotate(180deg); }
+  .tu-detail { display:flex; flex-wrap:wrap; gap:6px 22px; padding:8px 10px 0; font-size:12px; font-variant-numeric:tabular-nums; }
+  .tu-detail.hidden { display:none; }
+  .tu-act { display:flex; gap:8px; }
+  .tu-act .tu-act-name { color:var(--muted); }
   .twrap { overflow-x:auto; }
   .tempty { color:var(--muted); padding:24px; text-align:center; border:1px dashed var(--line); border-radius:8px; }
   /* Consistent waiting indicator: spinner + label (+ elapsed seconds for long waits). */
@@ -1332,7 +1419,8 @@ INDEX_HTML = """<!doctype html>
   .loop-apply:hover { background:#8f1e18; border-color:#8f1e18; }
   .loop-apply:disabled { opacity:.6; }
   .loop-rescan { display:flex; gap:8px; align-items:flex-start; margin-top:10px; font-size:12.5px;
-                 color:var(--muted); line-height:1.4; max-width:560px; }
+                 color:var(--muted); line-height:1.4; max-width:560px;
+                 text-transform:none; letter-spacing:normal; font-weight:400; }
   .loop-rescan input { width:auto; margin:2px 0 0; flex:0 0 auto; }
 </style>
 </head>
@@ -1379,6 +1467,23 @@ INDEX_HTML = """<!doctype html>
         <div id="loop-status" class="loopstat hidden"></div>
         <div id="loop-ready"></div>
       </div>
+      <div class="editor" id="dry-run-panel">
+        <h3 style="margin-top:0">Run a dry-run</h3>
+        <p class="editing">Run one full end-to-end <b>dry-run</b> with your current
+          <b>Discovery settings</b> (below): the bot searches your target boards, ranks every
+          posting by how well it fits <i>your</i> qualifications, then <b>follows through on
+          exactly one</b> — the single best match — tailoring your résumé and auto-filling that
+          application in a browser you can watch. It <b>never submits</b> (Agent Guideline #3);
+          when it finishes filling, review it in the browser and click <b>Finish</b>. A
+          <code>dry-run</code> row is recorded in Track.</p>
+        <div class="saverow">
+          <button id="test-run" type="button">▶ Find &amp; fill one application (dry-run)</button>
+          <span id="test-msg" class="msg"></span>
+        </div>
+        <div id="test-progress" class="testprog hidden"></div>
+        <div id="test-chosen" class="testchosen hidden"></div>
+        <div id="test-judged" class="testjudged hidden"></div>
+      </div>
       <div class="editor" id="parked-panel" style="display:none">
         <h3 style="margin-top:0">Applications waiting on you</h3>
         <p class="editing">These were filled but couldn't finish on their own — each needs one
@@ -1410,21 +1515,6 @@ INDEX_HTML = """<!doctype html>
           <button id="save-disc">Save settings</button>
           <span id="disc-msg" class="msg"></span>
         </div>
-
-        <h3>Run a dry-run</h3>
-        <p class="editing">Run one full end-to-end <b>dry-run</b> with the settings above: the
-          bot searches your target boards, ranks every posting by how well it fits <i>your</i>
-          qualifications, then <b>follows through on exactly one</b> — the single best match —
-          tailoring your résumé and auto-filling that application in a browser you can watch. It
-          <b>never submits</b> (Agent Guideline #3); when it finishes filling, review it in the
-          browser and click <b>Finish</b>. A <code>dry-run</code> row is recorded in Track.</p>
-        <div class="saverow">
-          <button id="test-run" type="button">▶ Find &amp; fill one application (dry-run)</button>
-          <span id="test-msg" class="msg"></span>
-        </div>
-        <div id="test-progress" class="testprog hidden"></div>
-        <div id="test-chosen" class="testchosen hidden"></div>
-        <div id="test-judged" class="testjudged hidden"></div>
       </div>
     </div>
 
@@ -1519,6 +1609,7 @@ INDEX_HTML = """<!doctype html>
           to hide any you don't need — your layout is remembered on this browser.</p>
         <div id="track-counts" class="tcounts"></div>
         <div id="track-funnel" class="funnel"></div>
+        <div id="track-usage" class="track-usage hidden"></div>
         <div class="trackbar">
           <input id="track-search" type="text" placeholder="Search company, role, location, notes…">
           <div class="colmenu">
@@ -2070,7 +2161,7 @@ function parkedCard(p) {
 // Resume a parked application: re-drive the deterministic fill on the same posting. `arm=false`
 // is a dry-run (never submits); `arm=true` really submits THIS one application after an explicit
 // confirm (decision 058). Reuses the run-progress panel + Finish button lower in the Discover tab.
-async function reapplyParked(id, btn, arm, who) {
+async function reapplyParked(id, btn, arm, who, retailor) {
   const label = btn ? btn.textContent : "";
   if (arm) {
     const ok = confirm("Really SUBMIT this application" + (who ? " to " + who : "") + "?\\n\\n"
@@ -2080,11 +2171,11 @@ async function reapplyParked(id, btn, arm, who) {
     if (!ok) return;
   }
   const msg = $("test-msg");
-  if (btn) { btn.disabled = true; btn.textContent = arm ? "Submitting…" : "Starting…"; }
+  if (btn) { btn.disabled = true; btn.textContent = arm ? "Submitting…" : (retailor ? "Re-tailoring…" : "Starting…"); }
   if (msg) { msg.className = "msg"; msg.textContent = ""; }
   try {
     const r = await (await fetch("/parked/reapply", {method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({ id, arm: !!arm })})).json();
+      body: JSON.stringify({ id, arm: !!arm, retailor: !!retailor })})).json();
     if (!r.ok) {
       if (msg) { msg.className = "msg err"; msg.textContent = r.error || "Could not start."; }
       if (btn) { btn.disabled = false; btn.textContent = label; }
@@ -2125,20 +2216,31 @@ function goToProfileAnswers() {
 const TRACK_COLS = [
   ["status","Status",120], ["fit_score","Fit",60], ["company","Company",140], ["role","Role",180], ["location","Location",140],
   ["remote","Remote",80], ["pay","Pay",100], ["portal","Portal",110], ["method","Method",90],
-  ["source_url","Source URL",220], ["date_discovered","Discovered",120], ["date_dry_run","Dry-run",120], ["date_applied","Applied",120],
-  ["run_count","Runs",76], ["follow_up_date","Follow up",110], ["resume_path","Résumé used",160], ["notes","Notes",240],
+  ["source_url","Source URL",220], ["date_discovered","Discovered",104], ["date_dry_run","Dry-run",104], ["date_applied","Applied",104],
+  ["run_count","Runs",76], ["tokens","Tokens",96], ["follow_up_date","Follow up",110], ["resume_path","Résumé used",160], ["notes","Notes",240],
 ];
 let TRACK_STATE = { status:null, search:"", statuses:[] };
 
-// Spreadsheet column layout (width + visibility), remembered per browser.
-const TRACK_LS_W = "ab_track_colw", TRACK_LS_H = "ab_track_hidden";
-let TRACK_COLW = {}, TRACK_HIDDEN = new Set(), TRACK_APPS = [];
+// Spreadsheet column layout (width + visibility + order), remembered per browser.
+const TRACK_LS_W = "ab_track_colw", TRACK_LS_H = "ab_track_hidden", TRACK_LS_O = "ab_track_order";
+let TRACK_COLW = {}, TRACK_HIDDEN = new Set(), TRACK_ORDER = [], TRACK_APPS = [];
 try { TRACK_COLW = JSON.parse(localStorage.getItem(TRACK_LS_W) || "{}") || {}; } catch (e) {}
 try { TRACK_HIDDEN = new Set(JSON.parse(localStorage.getItem(TRACK_LS_H) || "[]")); } catch (e) {}
+try { TRACK_ORDER = JSON.parse(localStorage.getItem(TRACK_LS_O) || "[]") || []; } catch (e) {}
 const saveColW = () => { try { localStorage.setItem(TRACK_LS_W, JSON.stringify(TRACK_COLW)); } catch (e) {} };
 const saveHidden = () => { try { localStorage.setItem(TRACK_LS_H, JSON.stringify([...TRACK_HIDDEN])); } catch (e) {} };
+const saveOrder = () => { try { localStorage.setItem(TRACK_LS_O, JSON.stringify(TRACK_ORDER)); } catch (e) {} };
 const colWidth = (key, def) => TRACK_COLW[key] || def;
-const visibleCols = () => TRACK_COLS.filter(([k]) => !TRACK_HIDDEN.has(k));
+// Columns in the user's saved order, with any not-yet-ordered (e.g. a newly added) column kept in
+// its TRACK_COLS position so a stale saved order never drops or duplicates a column.
+const orderedCols = () => {
+  const byKey = new Map(TRACK_COLS.map(c => [c[0], c]));
+  const seen = new Set(), out = [];
+  for (const k of TRACK_ORDER) { const c = byKey.get(k); if (c && !seen.has(k)) { out.push(c); seen.add(k); } }
+  for (const c of TRACK_COLS) if (!seen.has(c[0])) out.push(c);
+  return out;
+};
+const visibleCols = () => orderedCols().filter(([k]) => !TRACK_HIDDEN.has(k));
 
 async function loadTrack() {
   const body = $("track-body");
@@ -2151,6 +2253,7 @@ async function loadTrack() {
     TRACK_STATE.statuses = d.statuses;
     renderCounts(d.counts);
     renderFunnel(d.funnel);
+    renderUsageDiscovery(d.usage_discovery);
     renderTrack(d.applications);
   } catch (e) {
     body.innerHTML = ""; body.append(el("div", {class:"msg err", text:"Couldn't load applications: " + (e.message||e)}));
@@ -2192,6 +2295,34 @@ function renderFunnel(funnel) {
       meta,
     ]));
   }
+}
+
+// Discovery/judging Claude spend not tied to any one application (the batched fit judge, decision
+// 087). One line above the table, hidden until such spend exists — it's the answer to "how much is
+// the pipeline spending finding jobs, separate from what each application cost". Clicking it
+// expands the same per-activity breakdown the per-row cells use.
+function renderUsageDiscovery(u) {
+  const box = $("track-usage"); if (!box) return;
+  box.innerHTML = "";
+  if (!u || !u.total_tokens) { box.classList.add("hidden"); return; }
+  box.classList.remove("hidden");
+  const rows = Object.keys(u.by_activity || {}).map(k => [k, u.by_activity[k]])
+    .sort((a, b) => b[1].total_tokens - a[1].total_tokens);
+  const line = el("button", {class:"track-usage-line", type:"button",
+    title:"Discovery & judging tokens are shared across many candidates, so they're shown here "
+        + "rather than charged to individual applications. Click for the breakdown."},
+    [el("span", {class:"tu-label", text:"Discovery & judging (all-time): "}),
+     el("b", {text:fmtTokens(u.total_tokens) + " tokens"}),
+     document.createTextNode("  ·  " + grp(u.input_tokens) + " in / " + grp(u.output_tokens) + " out  ·  "
+       + u.calls + (u.calls === 1 ? " call" : " calls")),
+     el("span", {class:"caret", text:" ▾"})]);
+  const detail = el("div", {class:"tu-detail hidden"});
+  rows.forEach(([k, v]) => detail.append(el("div", {class:"tu-act"}, [
+    el("span", {class:"tu-act-name", text:ACT_LABELS[k] || k}),
+    el("span", {class:"tu-act-num", text:fmtTokens(v.total_tokens) + " (" + grp(v.input_tokens)
+      + " in / " + grp(v.output_tokens) + " out)"})])));
+  line.addEventListener("click", () => { detail.classList.toggle("hidden"); line.classList.toggle("open"); });
+  box.append(line, detail);
 }
 
 // The Source URL cell: the URL itself is the link — clicking the text opens the posting in a new
@@ -2239,22 +2370,53 @@ function isHttpUrl(v) {
 }
 
 function statusCell(app) {
-  const sel = el("select", {class:"st-" + app.status.replace("-","")});
+  const sel = el("select", {class:"stcell st-" + app.status.replace("-","")});
   for (const s of TRACK_STATE.statuses) {
     const o = el("option", {value:s, text:s}); if (s===app.status) o.selected = true; sel.appendChild(o);
   }
-  sel.addEventListener("change", () => { sel.className = "st-" + sel.value.replace("-",""); saveCell(app.id, "status", sel.value); });
+  sel.addEventListener("change", () => { sel.className = "stcell st-" + sel.value.replace("-",""); saveCell(app.id, "status", sel.value); });
   return sel;
 }
 
+// Date cell: shows the date as plain text (muted "—" when empty) instead of a native date picker in
+// every row. Clicking swaps in a real <input type=date>; picking a value saves and reverts to text,
+// blurring reverts unchanged. Mirrors urlCell so only the clicked cell ever shows an editor.
+function dateCell(app, key) {
+  const cell = el("span", {class:"datecell"});
+  let editing = false;
+  const fmt = (v) => { const m = /^(\\d{4})-(\\d{2})-(\\d{2})$/.exec(v || ""); return m ? (m[2] + "/" + m[3] + "/" + m[1]) : ""; };
+  const render = () => {
+    cell.innerHTML = "";
+    if (editing) {
+      const input = el("input", {type:"date", value:app[key] || "",
+        on:{change: async (e) => {
+              const v = e.target.value;
+              if (!(await saveCell(app.id, key, v))) return;  // save failed → row shows error
+              app[key] = v; editing = false; render();
+            },
+            blur: () => { editing = false; render(); }}});
+      cell.append(input); input.focus();
+      if (input.showPicker) { try { input.showPicker(); } catch (e) {} }
+      return;
+    }
+    const txt = fmt(app[key]);
+    cell.append(el("button", {class:"datebtn" + (txt ? "" : " empty"), type:"button",
+      text: txt || "—", title: txt ? "Edit date" : "Set date",
+      on:{click:()=>{ editing = true; render(); }}}));
+  };
+  render();
+  return cell;
+}
+
 // Re-run a previous dry-run from the tracker: re-drive the same deterministic fill on the same
-// posting URL with the stored tailored PDF (never submits — reuses reapplyParked with arm=false).
-// Switch to the Discover tab first so the fill reports into the one shared run-progress panel +
-// Finish button, instead of a second progress UI.
-function rerunDry(app, btn) {
+// posting URL (never submits — reuses reapplyParked with arm=false). `retailor=false` reuses the
+// stored tailored PDF; `retailor=true` regenerates the résumé from the saved JD first (decision
+// 086). Switch to the Discover tab first so the fill reports into the one shared run-progress
+// panel + Finish button, instead of a second progress UI.
+function rerunDry(app, btn, retailor) {
   const tab = document.querySelector('.tab[data-view="discover"]');
   if (tab) tab.click();
-  reapplyParked(app.id, btn, false);
+  reapplyParked(app.id, btn, false, null, retailor);
 }
 
 function renderTrack(apps) {
@@ -2273,8 +2435,11 @@ function renderTrack(apps) {
     .concat([el("col", {style:"width:200px"})]);
   const ths = vis.map(([key,label,def]) => {
     const rz = el("div", {class:"rz", title:"Drag to resize"});
-    const th = el("th", {}, [el("span", {class:"lbl", text:label}), rz]);
+    const th = el("th", {draggable:"true", title:"Drag to reorder"},
+      [el("span", {class:"lbl", text:label}), rz]);
+    th.dataset.key = key;
     rz.addEventListener("mousedown", (ev) => startResize(ev, key, colEls[key], def, th));
+    attachColDrag(th, key);
     return th;
   });
   const head = el("tr", {}, ths.concat([el("th", {text:""})]));
@@ -2283,26 +2448,34 @@ function renderTrack(apps) {
       let input;
       if (key === "status") input = statusCell(app);
       else if (key === "run_count") input = runsCell(app);
+      else if (key === "tokens") input = tokensCell(app);
       else if (key === "date_discovered" || key === "date_dry_run" || key === "date_applied")
-        input = el("input", {type:"date", value:app[key] || "", on:{change:e=>saveCell(app.id, key, e.target.value)}});
+        input = dateCell(app, key);
       else if (key === "resume_path")
         input = app.resume_path
           ? el("a", {class:"reslink", href:"/track/resume?id=" + app.id, target:"_blank",
                      title:app.resume_path, text:"View résumé ↗"})
           : el("span", {class:"muted", text:"—"});
       else if (key === "source_url") input = urlCell(app);
-      else input = el("input", {type:"text", value:app[key] || "", on:{change:e=>saveCell(app.id, key, e.target.value)}});
+      else input = el("input", {type:"text", value:app[key] || "", placeholder:"—", on:{change:e=>saveCell(app.id, key, e.target.value)}});
       return el("td", {}, [input]);
     });
     const saved = el("span", {class:"rowsaved"});
     const del = el("button", {class:"delrow", type:"button", text:"Delete",
       on:{click:()=>delApp(app.id)}});
-    // Re-run: only for rows that were dry-runs and still have a posting URL to re-fill.
+    // Re-run: only for rows that were dry-runs and still have a posting URL to re-fill. "Re-run"
+    // reuses the stored résumé; "Re-tailor" (shown only when a saved JD lets it run offline)
+    // regenerates the résumé from that JD + your current base résumé first (decision 086).
     const acts = [];
-    if (app.status === "dry-run" && app.source_url)
+    if (app.status === "dry-run" && app.source_url) {
       acts.push(el("button", {class:"rerun", type:"button", text:"Re-run ▶",
-        title:"Re-fill this posting in a browser to check it — never submits",
-        on:{click:(ev)=>rerunDry(app, ev.target)}}));
+        title:"Re-fill this posting with the stored résumé — never submits",
+        on:{click:(ev)=>rerunDry(app, ev.target, false)}}));
+      if (app.has_jd)
+        acts.push(el("button", {class:"rerun retailor", type:"button", text:"Re-tailor ▶",
+          title:"Regenerate the résumé from this posting's saved job description (a Claude call), then re-fill — never submits",
+          on:{click:(ev)=>rerunDry(app, ev.target, true)}}));
+    }
     acts.push(del, saved);
     tds.push(el("td", {}, [el("div", {style:"display:flex;gap:6px;align-items:center"}, acts)]));
     const tr = el("tr", {}, tds); tr._saved = saved; tr.dataset.id = app.id;
@@ -2321,6 +2494,69 @@ function runsCell(app) {
   return el("button", {class:"runsbtn", type:"button", title:"Show this posting's run history",
     on:{click:(ev)=>toggleRuns(ev.currentTarget, app)}},
     [document.createTextNode(n + (n === 1 ? " run" : " runs")), el("span", {class:"caret", text:"▾"})]);
+}
+
+// Compact token count: 2030 → "2.0k", 1_450_000 → "1.4M", small values verbatim. Used for the
+// Tokens column; the expanded sub-row shows exact comma-grouped numbers.
+function fmtTokens(n) {
+  n = n || 0;
+  const trim = (x) => x.endsWith(".0") ? x.slice(0, -2) : x;
+  if (n >= 1e6) return trim((n / 1e6).toFixed(1)) + "M";
+  if (n >= 1e3) return trim((n / 1e3).toFixed(1)) + "k";
+  return String(n);
+}
+const grp = (n) => (n || 0).toLocaleString();
+// Human labels for the activity keys (usage.ACTIVITIES); anything unmapped shows as-is.
+const ACT_LABELS = {tailoring:"Tailoring", "form-entry":"Form entry", judging:"Judging",
+  enrichment:"Enrichment", salary:"Salary", impact:"Impact", other:"Other"};
+
+// "Tokens" cell: the per-application Claude spend (input+output), one number that expands an
+// inline sub-row splitting it into in/out and a per-activity breakdown (decision 095). No tokens
+// recorded for this posting → a muted dash.
+function tokensCell(app) {
+  const t = app.tokens;
+  if (!t || !t.total_tokens) return el("span", {class:"muted", text:"—"});
+  return el("button", {class:"runsbtn", type:"button",
+    title:"Show what Claude spent on this application, by activity",
+    on:{click:(ev)=>toggleTokens(ev.currentTarget, app)}},
+    [document.createTextNode(fmtTokens(t.total_tokens)), el("span", {class:"caret", text:"▾"})]);
+}
+
+// Toggle the token-breakdown sub-row under a posting. All data is already in the /track payload
+// (app.tokens) — no fetch — so a second click just collapses it.
+function toggleTokens(btn, app) {
+  const tr = btn.closest("tr");
+  const next = tr.nextElementSibling;
+  if (next && next.classList.contains("tokrow")) { next.remove(); btn.classList.remove("open"); return; }
+  btn.classList.add("open");
+  const t = app.tokens || {};
+  const rows = Object.keys(t.by_activity || {})
+    .map(k => [k, t.by_activity[k]])
+    .sort((a, b) => b[1].total_tokens - a[1].total_tokens);
+  const cell = (txt, cls) => el("td", {class:cls || "", text:txt});
+  const bodyRows = rows.map(([k, v]) => el("tr", {}, [
+    cell(ACT_LABELS[k] || k, "tok-act"),
+    cell(grp(v.input_tokens), "tok-num"),
+    cell(grp(v.output_tokens), "tok-num"),
+    cell(grp(v.total_tokens), "tok-num tok-tot"),
+    cell(String(v.calls), "tok-num tok-calls"),
+  ]));
+  const totRow = el("tr", {class:"tok-total-row"}, [
+    cell("Total", "tok-act"),
+    cell(grp(t.input_tokens), "tok-num"),
+    cell(grp(t.output_tokens), "tok-num"),
+    cell(grp(t.total_tokens), "tok-num tok-tot"),
+    cell(String(t.calls), "tok-num tok-calls"),
+  ]);
+  const head = el("tr", {}, [
+    el("th", {text:"Activity", class:"tok-act"}), el("th", {text:"In", class:"tok-num"}),
+    el("th", {text:"Out", class:"tok-num"}), el("th", {text:"Total", class:"tok-num"}),
+    el("th", {text:"Calls", class:"tok-num"})]);
+  const table = el("table", {class:"toktable"},
+    [el("thead", {}, [head]), el("tbody", {}, bodyRows.concat([totRow]))]);
+  const holder = el("div", {class:"tokbox"}, [table]);
+  const rr = el("tr", {class:"tokrow"}, [el("td", {colspan:String(tr.children.length)}, [holder])]);
+  tr.after(rr);
 }
 
 // Toggle the run-history sub-row under a posting. Lazy-loads /track/runs on first open so the
@@ -2379,6 +2615,41 @@ function startResize(ev, key, colEl, def, th) {
   document.addEventListener("mouseup", up);
 }
 
+// Drag a column header onto another to reorder; persist the new order. The resize handle calls
+// preventDefault() on its mousedown, so grabbing the right edge resizes and never starts a drag.
+let DRAG_KEY = null;
+function attachColDrag(th, key) {
+  th.addEventListener("dragstart", (e) => {
+    DRAG_KEY = key; th.classList.add("dragging");
+    e.dataTransfer.effectAllowed = "move";
+    try { e.dataTransfer.setData("text/plain", key); } catch (err) {}
+  });
+  th.addEventListener("dragend", () => {
+    DRAG_KEY = null; th.classList.remove("dragging");
+    document.querySelectorAll(".ttable th.dropto").forEach(x => x.classList.remove("dropto"));
+  });
+  th.addEventListener("dragover", (e) => {
+    if (DRAG_KEY == null || DRAG_KEY === key) return;
+    e.preventDefault(); e.dataTransfer.dropEffect = "move"; th.classList.add("dropto");
+  });
+  th.addEventListener("dragleave", () => th.classList.remove("dropto"));
+  th.addEventListener("drop", (e) => {
+    e.preventDefault(); th.classList.remove("dropto");
+    if (DRAG_KEY == null || DRAG_KEY === key) return;
+    reorderCol(DRAG_KEY, key);
+  });
+}
+
+// Move column `from` to sit directly before column `to`, then persist and re-render.
+function reorderCol(from, to) {
+  const order = orderedCols().map(c => c[0]);
+  const src = order.indexOf(from);
+  if (src >= 0) order.splice(src, 1);
+  const dst = order.indexOf(to);
+  order.splice(dst < 0 ? order.length : dst, 0, from);
+  TRACK_ORDER = order; saveOrder(); renderTrack(TRACK_APPS);
+}
+
 // Show/hide columns — one checkbox per column, plus a reset.
 function renderColMenu() {
   const m = $("track-cols-menu"); m.innerHTML = "";
@@ -2393,7 +2664,8 @@ function renderColMenu() {
     m.appendChild(el("label", {}, [cb, " " + label]));
   });
   m.appendChild(el("button", {class:"rst", type:"button", text:"Reset columns", on:{click:()=>{
-    TRACK_HIDDEN.clear(); TRACK_COLW = {}; saveHidden(); saveColW(); renderColMenu(); renderTrack(TRACK_APPS);
+    TRACK_HIDDEN.clear(); TRACK_COLW = {}; TRACK_ORDER = [];
+    saveHidden(); saveColW(); saveOrder(); renderColMenu(); renderTrack(TRACK_APPS);
   }}}));
 }
 $("track-cols-btn").addEventListener("click", (e) => {
@@ -2511,6 +2783,15 @@ const COUNTRIES = ["United States","Canada","United Kingdom","Ireland","Australi
   "Germany","France","Netherlands","Spain","Italy","Switzerland","Sweden","Poland","Portugal","Mexico",
   "Brazil","Argentina","Singapore","Japan","China","South Korea","Israel","United Arab Emirates","Other"];
 const START_PRESETS = ["Immediately", "2 weeks' notice", "1 month"];
+// Work-arrangement preference — drives how remote/hybrid/on-site questions and office-location
+// dropdowns are answered (value stored on the profile, label shown to the user).
+const WORK_ARRANGEMENT_OPTS = [
+  ["", "No preference"],
+  ["in_office_if_commutable", "Prefer in-office when the office is commutable"],
+  ["hybrid", "Prefer hybrid"],
+  ["in_office", "Always prefer in-office"],
+  ["remote", "Always prefer remote"],
+];
 // Voluntary EEO option lists — standard self-identification wording that matches most ATS forms;
 // the autofill combobox falls back to Claude to map onto a form's exact option text. Each starts
 // with a blank "—" so leaving it unanswered (decline to self-identify) stays possible.
@@ -2843,6 +3124,8 @@ function renderProfileForm() {
     row2(boolSel("Authorized to work?","work_authorized",P.work_authorized), boolSel("Requires sponsorship?","requires_sponsorship",P.requires_sponsorship)),
     row2(boolSel("U.S. citizen?","us_citizen",P.us_citizen), boolSel("Willing to relocate?","willing_to_relocate",P.willing_to_relocate)),
     boolSel("Open to remote?","open_to_remote",P.open_to_remote),
+    row2(selField("Preferred work arrangement","work_arrangement",P.work_arrangement||"",WORK_ARRANGEMENT_OPTS),
+         fld("Max commute (miles) — for 'commutable' judgement","max_commute_miles",P.max_commute_miles==null?"":String(P.max_commute_miles))),
     area("Preferred office locations (one per line, most preferred first — e.g. 'New York, NY', 'Remote')","preferred_locations",(P.preferred_locations||[]).join("\\n")),
     row2(fld("Desired salary","desired_salary",P.desired_salary), startDateField(P.earliest_start_date)),
     fld("Years of experience","years_experience",P.years_experience),
@@ -2946,6 +3229,8 @@ function collectProfile() {
     linkedin_url:t("linkedin_url"), github_url:t("github_url"), portfolio_url:t("portfolio_url"),
     work_authorized:tri("work_authorized"), requires_sponsorship:tri("requires_sponsorship"), us_citizen:tri("us_citizen"),
     willing_to_relocate:tri("willing_to_relocate"), open_to_remote:tri("open_to_remote"),
+    work_arrangement:t("work_arrangement"),
+    max_commute_miles: (parseInt(t("max_commute_miles"),10) || null),
     preferred_locations: (d["preferred_locations"]||"").split("\\n").map(s=>s.trim()).filter(Boolean),
     desired_salary:t("desired_salary"), earliest_start_date:earliest_start_date, years_experience:t("years_experience"),
     gender:t("gender"), pronouns:t("pronouns"), race_ethnicity:t("race_ethnicity"), veteran_status:t("veteran_status"), disability_status:t("disability_status"),
