@@ -18,9 +18,9 @@ from pathlib import Path
 
 import yaml
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_SAFETY = REPO_ROOT / "profile" / "safety.yaml"
-DEFAULT_KILL = REPO_ROOT / "profile" / "KILL"
+from .paths import DATA_ROOT
+DEFAULT_SAFETY = DATA_ROOT / "profile" / "safety.yaml"
+DEFAULT_KILL = DATA_ROOT / "profile" / "KILL"
 
 
 @dataclass

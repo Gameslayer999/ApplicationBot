@@ -20,8 +20,8 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Optional
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_DB = REPO_ROOT / "applications.db"
+from .paths import DATA_ROOT
+DEFAULT_DB = DATA_ROOT / "applications.db"
 
 # Lifecycle of an application, in order. `dry-run` = filled + recorded but not submitted
 # (the safety-switch default, Guideline #3); `applied` = actually submitted once armed.

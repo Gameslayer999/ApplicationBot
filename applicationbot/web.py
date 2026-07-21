@@ -20,6 +20,7 @@ import base64
 import json
 import os
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -35,6 +36,28 @@ from .resume import load_resume
 from .tailor import tailor_resume
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# Dev auto-reload (set by `scripts/dev_reload.py`, i.e. `run.sh --dev`). When on, the page polls
+# /dev/reload-token; the token is this process's boot time, so a supervisor restart after a code
+# edit changes it and the browser reloads itself. Off (and inert) in normal runs.
+_DEV = os.environ.get("APPLICATIONBOT_DEV") == "1"
+_BOOT_TOKEN = str(time.time())
+_DEV_REFRESH_SCRIPT = """
+<script>
+/* Dev auto-reload: when the server restarts after a code change its boot token changes — reload
+   so edits show without a manual refresh. Only injected when APPLICATIONBOT_DEV=1. */
+(function(){
+  let token = null;
+  setInterval(async () => {
+    try {
+      const t = await (await fetch("/dev/reload-token", {cache:"no-store"})).text();
+      if (token === null) { token = t; return; }
+      if (t !== token) location.reload();
+    } catch (e) { /* server is mid-restart; ignore and retry */ }
+  }, 1000);
+})();
+</script>
+"""
 
 
 # --------------------------------------------------------------------------- test run
@@ -629,6 +652,56 @@ def do_tailor(payload: dict) -> dict:
     }
 
 
+def _has_any_application() -> bool:
+    """True once the user has run at least one dry-run (any tracked application row)."""
+    try:
+        from . import tracker
+
+        return sum(tracker.status_counts().values()) > 0
+    except Exception:
+        return False
+
+
+# First-run walkthrough steps (decision: in-app skippable checklist). Each step reuses a
+# `doctor` readiness check for its ok/detail/fix, and adds a UI `action` telling the front-end
+# exactly where to send the user to complete it (UI Principle #2: one click to the fix).
+# `required` is defined here, not taken from doctor: the pipeline can tailor with the free
+# `rules` engine, so Claude sign-in is optional; Chromium/profile/résumé/filters are needed to
+# discover and apply end-to-end.
+def _setup_status() -> dict:
+    from . import __version__, doctor
+
+    # Call doctor's per-check helpers directly (same package) so the walkthrough and the
+    # `doctor` CLI stay one source of truth for what "ready" means.
+    checks = {
+        "profile": (doctor._check_profile(doctor._PROFILE), "Add your details", True,
+                    {"view": "profile"}),
+        "resume": (doctor._check_resume(doctor._RESUME), "Add your résumé", True,
+                   {"view": "profile"}),
+        "discovery": (doctor._check_discovery(doctor._FILTERS), "Choose what jobs to find", True,
+                      {"view": "discover", "scroll": "disc-settings"}),
+        "playwright": (doctor._check_playwright(), "Install the apply browser", True,
+                       {"cmd": "playwright install chromium"}),
+        "claude": (doctor._check_claude(), "Connect Claude for best tailoring", False,
+                   {"scroll": "account", "flash": "account"}),
+    }
+    order = ["profile", "resume", "discovery", "playwright", "claude"]
+    steps = []
+    for key in order:
+        chk, title, required, action = checks[key]
+        steps.append({"key": key, "title": title, "ok": chk.ok, "required": required,
+                      "detail": chk.detail, "fix": chk.fix, "action": action})
+    # A synthetic final step: has the user actually watched one dry-run run end-to-end?
+    steps.append({
+        "key": "dryrun", "title": "Run your first dry-run", "ok": _has_any_application(),
+        "required": False,
+        "detail": "the pipeline finds, tailors, and fills one application without submitting",
+        "fix": "", "action": {"view": "discover", "scroll": "test-run", "flash": "test-run"},
+    })
+    required_ok = all(s["ok"] for s in steps if s["required"])
+    return {"version": __version__, "ready": required_ok, "steps": steps}
+
+
 class Handler(BaseHTTPRequestHandler):
     def _send(self, code: int, body: bytes, content_type: str, extra: dict | None = None) -> None:
         self.send_response(code)
@@ -646,6 +719,12 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?")[0]
         if path == "/auth/status":
             self._json(200, auth.status())
+            return
+        if path == "/setup/status":
+            self._json(200, _setup_status())
+            return
+        if path == "/dev/reload-token":  # dev auto-reload heartbeat (changes on every restart)
+            self._send(200, _BOOT_TOKEN.encode("utf-8"), "text/plain; charset=utf-8")
             return
         if path == "/resume":
             try:
@@ -838,6 +917,8 @@ class Handler(BaseHTTPRequestHandler):
             }
         )
         html = INDEX_HTML.replace("/*OPTIONS*/", options)
+        if _DEV:
+            html = html.replace("</body>", _DEV_REFRESH_SCRIPT + "</body>")
         self._send(200, html.encode("utf-8"), "text/html; charset=utf-8")
 
     def do_POST(self) -> None:  # noqa: N802
@@ -893,6 +974,30 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/profile/greenhouse/unlink":
                 apply_profile.set_greenhouse_password("")  # clear the keychain entry
                 self._json(200, {"ok": True})
+            elif path == "/auth/apikey":
+                # Connect the FALLBACK Anthropic API key (decision 111). Validate it with a free
+                # models.list() call before storing, so we never save a key that doesn't work;
+                # only then write it to the OS keychain (never YAML/git). Returns fresh status.
+                p = json.loads(raw or b"{}")
+                key = (p.get("key") or "").strip()
+                if not key:
+                    self._json(400, {"ok": False, "message": "Paste your Anthropic API key (starts with sk-ant-)."})
+                else:
+                    try:
+                        import anthropic
+                        anthropic.Anthropic(api_key=key, timeout=20, max_retries=0).models.list()
+                    except Exception as e:
+                        name = type(e).__name__
+                        msg = ("That key was rejected (401) — check it at console.anthropic.com."
+                               if "Authentication" in name else f"Couldn't verify the key ({name}): {e}")
+                        self._json(200, {"ok": False, "message": msg})
+                    else:
+                        auth.set_api_key(key)
+                        self._json(200, {"ok": True, "message": "API key connected (fallback).",
+                                         "status": auth.status()})
+            elif path == "/auth/apikey/disconnect":
+                auth.clear_api_key()
+                self._json(200, {"ok": True, "status": auth.status()})
             elif path == "/mailbox/link":
                 # Link the bot inbox (decision 057): test the IMAP connection, and only save on
                 # success so we never store credentials that don't work. Password → OS keychain.
@@ -1012,76 +1117,107 @@ INDEX_HTML = """<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ApplicationBot — Resume Review</title>
+<link rel="icon" type="image/png" href="data:image/png;base64,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">
+<link rel="apple-touch-icon" href="data:image/png;base64,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">
 <style>
   :root {
-    --bg:#f5f6f8; --surface:#ffffff; --surface-2:#eef1f5;
-    --ink:#1a1c22; --strong:#0c0e13; --muted:#68727f; --faint:#98a1ad;
-    --line:#e6e8ec; --accent:#2f68f5; --accent-ink:#ffffff; --ai:#6a4bd0;
-    --accent-weak:#e9f0ff; --accent-weak-2:#d7e3ff;
-    --ok:#1a9d54; --ok-bg:#eaf6ee; --ok-tint:#f2fbf5;
-    --bad:#d23f31; --bad-bg:#fdecec;
-    --warn:#8a5a00; --warn-strong:#b26a00; --warn-line:#e0a400; --warn-bg:#fffbf0; --warn-chip:#ffe7b3;
-    --neutral-tint:#f7f8fa; --accent-tint:#f1f6ff;
-    --track:#e9ecf1; --btn-dark:#222834;
-    --shadow:0 1px 2px rgba(16,24,40,.06), 0 8px 24px -12px rgba(16,24,40,.18);
-    --radius:12px;
+    --bg:#fafafa; --surface:#ffffff; --surface-2:#f4f4f5; --field:#ffffff;
+    --ink:#18181b; --strong:#09090b; --muted:#71717a; --faint:#a1a1aa;
+    --line:#e4e4e7; --accent:#2563eb; --accent-text:#1d4ed8; --accent-ink:#ffffff; --ai:#7c3aed;
+    --accent-weak:#eff6ff; --accent-weak-2:#dbeafe;
+    --ok:#16a34a; --ok-text:#15803d; --ok-bg:#f0fdf4; --ok-tint:#f7fdf9;
+    --bad:#c81e1e; --bad-bg:#fef2f2;
+    --warn:#a16207; --warn-strong:#b45309; --warn-line:#f59e0b; --warn-bg:#fffbeb; --warn-chip:#fde68a;
+    --neutral-tint:#f4f4f5; --accent-tint:#f5f8ff;
+    --track:#f4f4f5; --btn-dark:#18181b;
+    --shadow:0 1px 2px rgba(0,0,0,.05);
+    --radius:10px;
+    --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
     color-scheme:light;
   }
   @media (prefers-color-scheme: dark) {
     :root:not([data-theme="light"]) {
-      --bg:#0e1116; --surface:#171b22; --surface-2:#1e232c;
-      --ink:#e5e8ee; --strong:#f4f6fa; --muted:#9aa4b2; --faint:#6c7686;
-      --line:#2a303b; --accent:#4b7bf5; --accent-ink:#ffffff; --ai:#a48bf0;
-      --accent-weak:#1a2540; --accent-weak-2:#243458;
-      --ok:#4cc282; --ok-bg:#12271b; --ok-tint:#13231a;
-      --bad:#f0736a; --bad-bg:#2c1a1a;
-      --warn:#e0ab6c; --warn-strong:#e6b06e; --warn-line:#b8862f; --warn-bg:#241f12; --warn-chip:#463714;
-      --neutral-tint:#1b2029; --accent-tint:#172236;
-      --track:#272d38; --btn-dark:#2b3341;
-      --shadow:0 1px 2px rgba(0,0,0,.5), 0 10px 30px -12px rgba(0,0,0,.6);
+      --bg:#09090b; --surface:#18181b; --surface-2:#27272a; --field:#101013;
+      --ink:#ededef; --strong:#fafafa; --muted:#a1a1aa; --faint:#71717a;
+      --line:#2e2e33; --accent:#2563eb; --accent-text:#60a5fa; --accent-ink:#ffffff; --ai:#a78bfa;
+      --accent-weak:#182135; --accent-weak-2:#20304d;
+      --ok:#22c55e; --ok-text:#4ade80; --ok-bg:#0e2417; --ok-tint:#0d1f15;
+      --bad:#f87171; --bad-bg:#2a1416;
+      --warn:#fbbf24; --warn-strong:#fcd34d; --warn-line:#b45309; --warn-bg:#251c0e; --warn-chip:#3d2f12;
+      --neutral-tint:#1c1c1f; --accent-tint:#141a26;
+      --track:#27272a; --btn-dark:#27272a;
+      --shadow:0 1px 2px rgba(0,0,0,.4);
       color-scheme:dark;
     }
   }
   :root[data-theme="dark"] {
-      --bg:#0e1116; --surface:#171b22; --surface-2:#1e232c;
-      --ink:#e5e8ee; --strong:#f4f6fa; --muted:#9aa4b2; --faint:#6c7686;
-      --line:#2a303b; --accent:#4b7bf5; --accent-ink:#ffffff; --ai:#a48bf0;
-      --accent-weak:#1a2540; --accent-weak-2:#243458;
-      --ok:#4cc282; --ok-bg:#12271b; --ok-tint:#13231a;
-      --bad:#f0736a; --bad-bg:#2c1a1a;
-      --warn:#e0ab6c; --warn-strong:#e6b06e; --warn-line:#b8862f; --warn-bg:#241f12; --warn-chip:#463714;
-      --neutral-tint:#1b2029; --accent-tint:#172236;
-      --track:#272d38; --btn-dark:#2b3341;
-      --shadow:0 1px 2px rgba(0,0,0,.5), 0 10px 30px -12px rgba(0,0,0,.6);
+      --bg:#09090b; --surface:#18181b; --surface-2:#27272a; --field:#101013;
+      --ink:#ededef; --strong:#fafafa; --muted:#a1a1aa; --faint:#71717a;
+      --line:#2e2e33; --accent:#2563eb; --accent-text:#60a5fa; --accent-ink:#ffffff; --ai:#a78bfa;
+      --accent-weak:#182135; --accent-weak-2:#20304d;
+      --ok:#22c55e; --ok-text:#4ade80; --ok-bg:#0e2417; --ok-tint:#0d1f15;
+      --bad:#f87171; --bad-bg:#2a1416;
+      --warn:#fbbf24; --warn-strong:#fcd34d; --warn-line:#b45309; --warn-bg:#251c0e; --warn-chip:#3d2f12;
+      --neutral-tint:#1c1c1f; --accent-tint:#141a26;
+      --track:#27272a; --btn-dark:#27272a;
+      --shadow:0 1px 2px rgba(0,0,0,.4);
       color-scheme:dark;
   }
+  /* Brand logomark — theme-matched tile logos: dark-background tile in dark mode,
+     light-background tile in light mode (base64 @96px from assets/logo-{dark,light}mode.png).
+     Regenerate with: python scripts/embed_brand_assets.py */
+  :root { --lm-lightmode:url("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAGAAAABgCAYAAADimHc4AAAkPElEQVR42s19e5BkV3nf7zv33Hu7e6Z79r0SQkgIoQcgLXYhhAwKFHbKKlzl2HkUlaSCy+WYJDZQEAdjU5UEy0AwJkWVKKgyLgN+hECBjA0JuMLDGFAID+thDEIvdllJK+3s7M7szPTjPs758sd9nXPuubd7cSrJqFYzPXO7+/Z5fI/f9/t+h7TWjJ4vIgIAKKWQJBnSLAezBoEAIghBAAhA9TLmz8YXF39iNl+7uh7NH6jnNTyv59xt+VJsvwcbTykf1z9br+V7X+P+jPerHnL1fswgQQilRByHCIKgdS/e8e2bACJCnueYThdQWkPKAFJKBIEAkTBvzzsmbH8E7xj6h7CZLFph/JdMVes68z3Myen7PNz3msxgZiitkecKKlcIAoHRKIaUsncSvBNQrfrd3X0kaY7BIEYUhRDl79n6Hzl35P7OmRYGQJ6PU11WPZ+sNzKWq/FC7Czx+nXcoSNjC3r+zs7rWzNP/avLuYwAaGakaYY0TRFFIcbrw/pt3LlvTQARQSmF7Z09SCkxHA4giNqrzPlc7e+e9UN0iSbFtzZ79pU1ubTEhHkWz6V+sfOADBtb/jxfJNBKYTJZRxCI1m6wJqAwOQoXti9iNBwiHkTlE1YcOF7B3tCS65bODPcM/jK7dslOZbXb8D2ViwkhAEmaIVkk2NhYh5SBNQnCfI5Suhj80QjxIAbrnpuqB5S7ja07CLTCgHDfH3qsMnm+r+okVpkl8jzu3WxUm504CjEYxti5uA+ttHW5MFf/9s4uhsMB4iiEZt1vMupxoQ5rwUsGllcch64tQ/7XY2fCuswad9wHX4IJoiV/MwKoKAwxGMS4uLtvXSaqwd/bm0IIgeFgAGZevmt9q5m6lojPgS3ZBtz1puwfdKZmwLtWK3eEWy2zwu3JuJSJ8W4GRhSFICEwnS3qQEcQEXKlMF+kWFsbQXPlTMje+XwJN8JLlgj1bIZqcqgvkPSEHmTuRkZrJsj4MEz+SSRPVHZJfqRvPIrXHA4HWCQZcqWaHbC/P0McR0VSZSVExorqtN+8wkRw/6WdfoQ9Xo9WMAnkvxnqmVz6ERw3r7AgneCAiBCGErNyFwitNbIsRxxHhdN100PuGdguU+KabaYlQQZ1TBB5fM0lbcGOKMAziD/Ky5KzeHi1bDCKQqhcQ2sNOV8kCIKgiFE1r5bG0oqrhAvbV4ddl/ohecmOWv7mIKLa3rYtmbErvLjJkmiHV4iGqL15BQkIIZAkGWSaZAjD0LOaqWeAuX+vMqC0AhGVGTT+n30xA2mWN5Owiqky4vjGRNJy08lLFqwxU1IGyPIcMtcaAxmUf1olO+wA3apFo4vwdTiIAABPnz2PrfM7yHNlPd9EMpp7pxYiAHA9FkTkTbDdQahAPq0Ujl12FJcfPYhc6fLN2O9kW67GhSo6EIBOv9F/gQgEsiyDJBCEEMYHaI1KfyhYjw4KmyYDBELg7j/7Aj768c/hoUdO4eLuPrTWBrzTbH2qY2U2HlM98CZqysw2gtpa7Vw7OiJCluZ4zvXX4kMfvgvPOSqh68n0mJ4KxiDPLicXTmEbPe1JxLqyZ0EEzQxZTzabMTT3b08T2y2v15oRBAJ7e/t445vfjU99+kuQUmAwiGsf0wbSsFL6T1RmlUzWB7eXgm1oiQgkNLbPn8MPns6Rqgg3XJaXIbYb75MHIOxCIrjb1hF1AJSwx5YBKu2ybOw9d4dtrWyRrImqVmqapvjlX3kbPvf5e3D86CFozUVGzeSsDQEmf6RCHqyYQMVbesL35nJRjoGJMWsopbFIGKe3CGlKOPEshiZndRIvTfqoc9B9PtExcx5HTeUPouVru0KyOplwnsCMPM8xiEN84IMfx+c+fw8uO34EudJQmsHeSIYLe29+EOZ6dXCJr9cRovFD/bOxHrlegMXvdPl8rTWUyoq/MeP0FvDAaQFRLi7uC3uXVTO4A6IyQ2Z34CtTWhjYYgKYjQ/ZCpepyRw7Qk/NDBkEeOLJs/ij//IZbGyMS4dbhX9UooJkmcZmbVdLuxpQ7s53qLmmeUxtX8IMZg1mXZjH8jMGgnHqHHD/DwkCNnrcHd5eArzK3A/PsOsjGMKP+5ANJ1BPuKkUwkji6994AE+e2UQcRY07ocLZtI0YOfdEjW1me4uaNt29B2b7k7LhjLWuJqB5I62BMGCcOke49xQgyJmElfMU9ueo1JXLsBc5AZlwdAsHIT84Zvnh8oNqxkMPn4RS2hleqoGoJn5sHGgbr6H6ftmz0pjbn5TKnVatfGtJc7s+zFxMwuktwn2nAAFuJoFWwKCNcSFyRrN1e2601Y6bBZWRDLEPEWR7F3A709RaI89zXNzds2J8du2oeePV4/ob2eVQWgIbs40OmoPcXnzcmlAGEMliJ9x3SkAQe8wRLbMhSwAi9owZGbAYtwsy9vLzYCfULqVqzdBKlzF6sRppCZDI9nI2YncYO6MDfuZy/1TOuhMdo3ZMw2zUbYEoYJw8B9x/iopJgM8n8IrgYweETV0AbukDvPA7rTDLdUxbhJrVBFj2mNuzRrBXfMv8EbW2fGFiqFzMXLsLy8ywExI5e9BXD+JqEjYJ9/9QIBCmT+C/Y5HG+CwdJQwQQbQyPlod529FULzsvqn1PuS5SddFNxluN5zD1n9uVM6teyVjfMKAcXITuP+HQEAO0WJVXg1Tt7nqMAdUmCDywxgtz8ft1zfj99quFf8qc8Ll3xtf5cGQKmfNtj03c4I6B3CBsgrx9ERaQhDSLMUiycu3IHisXz0Jj50F7jsFBMT+wpJrJshfmV3JPJUPxdKpdaEJ9uQhxsCxE8v7qoHmL6pYvfE/3IqEqlUM1vXfm/drIh+yeE0MKSPsnN/E6ZOPIYqKkLmKXDQbOxhVdAT8oDZHbAGC3liTm3IoeWeWPdCEbRRFV47QXEeeYogdkbCJ2RixeDMxbJsVI2liI6ohkBWBUbmTWuQA5lasxRWeSsKYCAGwxp/+yfugNCGOJZTKoZUCa4VcKejynyq/S8rx6FMK953UAOfNoHJHnZtM4JKWR0bORHZA9U7mS/6kzM7VqLGtnpiYHefHXbEGO7uMGzPWNv6+/cX1zmHWGK0fxHe+9SW89+1vRZrlWJ8MMJ7ErX+TSYzJRoz1cYyDByI8PYtxeneAOAqglbHwmNowBGM1eoTnS7aDtkuvnpBFQiU/TMsMJmrZRDNS03VVoEmyLNSTuoBDNDCzHduCSGC8cRR/+ZkP45HvfQu3veIf4NhlVxTXCwM5NXYkMxCGEl+kGP/kjpvxEyeOYb7IEAhh7LWOGoF5fz0cssr0SD/c2serbKfT7fyI/TROtm+ewbZTJE+uQGSbTiNJsxDg+rG5+wREIBHIGBuHnoGzjz+Cj/3+nTa12d3FRCAKEAQBmGL81Wduxef+9C4cOrgBpbmGVpaGoDVNknuRJHlJPEJqk2sJTc2VaxCM29Uv6zs1i6RVz2gnVwzUcEPhtKkz1jV3YrV/pIxAJLC+cRyjcQ7WquXwi8iNQELUviSKB3jk+w/ir+/9W7zqjpcjmy0gpPSH1V56InngbvsiSXQJ9K92MNSRwHENlNhkVCpStPq+qE2EIk/J1oQx2Hx9+5X9ZonAEAiCEEIEYA7L5JHLPgeH7V1l8yQABAAJ7O5NG5i7Mo0my3oZe8ZEkx1WufQhqJ2UbGpe3eVLN7E4W5y84kqGEAJKKeRKW2VFM8wjc7CZu5sGOkogvqdzOWjN6wVgMIKAQALQistJanINIqr9B4igtYJS3GTcfU0kvgI+ddsYaX4gWonwuMxolU6oxmkYggRm0xmiKMSBycgKSqnM/dkwA+wmgCCQIC9T23SeRH4LymbIygVEvrs3wyJJMBoMoJlL/8QWQChEACIBrTS0Vp73IYeaDqfk6aE7kr1jJPeBTV3MAGefm4mRW8wRgjCbzfHjP3YD3v2OX8Plxw/bpUMif2p6ScALr0oyLwYbhKfPbuHXfvM9uO+BhzAcxgVpoBwcQrMLUPueJqepa8huKOQd/HZ/g3mJpE4n4PQIEVqNVmxwaMjdQWRACTrHb//7X8WJm67H/w9fzBrHjx/B2//D6/Cqf/S6GsW1EA6qzCrVJU5/Pxn7bb/VidNdjuqZAI/JYTdYtU0Je/lNxS4YjQYAgCzNIALxf7Q3A9xESlbCRP4mOaU04jjC+voQYRA05dPaPHBdgauYfUbJuqNLyMOkc0N4T2OaaGykL2vzuPeeGjWbFSmD/5JkOd77vg9jZ2cHMgwgyu5K6x9R8/tyLIRoyobU1HDqa+sagiAEQhjXFg62eA3j9cvvoQxwYXsH//mujyDNVd3pWUMfFtjYKp46Y2nAquSLDKg3qJTcgswsrNhTG/YNfMmIM2xltTuU1piMx7j7z7+Eb377b3DZ8SNQSjnBI9tRv9u5SL6ojPvbk7xZdwmAiQBnNy/gyae2sb4+hlKqtVMYbFGfOks9BD+5iz3+wWNfpDegYne1s8109jG8TRKseW+lE5tMNnD23D6eOLNtmQluYfsmlcUwdCTsYIAt1McALKjFsIMB+lUvHYUh1tfXioGviV+6BMeo3QzlSRh7Gx1olfKYNxNmtEpO1N043TAfmuoVGbhN5Ye0ZgziuOjA6bTx9sSzZY89GW9dISPPNU1WYsMjTcyvFCNPpmCdg4SEjEflhJgVLbJq1WwtC7aDFerr5vE/lF7yFaENsTK138SkirRMHRlxEjWsE81+wleDDPXAC35iGnuvYWcS7Nxdaw3iFFc8/8VYP341dp54FJuP3otADlp5VuVr0MXMor4iDPkjyfJ1ZS9ju6eUxhajzcbo6+JJSbxiFDG2EMLaWfbCJMe8oNOcWWRdNwkqn6zYoMKwru+3Xgj5HDf8zBtx/MWvBgG4LAc2vvYHePiLH4SMx9U+MTyVXde2Q/Il7VM9X/JHaQDujGrLGyJjC3FZGEnTFNPp3CHpdq1u6uCBN+ior1JF1LCsx+sjy3SaP6lkismVz4O49tU4u5nj6JrC+VkIeeMvYvzdL2B/8zRkNOyAB5eBZ9TB4meD2WfC0czdoAq7dG0/9csiSpsUwjLjTZMUx44dxBvf9npc8YxjNo/HGyAYHQNUOlg3SuG2b9BaIwgCfPPbf4v3/95/hQyjhkBc7k7NAKsEtHYVti4CyBT2piHSNIeQETA4DtaPgjH0Vlv6IyAzXOd2fcAzzLLNW+HlM0vkL0u2uc4gAGmW4l13vgGvuuMV/1cy3Z/++y/Dua1tfORPPo2DB8ZFR2LNI9JAEGL3ifuQb+2BghHAc7AYQWabmG0+DAri0oSK5eIQXbPhTgj7yXOyYeuaUIIThlolQbLqsAybIMVWOlFMjJQCV191BVBS2EWJuXd33NCK3ZcusgJkWYbRaIhnXnEMWZ47WE4JqokQ2YVHML/3nYif/wYQxSC1iYv3vxt6/ykEg42y7iBa4TlfSid9T5sSW43avu539rV3kjcJMmkh5OBAQgikaYZ3vef38PTTm8jzHGmaIk2T8l9qPHZ/TpAmCRLjX5oUv0+s5xc/LxYLCEH49r1/gz/+6KcxXh9BqdyAE0rHrHME8RhbD/whXj65G3/wG4dwM/8xdh76bxDRCKzzOqmsVhRzR4sG9zV1k794TKYTLu088ZLGDLLDRrJYDO2otHqS0grj8Rif+ezX8PVv3I9Dhw4U9JBWZEUObl8Ti2w3yrZ/arLuCrYWeOLJTaQZYzCIwawRiKLBg7loDCneQgHBCM9+xhCvvBb4xJEBOBgiEAXruoJETG0kg9LaTrjIhxhwfzNNHQV50Wb2I6PU0aHilsuc+RtPxtjdT3F+56k6pKQVFKXMD1WFtPWgsy7IK0ZvGMCIogijkYRSCrPZHIvFAqx1OW9Ff64QQD7dwsW9KTIG9vZnyPYv4EIQQnPRShqGIfYv7mExnzV9dEuVXviSWjhlf/ZGq+lAOE6awSAmo25W9JBFYYgoipqdYxTp2RcSuY8NyMAszNvRmoagALu7+2DWeOFN1+HFt5zA1c9+JjYm49pvEAmkyQwvuPkE9lLGL/yLn8crX/oChNGgNp1KA6dPP4Ebbrwes0VWu2Re1kRKq+hclO2q1KqDUb/4jlsXJmoNkgVTl5MgiGqOptukp42Erl7dbr21ojTXfWlcc3+KFqSCYUciwPnz53HbS34Mb/l3r8VLX3oLRrGEBqA9y2uRA/OFxm0vOYGXv/REKzSIAEw1MJsrQCmQ0oiFWTtwMscl7b3NWil+kLy0TZ3afQJO+0Sr18sBywosjSBIQFeoKcj2A9TwpomcFL4a8BJ3Ulp74QZBhJ3tbfyr1/4z/Pad/xZRJLG5o/H0xdSApQ1WITOCICikenY9iCgDudKQgcAgEpAyxCzXUDrHMCqK/UQ9C9xTPyYHKZVLwz3y9ARbibpRR+hgixARFosUaZIgqBWjuLP4X9hqcpQVuWwG0RiPR04EoiECge0LF/Ca1/xjvPtdv47zuwp72ylGA4nxSGJvmmNvP4cyCkXFTsstC2b2aYdSYGMtQDwIME8YSaYRRwLTXAJpjmGki0lAByGL+rJ70wlTHzm0o3fXcKSNFWrXDIQQmC8SPPtZl+Gtb/6XOH7sCDTrDkazPzWuW5AAfOnL/wt3feCjkGFYruLCue7t7eGmm6/Hb739LdjcUZinjMl6iO+fnOHjf7mPB59k7EwZStcwVV2I0cytgIIIGITA0Qnj9ueH+LmXbWB9LcRsUUzCxVQgFDmkNEOjjsZtF1EgFwvqGvyW6GZ3l2ZN/7A+RPGEPEvwn+58A175itv+zlnubbe+EI8+9jg++edfxIHJGvKcwQSoLMGvvv61GAxDbJ5LsTEO8am/2sHv3J1hinUMh2FJRSFHFcan4Vd8jn0FnDmb45unEvyPey/gHb+4gWceHyBNNTQFuLhQOLymoBG0E6pl+nllCO2pCXf4AWo7mpq3r7nF568MFbhYaUcOH6gFYOuQbgWlFbeWG4YS4/EIKs/rNTKfz/Dc667B7S9/GbZ3NNbXQnzl/il+6xOM4eQQjg8EFJvZrMdwGxQTZqp39WgQgTZiPLgd460f2cMHXhcgHkiACbNcYJxlCCPR+DSfYmwHj8iCo9mNhNhTiPEVRjoqDUwVB6doD73zne/HO+98Eybjdfj7+G14mo1Ej3UBI0gZ4iv3fBOf+vTnMRmvIc9zBFJgsVjgphM3Y30cY2cnBUHg9z+fI1ibYDQQyHWb8N0tTkJ1PUzX5VbGkQMxvrup8Kl7ZvilV21gd87IWSDJNMKQrfv1Z69+6oyHGdfRpuqTmYUTpcBtqizUZNfWRvjCl7+F//nTr8HaaFjH8XWG2ep2pFoKuN5RRNBa4/yFPcTxsNA3ArC/t490Mcdzr3sOmBmDiPDgaYXHtiJM1oKiLkAFqlPbfN2jxcoFGaBiWqtyZ+SaMRgN8NWHZvjnP6lLsQ1glmiMBqq+H+ovVDu9Ei4zzioqU0/fErxOC04raFWmZK0xGU+Kdta9pMXlZKdzzqaYlGuy/P36+qT2N7P9fdx++y14/Zt+BePDV2F3V2NjLcCZ8wpzJTGkwumSYCQ5IV0UrzeKUXZFklFPLtjbJAizlKBKyuJabEiNSeDcvsDuTGO8VmhDb86GUFLg8FAhjkRtvpZGlF442uWBVo1nxJ0stBY9wmQhUOOMNTNEECAOAq/Ybjfn02ZsVHlEnuc4cuQg3vPe38HxKzbww8ezOiqdpTBUCYvBv/YY49/8JLA7B+76C8ZuIiCFnezJgDBLgZ96PuMf3kJ44BTjQ18FwqBYAIEgJDlhkQEbothJQhCCUOLsnsYVG6qgtdekAF5ax5HdrtqlVrdBMnJkAtgQ2+gSlDLBQ4bJsqOGEliucK5gB7I1BYQQWMxnuOUlL8L44AbOn0uR5baEQZMPFjvwXa8mnLi6TH6I8eaPMQ6uNeaIqMiKn3lY432vIcQRcMcJ4OxFxie/TTgwBLJWl37h4wQ0ZikwSxTGI9Gh/Oj/Er2FBp9GhE9WzkQjjF4xNqoGviaMVmN2zaiguu+AhKj1jMxWpQKCEEizYoVXCszkOL1MAWthjmPjHEoxlGZceajYRVqX8ES50dOccHiYIw41pouienb1oRxZxg4S3AxNkjGSDEgzjSxThXRDLy5nfOK6UdsvyNC/MRzH7aLZRI7eJfmK1dRSbO9oOXaa/zSYFZg1lKaSOm6i7mTpGGmtoXTRAxwIIMsZWhmkYt10XKpcgzUgRWG+0kw1oauv3MuA0tUZC7kltdNu1nD8XtGo7aUftIfB2y1phnbUanJq1GqozTtq6aEsw7K4RYNkLlap0m5dhO3gtmJDkH9ZcjlZzMWOaOlPaKMV1qGrFO9f3IcuVVpsLYs+fUB2a25uVb+rwk/tnmWHH8nmpHCb2uFGTC1f7ooakCPwVAJ8WgFpxiXtvOnCbCQMyCZycd0+1knbtJg2RiWwBbugmPw047qBg5k9mrPkl94kMuG8HsNFWFrlaWSBXXYl+oVAfVIF5LR8e5rDhRCYz+bYnTKmswR5rts7rXwtXTZhV8w9GRQrtppiIm5ap5ghZFnvqwhZXQrMBCRJhv1Zjtk8N1qcuW1N2A2KishKUMembDr82po+VortdDFyy2QxWgA2t3UgTHYFcwcB2FiacTzAI9//Hh5+9HHM1QhZphpGZc3vJEgB7C4CfPKrUxClSBYJPvaVWcNPKpFXrYGhBB46w/jyvXsYxgpPPD3FZ+/NMYobKIOM0IIAXNzLcObcAulihlgydKcMpl/OWvZX2Kib92INKdU9t5X9JEdjyHbYXCufWL1h3CWXa7Duym0eyBC7O+fxu//xDfipn/tl3HbrCQRXrYO1RkC2hNnaMMTvfjbAX/z1eczzAA9fmGA8JqhSS86QH0SGCK/94BwnrtzCyS2JzeQA1kdso+4V6CkI2xcvIqIEN14TQoiJ06i2hFJFVEiWeXWQfNV8djrJDND00MENw+Ya5ofIDEabQa9CzQ4YmhyeqLuImDXiwQg/eOi7eO9vvhoP3vtFxMPi+JUD66KRACh7CUbjddx/7gge3T2EySSupRBM214cthBAjA7i648fwkU+iPEogDY6qYaRwFpcON80Z1w+2MT1R3axNpQAiTaPlNgPZJa/kJWN6z6xiGx+NjudkUIgyxSed8M1iEJp9QjXyZCLtxN8cFgZrZDDvzEP2aGWuuBwNMZsOsWZp89BMZAr4JrLCJOBLpMsrgv6ByZFi6piT5WqzPgZBCGAA5MQVYRaMcCznHHNMcLGOmG6ALI0x8Z4gMnGAEEQFk0iQvhzJ2JvCC6WN0IyepQdIARhPp/jphdch+deeyXm80XZ0k8GqunXi+iUsiATmiDrsakzVPcAhxEefvBBLBZAkhGuPka4/QbC7pwRh03hR+vG+cJpBGEnIVS6Tg9KYjGQ5xo/86KgLk8vFilGgxDD4RBxFEIEoqHKE3WQsmwTK8gtfHdlxEQWdd3sXtGaMV5fxy/9ws8jTReotHrMjNGk67IjKlW3FXm4wGRICFRkR6KCqyOEBJHAaLSO733nAZw8eRYiCJBkjH99R4ArNhgX9hkyAKRoohpBTVIWiOJnQVy3RNV/L68RAji7rfGzPw684gWEvTkjV4RsMcVkLcJgMEQYhXV9mZaJAhtzELz513/jbYM46lBb6RAL5cZ2F/KQjNl0juuuvQpJusBX77kXURQjCqXlqIUwNOVEs4rrgRHC0hc1Gy/qfjCzN6z8WxiGOH/uKaxvHMLLX3krpvsZDo4D/L0bgUfPME5tFSBblgNpXmA+aQYsMiDJgCQHUlX8roAVimuTnLFICYIZ//QnGG/6WYEkKwzH5oUEA30Bhw+MEEUxwlBCSll8Bm8/ATXCt+XKStMMdG5rhzc21qG1IYzN6NDWt7FK1hpKKySLFLP5HPPZHCQIH/vEf8eH/ujPsHV+F0EQeOxih5gHGaLdBhZYg3wwhaE0oEuup86RLPYxHMZ4/x/ejVtfdCNUnmE0KJzxNx4G7jvJOHeRa3xfs9G4LcjJi4uvYQg86yjhJdcTrr8CuFgoFmBnn3Fh8wyuOZJhY+MgojhEGEoEIiixK+oAzshSeN/bn4LObW3zxsa4rJPCK01sxf9mn3CJVmZphkU1CYsFolDisR+cxle+9i1857sP4/z5bSiljTPemlC1iJzJanMlXzuSe7CH5lpti7WGEISd7S087+YX4vVveQeOHh4jkgW+Px42kDK6VF46Ei0iYJYA00XxlO0p4+yZp3DlZA/Hjh7CYDDAII4gpSwGv6sEyTbZmYiqCdjhjcl6kcoTbDVx7mqdMZAWzVBKIc0yJIsUSZpgPl+UhxQILBYFaTbPVQukqmrHbKvg2z1i3EQxVMvks0VH1OU9aM1YzKfYmQKDI9fj2PFjmKxLyLLCZZoF4fCP7R4QI1dhQDMhzRhb23PsbJ3BZWv7uPz4YaytrWMwiBCGhv13x9BzKGi1hvf3Zz61lG6daP+xHUXrUSglEKNuRUrTDHmeIwxDhLI8l6ylguV295OnfmC0xVE1IGZrUoEDKVUIyI5GQ6ytzbE7fRRPPLYJOTqC4WgdcRwVrAjX2Zum1hIzKiY5yxXmiwSL6Q5kvo3LJ8CRQ4cRx3F5VkJQawiRD1r0nMZEJjGLlmFBbh+Uw/+hgpKGAEHxa0EIZIAwjKB1gY/rCk0k87hZu8PQ1oZ2GGqtw4XsaVJKl0osClmWIYpCDIZDLOYzTOcnMT8nMOWgDCvJs97I0IKwHbwgjUhqHB4QNg6uYW19gsFogCiMEEpZh57mWQreReyROCAiSK41cHwnm2LJeV6G7LEgBFTQD4MgQBgWmtJVlNQm4XpY2YZvIZeYZfJKzVaS0g8pXUxClhX9B3lehIfjcVYL9VUCs1aLq6dyZUZeMpCQYYgwjBDFEYZxjCiOEEUhpCwCjLpo1HkGqefEjdIKyJrO6UsclmtztaDiKgrQQjgSlOzofbJXDZE9nZFdNQFTrqYyQ2GYI4pCZFmOLMuhdFhGeO5hz3ZblSXyLRopBAAIRIAwlIjCEGEUIpQSMixCTiFENxm6JwHQpSOWRE1zWy/Dl3tOEzJlK0u7HHirQi7jjhyt6rbonk/B3ZUwqFa1lMUZNkpJRFFplkrn7064qXVKztEjjZ+o8pMAMggQyKBe9UEV76NHG4g7To8uWd2CCDIIBPJclcesriKc0qcIxdYpRuSJ67ilEkEtSov/DAtq+TRqyd4LCFEwnrXStSwZa7bOFrAi6hYV0212oZrZLQJRMqyFXSBqMcepR7qeapZfIAPIOAoxn6cYDOKSQU/d53s79HRfhtxpvjrOdO7T4CL/0RJ2i7yZsJU1ViqTv1pmBrrUpeClTRMEO+CwJBgs0sAqx+x191YopTCIQ8hBHGM6WxicTfYLIdOy0zipK1XwCBmtqm91acppVKCDFqpaiqb9yGRgtyS6vEOJuiuI5e8quf8oCiFJEOIoxGKRlLTBFRTDO+UZPUc2LTuqyifFSPB3yZvbqxUqucedNHo+BO4N5FZq66KGPedXSyNb1r/nK80yhGGRuAlmYDQaIsuyoqJf7+dVjgnl7jN8fTPFS2rL1LfTHNUeotUOoiT2HEzkkWO2oFtnFRsis34Kep/ePbXO3FFKYTiIi5owUBzANhrG2J/OjOMCafnRs16dHPYcR8s9p4HQiicndx1HQd15ituv63VAvORYW2oLS1HHIT1LesNAQJKkGMRhTdEXdd10bQQCMJsv7HOFW6eYulRy8miiuU3D/mNxmTtWTJeAB/tYBty96vpOSq2hYZPv1HUMEncfWE99DDiqyQlEhCTJQFQc6lyFwMKMiw8cGCNJEiwWaVFk96m6sqHqTx2rokt90aHPdR4NSCucxE0dumyM1c+fpX76oPfgHN9OoA5mITfM8TTNkGUZJpVKlylV0CCEAocPbWA+m2M+T0qmA9t6cuTjW/Dy07Qrqgt39Rez/zx5r0Yy+48qr+k0nUdHGEJ87vVYLr7h3Xk+82+ww4iQpCnSJMXGZK0t66a1LWFVNUJsb+9BBAKj0bDu8W2dkt2DKnTHa7xaTMnLe27b4R/3C7va0u1tsdUWzsd2HeQSbrvQG9VYLFIwa0zGa3Vu0jsBdQxNhP39GRZJijgqgCjhEGjds1zss3q5I0xlvwqjF+pgRx6nY1X6TI13Y5InbzEyV1DHsb68QiRNRj85lyIiGQaDqAzv/TutPQHObsjzQm8hVxpBICClLMqMtcD1MlHVTuGt/sO5l4lkr9KJ2Hfa9SXlgP7AwFyIFRhYIK/FWI1Gg6Jhoyek75yARrOvwS6SJEWWZWWnupOet5xbWw/CO65ELSS0F9ld5rCZ+w93tM4t7Ii2iP2D7rlXNs6/EYIQhmFNUcEKYiT/G+AcBeURAdyKAAAAAElFTkSuQmCC"); --lm-darkmode:url("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAGAAAABgCAYAAADimHc4AAAeIElEQVR42s2dabBs11Xff2ufc3q6faf37hs0WIMlC9lGtgVKLBQj22BUoQwhYBsXSLFlEyRjROwvobBEEiWVVAJkIBCGuEiCUXAlCCKjGGyTwlIEGJzIRB6FJGQ068lvuHMPZ9grH04PZ9jndPd9TxJd1dK73afPsPfaa/iv/1pbAMX5kslXjWaTbneNVruL7zcwnoeIQVXzR+roD+dZpv+eHCICqqUbkMzRjlOWzpw9Rqm+fumlOrmHyf3k7iFzaPFco99K5jkSGxOHQ4aDffb2thkOB6PTymSsWOT+Wq02a+tHabaWEDFYa1EtD0pxAIRZLxldWWd875i5yt9Uv6omqO6z4tC4zuEcAxE8YwBlONhjc/Mkg36vbiTKEyAiHD58nOXVDayCTWJUFRGZDI7USUeFBFV9574Tqbzj7Mqbd7CrBkwdIyo1E1l164zXq47uTwTPeHiesLtzmlMnn0sXjWMscuf1fZ9jxy+m0VwiisLRYMtoeerozoWzec16QJmxauaR4tmDlVElFaMvNQJWKWg5tZb+MggahMM9Tjz/JHEcV8ud7/tc+IrLUXziJMKImRwmkr3p/P2qYyTzcyRotaarlGTmUmfl47VmgZUnbPSpOoZ6pOMrz6fleVOH3bOqBH6AasQzTz1GHMeTY8xY5YgIx45fjOKTJHFm8F3LTycfOHW+lB9SHMdJ5mY1cx2tWfbF47RwLhz/d/1OJh9K+YZkbFgrBEFdKyh/jexnRoQ4jlB8jp13carKRxJqxhb60OGjNJod4jga6fr8vErBRswSTZ1hB4qDUac28g+mpUGpm7TpmEpufJX87KePLNMvCqJcfh4F0dGZ3XOYux8Rkjii0Vzi8MaxiU01qkqz2WJ55QhhGCKmKBFS8g3mMU5VblzVKGvpxrXiGuJUNeJQW64zqMvWS9aLqfKZXQ8nI6eAiYGtkyAxhiiMWF7ZoNlsoaqpClpbPzLRZ7n5zCj94r1UqZO5LLC6fz+vsa66phzkfmquW/Q1XLYu+6FqQTWq+0fWwvr6kVQFBY0GrfZyXu+PJV+mKsetTrR0AZnHZZPZ7qJkJH2WayvVY5I7Qh22olJlzHBjc764KLVGTvLqO0kSWu1lGo0mpru0CgWDm13mMjOg0lJwVNTpOqfbOSvEcnk6LmNcpyRnXbNyVU3cX01Vf+70Uj1RTtWkqBi63RX8dqeLtbYgAjrT158OQjoJSrVacetrzUnmrMBK57A5WuP9zDvR1e7sOA6S/HRK2S5pwUzk3fd0bVtraba6GD9ogmpe90utqqtYK9UPpM6/M4HdyIppjeEuSWXmd3PFDTrV0VITHVPnzmoZjJAa9Vh89qxMqypBo4nveT5RFKfej+ZXgZaCqWo1UylNmrdqxvmd5AK+kr4u2Ax0rDWloP4kHyDqKATU2WjPTINdYWjUHQ5PkQOXLRNBreIHAT5iRkZWMgFhZmlNkMJyKFm8uMvtM8ZgjCFJEpJCGD651vgmZT4bUEJMK9zFMTjme16qZieCJeWASfMB5CysK/uN5J6lcEKp87AEXwtLuCS+UoRuM46pSEV4mL48z6Pf77Pf67G0tMRydwljPKdvPoV1y0OglHWHZGBelxSPv4uThN2dbdrtpelKyEDJWgK2R6pGHCpPxoOaCub0+g5BnYyJ5O1AVoZV8afnroqQJKt089bFEY5PB99w5swml1/+Sm668d1cf/3f4rzjxzDGy4yz45qSl6jJyix6WmMpVq0G7WzE06eF//BL/5nfu/tX6K4eSj/X+iAvO2BS9J8zE6hFiFzqzbw4/DG/1kcYo3qaUUfFi2j51Makg/++m2/izn9yO2trq7wcL02GbIWWWz78j2gEHnff9e9ZP3QkFzQVVas4YoGSNzdBO/OiPQ8KW8QU/Bx8qRUAixRuyQX5jSbI8zxOnz7NLT/6Pv71z/0LAKIowhgzxZh0sTB1mouYw1UefW6tMuj36O0nbO56vP+220GEu3/j51k/dBRVWwuv17vEGWC/MG5jVaoFlawltZr+11s7dOxOtZmHkSJCKNUgQAbVG0t+r9fj1a/+Ju762EcRBKsWz/MmiGvd24zOJ+fgDWDjkFM7yu6wRRRGXPumtxJHCQ/+2R/SbncKKz1vM+thIMkcrKVU5jQ+ykPbRVfOMx4mtzQks6wkcwGtgBiL4bwRev0eH7jl/TQaDRKbYIxZKHV4rl5jL0MnAyHs7Ax5zwd+infe9CF2tk9PV6XqXHkIqY2p62CT6r+M+2cZ/a4FP1OnN1y8yTAM2Th8iDe/+U0p0rfA4L9IVmASvYgYFGFnZ8CP/MTtvOPGD7F55mRGtelcKVFXkOaCL/JOhlae0uSSJ0VrLgXoUkbYj0tnihBHMRsbGxw5spFTBS/fSyaZQZ3kMQxbWwNu/uBH+MH3fJjNMyczgqIF3KDODsh8y1CqJnJshFWrl5pqxkbLJOxw4j4Cqhbf8/A8D1522R+tABmtA7UZvWzY3Rvy3h/7CKo68Y6yMYXWwO46b25E6+xoegLjyvOqwwHTuXK49bnfl2UFOMLcNIASdneH3PzB23nnTf+ArZE6mgtemSsxpTM9O1SnRnjs/eSBJ53bQgoCf62G3p1UykXKCDu7Q95/2x28IzMJY6+jKiYQFsg8FWxLcYJ9Jz4+8bGliF3Wz+h8mvElnQJPkjKam7UJCtvbA95/2x0I8Nu/+QujDKGWUJG6LKW64pECOIgD4jauDFDeeMrcLqLq2SYDz/EUGI9OMMSQgE7XqC0ZSsP2zpD33XYH77wxuxLqwEZxK7wi5q0V6mv0vZEKKsUsiLaU7Zq625UY+Ust/8ZrsNJWuv4Wifowin7LuacUDd7eHnLzWB1tnkoDwyqwkgo+ThZDl4Jd1XL20FDJRMigjKrVvm4OE6rORr0cL88zdJZXOH95myZniDXAqnGgGdMIemc7XQnvfu+H2dneTF1UzYOO6khFSg6crslKieRspqme0swQS01QokU08Sw8IdVzugSMMbTbHTY2DnHJ2jdYkafxtIfaBGstVhVrU3TUZgL+7e0+N936U9zwvTeyv7eNMZLDjGYpZSk6AbmkvY6uo3kjXBqA0bLUDGClRaKyYx1qGdxdFD84h3BEmozpLq/geR5LnU12955hEAlWpZJNpKpccPh8bviOa/j9T9xFV8q2QOawCunoidtXHP3Udw9+gWiayTppVbqRKa/or5NLKsYQBIK3vEyz1WZlLSSJo1FgNgosVaeCo2DVcuRIF58wkzvQgznbhaR9cYz9VMB14pKVYgAtwtBSTUXXNBpWRyg3flnrduTmQ6gXrURQjEkFwjMepmloNIIKTTcFjOMkAfHwg8bkfqUQjM7HqhAnjWaaw1H8arZNheevoJPUXIFNMYf29zxzjojtMncwNHUmJE+9nAOWrYZz6iMjLaQxxZVPGKugXMkQ6i7fqcAEK3LPlQNy/5f7PH4iwjfunIqW4pCptEylUKcr2+F2i6Qe58aK4Yarlwj8s/WLxWntZjoUBaqnTNT69BO/KCuTh5SCGFDWheXBd+tIa8HzhE9/occv/M9t2g2wSmGxSm2FijrFy5GrzRjAfqic2rHc/LYVksSm3syBBl8XP1qkWpdo1giLZECrqWs7HsqJC6qSJdvkKCnzFs08/nyIb5TVjkdiC/T3urRgFemgwj6ogicgxvL4idAR3S9M011oUqQqn+xgfvmlIExdBRYZsoGIO+DSGjbA6ODveF2TP390l94gnk7wWPozntYkVBGtX/g61fDjzNb4IY0RWj7c8IbujGrLGfwjmQ/3lBlVOZojXUzH0HfOqmYEfhG6fIUvLyNayasvavGzP3KEb2xG5GtApuWq87DVdI78rQJrXZ/zDrdQzWAuC4Ujo6BpRoAoNZMhrlxx5mC/stJWyxGwzOM61tystXB4tcXh1dZLFgdYq4vHd+rQfXPmB2RWMiej5pWRCpo4k0WqxRz+thZPPkOyrNWzynItVo980OBa85CDVKfk5y08nM5pfp27K/GyrpJOGWhZxm82HJeK4oqFalTniCKkBubQA0JPWgNzuuBjrUjKU4Mqa7nQeXJdX50whFRk9x3hWjZhIeSAJtcDG1MnlsLBKoyr14pTBWnqBo9T15MaL6m6muQgxmJmTKkui9KsUS2mxtAUinCHuwX2c1X4LpkgaYYYGiP0h5aT2/EkwswSMVTnc71lhmpOVR2sdg2rHa9kRK0qnmfZ3FXO7CuXbAieb0gSwZgy5KAFPqlUJx/dAZs68PppHFBTruioLtBy2FpgJVexBYWvn4j4N/dssbWXjBhwlSxuxwBrrn4gnwrN957wjKTF0QZ+/O1rXHNFi8SmCfAkUXwv5p7/A7/+J4ZBZLj0iPKT3x1z6TEPaz13SdGBOgCoEzSbrifJrIAcDCGl8hu3jzX232Ui0S79n5K0hM/8vx5PnYw5suqT2GkMIFJRu6XFwZ+yHJzsaDGTUpjACLs9yycf3OOaK1qjsiDF8xK++Fcxd/5OgyQB37M8/rwhjoRffm+E8Yr5DEFyQ7ZIGCejoSyS4DXDC8o99Yh45QigpUybn/gKxdKbqtfFhw02Sdje10z+OE8lLAU5BSdEc5m+KU18SuBN1YUn0BtYLjjUzOt9Qj7/aMgLWwFrS9ALwTPKg48rz54KueS4R6QmD8vLgrGQ0xXTAmwwoadn0TotSX+x8Exriu+qxt6YFHO/4Vs6JEnEky+EeGZMmNJROpD8pGgZcbVjSmSWQiNTsG78+3Hgd3g54O3XLk8AMFElCS2vWN1n0BP6XotmYDi1HXP8/H26QUIYtzBGnW6MLtAVwOmjZTCbMYvEz5XYzCgumPm51P/G9wzf+22H5ixc1Rl9Ver6pORFZOzhGIFeZHj9BQPe+zc2+fjn19kTj6PdkNuu36PhH8bakadGFuY4SEH5NCOgxYAu4234eda05Iri6kJrHOWYMk5uFwqjs8dXBmKaqXqZuaizdHJx1LVNI0PJssRF8H0Pr9HllutPcfUlPnvmON+0coJXnd/AShvfN+V4QBeQdinzWKYYWrYxxWQFuKsRF5HBRV5mjqU0d8uDQjFeLYg5eqAg8Gl3ljCNFa597SHWjq5z+pnT+M0W7XYLz3gkNsnhxjKHpM+bUSgaeL8qkFg01M5YkdrfWnsWiRGHq1RDQHZKImIIgoClpQ57sc/eAIJGg1arge97+XkUwfM8jGewarHWUWdBIXGlM5DScfRaSsofsEnSImCcSJqY4RzzoF2XtNZik5R+otnAkrSOIYkjhsOQpB9DGBFFhuFwmJbUxjFBEBBFETtbW3jGZ6m7hB8EJEmcA0VkzgRN0acck9h8LZagCtUV69UFpnMhM2EE9/zZHk+fikvRbG3CJNNsTUdqzFpY6QjvelOXtaU02hUUq0oSR8SJxYqHxRt5WxlX1g9YPnoRS5oSdGXtQjwjhGJS4TQ+O0PL9d/5Xfz2Pb/FfZ+9n09+8tPsbG2zurZCkiTksuEV1Z4oGUNMqfZAALnksqs0jqLyANRUert8D2MM+/t7vPLSi3ngf/8BjUYDay0iMklJ3vOn+/zq7++w3Ek/c7JWiwmfik6JIkpvCG+5qs1P/sAqiVVULeFwSIzBmiZhLCRWMDK1PUJ1u7UsOGdV8Xyh2YKOB4888hh3fORO7r/vftYPHSJJkhIK4Oykoll/SnN11kEQOLCgbF1ZRTGG2xboTNX9wmaE7ylLDUOiUrtepTblAUYMahNOnBmipIM/6PeJxCeWNr19xTeKTWJObEZs7duMB5ZVW/l6l/FKaQbCxrLHWtfjlBqOX/QqfvO3foMf+9HbuPcT96aTYG2lF1SkbuZzxTqJd/18j7Q8Ajf/4Feswozno8B3f2ubrz2xz+beMCW+FiRmXCwujiSzFljHorDegXdcl9Yg9/t9homQeG16PUtglIf+ssdd9w/5yrOG3aGXk0LNgXpTUoDouIJR2Vjq89bXwA9d30UUBi2ff/uL/46vf/2veOQvHqHb7ZJYm0/C5NAcdfXcHEEqo2e99LLXaRxHLvM+V2/OrA7f7+1zmUMFZY/pD0JO7UR5uoaUVP0M5DOV4OWOz9pywGAwZHevR+SvEUaGwFju+dwu//JeGGqHTtPMyYjIV+bHsbLXD7nyaJ+fvanFhUebrB8KeOCzD/C+m25kZWXV2ch2Ql5zVF9m6T5B4OdpKVSAYjKr9+YYVJvhFlirtJsBrzjaOGc+UBQnhMMhvcjDqkfTt/zRl/v8808YGq0l1vzUMGux+E6koqArXR4GaARwtNXisc0Gt/+3PT56q8/Wlscbr3sTr3v96/jqV77G0tISai0qed6nVghyMc1rXAUIUtHqcWYxGrNxfKvpRLjftuY79xu1DIchYRJgFcLI8p/ut1ivTcNX4iSL1qqjS18hlydpToBRHVkUK4eXDV97ocPv/t+IppfgBYY3fOsbiaNhNWtC51HdgkEPgPmcRR2MSN1bZnyffwMkccxgMCSxHq0AHn464eHnfLotIbGj1pACcQKDUEoNXkQKhf9AP8xm71KBaTU9Pvsw9IcWBc674CK2t7exI6i93HBK56pGNzlbrdU9nrWmVZiIvOQFGapKksTESUyYGGILDR+ePm3ph1O30wgMYjjUFa48H4aROrsVjzvcJgrffKEQ+EoYpW0l1YJv4IVtj61+WuN04UWX8J1veysCDIfDKS9pDqJFqUIG8iZcXb3PdA6YQl+6wY/jmGEYkwRLRMHhVM0AkR2rjxSIG8bKpUfh3n8o/K+f9rj1bcL+UClyhEUgioV/9i7DZ2433PVBQ7vBiMGXuqmJCohHv6+8/luu43/83ie56+O/Tne5S5SJpXSB4TFzd4CTMm9ai26MvDRzYG3q8++GHr2BoT9IKKcSJE3KhPBtl8NFG4JnhO+/RtL4oNDgM7Gw0rF8z9Xpin7jqwzffKHSC6dJfRn1qTMiDIchTzy9z7dfew3v/uEb2dvbxYxmtaa9SZk+X8XVZ8GmqfMzpM/+lSQxvf6A3Z7SH0IY2nyfOCGXQhx7QUq6IooJqgljA2UQ6SgSHmXZKiQxSZQ4gZMDyysuunQSQy00BlpYAVWNTGWB2q5FGfwHIfPYxDIYDImTVJKt02WWXNXm2MAaqWzmmSMZG6kpihv9kQbChsEwXoi0ldV7Zt5ezzKLEKUvjUkY846stTkIeNqUQyfRba7pywTjqfaps1iQOo6bBF1ShiRn3zNOuouZzXPnwP1+5BxJfNXV0grHKZxAob5kPPCekQlXqBVIJeVTRhjQGPdPGRKOgpHMf+PYYow/Adi0ghWXJRJotRFefACF6syUnrvOSwW31yAovV6fYWixanPMlEmzJoVmAF9+KmEQKsbAnz6aECbTvC+TfV9gty889ESCMak7+9iJdMLspFniOOWa1sKFYYRieOrJp3JogKs/tSs/X0rInIuy0CgMieOYRqPBi/USEQLfI9x9jt4QeoOYdqs5zbiN5i2x0A7goSeEv/MzA85bhwf+wtBpeBlkdOqyIsJP/JeEa18V87VnhFN7Hq1grNJMrqmsquAFS3zuj7/EJ+7+r3SWutPepHXtlyWv6/xzkeedtOINGpw48QLPPvs8l1/+SnezvXOwIowxtNpLrHY2OXHyq+zuxJx39G9iLbQbgjFTIEwV2k3hS88EfOFJWG4LnpTzWaoQeLAf+vzuF5R2A1pBOqFmNGiegGBpNuGRhx/iY7/2Szz+6Ffo7+/SGvUllZkNAPOVRuZcmsog8Nnc2uJTn/pMmohJkhfFCnueR7vT5sjR45x3dJWN5Ri1CbGFi454BMbm8H5V6DRhrUMmw1GKZkb2QllfEhp+xqUViGI4ugprS4IFnnriMe77zN3E0ZBmqzOhX85d8DT2yqp3x5C5G3hn0c5ud5lf/Y+/xubmJkGjUWpXfE5aEIjQbDZZWVnh6LHzWT+0QRwOGYRwxfker7kAeoNUYicmU8fqqaI7ZGYSEpvPM3ue0A8T3nSl0GmmqdXnn32WldUjBEFzBOCZheze2FqYeQNnmZOA0e50eOqZZ7nl1tuI4wQ/CIjjOO0dndgR4mlJxknzUeJ8nERPSt+n/06szfxeRysuoN1u0e20ifpb7PcT2k3hx/+2TxJHJCMMRwp+vGS6WkiNlIlAwxe29yxXnhfzg9cF9IaG/f2Eh77weYKgMYo3zAEJ9oq3fuj4nZPEidZzcZm5m0zam63T6fDFL32ZBx98kKvf8HqOHTs6aeJ9Lt+e59FsNgkCn/3dHUxjjSiBKy70ObaqfPZLIf3I4PspIprzUoT89j5ZT2f0LHGibO4lXLIR8fM3NzncBTyfzz3wx3z8Y79Mp9PNtMdcfDsuzzPIpZddpXEcZ9jGs3eUm0VKsjZBRNjcPMPKyjJ/9/u+h7e8+du58MIL8Xyvvt5IZxSjaZ7Ma62l3+/zwolnibwjXHPd2zBEHF71+fOvR3z0D0K++jTsD2VSm5w1lhOajuRroD0DG8vKW15r+Pvf1aTbhL0BhGHEre/5AR59+It0l9cWo89kC19GGbHyBNQwIRYFzIwRhuGQ7a1tQGk0glxBtqvLjtZuyebgZo93pFCLWsud/+pX+P53vYN+L2J1SWg0DCe2Ejb3UsDNuVeMamnjucCD89YNa0vCmZ0ES4MosvzTOz7Ep+/976ytb4zqmw/SmFZHExC4JqBqN7yDuaagiDGoWmxip/tAyrQONus9aE1FdmV+2KYxaBQOCcMBH/jQT/NDf+8WOt12mlr0mbQrEKmoXC+gqVZhGEE0Ctr+8rEn+MWf+8f80X2fYu3Q4bQFmpHyLmLlJkr5BTxacjraXU8uuewqTUYToIVC3EUnQAs0RQob4Dhbwms9H1LR2qK/6QaaKQMuiSP2dra44jVv4O3f98Nc+dqrWT+8MWmb7+z15mgMbhXiaMBzzz3N5//kPv7w07/DmVPfYHV9NPilxrR1WzwUGnUAakcr4JJXXqVJUl4BctalpHKAnR4Pfr1xHZdiQWF/f4dwOKDd6bLUXZ62Hiu0PSi3WpjefRiG7O1uEUUh3e5Kzt/PCqwc4H7T/SV9fBEpMerPSb9OKfNhSkTW7K6jFatAK/oT5knsI3WgKUSgoiwvr6NdSxJH9Hv79c33KpamMR5L3VU8z5uAe8V+2HIW3SfECL6Wen3KuYHRnKyDwkpQx2YIUp1fqNzVRbJBmslwdQye38DzGznaU9XGF1oq0M225s+0hlTm6pGqBVuqjifwbRKBmEydrFaOYXmvlwqZmhYMz7G1UpmHOnMn7mwNrdT0dc6oiiyRNteL3FFELFWcj0VqaXMeT5kzJaQ7rJo4CqfFbVQQZB27yhUc8jlSEZrZ9q+Aw6jWNOmS8tZN6iaBVTVskQKDY7qdrAt8kcptafMu2GwurKvQL9vLLoqGmH5vN7d3sC4E5OucrSYzKLlKRWWfONJQUpMT03yqq6JRXu3GcqLlDTgrKmIW6Ycqpd2XillNxTOG4WAfs7+/7SgD1HNgjrUmg6/zc1pkjo3JNdspROt7F+VuRw7UdEKYu0w7z43NaQ3L7s4mJgxDBv0dPC8oGJYDJJldu6Llkq3zOW7q1h2OeiSpaDa4WG4vv5G2nL3AVSIqafLHMx6D/g5hGKYpyc0z35jWxp7jLRTm2dl0dut5h5ssFdX8Toq3zketqeV2uDcumuWjqaNfkDHpmE+2NB8OB+xsnyIIGm5K9YuQVdGZBYFS3Sy8ViE7WiapHFBcJI9fHKwpzuRM1loajQY726cYDAbTLc1FhNOnTjAc7OH7wRSvmbmA5cBrYmZrMtGy1VRqNtqp6gO/6OAXnloKNmVWV6oK79GqxfcDwuEep0+dmGyDaLLtWF448SSqcW4SFnC4Zs6NLDJ9ld07tCY9d7B4XmpLrWQm3Rznlr3TmxwPPsSceP7JXPubkuft+z7Hjl9Ms71MFIXZhmb1MiWFQrs5eq3JzGZA4g5dcRfC1e+BOmujQYe/mLuu1HcUdsab48xdg3C4x4nnnyQupGjdoY/A4Y3zWFk9giIkcZw2u84FaFKfVamsQJmDB6TuOh11hf/OqLzY3kSdzV3zu7fibuN7AL0/bnpujIdnhN2dU5w6+VxlyFJ5hVarzdr6UdqdZcBMkh7lDZLVTaZSXYx8pa4Op7Pcu1mJA8nv3lrZpitTLOjYrrKqDU++l6pMEvSqCf3eLttbJxkM+ov35R0bCYBms8VSd4VOZwU/aCDGczdmquijltvXCyls0unweDL7/TJH385p0w6drWV4cYhiqJLYhDAcMOjtpnB4OJypkv8/Mh3H7/Pom8QAAAAASUVORK5CYII="); --lm:var(--lm-lightmode); }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --lm:var(--lm-darkmode); } }
+  :root[data-theme="dark"] { --lm:var(--lm-darkmode); }
+  :root[data-theme="light"] { --lm:var(--lm-lightmode); }
   * { box-sizing:border-box; }
   body { margin:0; font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif; color:var(--ink); background:var(--bg); -webkit-font-smoothing:antialiased; }
   .app { display:grid; grid-template-columns:248px 1fr; min-height:100vh; }
   /* Left nav rail */
   aside.nav { background:var(--surface); border-right:1px solid var(--line); padding:16px 12px; position:sticky; top:0; height:100vh; display:flex; flex-direction:column; }
-  .brand { display:flex; align-items:center; gap:8px; font-size:15px; font-weight:800; letter-spacing:-.01em; padding:6px 10px 16px; }
+  .brand { display:flex; align-items:center; gap:8px; font-size:15px; font-weight:800; letter-spacing:-.01em; padding:12px 10px; }
+  .brand-logo { width:22px; height:22px; flex:none; background:var(--lm) center/contain no-repeat; }
   .navlist { display:flex; flex-direction:column; gap:3px; }
-  .tab { display:flex; align-items:center; gap:11px; width:100%; text-align:left; margin:0; padding:10px 12px; border:0; border-radius:9px; background:transparent; color:var(--ink); font-weight:600; font-size:14px; cursor:pointer; transition:background .12s, color .12s; }
+  .tab { display:flex; align-items:center; gap:10px; width:100%; text-align:left; margin:0; padding:8px 10px; border:0; border-radius:8px; background:transparent; color:var(--muted); font-weight:500; font-size:13.5px; cursor:pointer; transition:background .12s, color .12s; }
   .tab:hover { background:var(--surface-2); filter:none; }
-  .tab.active { background:var(--accent-weak); color:var(--accent); }
-  .tab .ic { width:20px; text-align:center; font-size:15px; }
-  .nav-foot { margin-top:auto; display:flex; flex-direction:column; gap:10px; padding-top:14px; }
-  #theme-toggle { width:100%; margin:0; padding:9px; background:var(--surface-2); color:var(--muted); font-weight:600; font-size:13px; border:1px solid var(--line); border-radius:9px; cursor:pointer; }
+  .tab.active { background:var(--accent-weak); color:var(--accent-text); }
+  .tab .ic { width:17px; height:17px; flex:none; opacity:.9; }
+  .tab.active .ic { opacity:1; }
+  .nav-foot { margin-top:auto; display:flex; flex-direction:column; gap:10px; padding:12px 0; }
+  #theme-toggle { width:100%; margin:0; padding:9px; display:flex; align-items:center; justify-content:center; gap:7px; background:var(--surface-2); color:var(--muted); font-weight:600; font-size:13px; border:1px solid var(--line); border-radius:8px; cursor:pointer; }
   #theme-toggle:hover { color:var(--ink); border-color:var(--muted); filter:none; }
+  /* Inline stroke icon inside a text button (sits next to a label). */
+  .btn-ic { width:15px; height:15px; flex:none; }
   label { display:block; font-size:12px; font-weight:600; color:var(--muted); margin:14px 0 4px; text-transform:uppercase; letter-spacing:.03em; }
-  select, textarea, input { width:100%; padding:8px 10px; border:1px solid var(--line); border-radius:9px; font:inherit; background:var(--surface); color:var(--ink); }
+  select, textarea, input { width:100%; padding:8px 10px; border:1px solid var(--line); border-radius:8px; font:inherit; background:var(--field); color:var(--ink); }
   select:focus, textarea:focus, input:focus { outline:none; border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-weak); }
   textarea { min-height:140px; resize:vertical; }
-  button { width:100%; margin-top:18px; padding:10px; border:0; border-radius:9px; background:var(--accent); color:var(--accent-ink); font-weight:600; cursor:pointer; transition:filter .12s; }
-  button:hover { filter:brightness(1.06); }
+  button { width:100%; margin-top:18px; padding:9px 14px; border:0; border-radius:8px; background:var(--accent); color:var(--accent-ink); font-weight:600; font-size:13.5px; cursor:pointer; transition:filter .12s; }
+  button:hover { filter:brightness(1.08); }
   button:disabled { opacity:.5; cursor:wait; filter:none; }
-  .account { border:1px solid var(--line); border-radius:10px; padding:10px 12px; font-size:12.5px; line-height:1.4; background:var(--surface-2); }
+  /* Account panel — a clickable button that opens the Claude-connection modal. */
+  .account { display:block; width:100%; margin:0; text-align:left; cursor:pointer; border:1px solid var(--line); border-radius:10px; padding:9px 11px; font:inherit; font-size:12.5px; line-height:1.4; background:var(--surface-2); color:var(--ink); }
+  .account:hover { border-color:var(--muted); filter:none; }
   .account .dot { display:inline-block; width:8px; height:8px; border-radius:99px; margin-right:6px; vertical-align:middle; }
-  .account .on { background:var(--ok); } .account .off { background:var(--bad); }
-  .account button { margin-top:8px; background:var(--btn-dark); }
-  .account .hint { color:var(--muted); font-size:12px; margin-top:6px; line-height:1.4; }
-  main { padding:28px 32px; overflow:auto; height:100vh; }
+  .account .on { background:var(--ok); } .account .off { background:var(--faint); }
+  .account .acc-eng { font-weight:600; }
+  .account .acc-sub { color:var(--muted); font-size:11.5px; margin-top:2px; }
+  .account .acc-manage { color:var(--accent-text); font-size:11.5px; margin-top:4px; }
+  /* Connection modal sections (subscription primary, API-key fallback). */
+  .conn-sec { border:1px solid var(--line); border-radius:10px; padding:14px 15px; margin-top:12px; background:var(--surface); }
+  .conn-head { display:flex; align-items:center; gap:8px; font-weight:600; font-size:14px; color:var(--strong); }
+  .conn-head .tag { font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:.03em; padding:1px 7px; border-radius:99px; border:1px solid var(--line); color:var(--muted); }
+  .conn-head .tag.primary { color:var(--accent-text); border-color:color-mix(in srgb, var(--accent-text) 40%, transparent); }
+  .conn-body { color:var(--muted); font-size:12.5px; line-height:1.5; margin-top:6px; }
+  .conn-body code { background:var(--surface-2); padding:1px 5px; border-radius:4px; font-size:12px; }
+  .conn-row { display:flex; gap:8px; align-items:center; margin-top:10px; flex-wrap:wrap; }
+  .conn-row input { flex:1; min-width:180px; margin:0; }
+  .conn-row button { width:auto; margin:0; }
+  .conn-ok { color:var(--ok-text); } .conn-off { color:var(--muted); }
+  main { padding:28px 32px; overflow:auto; height:100vh; position:relative; }
+  /* Persistent brand mark, top-right of the content area (theme-aware var --lm; decorative). */
+  .brandmark { position:absolute; top:20px; right:32px; z-index:6; pointer-events:none;
+    width:38px; height:38px; background:var(--lm) center/contain no-repeat; }
   /* Review controls bar */
   .controls { display:flex; flex-wrap:wrap; gap:12px 16px; align-items:flex-end; background:var(--surface); border:1px solid var(--line); border-radius:var(--radius); padding:16px 18px; margin-bottom:22px; box-shadow:var(--shadow); }
   .controls .ctrl { display:flex; flex-direction:column; gap:5px; flex:1 1 160px; min-width:140px; }
@@ -1092,28 +1228,41 @@ INDEX_HTML = """<!doctype html>
   .controls button { width:auto; margin:0; padding:10px 18px; white-space:nowrap; }
   .controls .ctrl-go { flex:0 0 auto; }
   .controls .ctrl.hidden { display:none; }
-  .editor { max-width:640px; }
+  .editor { max-width:none; }
   .editor h3 { margin:22px 0 8px; font-size:15px; }
   .editing { font-size:13px; color:var(--muted); line-height:1.5; }
+  /* Page header — a title + constrained lead line that anchors a view (reusable across tabs). */
+  .page-head { margin:20px 0; }
+  .page-title { margin:0 0 5px; font-size:22px; font-weight:800; letter-spacing:-.02em; line-height:1.15; color:var(--strong); }
+  .page-sub { max-width:66ch; margin:0; font-size:13px; color:var(--muted); line-height:1.55; }
+  .page-sub code { background:var(--surface-2); padding:1px 5px; border-radius:4px; font-size:12px; }
   .form { border:1px solid var(--line); border-radius:10px; padding:14px; background:var(--surface); }
   .form input, .form select, .form textarea { margin-bottom:8px; }
   .form textarea { min-height:80px; }
   .row2 { display:flex; gap:8px; }
   .msg { font-size:13px; margin-top:6px; min-height:1em; }
-  .msg.ok { color:var(--ok); } .msg.err { color:var(--bad); } .msg.busy { color:var(--muted); }
+  .msg.ok { color:var(--ok-text); } .msg.err { color:var(--bad); } .msg.busy { color:var(--muted); }
   /* Track tab */
   .tcounts { display:flex; flex-wrap:wrap; gap:8px; margin:4px 0 14px; }
   .tcounts .pill { font-size:12px; font-weight:600; padding:6px 12px; border-radius:99px; background:var(--surface); border:1px solid var(--line); cursor:pointer; }
-  .tcounts .pill.active { background:var(--accent); color:#fff; border-color:var(--accent); }
+  .tcounts .pill.active { background:var(--accent); color:var(--accent-ink); border-color:var(--accent); }
   .tcounts .pill .n { font-variant-numeric:tabular-nums; }
-  .funnel { display:flex; flex-direction:column; gap:5px; margin:0 0 16px; max-width:560px; }
-  .funnel .fn-row { display:grid; grid-template-columns:78px 1fr 92px; align-items:center; gap:10px; }
-  .funnel .fn-label { font-size:12px; font-weight:600; color:var(--ink); text-align:right; }
-  .funnel .fn-track { background:var(--track); border-radius:5px; height:22px; overflow:hidden; }
-  .funnel .fn-bar { height:100%; background:var(--accent); border-radius:5px; min-width:2px; transition:width .3s; }
-  .funnel .fn-meta { font-size:11.5px; color:var(--muted); font-variant-numeric:tabular-nums; }
-  .funnel .fn-meta b { color:var(--strong); }
-  .funnel .fn-conv { color:var(--ok); }
+  /* Metric tiles — a KPI row of bordered stat cards (funnel stages, token spend); the
+     Apify/Bright Data "statistics" look. The value is proportional sans (big numbers read
+     loose in tabular-nums); the sub-line + meter carry magnitude and stage conversion. */
+  .mtiles { display:grid; grid-template-columns:repeat(auto-fit, minmax(118px, 1fr)); gap:10px; margin:4px 0 16px; }
+  .mtiles.tight { max-width:840px; }
+  .mtile { border:1px solid var(--line); border-radius:10px; padding:11px 13px; background:var(--surface); }
+  .mtile-label { font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:.03em; color:var(--muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .mtile-val { font-size:24px; font-weight:700; letter-spacing:-.02em; color:var(--strong); line-height:1.1; margin-top:3px; }
+  .mtile-sub { font-size:11.5px; color:var(--muted); font-family:var(--mono); font-variant-numeric:tabular-nums; margin-top:3px; min-height:1em; }
+  .mtile-sub .conv { color:var(--ok-text); }
+  .mtile-meter { margin-top:9px; height:4px; border-radius:99px; background:var(--accent-weak); overflow:hidden; }
+  .mtile-meter-fill { height:100%; border-radius:99px; background:var(--accent); min-width:2px; transition:width .3s; }
+  .tu-cap { font-size:12px; color:var(--muted); margin:0 0 8px; }
+  .tu-toggle { display:inline-flex; align-items:center; gap:4px; margin:2px 0 0; }
+  .tu-toggle .caret { display:inline-block; transition:transform .12s; }
+  .tu-toggle.open .caret { transform:rotate(180deg); }
   .funnel-empty { font-size:12.5px; color:var(--faint); margin:0 0 14px; }
   .trackbar { display:flex; gap:8px; align-items:center; margin-bottom:12px; flex-wrap:wrap; }
   .trackbar input { flex:1; min-width:200px; margin:0; }
@@ -1144,15 +1293,20 @@ INDEX_HTML = """<!doctype html>
   /* Keep the checkbox its natural size — .trackbar input's flex:1/min-width:200px would otherwise
      stretch it across the row and shove the label text to the far edge. */
   .colmenu .menu input { width:auto; flex:0 0 auto; min-width:0; }
-  .colmenu .menu .rst { width:100%; margin:8px 0 0; padding:6px 10px; background:var(--accent-weak); color:var(--accent); font-size:12px; }
+  .colmenu .menu .rst { width:100%; margin:8px 0 0; padding:6px 10px; background:var(--accent-weak); color:var(--accent-text); font-size:12px; }
   .ttable td { padding:3px 4px; border-bottom:1px solid var(--line); vertical-align:middle; overflow:hidden; }
   .ttable tr:last-child td { border-bottom:0; }
   .ttable input, .ttable select { width:100%; border:1px solid transparent; background:transparent; padding:5px 6px; margin:0; border-radius:4px; text-overflow:ellipsis; }
   .ttable input:hover, .ttable select:hover { border-color:var(--line); }
   .ttable input:focus, .ttable select:focus { border-color:var(--accent); background:var(--surface); outline:none; }
-  .ttable .st-dryrun { color:var(--warn); } .ttable .st-applied { color:var(--accent); }
-  .ttable .st-responded { color:var(--ok); } .ttable .st-failed { color:var(--bad); }
-  .ttable .st-discovered, .ttable .st-tailored { color:var(--muted); }
+  /* Status colours — one muted system shared with the feed's .stbadge (statusMeta in JS):
+     neutral=pending, blue=applied, green=positive reply, amber=blocked, red=failed. */
+  .ttable .st-applied { color:var(--accent-text); }
+  .ttable .st-responded, .ttable .st-interview, .ttable .st-offer { color:var(--ok-text); }
+  .ttable .st-blocked { color:var(--warn); }
+  .ttable .st-failed { color:var(--bad); }
+  .ttable .st-discovered, .ttable .st-tailored, .ttable .st-dryrun,
+  .ttable .st-rejected, .ttable .st-noresponse { color:var(--muted); }
   /* Status renders as a badge: the st-* class sets the color, the tint/border derive from it. */
   .ttable select.stcell { font-weight:600; border-radius:99px; padding:4px 10px;
                           border:1px solid transparent; background:color-mix(in srgb, currentColor 14%, transparent); }
@@ -1165,10 +1319,10 @@ INDEX_HTML = """<!doctype html>
   .ttable .datebtn:hover { border-color:var(--line); }
   .ttable .datebtn.empty { color:var(--faint); }
   .ttable .delrow { width:auto; margin:0; padding:4px 8px; background:var(--surface); color:var(--bad); border:1px solid var(--line); font-size:12px; }
-  .ttable .rerun { width:auto; margin:0; padding:4px 8px; background:var(--surface); color:var(--accent); border:1px solid var(--line); font-size:12px; white-space:nowrap; }
+  .ttable .rerun { width:auto; margin:0; padding:4px 8px; background:var(--surface); color:var(--accent-text); border:1px solid var(--line); font-size:12px; white-space:nowrap; }
   .ttable .rerun:disabled { opacity:.6; cursor:default; }
-  .ttable .rowsaved { color:var(--ok); font-size:12px; }
-  .ttable .reslink { color:var(--accent); text-decoration:none; font-size:12px; white-space:nowrap; padding:5px 6px; display:inline-block; }
+  .ttable .rowsaved { color:var(--ok-text); font-size:12px; }
+  .ttable .reslink { color:var(--accent-text); text-decoration:none; font-size:12px; white-space:nowrap; padding:5px 6px; display:inline-block; }
   .ttable .reslink:hover { text-decoration:underline; }
   .ttable .muted { color:var(--muted); padding:5px 6px; display:inline-block; }
   /* Source URL: the URL is the link and takes the cell's width, truncating with an ellipsis;
@@ -1178,24 +1332,26 @@ INDEX_HTML = """<!doctype html>
   /* contain:inline-size keeps the URL's own (very long, unbreakable) text out of the table's
      intrinsic width: without it the link stretches the column far past the width set here and on
      the resize handle, squeezing every other column. */
-  .ttable .urllink { flex:1; min-width:0; contain:inline-size; color:var(--accent); text-decoration:none;
+  .ttable .urllink { flex:1; min-width:0; contain:inline-size; color:var(--accent-text); text-decoration:none;
                      font-size:12px; padding:5px 6px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .ttable .urllink:hover { text-decoration:underline; }
   .ttable .urledit { width:auto; margin:0; flex:none; padding:4px 6px; background:var(--surface);
                      color:var(--muted); border:1px solid var(--line); font-size:12px; }
-  .ttable .urledit:hover { color:var(--accent); }
+  .ttable .urledit:hover { color:var(--accent-text); }
   /* Run history: a per-posting run count that expands an inline sub-row (decision 084). */
-  .ttable .runsbtn { width:auto; margin:0; padding:4px 7px; background:var(--surface); color:var(--accent);
+  .ttable .runsbtn { width:auto; margin:0; padding:4px 7px; background:var(--surface); color:var(--accent-text);
                      border:1px solid var(--line); font-size:12px; white-space:nowrap; }
   .ttable .runsbtn:hover { border-color:var(--accent); }
   .ttable .runsbtn .caret { display:inline-block; transition:transform .12s; margin-left:3px; }
   .ttable .runsbtn.open .caret { transform:rotate(180deg); }
-  .ttable tr.runsrow > td { padding:0; background:var(--track); }
-  .runsbox { padding:8px 12px; display:flex; flex-direction:column; gap:6px; }
-  .runline { display:flex; align-items:baseline; gap:10px; font-size:12px; }
-  .runline .runwhen { color:var(--muted); white-space:nowrap; font-variant-numeric:tabular-nums; }
-  .runline .runoutcome { font-weight:600; white-space:nowrap; }
-  .runline .rundetail { color:var(--text); flex:1; min-width:0; }
+  /* Run history expands as a monospace terminal log on the recessed --field surface:
+     dim timestamp, colored outcome tag, muted detail — one log line per run. */
+  .ttable tr.runsrow > td { padding:0; background:var(--field); }
+  .runsbox { padding:10px 14px; display:flex; flex-direction:column; gap:5px; font-family:var(--mono); }
+  .runline { display:flex; align-items:baseline; gap:12px; font-size:11.5px; }
+  .runline .runwhen { color:var(--faint); white-space:nowrap; font-variant-numeric:tabular-nums; }
+  .runline .runoutcome { font-weight:700; white-space:nowrap; }
+  .runline .rundetail { color:var(--muted); flex:1; min-width:0; }
   .runline .reslink { padding:0; }
   /* Token breakdown sub-row (decision 095) — reuses the runsbtn trigger; its own compact table. */
   .ttable tr.tokrow > td { padding:0; background:var(--track); }
@@ -1241,18 +1397,21 @@ INDEX_HTML = """<!doctype html>
   .brd-row .bd-ats { width:130px; flex:none; }
   .brd-row .del { width:auto; margin:0; padding:4px 10px; background:var(--surface-2); color:var(--bad); }
   .cards { display:flex; flex-direction:column; gap:10px; }
-  .card { position:relative; border:1px solid var(--line); border-radius:8px; padding:12px 12px 10px; background:var(--surface); }
+  .card { position:relative; border:1px solid var(--line); border-radius:10px; padding:12px 12px 10px; background:var(--surface); }
   .card .del { position:absolute; top:8px; right:8px; width:auto; margin:0; padding:1px 8px; background:var(--surface-2); color:var(--bad); font-size:13px; }
   .row2 { display:flex; gap:8px; }
   .row2 > * { flex:1; }
   .fld { margin-bottom:8px; }
   .fld label { margin:0 0 3px; text-transform:none; font-size:11px; }
-  .addbtn { width:auto; margin:8px 0 0; padding:6px 12px; background:var(--accent-weak); color:var(--accent); }
-  .saverow { position:sticky; bottom:0; background:var(--bg); padding:12px 0 4px; display:flex; align-items:center; gap:12px; }
+  .addbtn { width:auto; margin:8px 0 0; padding:6px 12px; background:var(--accent-weak); color:var(--accent-text); }
+  .saverow { position:sticky; bottom:0; background:var(--bg); padding:12px 0; display:flex; align-items:center; gap:12px; }
+  /* bleed the sticky bar's background down over main's 28px bottom padding so scrolled content can't peek through below it */
+  .saverow::after { content:""; position:absolute; left:0; right:0; top:100%; height:28px; background:var(--bg); }
   .saverow button { width:auto; margin:0; }
   /* profile section-jump nav */
-  .pnav { position:sticky; top:0; z-index:5; display:flex; flex-wrap:wrap; gap:6px; background:var(--bg); padding:10px 0; margin-bottom:4px; border-bottom:1px solid var(--line); }
-  .pnav a { font-size:12px; font-weight:600; color:var(--accent); background:var(--accent-weak); padding:5px 10px; border-radius:99px; text-decoration:none; }
+  /* top:-28px pulls the stuck bar flush over main's 28px top padding, so the pills get equal space above and below (not 28px of padding on top only) and scrolled content can't peek above it */
+  .pnav { position:sticky; top:-28px; z-index:5; display:flex; flex-wrap:wrap; gap:6px; background:var(--bg); padding:12px 0; margin-bottom:4px; border-bottom:1px solid var(--line); }
+  .pnav a { font-size:12px; font-weight:600; color:var(--accent-text); background:var(--accent-weak); padding:5px 10px; border-radius:99px; text-decoration:none; }
   .pnav a:hover { background:var(--accent-weak-2); }
   .subhint { color:var(--muted); font-size:12px; margin:0 0 8px; line-height:1.45; }
   /* collapsible entry cards — collapsed shows a one-line summary; click to edit granularly */
@@ -1266,7 +1425,7 @@ INDEX_HTML = """<!doctype html>
   .entry-body { padding:0 12px 12px; }
   .card.entry.collapsed .entry-body { display:none; }
   /* Screening answers — wider profile editor + a ranked "needs answer" list vs a compact grid. */
-  #view-profile .editor { max-width:1040px; }
+  #view-profile .editor { max-width:none; }
   .qa-summary { display:flex; align-items:center; flex-wrap:wrap; gap:10px 16px; margin:2px 0 14px; font-size:13px; }
   .qa-summary .pill { display:inline-flex; align-items:center; gap:6px; font-weight:600; }
   .qa-summary .pill b { font-size:15px; }
@@ -1292,8 +1451,8 @@ INDEX_HTML = """<!doctype html>
   .linkedin button { width:auto; margin:8px 8px 0 0; padding:7px 14px; }
   .linkedin code { background:var(--surface-2); padding:1px 4px; border-radius:3px; font-size:12px; }
   .meta { margin-bottom:16px; }
-  .badge { display:inline-block; padding:2px 8px; border-radius:99px; background:var(--accent-weak); color:var(--accent); font-size:12px; font-weight:600; }
-  #dl-pdf { width:auto; margin:0 0 16px; padding:8px 14px; background:#111; }
+  .badge { display:inline-block; padding:2px 8px; border-radius:99px; background:var(--accent-weak); color:var(--accent-text); font-size:12px; font-weight:600; }
+  #dl-pdf { width:auto; margin:0 0 16px; padding:8px 14px; background:var(--btn-dark); }
   .notes, .warn { font-size:13px; border-radius:8px; padding:10px 12px; margin:10px 0; }
   .notes { background:var(--ok-bg); }
   .warn { background:var(--bad-bg); color:var(--bad); }
@@ -1335,7 +1494,7 @@ INDEX_HTML = """<!doctype html>
   .fit-legend { display:flex; flex-wrap:wrap; align-items:center; gap:4px 14px; color:var(--muted); font-size:11px; }
   .fit-legend .lg { display:inline-flex; align-items:center; gap:6px; }
   .fit-legend .sw { width:15px; border-top:2px solid currentColor; }
-  .fit-legend .sw.best { color:var(--accent); }
+  .fit-legend .sw.best { color:var(--accent-text); }
   .fit-legend .sw.mean { color:var(--muted); }
   .fit-legend .sw.bar { color:var(--warn-line); border-top-style:dashed; }
   .fit-window-bar { display:flex; justify-content:flex-end; align-items:center; gap:6px;
@@ -1366,12 +1525,12 @@ INDEX_HTML = """<!doctype html>
   /* Discover / test run */
   .testprog { margin-top:14px; padding:14px; border:1px solid var(--line); border-radius:8px; background:var(--surface); }
   .tstep { font-size:13px; color:var(--muted); padding:2px 0; }
-  .tstep.act { color:var(--accent); font-weight:600; }
-  .tstep.done { color:var(--ok); }
+  .tstep.act { color:var(--accent-text); font-weight:600; }
+  .tstep.done { color:var(--ok-text); }
   .tmsg { margin-top:8px; font-size:14px; color:var(--ink); }
   .tmeta { margin-top:6px; font-size:12px; color:var(--muted); }
   .tmeta.cache { color:var(--ink); }
-  .linklike { background:none; border:none; padding:0; margin-left:8px; color:var(--accent);
+  .linklike { background:none; border:none; padding:0; margin-left:8px; color:var(--accent-text);
               font:inherit; text-decoration:underline; cursor:pointer; }
   .linklike:disabled { color:var(--muted); text-decoration:none; cursor:default; }
   .tbar { margin-top:8px; height:7px; background:var(--line); border-radius:4px; overflow:hidden; }
@@ -1381,7 +1540,7 @@ INDEX_HTML = """<!doctype html>
   .tctitle { font-size:15px; font-weight:600; margin-top:4px; }
   .tcmeta { font-size:12px; color:var(--muted); margin-top:4px; word-break:break-all; }
   .tcwhy { font-size:13px; margin-top:6px; line-height:1.5; }
-  .fitpill { font-size:12px; font-weight:600; color:#fff; background:var(--accent); border-radius:10px; padding:1px 8px; margin-left:6px; }
+  .fitpill { font-size:12px; font-weight:600; color:var(--accent-ink); background:var(--accent); border-radius:10px; padding:1px 8px; margin-left:6px; }
   .tfinish { margin-top:14px; padding-top:12px; border-top:1px solid var(--line); font-size:13px; }
   .tfinish button { width:auto; margin-top:8px; }
   .testjudged { margin-top:14px; }
@@ -1391,7 +1550,7 @@ INDEX_HTML = """<!doctype html>
   .tjrow.no { border-left-color:var(--line); background:var(--neutral-tint); }
   .tjtop { display:flex; align-items:baseline; gap:8px; }
   .tjscore { font-weight:700; font-size:13px; min-width:34px; }
-  .tjrow.ok .tjscore { color:var(--ok); } .tjrow.no .tjscore { color:var(--warn-strong); }
+  .tjrow.ok .tjscore { color:var(--ok-text); } .tjrow.no .tjscore { color:var(--warn-strong); }
   .tjname { font-weight:600; font-size:14px; }
   .tjmeta { font-size:12px; color:var(--muted); margin-top:3px; word-break:break-all; }
   .tjwhy { font-size:12.5px; margin-top:4px; line-height:1.45; }
@@ -1409,10 +1568,15 @@ INDEX_HTML = """<!doctype html>
   .pk-note { font-size:12.5px; color:var(--muted); }
   /* Auto-apply loop (decision 069) */
   #loop-panel { border-left:4px solid var(--accent); padding-left:18px; }
-  #loop-stop { width:auto; margin:0; background:var(--btn-dark); border-color:var(--btn-dark); color:#fff; }
-  .loopstat { margin-top:12px; padding:10px 12px; border:1px solid var(--line); border-radius:8px;
-              background:var(--surface-2); font-size:13px; display:flex; align-items:center; gap:9px; line-height:1.4; }
+  #loop-stop { width:auto; margin:0; background:var(--btn-dark); border-color:var(--btn-dark); color:var(--accent-ink); }
+  /* Live loop status reads as a monochrome terminal stream (recessed --field + monospace,
+     a colored prompt glyph) — the Railway/Apify "live run log" look. */
+  .loopstat { margin-top:12px; padding:10px 13px; border:1px solid var(--line); border-radius:8px;
+              background:var(--field); font-family:var(--mono); font-size:12.5px; display:flex; align-items:center; gap:9px; line-height:1.4; }
+  .loopstat::before { content:"\203a"; color:var(--accent-text); font-weight:700; flex:none; }
+  .loopstat.hidden { display:none; }  /* .loopstat sets display:flex; beat it when also .hidden */
   .loopstat.err { border-color:var(--bad); color:var(--bad); }
+  .loopstat.err::before { color:var(--bad); }
   .loopstat .lp-count { margin-left:auto; font-weight:700; color:var(--muted); white-space:nowrap; }
   .loop-ready-head { font-weight:700; font-size:13.5px; margin:16px 0 8px; }
   .loop-apply { width:auto; margin:0; background:#b3261e; border-color:#b3261e; color:#fff; }
@@ -1422,103 +1586,271 @@ INDEX_HTML = """<!doctype html>
                  color:var(--muted); line-height:1.4; max-width:560px;
                  text-transform:none; letter-spacing:normal; font-weight:400; }
   .loop-rescan input { width:auto; margin:2px 0 0; flex:0 0 auto; }
+  /* First-run tour — a spotlight walkthrough that highlights each section and says, in one line,
+     what it does (UI Principle #4). The dim backdrop covers the content; the nav rail floats above
+     it (aside.nav is a sticky stacking context) so the highlighted tab glows through. */
+  .tour-overlay { position:fixed; inset:0; z-index:100; background:rgba(0,0,0,.45); }
+  .tour-overlay.hidden { display:none; }
+  .tour-on aside.nav { z-index:101; }
+  .tab.tour-spot { background:var(--accent-weak); color:var(--accent-text); box-shadow:0 0 0 2px var(--accent); }
+  .tour-pop { position:fixed; width:322px; max-width:calc(100vw - 32px); background:var(--surface); border:1px solid var(--line); border-radius:14px; box-shadow:var(--shadow); padding:16px 18px; z-index:102; }
+  .tour-pop.center { left:50%; top:50%; transform:translate(-50%,-50%); width:392px; }
+  .tour-arrow { position:absolute; left:-8px; top:20px; width:15px; height:15px; background:var(--surface); border-left:1px solid var(--line); border-bottom:1px solid var(--line); transform:rotate(45deg); }
+  .tour-pop.center .tour-arrow { display:none; }
+  .tour-count { font-size:11px; text-transform:uppercase; letter-spacing:.04em; color:var(--faint); font-weight:600; }
+  .tour-title { font-size:17px; font-weight:700; letter-spacing:-.01em; margin:3px 0 6px; display:flex; align-items:center; gap:8px; }
+  .tour-body { font-size:13.5px; color:var(--muted); line-height:1.5; margin:0; }
+  .tour-foot { display:flex; align-items:center; gap:8px; margin-top:16px; }
+  .tour-foot .grow { flex:1; }
+  .tour-foot button { width:auto; margin:0; padding:7px 14px; font-size:13px; }
+  .tour-skip { background:transparent; color:var(--muted); border:1px solid var(--line); }
+  .tour-back { background:var(--surface-2); color:var(--ink); border:1px solid var(--line); }
+  #tour-open { width:100%; margin:0; padding:9px; display:flex; align-items:center; justify-content:center; gap:7px; background:var(--accent-weak); color:var(--accent-text); font-weight:600; font-size:13px; border:1px solid var(--line); border-radius:8px; cursor:pointer; }
+  #tour-open:hover { filter:none; border-color:var(--accent); }
+  /* First-visit nudges — one dismissible line pointing at where to start in this section (UI Principle #2). */
+  .nudge { display:flex; align-items:flex-start; gap:12px; padding:12px 14px; margin:0 0 14px; background:var(--accent-weak); border:1px solid var(--accent); border-radius:12px; }
+  .nudge.hidden { display:none; }
+  .nudge-b { flex:1; min-width:0; font-size:13px; color:var(--ink); line-height:1.5; }
+  .nudge-b b { color:var(--accent-text); }
+  .nudge-go { width:auto; margin:8px 0 0; padding:6px 13px; font-size:13px; }
+  .nudge-x { flex:0 0 auto; width:auto; margin:0; padding:2px 9px; background:transparent; color:var(--muted); border:1px solid var(--line); border-radius:8px; font-size:13px; line-height:1.4; }
+  .nudge-x:hover { color:var(--ink); border-color:var(--muted); filter:none; }
+  .flash-target { animation:flashpulse 1.5s ease-out 1; border-radius:10px; }
+  @keyframes flashpulse { 0%,100% { box-shadow:0 0 0 0 rgba(0,0,0,0); } 25%,55% { box-shadow:0 0 0 3px var(--accent); } }
+  /* ── Dashboard refinements (shadcn / infra-console language) ─────────────────────────────
+     Toggle switches for on/off options, monospace for metrics/data, and a monochrome
+     terminal-style stream for live run logs. */
+  /* Toggle switch — an on/off option reads as a switch. The control stays a real
+     <input type=checkbox> (JS still reads .checked); only its appearance changes. */
+  .loop-rescan input[type=checkbox] { appearance:none; -webkit-appearance:none; position:relative;
+    flex:0 0 auto; width:34px; height:19px; margin:0; border-radius:99px; background:var(--surface-2);
+    border:1px solid var(--line); cursor:pointer; transition:background .15s, border-color .15s; }
+  .loop-rescan input[type=checkbox]::after { content:""; position:absolute; top:1px; left:1px;
+    width:15px; height:15px; border-radius:50%; background:var(--strong); transition:transform .15s; }
+  .loop-rescan input[type=checkbox]:checked { background:var(--accent); border-color:var(--accent); }
+  .loop-rescan input[type=checkbox]:checked::after { transform:translateX(15px); background:#fff; }
+  .loop-rescan input[type=checkbox]:focus-visible { outline:2px solid var(--accent-text); outline-offset:2px; }
+  /* Metrics read as data — tabular monospace for counts, funnel figures, and the fit chart. */
+  .tcounts .pill .n { font-family:var(--mono); font-weight:700; }
+  .ps-fit, .ps-band, .ps-n { font-family:var(--mono); }
+  /* Live run log — the dry-run progress panel is a recessed, monospace terminal stream. */
+  .testprog { background:var(--field); font-family:var(--mono); }
+  .testprog .tstep, .testprog .tmeta { font-size:12px; }
+  .loopstat .lp-count { font-family:var(--mono); }
+  /* ── Track: scorecards · status system · card feed · context drawer · terminal ──────── */
+  /* Hero scorecards — 3–4 at the top; identical border, big dark value, muted label. */
+  .scorecards { display:grid; grid-template-columns:repeat(auto-fit, minmax(150px, 1fr)); gap:12px; margin:6px 0 18px; }
+  .scorecard { border:1px solid var(--line); border-radius:10px; padding:14px 16px; background:var(--surface); }
+  .scorecard .sc-val { font-size:30px; font-weight:800; letter-spacing:-.02em; color:var(--strong); line-height:1.05; }
+  .scorecard .sc-label { font-size:12px; color:var(--muted); margin-top:4px; }
+  .scorecard.info .sc-val { color:var(--accent-text); }
+  .scorecard.warn2 .sc-val { color:var(--warn); }
+  .scorecard.bad2 .sc-val { color:var(--bad); }
+  /* Unified status badge — muted dot + label; the dot pulses only for a live/active state. */
+  .stbadge { display:inline-flex; align-items:center; gap:6px; padding:3px 9px; border-radius:99px; font-size:11.5px;
+    font-weight:600; white-space:nowrap; border:1px solid color-mix(in srgb, currentColor 28%, transparent);
+    background:color-mix(in srgb, currentColor 12%, transparent); }
+  .stbadge .dot { width:7px; height:7px; border-radius:99px; background:currentColor; flex:none; }
+  .st-neutral { color:var(--muted); } .st-info { color:var(--accent-text); } .st-good { color:var(--ok-text); }
+  .st-warn2 { color:var(--warn); } .st-bad2 { color:var(--bad); }
+  .stbadge.live .dot { animation:stpulse 1.6s ease-in-out infinite; }
+  @keyframes stpulse { 0%,100% { box-shadow:0 0 0 0 color-mix(in srgb, currentColor 60%, transparent); } 65% { box-shadow:0 0 0 5px transparent; } }
+  /* Segmented view toggle (Feed | Table). */
+  .viewtog { display:inline-flex; border:1px solid var(--line); border-radius:8px; overflow:hidden; }
+  .viewtog button { width:auto; margin:0; padding:6px 13px; background:var(--surface); color:var(--muted); font-size:12.5px; font-weight:600; border:0; border-radius:0; }
+  .viewtog button.on { background:var(--surface-2); color:var(--ink); }
+  .viewtog button + button { border-left:1px solid var(--line); }
+  /* Application feed — uniform vertical cards (company/role/site metadata + status dot). */
+  .feed { display:flex; flex-direction:column; gap:8px; }
+  .feed.hidden { display:none; }
+  .fcard { display:flex; align-items:center; gap:14px; padding:12px 15px; border:1px solid var(--line); border-radius:10px;
+    background:var(--surface); cursor:pointer; transition:border-color .12s; text-align:left; width:100%; margin:0; }
+  .fcard:hover { border-color:var(--muted); }
+  .fcard.sel { border-color:var(--accent); box-shadow:inset 2px 0 0 var(--accent); }
+  .fcard .fc-main { flex:1; min-width:0; }
+  .fcard .fc-title { font-size:14px; font-weight:600; color:var(--strong); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .fcard .fc-meta { font-size:12px; color:var(--muted); margin-top:3px; font-family:var(--mono); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .fcard .fc-fit { font-size:12px; font-weight:700; color:var(--muted); font-family:var(--mono); flex:none; }
+  /* Metadata string — tight, borderless, •-separated (e.g. greenhouse • dry-run • 2 runs). */
+  .metaline { color:var(--muted); font-size:12px; }
+  .sep { opacity:.45; margin:0 6px; }
+  /* Context drawer — slides in from the right when a feed card is clicked. */
+  .drawer-scrim { position:fixed; inset:0; background:rgba(0,0,0,.4); z-index:110; opacity:0; transition:opacity .18s; }
+  .drawer-scrim.open { opacity:1; }
+  .drawer { position:fixed; top:0; right:0; height:100vh; width:460px; max-width:92vw; background:var(--surface);
+    border-left:1px solid var(--line); z-index:111; display:flex; flex-direction:column; transform:translateX(100%);
+    transition:transform .2s ease-out; box-shadow:-10px 0 34px -14px rgba(0,0,0,.5); }
+  .drawer.open { transform:translateX(0); }
+  .drawer-head { display:flex; align-items:flex-start; gap:10px; padding:16px 18px; border-bottom:1px solid var(--line); }
+  .drawer-head .dh-main { flex:1; min-width:0; }
+  .drawer-title { font-size:15px; font-weight:700; color:var(--strong); line-height:1.3; }
+  .drawer-x { width:auto; margin:0; padding:4px 10px; background:var(--surface-2); color:var(--muted); border:1px solid var(--line); font-size:15px; line-height:1; }
+  .drawer-x:hover { color:var(--ink); border-color:var(--muted); filter:none; }
+  .drawer-body { padding:16px 18px; overflow-y:auto; flex:1; display:flex; flex-direction:column; gap:16px; }
+  .drawer-sec-label { font-size:11px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); font-weight:600; margin-bottom:8px; }
+  .drawer-actions { display:flex; flex-wrap:wrap; gap:8px; }
+  .drawer-actions button, .drawer-actions a { width:auto; margin:0; padding:8px 14px; }
+  /* Active terminal window — a code block for run logs (dim lines, colored levels). */
+  .terminal { background:var(--field); border:1px solid var(--line); border-radius:8px; font-family:var(--mono);
+    font-size:11.5px; line-height:1.55; padding:11px 13px; overflow:auto; max-height:300px; }
+  .terminal .tl { color:var(--muted); white-space:pre-wrap; word-break:break-word; margin:2px 0; }
+  .terminal .tl .tl-when { color:var(--faint); }
+  .terminal .tl .tl-prompt { color:var(--accent-text); }
+  .terminal .tl.warn { color:var(--warn); } .terminal .tl.err { color:var(--bad); } .terminal .tl.ok { color:var(--ok-text); }
+  /* Collapsible pipeline/spend details, to keep the top uncluttered. */
+  .trk-details { border:0; margin:0 0 16px; }
+  .trk-details > summary { cursor:pointer; font-size:12.5px; font-weight:600; color:var(--accent-text); list-style:none; padding:2px 0; display:inline-flex; align-items:center; gap:6px; }
+  .trk-details > summary::-webkit-details-marker { display:none; }
+  .trk-details > summary .caret { transition:transform .12s; }
+  .trk-details[open] > summary .caret { transform:rotate(180deg); }
+  .trk-details-body { padding-top:12px; }
+  /* ── Discover: aligned panel headers · concise toggles · 2-col info · settings modal ── */
+  /* Panel header: title on the left, its primary action button lined up on the right. */
+  .panel-head { display:flex; align-items:center; gap:14px; margin:0 0 8px; flex-wrap:wrap; }
+  .panel-head h3 { margin:0; flex:1; min-width:0; font-size:15px; }
+  .panel-head button { width:auto; margin:0; padding:9px 16px; white-space:nowrap; }
+  .editing.tight { margin:0 0 12px; max-width:74ch; }
+  /* Concise toggle rows — switch + short bold label + one muted hint line. */
+  .loop-rescan { max-width:none; margin-top:12px; }
+  .loop-rescan .rl-main { display:flex; flex-direction:column; gap:1px; min-width:0; }
+  .loop-rescan .rl-t { font-weight:600; color:var(--ink); font-size:13px; }
+  .loop-rescan .rl-h { color:var(--muted); font-size:12px; line-height:1.4; }
+  /* Read-only info panels stack full page-width. */
+  .disc-grid { display:flex; flex-direction:column; gap:16px; }
+  .disc-grid .editor { margin:0; }
+  .disc-actions { display:flex; justify-content:flex-end; margin:0 0 16px; }
+  .disc-actions button { width:auto; margin:0; padding:9px 15px; display:inline-flex; align-items:center; gap:7px; }
+  /* Centered modal (Discovery settings). */
+  .modal-scrim { position:fixed; inset:0; background:rgba(0,0,0,.45); z-index:112; display:flex; align-items:flex-start; justify-content:center; padding:44px 20px; overflow:auto; }
+  .modal-scrim.hidden { display:none; }
+  .modal { background:var(--surface); border:1px solid var(--line); border-radius:12px; width:740px; max-width:100%; box-shadow:var(--shadow); }
+  .modal-head { display:flex; align-items:center; gap:10px; padding:15px 20px; border-bottom:1px solid var(--line); position:sticky; top:0; background:var(--surface); border-radius:12px 12px 0 0; z-index:1; }
+  .modal-head h3 { margin:0; flex:1; font-size:16px; }
+  .modal-x { width:auto; margin:0; padding:4px 10px; background:var(--surface-2); color:var(--muted); border:1px solid var(--line); font-size:15px; line-height:1; }
+  .modal-x:hover { color:var(--ink); border-color:var(--muted); filter:none; }
+  .modal-body { padding:18px 20px; }
+  .modal-body .saverow { position:static; background:transparent; padding:14px 0 0; }
+  .modal-body .saverow::after { display:none; }
+  /* Accessibility: a clearly visible keyboard-focus ring on every interactive control
+     (mouse clicks don't trigger :focus-visible, so this never shows on click). */
+  a:focus-visible, button:focus-visible, .tab:focus-visible, [tabindex]:focus-visible,
+  summary:focus-visible { outline:2px solid var(--accent-text); outline-offset:2px; border-radius:8px; }
+  /* Respect users who ask for less motion: drop the decorative flash + smooth scroll, but keep
+     functional loading spinners so "working…" never looks frozen. */
+  @media (prefers-reduced-motion: reduce) {
+    html { scroll-behavior:auto; }
+    .flash-target { animation:none !important; }
+  }
 </style>
 </head>
 <body>
+<div id="tour-overlay" class="tour-overlay hidden"></div>
+<div id="tour-pop" class="tour-pop hidden" role="dialog" aria-modal="true" aria-labelledby="tour-title" aria-describedby="tour-body">
+  <div class="tour-arrow"></div>
+  <div id="tour-count" class="tour-count"></div>
+  <div id="tour-title" class="tour-title"></div>
+  <p id="tour-body" class="tour-body"></p>
+  <div class="tour-foot">
+    <button id="tour-skip" class="tour-skip" type="button">Skip tour</button>
+    <span class="grow"></span>
+    <button id="tour-back" class="tour-back hidden" type="button">Back</button>
+    <button id="tour-next" type="button">Next →</button>
+  </div>
+</div>
 <div class="app">
   <aside class="nav">
-    <div class="brand">📄 ApplicationBot</div>
+    <div class="brand"><span class="brand-logo" aria-hidden="true"></span>ApplicationBot</div>
     <nav class="navlist">
-      <button class="tab active" data-view="review"><span class="ic">📝</span>Review</button>
-      <button class="tab" data-view="discover"><span class="ic">🔍</span>Discover</button>
-      <button class="tab" data-view="profile"><span class="ic">👤</span>Profile</button>
-      <button class="tab" data-view="track"><span class="ic">📊</span>Track</button>
+      <button class="tab active" data-view="review"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.375 2.625a1 1 0 0 1 3 3l-9.013 9.014a2 2 0 0 1-.853.505l-2.873.84a.5.5 0 0 1-.62-.62l.84-2.873a2 2 0 0 1 .506-.852z"/></svg>Review</button>
+      <button class="tab" data-view="discover"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>Discover</button>
+      <button class="tab" data-view="profile"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="8" r="5"/><path d="M20 21a8 8 0 0 0-16 0"/></svg>Profile</button>
+      <button class="tab" data-view="track"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 3v16a2 2 0 0 0 2 2h16"/><path d="M18 17V9"/><path d="M13 17V5"/><path d="M8 17v-3"/></svg>Track</button>
     </nav>
     <div class="nav-foot">
-      <div id="account" class="account">Checking Claude sign-in…</div>
-      <button id="theme-toggle" type="button" aria-label="Toggle dark mode">🌙 Dark</button>
+      <button id="tour-open" type="button"><svg class="btn-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9.937 15.5A2 2 0 0 0 8.5 14.063l-6.135-1.582a.5.5 0 0 1 0-.962L8.5 9.936A2 2 0 0 0 9.937 8.5l1.582-6.135a.5.5 0 0 1 .963 0L14.063 8.5A2 2 0 0 0 15.5 9.937l6.135 1.581a.5.5 0 0 1 0 .964L15.5 14.063a2 2 0 0 0-1.437 1.437l-1.582 6.135a.5.5 0 0 1-.963 0z"/><path d="M20 3v4"/><path d="M22 5h-4"/></svg>Take the tour</button>
+      <button id="account" class="account" type="button" title="Manage Claude connection">Checking Claude sign-in…</button>
+      <button id="theme-toggle" type="button" aria-label="Toggle dark mode"></button>
     </div>
   </aside>
 
   <main>
+    <div class="brandmark" aria-hidden="true"></div>
     <div id="view-discover" class="hidden">
+      <div id="discover-nudge" class="nudge hidden">
+        <div class="nudge-b">First, tell the bot <b>what jobs to find</b> — set your roles, keywords,
+          location, and pay in <b>Discovery settings</b> below. Then run a dry-run and watch it
+          search, tailor, and fill one application (it never submits until you arm it).
+          <br><button id="discover-nudge-go" class="nudge-go" type="button">Set what jobs to find →</button></div>
+        <button id="discover-nudge-x" class="nudge-x" type="button" aria-label="Dismiss">✕</button>
+      </div>
+      <header class="page-head">
+        <h2 class="page-title">Discover &amp; apply</h2>
+        <p class="page-sub">Find matching openings, prepare each one (tailor, export, fill), and
+          stack them up to apply. Everything runs as a dry-run until you arm submission.</p>
+      </header>
+      <div class="disc-actions">
+        <button id="disc-open" type="button" class="tbtn"><svg class="btn-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>Discovery settings</button>
+      </div>
       <div class="editor" id="loop-panel">
-        <h3 style="margin-top:0">Auto-apply loop</h3>
-        <p class="editing">Find as many matches as possible and prepare each one — tailor your
-          résumé, export the PDF, and fill the application (a <b>dry-run</b> in the background,
-          never submitted). Prepared applications stack up below as <b>Ready to apply</b>; click
-          <b>Apply&nbsp;▶</b> on any one and the bot submits just that application for you
-          (irreversible — it confirms first). The loop only re-searches once it has worked through
-          everything it already found, so it doesn't burn Claude usage re-judging the same
-          postings. Stop it any time.</p>
-        <div class="saverow">
-          <button id="loop-start" type="button">▶ Start auto-apply loop</button>
+        <div class="panel-head">
+          <h3>Auto-apply loop</h3>
+          <button id="loop-start" type="button">▶ Start loop</button>
           <button id="loop-stop" type="button" class="hidden">■ Stop loop</button>
-          <span id="loop-msg" class="msg"></span>
         </div>
+        <p class="editing tight">Finds matches and prepares each one (tailor · export · fill) as a
+          background dry-run — they stack up below as <b>Ready to apply</b>. Click <b>Apply&nbsp;▶</b>
+          on one to submit just that application (confirms first). Stop anytime.</p>
+        <span id="loop-msg" class="msg"></span>
         <label class="loop-rescan"><input type="checkbox" id="loop-rescan">
-          Re-prepare postings I've already seen — re-fills every match from the last search
-          (not just new openings), reusing each one's cached fit score so it doesn't re-score,
-          and reusing its already-tailored résumé unless your résumé or profile changed since.
-          Spends no Claude usage when nothing changed.</label>
+          <span class="rl-main"><span class="rl-t">Re-prepare postings I've already seen</span>
+          <span class="rl-h">Re-fills every match from the last search, reusing cached fit scores &amp; tailored résumés — no Claude spend when nothing changed.</span></span></label>
         <label class="loop-rescan"><input type="checkbox" id="loop-retailor">
-          Re-tailor from scratch — regenerate each résumé with Claude even when nothing changed,
-          instead of reusing the last tailored PDF (spends Claude usage on every posting).</label>
+          <span class="rl-main"><span class="rl-t">Re-tailor from scratch</span>
+          <span class="rl-h">Regenerate every résumé with Claude even when nothing changed — spends Claude usage on every posting.</span></span></label>
         <div id="loop-status" class="loopstat hidden"></div>
         <div id="loop-ready"></div>
       </div>
       <div class="editor" id="dry-run-panel">
-        <h3 style="margin-top:0">Run a dry-run</h3>
-        <p class="editing">Run one full end-to-end <b>dry-run</b> with your current
-          <b>Discovery settings</b> (below): the bot searches your target boards, ranks every
-          posting by how well it fits <i>your</i> qualifications, then <b>follows through on
-          exactly one</b> — the single best match — tailoring your résumé and auto-filling that
-          application in a browser you can watch. It <b>never submits</b> (Agent Guideline #3);
-          when it finishes filling, review it in the browser and click <b>Finish</b>. A
-          <code>dry-run</code> row is recorded in Track.</p>
-        <div class="saverow">
-          <button id="test-run" type="button">▶ Find &amp; fill one application (dry-run)</button>
-          <span id="test-msg" class="msg"></span>
+        <div class="panel-head">
+          <h3>Run a dry-run</h3>
+          <button id="test-run" type="button">▶ Find &amp; fill one (dry-run)</button>
         </div>
+        <p class="editing tight">One end-to-end pass: searches, ranks every posting by fit, then
+          tailors and auto-fills the single best match in a browser you can watch. <b>Never
+          submits</b> — review it, click Finish. Recorded in Track.</p>
+        <span id="test-msg" class="msg"></span>
         <div id="test-progress" class="testprog hidden"></div>
         <div id="test-chosen" class="testchosen hidden"></div>
         <div id="test-judged" class="testjudged hidden"></div>
       </div>
       <div class="editor" id="parked-panel" style="display:none">
         <h3 style="margin-top:0">Applications waiting on you</h3>
-        <p class="editing">These were filled but couldn't finish on their own — each needs one
-          thing from you before it can go through. Click to go straight to the fix.</p>
+        <p class="editing tight">Filled but couldn't finish on their own — each needs one thing from
+          you. Click to go straight to the fix.</p>
         <div id="parked-body"></div>
       </div>
-      <div class="editor" id="sources-overview">
-        <h3 style="margin-top:0">Where your postings come from</h3>
-        <p class="editing">The live view of every source feeding discovery — target boards by
-          ATS, the optional aggregator, early-career feeds, and the aggregator→ATS bridge.
-          Configure them in <b>Discovery settings</b> below.</p>
-        <div id="sources-body">Loading…</div>
-      </div>
-      <div class="editor" id="fit-insights" style="display:none">
-        <h3 style="margin-top:0">What past runs taught the search</h3>
-        <p class="editing">Every posting Claude judges is remembered. The search now steers each
-          run's scarce judge slots toward the kinds of postings that scored highest for you before,
-          so new runs should surface more matches above your bar. Below is what it has learned and
-          what it recommends changing.</p>
-        <div id="fit-insights-body">Loading…</div>
-      </div>
-      <div class="editor">
-        <h3 style="margin-top:0">Discovery settings</h3>
-        <p class="editing">Control what the bot searches and how it filters matches — every
-          setting is editable here, no code or config files to touch. Saved to
-          <code>profile/discovery.yaml</code> (git-ignored).</p>
-        <div id="disc-form">Loading…</div>
-        <div class="saverow">
-          <button id="save-disc">Save settings</button>
-          <span id="disc-msg" class="msg"></span>
+      <div class="disc-grid">
+        <div class="editor" id="sources-overview">
+          <h3 style="margin-top:0">Where your postings come from</h3>
+          <p class="editing tight">Every source feeding discovery — target boards by ATS, the
+            aggregator, early-career feeds, and the aggregator→ATS bridge.</p>
+          <div id="sources-body">Loading…</div>
+        </div>
+        <div class="editor" id="fit-insights" style="display:none">
+          <h3 style="margin-top:0">What past runs taught the search</h3>
+          <p class="editing tight">Every posting Claude judges is remembered, so runs steer scarce
+            judge slots toward what scored highest for you. Below: what it learned and recommends.</p>
+          <div id="fit-insights-body">Loading…</div>
         </div>
       </div>
     </div>
 
     <div id="view-review">
+      <header class="page-head">
+        <h2 class="page-title">Review &amp; tailor</h2>
+        <p class="page-sub">Pick a résumé and a job posting, tailor it with your chosen engine,
+          and read the result — relevance notes, factual-drift warnings, and which engine ran.</p>
+      </header>
       <div class="controls">
         <div class="ctrl"><label for="resume">Résumé</label><select id="resume"></select></div>
         <div class="ctrl"><label for="jobmode">Job posting</label>
@@ -1536,8 +1868,9 @@ INDEX_HTML = """<!doctype html>
         </div>
         <div class="ctrl"><label for="backend">Engine</label>
           <select id="backend">
-            <option value="auto">auto (Claude subscription if available, else rules)</option>
+            <option value="auto">auto (subscription → API key → rules)</option>
             <option value="claude-code">claude-code (your subscription)</option>
+            <option value="anthropic-api">anthropic-api (your API key — fallback)</option>
             <option value="rules">rules (no account)</option>
           </select>
         </div>
@@ -1572,11 +1905,20 @@ INDEX_HTML = """<!doctype html>
 
     <div id="view-profile" class="hidden">
       <div class="editor">
-        <p class="editing">Everything about you, in one place. Edit any section granularly —
-          click an entry to expand it. Applicant details save to
-          <code>profile/application_profile.yaml</code>; experience, projects, education, and
-          skills save to your résumé <b id="editing-path"></b>. Both are git-ignored. Tailoring
-          picks the relevant parts per job.</p>
+        <div id="profile-nudge" class="nudge hidden">
+          <div class="nudge-b"><b>Start here.</b> Import your résumé and it fills these sections in
+            for you — then review and add anything missing. No résumé handy? Fill the fields directly.
+            <br><button id="profile-nudge-go" class="nudge-go" type="button">Import my résumé →</button></div>
+          <button id="profile-nudge-x" class="nudge-x" type="button" aria-label="Dismiss">✕</button>
+        </div>
+        <header class="page-head">
+          <h2 class="page-title">Your details &amp; résumé</h2>
+          <p class="page-sub">Everything about you, in one place — edit any section granularly
+            (click an entry to expand). Applicant details save to
+            <code>profile/application_profile.yaml</code>; experience, projects, education, and
+            skills save to your résumé <b id="editing-path"></b>. Both are git-ignored; tailoring
+            picks the relevant parts per job.</p>
+        </header>
 
         <div id="profile-form">Loading…</div>
 
@@ -1602,27 +1944,82 @@ INDEX_HTML = """<!doctype html>
 
     <div id="view-track" class="hidden">
       <div class="editor track-editor">
-        <p class="editing">Every application the pipeline discovered, tailored, and (in
-          <code>dry_run</code>) would have submitted — the local system of record
-          (<code>applications.db</code>, git-ignored). Edit any cell inline; changes save
-          as you go. <b>Drag a column's right edge to resize it</b>, and use <b>Columns</b>
-          to hide any you don't need — your layout is remembered on this browser.</p>
+        <header class="page-head">
+          <h2 class="page-title">Application tracker</h2>
+          <p class="page-sub">Every application the pipeline discovered, tailored, and (in
+            <code>dry_run</code>) would have submitted — the local system of record
+            (<code>applications.db</code>, git-ignored). Edit any cell inline; changes save
+            as you go. <b>Drag a column's right edge to resize it</b>, and use <b>Columns</b>
+            to hide any you don't need — your layout is remembered on this browser.</p>
+        </header>
+        <div id="track-scores" class="scorecards"></div>
         <div id="track-counts" class="tcounts"></div>
-        <div id="track-funnel" class="funnel"></div>
-        <div id="track-usage" class="track-usage hidden"></div>
+        <details class="trk-details">
+          <summary>Pipeline funnel &amp; spend <span class="caret">▾</span></summary>
+          <div class="trk-details-body">
+            <div id="track-funnel" class="funnel"></div>
+            <div id="track-usage" class="track-usage hidden"></div>
+          </div>
+        </details>
         <div class="trackbar">
           <input id="track-search" type="text" placeholder="Search company, role, location, notes…">
-          <div class="colmenu">
+          <div class="viewtog" role="tablist" aria-label="View">
+            <button id="view-feed" type="button" class="on">Feed</button>
+            <button id="view-table" type="button">Table</button>
+          </div>
+          <div class="colmenu" id="colmenu-wrap">
             <button id="track-cols-btn" type="button" class="tbtn">Columns ▾</button>
             <div id="track-cols-menu" class="menu hidden"></div>
           </div>
           <button id="track-add" type="button" class="tbtn">+ Add application</button>
           <span id="track-msg" class="msg"></span>
         </div>
-        <div id="track-body">Loading…</div>
+        <div id="track-feed" class="feed"></div>
+        <div id="track-body" class="hidden">Loading…</div>
       </div>
     </div>
   </main>
+</div>
+<div id="drawer-scrim" class="drawer-scrim hidden"></div>
+<aside id="track-drawer" class="drawer" role="dialog" aria-modal="true" aria-labelledby="drawer-title" aria-hidden="true">
+  <div class="drawer-head">
+    <div class="dh-main">
+      <div id="drawer-title" class="drawer-title">—</div>
+      <div id="drawer-meta" class="metaline" style="margin-top:6px"></div>
+    </div>
+    <button id="drawer-x" class="drawer-x" type="button" aria-label="Close">✕</button>
+  </div>
+  <div id="drawer-body" class="drawer-body"></div>
+</aside>
+<div id="disc-modal" class="modal-scrim hidden" role="dialog" aria-modal="true" aria-labelledby="disc-modal-title">
+  <div class="modal">
+    <div class="modal-head">
+      <h3 id="disc-modal-title">Discovery settings</h3>
+      <button id="disc-modal-x" class="modal-x" type="button" aria-label="Close">✕</button>
+    </div>
+    <div class="modal-body">
+      <p class="editing tight">Control what the bot searches and how it filters matches — no config
+        files to touch. Saved to <code>profile/discovery.yaml</code> (git-ignored).</p>
+      <div id="disc-form">Loading…</div>
+      <div class="saverow">
+        <button id="save-disc">Save settings</button>
+        <span id="disc-msg" class="msg"></span>
+      </div>
+    </div>
+  </div>
+</div>
+<div id="claude-modal" class="modal-scrim hidden" role="dialog" aria-modal="true" aria-labelledby="claude-modal-title">
+  <div class="modal">
+    <div class="modal-head">
+      <h3 id="claude-modal-title">Claude connection</h3>
+      <button id="claude-modal-x" class="modal-x" type="button" aria-label="Close">✕</button>
+    </div>
+    <div class="modal-body">
+      <p class="editing tight" id="claude-active"></p>
+      <div class="conn-sec" id="claude-sub"></div>
+      <div class="conn-sec" id="claude-key"></div>
+    </div>
+  </div>
 </div>
 <script>
 const OPTS = /*OPTIONS*/;
@@ -1641,16 +2038,106 @@ fill($("fixture"), OPTS.fixtures);
 const prof = OPTS.resumes.find(r => r.path.startsWith("profile/"));
 if (prof) $("resume").value = prof.path;
 
-// ---- Claude access panel (subscription via Claude Code) ----
+// ---- Claude connection panel + modal (subscription PRIMARY, API-key FALLBACK) ----
+let AUTH = OPTS.auth || {};
 function renderAccount(a) {
+  AUTH = a || {};
   const el = $("account");
-  if (a.available) {
-    el.innerHTML = `<span class="dot on"></span><b>Claude ready</b> — using your Claude subscription via Claude Code (not the paid API). The <b>claude-code</b> engine rewrites bullets to match each job.`;
+  let dot, eng, sub;
+  if (a.claude_code) {
+    dot = "on"; eng = "Claude subscription"; sub = "via Claude Code — recommended, not metered";
+  } else if (a.api_key_set) {
+    dot = "on"; eng = "Anthropic API key";
+    sub = "fallback · " + (a.api_key_masked || "connected") + " · pay-per-token";
   } else {
-    el.innerHTML = `<span class="dot off"></span><b>Claude Code not found.</b> The <b>rules</b> engine still works with no account.<div class="hint">${escapeHtml(a.hint || "")}</div>`;
+    dot = "off"; eng = "Not connected"; sub = "using the free rules engine";
   }
+  el.innerHTML = `<span class="dot ${dot}"></span><span class="acc-eng">${escapeHtml(eng)}</span>`
+    + `<div class="acc-sub">${escapeHtml(sub)}</div><div class="acc-manage">Manage connection →</div>`;
 }
 renderAccount(OPTS.auth);
+$("account").addEventListener("click", openClaudeModal);
+
+async function refreshAuth() {
+  try { const a = await (await fetch("/auth/status")).json(); renderAccount(a); renderClaudeModal(a); } catch (e) {}
+}
+
+function renderClaudeModal(a) {
+  a = a || AUTH;
+  const engName = a.claude_code ? "your Claude subscription (Claude Code)"
+    : a.api_key_set ? "your Anthropic API key (fallback)" : "the free rules engine";
+  $("claude-active").innerHTML = "Right now, tailoring uses <b>" + escapeHtml(engName) + "</b>. "
+    + "The app prefers your subscription, falls back to an API key, then the no-account rules engine.";
+  const subHead = '<div class="conn-head">Claude subscription <span class="tag primary">Primary</span></div>';
+  $("claude-sub").innerHTML = a.claude_code
+    ? subHead + '<div class="conn-body"><span class="conn-ok">✓ Connected via Claude Code.</span> '
+        + 'Tailoring runs on your Claude Pro/Max plan (not metered). Sign-in lives inside Claude Code itself.</div>'
+    : subHead + '<div class="conn-body">Not detected. Install <b>Claude Code</b> and run <code>claude</code> → '
+        + '<code>/login</code> to tailor on your subscription (recommended — no per-token cost). '
+        + '<a href="https://claude.com/product/claude-code" target="_blank" rel="noopener">Get Claude Code ↗</a><br>'
+        + '<span style="color:var(--faint)">Anthropic only allows the subscription inside Claude Code / Claude.ai, '
+        + 'so this app can’t “log in with Claude” directly.</span></div>';
+  const keyHead = '<div class="conn-head">Anthropic API key <span class="tag">Fallback</span></div>';
+  const key = $("claude-key");
+  if (a.api_key_set) {
+    key.innerHTML = keyHead + '<div class="conn-body"><span class="conn-ok">✓ Connected</span> — <b>'
+      + escapeHtml(a.api_key_masked || "key") + '</b>. Used only when Claude Code isn’t available. '
+      + 'Billed pay-per-token to your API account.</div>'
+      + '<div class="conn-row"><button id="key-disconnect" class="tbtn" type="button">Disconnect</button>'
+      + '<span id="key-msg" class="msg"></span></div>';
+    $("key-disconnect").addEventListener("click", disconnectKey);
+  } else {
+    key.innerHTML = keyHead + '<div class="conn-body">Optional. Uses the <b>metered Anthropic API</b> with your own key '
+      + '(<a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener">console.anthropic.com ↗</a>) '
+      + '— pay-per-token, <b>separate</b> from your subscription. Stored in your OS keychain, never in a file.</div>'
+      + '<div class="conn-row"><input id="key-input" type="password" placeholder="sk-ant-…" autocomplete="off">'
+      + '<button id="key-connect" type="button">Connect</button></div>'
+      + '<div class="conn-row"><span id="key-msg" class="msg"></span></div>';
+    $("key-connect").addEventListener("click", connectKey);
+  }
+}
+
+async function connectKey() {
+  const inp = $("key-input"), btn = $("key-connect"), msg = $("key-msg");
+  const key = (inp.value || "").trim();
+  if (!key) { msg.className = "msg err"; msg.textContent = "Paste your Anthropic API key."; return; }
+  btnBusy(btn, "Verifying…"); msg.className = "msg busy"; msg.textContent = "";
+  try {
+    const d = await (await fetch("/auth/apikey", {method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({key})})).json();
+    btnDone(btn);
+    if (d.ok) { renderAccount(d.status); renderClaudeModal(d.status); }
+    else { msg.className = "msg err"; msg.textContent = d.message || "Couldn't connect."; }
+  } catch (e) { btnDone(btn); msg.className = "msg err"; msg.textContent = String(e.message || e); }
+}
+
+async function disconnectKey() {
+  const btn = $("key-disconnect");
+  btnBusy(btn, "Disconnecting…");
+  try {
+    const d = await (await fetch("/auth/apikey/disconnect", {method:"POST",
+      headers:{"Content-Type":"application/json"}, body:"{}"})).json();
+    btnDone(btn); renderAccount(d.status); renderClaudeModal(d.status);
+  } catch (e) { btnDone(btn); }
+}
+
+// Claude-connection modal (reuses the centered-modal pattern; re-checks status on open).
+let CLAUDE_MODAL_PREV = null;
+function openClaudeModal() {
+  renderClaudeModal(AUTH); refreshAuth();
+  CLAUDE_MODAL_PREV = document.activeElement;
+  $("claude-modal").classList.remove("hidden");
+  $("claude-modal-x").focus();
+}
+function closeClaudeModal() {
+  $("claude-modal").classList.add("hidden");
+  if (CLAUDE_MODAL_PREV && CLAUDE_MODAL_PREV.focus) CLAUDE_MODAL_PREV.focus();
+}
+$("claude-modal-x").addEventListener("click", closeClaudeModal);
+$("claude-modal").addEventListener("click", (e) => { if (e.target === $("claude-modal")) closeClaudeModal(); });
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !$("claude-modal").classList.contains("hidden")) closeClaudeModal();
+});
 
 $("jobmode").addEventListener("change", () => {
   const custom = $("jobmode").value === "custom";
@@ -1881,7 +2368,44 @@ document.querySelectorAll(".tab").forEach(t => t.addEventListener("click", () =>
   if (v === "profile") loadProfile();
   if (v === "track") loadTrack();
   if (v === "discover") { pollLoop(); loadParked(); loadSources(); loadFitInsights(); loadDisc(); pollTest(); }
+  maybeShowNudge(v);
 }));
+
+// ---- First-visit nudges — the one thing to do in Profile / Discover, shown once per section --
+// (moved out of the old up-front checklist: résumé import auto-fills the Profile fields, so the
+// "add details" and "choose jobs" prompts belong where the user lands, not as chores at launch).
+// The tour drives the tabs too; suppress nudges while it runs so they don't flash behind it.
+let TOUR_ACTIVE = false;
+let SETUP = null;  // cached /setup/status readiness, so a nudge hides once its section is done
+const nudgeSeen = (v) => { try { return localStorage.getItem("ab-nudge-" + v) === "1"; } catch (e) { return false; } };
+const markNudgeSeen = (v) => { try { localStorage.setItem("ab-nudge-" + v, "1"); } catch (e) {} };
+function setupOk(key) {  // true when that readiness step is satisfied (unknown ⇒ assume not, so we still help)
+  if (!SETUP) return false;
+  const s = (SETUP.steps || []).find(x => x.key === key);
+  return !!(s && s.ok);
+}
+function maybeShowNudge(v) {
+  if (TOUR_ACTIVE) return;
+  if (v === "profile") {
+    const done = setupOk("profile") && setupOk("resume");
+    if (nudgeSeen("profile") || done) return;
+    $("profile-nudge").classList.remove("hidden");
+  } else if (v === "discover") {
+    if (nudgeSeen("discover") || setupOk("discovery")) return;
+    $("discover-nudge").classList.remove("hidden");
+  }
+}
+function dismissNudge(v) { markNudgeSeen(v); $(v + "-nudge").classList.add("hidden"); }
+$("profile-nudge-x").addEventListener("click", () => dismissNudge("profile"));
+$("discover-nudge-x").addEventListener("click", () => dismissNudge("discover"));
+$("profile-nudge-go").addEventListener("click", () => {
+  dismissNudge("profile");
+  const e = $("s-linkedin"); if (e) e.scrollIntoView({behavior:"smooth", block:"center"});
+});
+$("discover-nudge-go").addEventListener("click", () => {
+  dismissNudge("discover");
+  openDiscModal();
+});
 $("resume").addEventListener("change", () => { if (!$("view-profile").classList.contains("hidden")) loadProfile(); });
 
 // ---- Discover: run one full dry-run test ------------------------------------
@@ -2251,9 +2775,11 @@ async function loadTrack() {
     if (TRACK_STATE.search) q.set("search", TRACK_STATE.search);
     const d = await (await fetch("/track?" + q.toString())).json();
     TRACK_STATE.statuses = d.statuses;
+    renderScores(d.counts);
     renderCounts(d.counts);
     renderFunnel(d.funnel);
     renderUsageDiscovery(d.usage_discovery);
+    renderFeed(d.applications);
     renderTrack(d.applications);
   } catch (e) {
     body.innerHTML = ""; body.append(el("div", {class:"msg err", text:"Couldn't load applications: " + (e.message||e)}));
@@ -2270,8 +2796,134 @@ function renderCounts(counts) {
   for (const s of TRACK_STATE.statuses) c.append(mk(s, s, counts[s] || 0));
 }
 
-// The discovery→offer funnel (survey #4): one bar per stage, width relative to Discovered,
-// with the count and the conversion from the previous stage.
+// Exactly four hero scorecards at the top of Track — total processed, applied, blocked, failed.
+function renderScores(counts) {
+  const box = $("track-scores"); if (!box) return;
+  const c = counts || {};
+  const sum = (...ks) => ks.reduce((n, k) => n + (c[k] || 0), 0);
+  const cards = [
+    {label:"Total processed", val:c.total || 0, cls:""},
+    {label:"Applied", val:sum("applied", "responded", "interview", "offer"), cls:"info"},
+    {label:"Blocked / needs you", val:c.blocked || 0, cls:"warn2"},
+    {label:"Failed", val:c.failed || 0, cls:"bad2"},
+  ];
+  box.innerHTML = "";
+  cards.forEach(k => box.append(el("div", {class:"scorecard " + k.cls}, [
+    el("div", {class:"sc-val", text:grp(k.val)}),
+    el("div", {class:"sc-label", text:k.label})])));
+}
+
+// One muted status system, shared by the feed badge and the table cell colours. Colour by outcome:
+// neutral=pending, blue=applied, green=positive reply, amber=blocked (pulses — needs you), red=failed.
+const STATUS_META = {
+  discovered:{c:"st-neutral"}, tailored:{c:"st-neutral"}, "dry-run":{c:"st-neutral"},
+  applied:{c:"st-info"}, responded:{c:"st-good"}, interview:{c:"st-good"}, offer:{c:"st-good"},
+  blocked:{c:"st-warn2", live:true}, rejected:{c:"st-neutral"}, "no-response":{c:"st-neutral"},
+  failed:{c:"st-bad2"},
+};
+function statusMeta(s) { return STATUS_META[s] || {c:"st-neutral"}; }
+function stbadge(status) {
+  const m = statusMeta(status);
+  return el("span", {class:"stbadge " + m.c + (m.live ? " live" : "")},
+    [el("span", {class:"dot"}), status || "—"]);
+}
+
+// The application feed — one uniform card per row (company · role, a •-metadata string, fit, status).
+function renderFeed(apps) {
+  const box = $("track-feed"); if (!box) return;
+  box.innerHTML = "";
+  if (!apps.length) {
+    box.append(el("div", {class:"tempty", text:
+      TRACK_STATE.search || TRACK_STATE.status
+        ? "No applications match this filter."
+        : "No applications yet. The pipeline records them here as it runs — or add one manually."}));
+    return;
+  }
+  apps.forEach(app => box.append(feedCard(app)));
+}
+function metaString(bits) {
+  const wrap = el("span");
+  bits.filter(Boolean).forEach((b, i) => {
+    if (i) wrap.append(el("span", {class:"sep", text:"•"}));
+    wrap.append(document.createTextNode(b));
+  });
+  return wrap;
+}
+function feedCard(app) {
+  const title = (app.company || "—") + (app.role ? "  ·  " + app.role : "");
+  const meta = el("div", {class:"fc-meta"}, [metaString([
+    app.portal, app.location, app.run_count ? app.run_count + (app.run_count == 1 ? " run" : " runs") : null])]);
+  const kids = [el("div", {class:"fc-main"}, [el("div", {class:"fc-title", text:title}), meta])];
+  if (app.fit_score != null && app.fit_score !== "") kids.push(el("span", {class:"fc-fit", text:"fit " + app.fit_score}));
+  kids.push(stbadge(app.status));
+  const card = el("button", {class:"fcard", type:"button", on:{click:() => openDrawer(app)}}, kids);
+  card.dataset.id = app.id;
+  return card;
+}
+
+// Context drawer — slides in from the right on a feed-card click: status, actions, and the run log.
+let DRAWER_PREV = null;
+function openDrawer(app) {
+  const dr = $("track-drawer"), scrim = $("drawer-scrim");
+  DRAWER_PREV = document.activeElement;
+  $("drawer-title").textContent = (app.company || "—") + (app.role ? " — " + app.role : "");
+  const meta = $("drawer-meta"); meta.innerHTML = "";
+  meta.append(metaString([app.portal, app.method, app.location, app.pay]));
+  const body = $("drawer-body"); body.innerHTML = "";
+  const statusRow = el("div", {}, [stbadge(app.status)]);
+  if (app.fit_score != null && app.fit_score !== "")
+    statusRow.append(el("span", {class:"fc-fit", style:"margin-left:10px", text:"fit " + app.fit_score}));
+  body.append(statusRow);
+  const acts = el("div", {class:"drawer-actions"});
+  if (app.source_url && /^https?:/i.test(app.source_url))
+    acts.append(el("a", {href:app.source_url, target:"_blank", class:"tbtn", text:"Open posting ↗"}));
+  if (app.resume_path)
+    acts.append(el("a", {href:"/track/resume?id=" + app.id, target:"_blank", class:"tbtn", text:"View résumé ↗"}));
+  if (app.status === "dry-run" && app.source_url)
+    acts.append(el("button", {class:"rerun", type:"button", text:"Re-run ▶",
+      title:"Re-fill this posting in a watchable browser (dry-run — nothing is submitted)",
+      on:{click:(ev) => rerunDry(app, ev.target, false)}}));
+  if (acts.childElementCount)
+    body.append(el("div", {}, [el("div", {class:"drawer-sec-label", text:"Actions"}), acts]));
+  const termWrap = el("div", {}, [el("div", {class:"drawer-sec-label", text:"Run log"})]);
+  const term = el("div", {class:"terminal"}, [el("div", {class:"tl", text:"Loading run history…"})]);
+  termWrap.append(term); body.append(termWrap);
+  loadDrawerRuns(app, term);
+  scrim.classList.remove("hidden");
+  requestAnimationFrame(() => { scrim.classList.add("open"); dr.classList.add("open"); });
+  dr.setAttribute("aria-hidden", "false");
+  document.querySelectorAll("#track-feed .fcard").forEach(c => c.classList.toggle("sel", c.dataset.id === String(app.id)));
+  $("drawer-x").focus();
+}
+function closeDrawer() {
+  const dr = $("track-drawer"), scrim = $("drawer-scrim");
+  dr.classList.remove("open"); scrim.classList.remove("open");
+  dr.setAttribute("aria-hidden", "true");
+  setTimeout(() => scrim.classList.add("hidden"), 220);
+  document.querySelectorAll("#track-feed .fcard.sel").forEach(c => c.classList.remove("sel"));
+  if (DRAWER_PREV && DRAWER_PREV.focus) DRAWER_PREV.focus();
+}
+async function loadDrawerRuns(app, term) {
+  try {
+    const d = await (await fetch("/track/runs?id=" + app.id)).json();
+    term.innerHTML = "";
+    if (!d.runs || !d.runs.length) { term.append(el("div", {class:"tl", text:"No runs recorded yet."})); return; }
+    d.runs.forEach(r => {
+      const lvl = r.outcome === "failed" ? "err" : (r.outcome === "blocked" ? "warn" : "");
+      term.append(el("div", {class:"tl " + lvl}, [
+        el("span", {class:"tl-prompt", text:"› "}),
+        el("span", {class:"tl-when", text:(r.ran_at || "").replace("T", " ") + "  "}),
+        (r.outcome || "run") + (r.detail ? " — " + r.detail : ""),
+      ]));
+    });
+    if (app.resume_path) term.append(el("div", {class:"tl", text:"résumé: " + app.resume_path}));
+  } catch (e) {
+    term.innerHTML = ""; term.append(el("div", {class:"tl err", text:"Couldn't load runs: " + (e.message || e)}));
+  }
+}
+
+// The discovery→offer funnel (survey #4): one metric tile per stage. The count is the value;
+// the meter width (relative to Discovered) and sub-line carry the drop-off + stage conversion.
 function renderFunnel(funnel) {
   const box = $("track-funnel"); if (!box) return;
   box.innerHTML = "";
@@ -2281,20 +2933,27 @@ function renderFunnel(funnel) {
     box.textContent = "The funnel fills in as the pipeline discovers, fills, and (once armed) submits applications.";
     return;
   }
-  box.className = "funnel";
+  box.className = "mtiles tight";
   for (const s of funnel) {
     const pct = Math.round(100 * s.count / top);
-    const conv = (s.conversion_from_prev != null)
-      ? el("span", {class:"fn-conv", text:" · " + Math.round(100 * s.conversion_from_prev) + "%"})
-      : null;
-    const meta = el("span", {class:"fn-meta"}, [el("b", {text:String(s.count)}), " " + pct + "%"]);
-    if (conv) meta.append(conv);
-    box.append(el("div", {class:"fn-row"}, [
-      el("span", {class:"fn-label", text:s.stage}),
-      el("div", {class:"fn-track"}, [el("div", {class:"fn-bar", style:"width:" + pct + "%"})]),
-      meta,
+    const sub = [document.createTextNode(pct + "% of top")];
+    if (s.conversion_from_prev != null)
+      sub.push(el("span", {class:"conv", text:"  ·  " + Math.round(100 * s.conversion_from_prev) + "% conv"}));
+    box.append(el("div", {class:"mtile"}, [
+      el("div", {class:"mtile-label", text:s.stage}),
+      el("div", {class:"mtile-val", text:grp(s.count)}),
+      el("div", {class:"mtile-sub"}, sub),
+      el("div", {class:"mtile-meter"}, [el("div", {class:"mtile-meter-fill", style:"width:" + pct + "%"})]),
     ]));
   }
+}
+
+// A metric tile: uppercase label, big proportional-sans value, optional mono sub-line, optional meter.
+function mtile(label, value, sub, meterPct) {
+  const kids = [el("div", {class:"mtile-label", text:label}), el("div", {class:"mtile-val", text:value})];
+  if (sub != null) kids.push(el("div", {class:"mtile-sub"}, Array.isArray(sub) ? sub : [document.createTextNode(sub)]));
+  if (meterPct != null) kids.push(el("div", {class:"mtile-meter"}, [el("div", {class:"mtile-meter-fill", style:"width:" + meterPct + "%"})]));
+  return el("div", {class:"mtile"}, kids);
 }
 
 // Discovery/judging Claude spend not tied to any one application (the batched fit judge, decision
@@ -2308,21 +2967,26 @@ function renderUsageDiscovery(u) {
   box.classList.remove("hidden");
   const rows = Object.keys(u.by_activity || {}).map(k => [k, u.by_activity[k]])
     .sort((a, b) => b[1].total_tokens - a[1].total_tokens);
-  const line = el("button", {class:"track-usage-line", type:"button",
-    title:"Discovery & judging tokens are shared across many candidates, so they're shown here "
-        + "rather than charged to individual applications. Click for the breakdown."},
-    [el("span", {class:"tu-label", text:"Discovery & judging (all-time): "}),
-     el("b", {text:fmtTokens(u.total_tokens) + " tokens"}),
-     document.createTextNode("  ·  " + grp(u.input_tokens) + " in / " + grp(u.output_tokens) + " out  ·  "
-       + u.calls + (u.calls === 1 ? " call" : " calls")),
-     el("span", {class:"caret", text:" ▾"})]);
+  const cap = el("div", {class:"tu-cap",
+    text:"Discovery & judging spend (all-time) — shared across candidates, not charged to any one application."});
+  const tiles = el("div", {class:"mtiles tight"}, [
+    mtile("Total tokens", fmtTokens(u.total_tokens), grp(u.total_tokens) + " · " + u.calls + (u.calls === 1 ? " call" : " calls")),
+    mtile("Input", fmtTokens(u.input_tokens), grp(u.input_tokens)),
+    mtile("Output", fmtTokens(u.output_tokens), grp(u.output_tokens)),
+  ]);
   const detail = el("div", {class:"tu-detail hidden"});
   rows.forEach(([k, v]) => detail.append(el("div", {class:"tu-act"}, [
     el("span", {class:"tu-act-name", text:ACT_LABELS[k] || k}),
     el("span", {class:"tu-act-num", text:fmtTokens(v.total_tokens) + " (" + grp(v.input_tokens)
       + " in / " + grp(v.output_tokens) + " out)"})])));
-  line.addEventListener("click", () => { detail.classList.toggle("hidden"); line.classList.toggle("open"); });
-  box.append(line, detail);
+  const toggle = el("button", {class:"linklike tu-toggle", type:"button",
+    title:"Per-activity breakdown of discovery & judging tokens."},
+    [document.createTextNode("Show per-activity breakdown "), el("span", {class:"caret", text:"▾"})]);
+  toggle.addEventListener("click", () => {
+    const hidden = detail.classList.toggle("hidden");
+    toggle.classList.toggle("open", !hidden);
+  });
+  box.append(cap, tiles, toggle, detail);
 }
 
 // The Source URL cell: the URL itself is the link — clicking the text opens the posting in a new
@@ -2726,6 +3390,57 @@ $("track-search").addEventListener("input", (e) => {
   trackSearchT = setTimeout(() => { TRACK_STATE.search = e.target.value.trim(); loadTrack(); }, 250);
 });
 
+// Feed | Table view toggle — remembered per browser. Table view shows the full editable spreadsheet
+// (and its Columns menu); Feed view shows the card list + drawer. Default: Feed.
+function setTrackView(v) {
+  const feed = v !== "table";
+  $("track-feed").classList.toggle("hidden", !feed);
+  $("track-body").classList.toggle("hidden", feed);
+  $("colmenu-wrap").style.display = feed ? "none" : "";
+  $("view-feed").classList.toggle("on", feed);
+  $("view-table").classList.toggle("on", !feed);
+  try { localStorage.setItem("ab_track_view", feed ? "feed" : "table"); } catch (e) {}
+}
+$("view-feed").addEventListener("click", () => setTrackView("feed"));
+$("view-table").addEventListener("click", () => setTrackView("table"));
+(function(){ let v = "feed"; try { v = localStorage.getItem("ab_track_view") || "feed"; } catch (e) {} setTrackView(v); })();
+
+// Drawer close: X button, click the scrim, or Escape. Tab is trapped inside while open
+// (ARIA dialog pattern — matches the setup-overlay reference).
+$("drawer-x").addEventListener("click", closeDrawer);
+$("drawer-scrim").addEventListener("click", closeDrawer);
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && $("track-drawer").classList.contains("open")) closeDrawer();
+});
+$("track-drawer").addEventListener("keydown", (e) => {
+  if (e.key !== "Tab") return;
+  const f = $("track-drawer").querySelectorAll('a[href],button:not([disabled]),input,[tabindex]:not([tabindex="-1"])');
+  if (!f.length) return;
+  const first = f[0], last = f[f.length - 1];
+  if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+  else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+});
+
+// Discovery settings modal — the settings form lives here (opened from the Discover action bar or
+// the first-visit nudge), keeping the Discover page itself to actions + status.
+let DISC_MODAL_PREV = null;
+function openDiscModal() {
+  const m = $("disc-modal");
+  DISC_MODAL_PREV = document.activeElement;
+  m.classList.remove("hidden");
+  $("disc-modal-x").focus();
+}
+function closeDiscModal() {
+  $("disc-modal").classList.add("hidden");
+  if (DISC_MODAL_PREV && DISC_MODAL_PREV.focus) DISC_MODAL_PREV.focus();
+}
+$("disc-open").addEventListener("click", openDiscModal);
+$("disc-modal-x").addEventListener("click", closeDiscModal);
+$("disc-modal").addEventListener("click", (e) => { if (e.target === $("disc-modal")) closeDiscModal(); });
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !$("disc-modal").classList.contains("hidden")) closeDiscModal();
+});
+
 // ---- LinkedIn import ----
 function fileB64(file) {
   return new Promise((res, rej) => {
@@ -2844,10 +3559,10 @@ function startDateField(value) {
   return el("div", {class:"fld"}, [el("label", {text:"Earliest start date"}), sel, date]);
 }
 function qaStatus(qa) {
-  if ((qa.maps_to||"").trim()) return {mark:"↔", label:"Auto-answered from your profile ("+qa.maps_to.trim()+")", color:"var(--ok)"};
+  if ((qa.maps_to||"").trim()) return {mark:"↔", label:"Auto-answered from your profile ("+qa.maps_to.trim()+")", color:"var(--ok-text)"};
   if ((qa.answer||"").trim()) return qa.generated
     ? {mark:"✨", label:"AI-drafted — review & edit", color:"var(--ai)"}
-    : {mark:"✓", label:"Answered", color:"var(--ok)"};
+    : {mark:"✓", label:"Answered", color:"var(--ok-text)"};
   return {mark:"○", label:"Needs your answer", color:"var(--warn-strong)"};
 }
 // Hidden fields that carry the classification/flags through the save round-trip (cardData reads any [data-k]).
@@ -2959,7 +3674,7 @@ function screeningSection(list) {
 }
 function acctRow(name, ok, text) {
   return el("div", {style:"display:flex;align-items:center;gap:10px;padding:7px 0;border-bottom:1px solid var(--line)"}, [
-    el("span", {style:"font-weight:700;font-size:15px;color:"+(ok?"var(--ok)":"var(--muted)"), text: ok ? "✓" : "○"}),
+    el("span", {style:"font-weight:700;font-size:15px;color:"+(ok?"var(--ok-text)":"var(--muted)"), text: ok ? "✓" : "○"}),
     el("span", {style:"font-weight:600;min-width:130px", text:name}),
     el("span", {style:"color:var(--muted);font-size:13px", text:text}),
   ]);
@@ -3052,7 +3767,7 @@ async function loadMailbox() {
     if (s.linked) {
       const how = s.auth === "oauth" ? "Gmail, read-only" : (s.host + ":" + s.port);
       st.textContent = "✓ Connected: " + s.email + " (" + how + ") · " + s.source;
-      st.style.color = "var(--ok)";
+      st.style.color = "var(--ok-text)";
       if (un) un.style.display = "";
       if (s.client_id && $("mb-cid") && !$("mb-cid").value) $("mb-cid").value = s.client_id;
       if ($("mb-email") && !$("mb-email").value) $("mb-email").value = s.email;
@@ -3078,7 +3793,7 @@ async function connectGmail(btn) {
       body: JSON.stringify({client_id, client_secret})})).json();
     clearInterval(tick);
     msg.textContent = (r.ok ? "✓ " : "⚠ ") + (r.message || "");
-    msg.style.color = r.ok ? "var(--ok)" : "var(--bad)";
+    msg.style.color = r.ok ? "var(--ok-text)" : "var(--bad)";
     if (r.ok) { $("mb-csec").value = ""; await loadMailbox(); }
   } catch (e) { clearInterval(tick); msg.textContent = "Failed: " + e.message; msg.style.color = "var(--bad)"; }
   finally { btnDone(btn); }
@@ -3093,7 +3808,7 @@ async function linkMailbox(btn) {
     const r = await (await fetch("/mailbox/link", {method:"POST", headers:{"Content-Type":"application/json"},
       body: JSON.stringify({email, host, port, password})})).json();
     msg.textContent = (r.ok ? "✓ " : "⚠ ") + (r.message || "");
-    msg.style.color = r.ok ? "var(--ok)" : "var(--bad)";
+    msg.style.color = r.ok ? "var(--ok-text)" : "var(--bad)";
     if (r.ok) { $("mb-pass").value = ""; await loadMailbox(); }
   } catch (e) { msg.textContent = "Failed: " + e.message; msg.style.color = "var(--bad)"; }
   finally { btnDone(btn); }
@@ -3591,11 +4306,14 @@ function escapeHtml(s){ const d=document.createElement("div"); d.textContent=s; 
 (function(){
   const root = document.documentElement, btn = document.getElementById("theme-toggle");
   const sysDark = () => window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+  const SVG = 'viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"';
+  const SUN = '<svg class="btn-ic" '+SVG+'><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>';
+  const MOON = '<svg class="btn-ic" '+SVG+'><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>';
   function apply(mode){
     if (mode === "dark" || mode === "light") root.setAttribute("data-theme", mode);
     else root.removeAttribute("data-theme");
     const dark = mode === "dark" || (mode !== "light" && sysDark());
-    if (btn) btn.textContent = dark ? "☀️ Light" : "🌙 Dark";
+    if (btn) btn.innerHTML = dark ? SUN + "Light" : MOON + "Dark";
   }
   let saved = null; try { saved = localStorage.getItem("ab-theme"); } catch(e){}
   apply(saved || "system");
@@ -3607,6 +4325,92 @@ function escapeHtml(s){ const d=document.createElement("div"); d.textContent=s; 
     apply(next);
   });
 })();
+
+// ---- First-run tour — a spotlight walkthrough of what each section does ----------------------
+// Replaces the old up-front chore checklist: a quick tour that highlights each nav tab in turn and
+// says, in one line, what it's for (UI Principle #4). The two things that used to be checklist
+// chores — "add details" and "choose jobs" — now surface as first-visit nudges where the user lands
+// (see maybeShowNudge), because résumé import auto-fills the details. Auto-runs once on a fresh
+// browser; reopenable any time from the nav "Take the tour" button.
+(function(){
+  const DONE_KEY = "ab-tour-done";
+  const overlay = $("tour-overlay"), pop = $("tour-pop"), nav = document.querySelector("aside.nav");
+  const STEPS = [
+    { view:null, title:"👋 Welcome to ApplicationBot", body:"It finds jobs, tailors your résumé, and fills out applications for you — everything runs as a safe dry-run until you arm it. Here's a 20-second tour of the four sections." },
+    { view:null, title:"🔑 How Claude tailors your résumé", body:"Primary: your Claude subscription via Claude Code (recommended — not metered; sign in inside Claude Code). Fallback: your own Anthropic API key (pay-per-token, separate from your subscription) — a third-party app can't use the subscription any other way. Neither? The free rules engine runs. Manage it anytime from the panel in the bottom-left." },
+    { view:"profile", title:"👤 Profile", body:"Your details and résumé. Import your résumé and it fills these in automatically — the bot uses them to answer application questions truthfully." },
+    { view:"discover", title:"🔍 Discover", body:"Choose what jobs to find, then let the bot search, rank every posting by how well it fits you, tailor your résumé, and fill the application — a dry-run you can watch." },
+    { view:"review", title:"📝 Review", body:"See each tailored résumé and why it was written that way, and fine-tune it before it's used." },
+    { view:"track", title:"📊 Track", body:"Every application the bot discovered, tailored, and filled — with status, notes, and how much Claude each one cost." },
+  ];
+  let i = 0, startView = null, running = false;
+  const spot = (v) => document.querySelectorAll(".tab").forEach(t => t.classList.toggle("tour-spot", !!v && t.dataset.view === v));
+
+  function place(v){
+    if (!v){ pop.classList.add("center"); pop.style.top = pop.style.left = ""; return; }
+    pop.classList.remove("center");
+    const tab = document.querySelector('.tab[data-view="' + v + '"]');
+    const nr = nav.getBoundingClientRect(), tr = (tab || nav).getBoundingClientRect();
+    pop.style.left = (nr.right + 14) + "px";
+    let top = tr.top + tr.height / 2 - 27;                       // align the arrow (~27px down) with the tab
+    top = Math.max(12, Math.min(top, window.innerHeight - pop.offsetHeight - 12));
+    pop.style.top = top + "px";
+  }
+
+  function show(){
+    const s = STEPS[i];
+    if (s.view){ const t = document.querySelector('.tab[data-view="' + s.view + '"]'); if (t) t.click(); }
+    spot(s.view);
+    $("tour-count").textContent = "Step " + (i + 1) + " of " + STEPS.length;
+    $("tour-title").textContent = s.title;
+    $("tour-body").textContent = s.body;
+    $("tour-back").classList.toggle("hidden", i === 0);
+    $("tour-next").textContent = i === STEPS.length - 1 ? "Get started →" : "Next →";
+    place(s.view);
+    place(s.view);                                               // twice: first render sets height, second re-clamps
+    $("tour-next").focus();
+  }
+
+  function open(){
+    running = true; TOUR_ACTIVE = true;
+    const active = document.querySelector(".tab.active");
+    startView = active ? active.dataset.view : "review";
+    document.body.classList.add("tour-on");
+    overlay.classList.remove("hidden"); pop.classList.remove("hidden");
+    i = 0; show();
+  }
+  function close(goProfile){
+    running = false; TOUR_ACTIVE = false;
+    try { localStorage.setItem(DONE_KEY, "1"); } catch(e){}
+    spot(null);
+    document.body.classList.remove("tour-on");
+    overlay.classList.add("hidden"); pop.classList.add("hidden");
+    const to = goProfile ? "profile" : (startView || "review");
+    const t = document.querySelector('.tab[data-view="' + to + '"]'); if (t) t.click();
+  }
+
+  $("tour-next").addEventListener("click", () => { if (i < STEPS.length - 1){ i++; show(); } else close(true); });
+  $("tour-back").addEventListener("click", () => { if (i > 0){ i--; show(); } });
+  $("tour-skip").addEventListener("click", () => close(false));
+  $("tour-open").addEventListener("click", open);
+  window.addEventListener("resize", () => { if (running) place(STEPS[i].view); });
+  pop.addEventListener("keydown", (e) => {
+    if (e.key !== "Tab") return;                                 // keep focus inside the popover
+    const f = Array.from(pop.querySelectorAll("button")).filter(b => !b.disabled && b.offsetParent !== null);
+    if (!f.length) return;
+    const first = f[0], last = f[f.length - 1];
+    if (e.shiftKey && document.activeElement === first){ e.preventDefault(); last.focus(); }
+    else if (!e.shiftKey && document.activeElement === last){ e.preventDefault(); first.focus(); }
+  });
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape" && running) close(false); });
+
+  // Cache readiness for the nudges, and auto-run the tour once per browser.
+  (async () => {
+    try { SETUP = await (await fetch("/setup/status")).json(); } catch(e){ SETUP = null; }
+    let done = false; try { done = localStorage.getItem(DONE_KEY) === "1"; } catch(e){}
+    if (!done) open();
+  })();
+})();
 </script>
 </body>
 </html>
@@ -3614,9 +4418,12 @@ function escapeHtml(s){ const d=document.createElement("div"); d.textContent=s; 
 
 
 def main(argv: list[str] | None = None) -> int:
+    from . import __version__
+
     parser = argparse.ArgumentParser(description="Local web UI for reviewing tailored resumes.")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--version", action="version", version=f"ApplicationBot {__version__}")
     args = parser.parse_args(argv)
 
     server = ThreadingHTTPServer((args.host, args.port), Handler)

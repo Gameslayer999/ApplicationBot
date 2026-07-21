@@ -30,8 +30,8 @@ from typing import Optional
 from .discovery import Posting
 from .matching import Match
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_PATH = REPO_ROOT / "profile" / "discovery_cache.json"
+from .paths import DATA_ROOT
+DEFAULT_PATH = DATA_ROOT / "profile" / "discovery_cache.json"
 
 # Bump when the on-disk shape changes so old snapshots are ignored rather than misread.
 _SCHEMA_VERSION = 1

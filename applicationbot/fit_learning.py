@@ -33,12 +33,12 @@ from typing import Iterable, Optional
 from .discovery import Posting, canonical_url
 from .filters import EXPERIENCE_LEVELS, detect_levels
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_PATH = REPO_ROOT / "profile" / "fit_history.jsonl"
+from .paths import DATA_ROOT
+DEFAULT_PATH = DATA_ROOT / "profile" / "fit_history.jsonl"
 # One summary row per live run — the trend the UI charts so the user can watch results get
 # better run over run (best/mean fit + how many cleared their bar). Separate from the
 # per-posting history: runs must NOT be de-duplicated, each is its own point in time.
-RUNS_PATH = REPO_ROOT / "profile" / "fit_runs.jsonl"
+RUNS_PATH = DATA_ROOT / "profile" / "fit_runs.jsonl"
 
 # Judged postings needed before the predictor steers anything. Below this the pre-filter
 # keeps its pure keyword ordering (today's behaviour) — too few samples to trust.
