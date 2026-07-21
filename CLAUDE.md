@@ -270,6 +270,27 @@ When you encounter a choice during development, follow this process:
 
 ---
 
+## Branching & releases
+
+**`master` (main) is the source of truth for releases. `development` is the working branch.**
+(Decision 112.)
+
+- **Do all work on `development`** — never commit directly to `master`.
+- **Releases push to main:** bring `development` onto `master` (a GitHub PR `development → master`,
+  or an equivalent local `git merge --no-ff development` on `master` pushed over SSH), then cut the
+  release **from `master`**.
+- **Cut a release** with `./scripts/release.sh` (dry-run by default; `--publish` to tag + release).
+  It tags `v{applicationbot.__version__}` at HEAD, pushes the tag, and creates the GitHub Release.
+  **Bump `applicationbot.__version__` before each `--publish`** — the script refuses to reuse an
+  existing tag.
+- **Release artifacts:** GitHub's auto-generated **source zip** *plus* the self-contained
+  **`ApplicationBot.app.zip`** — rebuild it with `./scripts/build_macapp.sh` (bundles every runtime
+  dep, incl. `anthropic`) and attach it with `gh release upload <tag> ApplicationBot.app.zip`.
+- The `gh` CLI must be authed as an account with **push** access to the repo before `--publish`
+  (`gh auth status` / `gh auth switch`); plain `git push` may work over SSH even when `gh` cannot.
+
+---
+
 ## Parallel agents (Cursor ↔ Claude VS Code)
 
 When working alongside Cursor in parallel, use the **agent bus** — git-ignored
