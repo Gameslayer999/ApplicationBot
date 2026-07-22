@@ -1,9 +1,8 @@
 # ApplicationBot
 
-A personalized, end-to-end job-application pipeline. Clone the repo, set up your
-profile and filters, and ApplicationBot discovers matching job openings, tailors your
-resume to each one, applies with no human intervention, and tracks every application it
-submits.
+A personalized, end-to-end job-application pipeline. **[Download the latest release](../../releases)**,
+set up your profile and filters, and ApplicationBot discovers matching job openings, tailors your
+resume to each one, applies with no human intervention, and tracks every application it submits.
 
 > **Status:** Early development — high-level design only. Architecture, tech stack, and
 > module boundaries are still being defined.
@@ -27,7 +26,7 @@ submits.
 
 ApplicationBot is meant to be used by anyone. Nothing about a specific user is baked
 into the repo — your profile, resume, filters, and application history all live in your
-own local (git-ignored) config. Clone, configure, run.
+own local (git-ignored) config. Download a release, configure, run.
 
 ## Safety
 
@@ -51,24 +50,24 @@ See Agent Guideline #3 in [CLAUDE.md](CLAUDE.md).
 
 ## Getting started
 
-### Quick start — download & run (v0.1)
+### Get it — download the latest release (recommended)
 
-The easiest way to run ApplicationBot. No terminal setup required beyond having **Python 3**.
+**The easiest way to run ApplicationBot** — no need to clone the repo or build anything. Grab it
+from the **[latest release](../../releases)**:
 
-1. Download the latest release's source zip from the
-   [Releases page](../../releases) and unzip it.
-2. Launch it:
-   - **macOS** — double-click **`ApplicationBot.command`** (first launch after downloading:
-     right-click → **Open**, then **Open** once to trust it).
-   - **Windows** — double-click **`ApplicationBot.bat`**.
-   - **Linux** — run **`./scripts/run.sh`**.
+- **macOS — the desktop app (no Python needed):** download **`ApplicationBot.app.zip`**, unzip, drag
+  **`ApplicationBot.app`** into your Applications folder, and double-click. First launch after
+  downloading needs one quick trust step — see [Install the desktop app](#install-the-desktop-app-macos)
+  below.
+- **Windows / Linux (or macOS from source):** download the release's **source zip**, unzip, and run
+  the launcher — **`ApplicationBot.bat`** (Windows), **`./scripts/run.sh`** (Linux), or
+  **`ApplicationBot.command`** (macOS; first launch: right-click → **Open**). Needs **Python 3**; the
+  launcher sets up the virtualenv, dependencies, and the automation browser (Chromium) on first run.
+  It's idempotent — safe to re-run any time.
 
-   The launcher sets up everything on first run — virtualenv, dependencies, and the automation
-   browser (Chromium) — then opens the app in your browser. It's idempotent: safe to re-run any
-   time (it reuses what's already installed).
-3. In the app, follow the **✨ Finish setup** walkthrough: add your details and résumé, choose
-   what jobs to find, and run your first dry-run. Nothing is ever submitted until you deliberately
-   arm the safety switch.
+Then, in the app, follow the **✨ Finish setup** walkthrough: add your details and résumé, choose what
+jobs to find, and run your first dry-run. Nothing is ever submitted until you deliberately arm the
+safety switch.
 
 > **Claude connection (optional).** Tailoring uses your **Claude subscription** via
 > [Claude Code](https://claude.com/product/claude-code) (recommended — not metered; sign in
