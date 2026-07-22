@@ -346,8 +346,8 @@ def _print_funnel(res: "PipelineResult", filters: DiscoveryFilters) -> None:
     # Coarse gates, itemized — only the ones that actually dropped something.
     gate_labels = {
         "gate_remote": "remote_only", "gate_title": "title_exclude",
-        "gate_company": "company_exclude", "gate_level": "experience_levels",
-        "gate_salary": "min_salary", "gate_stale": "stale",
+        "gate_company": "company_exclude", "gate_spam": "staffing spam",
+        "gate_level": "experience_levels", "gate_salary": "min_salary", "gate_stale": "stale",
         "gate_duplicate": "duplicate reposts",
     }
     for key, label in gate_labels.items():

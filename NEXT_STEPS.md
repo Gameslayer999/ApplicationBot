@@ -504,22 +504,26 @@ value ÷ effort:
 
 ## Next
 
-### Discovery quality: staffing-spam down-ranking (surfaced by decision 122)
+### Discovery quality: staffing-spam down-ranking (decision 122 → 123)
 
-- [ ] The curated early-career feed, ranked by title-relevance to a Java/Python résumé, is
-      **saturated with staffing-agency reposts** ("Java Developer", "Python Developer",
-      "Java Developer - Need Locals - Need GC and USC") whose keyword-stuffed titles out-rank real
-      new-grad roles at good companies. `company_exclude` (decision 122) removes named agencies but
-      is whack-a-mole. Structural fix: a **heuristic spam detector** that down-ranks/drops on tells
-      — body-shop phrases ("Need Locals", "GC and USC", "C2C", "Corp to Corp", "W2", "Multiple
-      Teams/Positions"), agency-name patterns, and per-(company,title) repost frequency — applied
-      **before** the title-relevance selection so real roles fill the resolve + judge slots.
-      Measured impact of the current partial fix: best fit 41 → 72, but only 1 of 10 judged cleared;
-      the other 9 slots were still mostly spam.
-- [ ] **`top_n` is the binding throughput knob** (confirms decisions 073/115): with `top_n: 10`,
-      real roles (cin7 SWE, Ramp Core Product, Ciena intern) sometimes rank 11+ and never get judged
-      while spam fills the 10. Pair a `top_n` raise with the spam down-ranking above (raising it
-      alone just judges more spam) and a cheaper judge (Haiku pre-rank) to bound cost.
+- [x] **Heuristic staffing-spam detector — done (decision 123).** `filters.is_staffing_spam(title)`
+      (high-precision body-shop title tells: "Need Locals", "GC and USC", "C2C", "Corp to Corp",
+      "W2", "Multiple Positions"; word-boundary tokens so `opt`≠`option`), a `filter_staffing_spam`
+      toggle, a `gate_spam` gate, AND the cheap gates (title/company/spam) + `(company,title)` dedup
+      pushed INTO `CuratedListSource` *before* the title-relevance sort so reposts don't burn the
+      `max_resolve` JD-fetch budget. Measured: cleared apps 0 → 1 → 2; curated resolve set is now
+      real roles (Canonical grad, Buyers Edge junior, Vestmark associate) not Instructor/agency dupes.
+- [ ] **Clean-titled body shops remain a whack-a-mole** (USM/Testing Xperts/Career Guidant/…): they
+      look like small real companies by title+company, so they can't be auto-detected without false
+      positives. Handled by extending `company_exclude` (seeded in the user's config). A durable fix
+      would need a maintained agency list or an external classifier — low priority.
+- [ ] **`top_n` is now THE binding lever** (confirms decisions 073/115; the spam work above cleared
+      the noise, so this is what's left): with `top_n: 10` the judged pool is dominated by the direct
+      ATS boards (Stripe/Ramp/cin7/Hartford/Motorola), so real curated roles (Canonical "Graduate
+      Level Python Cloud", Buyers Edge "Junior Developer Python & Go", Vestmark "Associate Java SWE")
+      rank 11+ and never get judged. Raising `top_n` is what turns "2 cleared" into "many" — pair it
+      with a **Haiku pre-rank** over the resolved pool (cheap first pass → frontier judge only the
+      finalists) so more get judged without a linear token cost. This is the highest-yield item left.
 
 ### Persist each posting's JD beside its tailored PDF (surfaced by decision 086)
 
@@ -801,6 +805,14 @@ Posted to the agent bus 2026-07-06; independent of the engine work above.
 ---
 
 ## Recently added (this session, latest first)
+
+- 2026-07-22 — **Staffing-spam down-ranking + cheap gates pushed into the curated source (decision 123).**
+  `is_staffing_spam(title)` (high-precision body-shop title tells + word-boundary tokens) as a
+  `gate_spam` gate with a `filter_staffing_spam` toggle, plus the title/company/spam gates +
+  `(company,title)` dedup now run INSIDE `CuratedListSource` before its `max_resolve` JD-fetch — so
+  reposts stop stealing resolve + judge slots from real roles. **Measured: cleared apps 0 → 1 → 2**
+  at min_fit 60; the curated resolve set is now real early-career roles (Canonical/Buyers Edge/
+  Vestmark) instead of Instructor + agency dupes. 2 new tests. **Remaining lever: `top_n`** (see Next).
 
 - 2026-07-22 — **Honest loop messages + early-career match-quality fixes (decision 122).**
   Fixed the misleading *"Nothing recently scored to re-prepare"* (it fired when the cache was

@@ -191,6 +191,12 @@ class DiscoveryFilters(BaseModel):
         "e.g. staffing agencies that repost the same role many times ('Consultadd', "
         "'DellFor') — a cheap gate before the matcher.",
     )
+    filter_staffing_spam: bool = Field(
+        default=True,
+        description="Drop postings whose TITLE carries a body-shop / staffing tell "
+        "('Need Locals', 'GC and USC', 'C2C', 'Corp to Corp', 'W2') — high-precision, "
+        "on by default. Turn off if you actually want contract / corp-to-corp listings.",
+    )
     experience_levels: list[str] = Field(
         default_factory=list,
         description="Keep only postings at these experience levels, detected from the TITLE: "
@@ -275,6 +281,13 @@ def build_sources(
             resume, kinds=tuple(filters.early_career.kinds or ["new-grad", "intern"]),
             max_resolve=filters.early_career.max_resolve,
             feeds={f.name: f.url for f in filters.early_career.feeds},
+            # Apply the cheap title/company/spam gates + repost dedup BEFORE the title-relevance
+            # sort, so real roles — not staffing reposts (keyword-stuffed OR clean-titled
+            # Consultadd/DellFor dupes) — win the scarce max_resolve JD-fetch budget (decision
+            # 122 open item). Mirrors the apply_gates gates so nothing wastes a fetch first.
+            filter_spam=filters.filter_staffing_spam,
+            title_exclude=list(filters.title_exclude),
+            company_exclude=list(filters.company_exclude),
         ))
     return sources
 
@@ -379,6 +392,35 @@ def _norm_title(title: str) -> str:
     return _TITLE_NORM_RE.sub(" ", (title or "").lower()).strip()
 
 
+# Body-shop / staffing-agency tells that appear in a job TITLE almost only on reposted contract
+# listings — a real employer never titles a new-grad role by its work-authorization filter or
+# "corp to corp". These keyword-stuffed titles otherwise out-rank real roles in the curated
+# feed's title-relevance sort (decision 122's open item). Precision over recall: multi-word
+# phrases are matched as substrings; a few unambiguous tokens on word boundaries (so 'opt' can't
+# match 'option'). Weak signals (agency-name guesses) stay in the user-controlled company_exclude.
+_STAFFING_TITLE_PHRASES = (
+    "need locals", "locals only", "local candidates", "local only",
+    "gc and usc", "usc and gc", "citizens only", "citizen only",
+    "corp to corp", "corp-to-corp", "corp 2 corp",
+    "third party", "no third party",
+    "immediate joiner", "immediate joining", "immediate hire",
+    "contract to hire", "multiple positions", "multiple openings",
+)
+_STAFFING_TITLE_TOKENS = ("c2c", "c2h", "w2", "1099")
+_STAFFING_TOKEN_RE = re.compile(r"\b(?:" + "|".join(_STAFFING_TITLE_TOKENS) + r")\b")
+
+
+def is_staffing_spam(title: str) -> bool:
+    """True when a job TITLE carries a near-certain staffing / body-shop tell (visa-status
+    filters, corp-to-corp, 'need locals', multi-position reposts). High-precision by design —
+    a genuine employer never titles a role this way — so it drops obvious reposts without
+    catching real openings. Company-name-based agency detection is left to `company_exclude`."""
+    t = (title or "").lower()
+    if any(p in t for p in _STAFFING_TITLE_PHRASES):
+        return True
+    return bool(_STAFFING_TOKEN_RE.search(t))
+
+
 def apply_gates(postings, filters: DiscoveryFilters, stats: Optional[dict] = None):
     """Cheap pre-matcher gates from the filter config: remote_only, title_exclude, a salary
     floor when the posting states pay, an experience-level gate (by title), and — when
@@ -395,8 +437,8 @@ def apply_gates(postings, filters: DiscoveryFilters, stats: Optional[dict] = Non
     co_excl = [c.lower() for c in filters.company_exclude]
     want_levels = {_norm_level(l) for l in filters.experience_levels} & set(EXPERIENCE_LEVELS)
     now = datetime.now(timezone.utc)
-    drops = {"gate_remote": 0, "gate_title": 0, "gate_company": 0, "gate_level": 0,
-             "gate_salary": 0, "gate_stale": 0, "gate_duplicate": 0}
+    drops = {"gate_remote": 0, "gate_title": 0, "gate_company": 0, "gate_spam": 0,
+             "gate_level": 0, "gate_salary": 0, "gate_stale": 0, "gate_duplicate": 0}
     kept = []
     seen_key: set[tuple[str, str]] = set()  # (company, title) already kept — collapse reposts
     for p in postings:
@@ -408,6 +450,9 @@ def apply_gates(postings, filters: DiscoveryFilters, stats: Optional[dict] = Non
             continue
         if co_excl and any(x in (p.company or "").lower() for x in co_excl):
             drops["gate_company"] += 1
+            continue
+        if filters.filter_staffing_spam and is_staffing_spam(p.title):
+            drops["gate_spam"] += 1
             continue
         if want_levels:
             # Lenient: drop only when the title clearly names a level and none is wanted;

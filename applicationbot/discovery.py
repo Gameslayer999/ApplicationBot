@@ -1108,10 +1108,15 @@ class CuratedListSource(Source):
     Personal-use only (public job links)."""
 
     def __init__(self, resume, kinds=("new-grad", "intern"), max_resolve: int = 40,
-                 feeds: dict[str, str] | None = None) -> None:
+                 feeds: dict[str, str] | None = None, filter_spam: bool = True,
+                 title_exclude: list[str] | None = None,
+                 company_exclude: list[str] | None = None) -> None:
         self.resume = resume
         self.kinds = tuple(kinds)
         self.max_resolve = max_resolve
+        self.filter_spam = filter_spam
+        self.title_exclude = [t.lower() for t in (title_exclude or [])]
+        self.company_exclude = [c.lower() for c in (company_exclude or [])]
         # Built-ins named by `kinds`, plus any dropped-in {name: url}. Ranking is global across
         # the merged set, so max_resolve stays a whole-run budget however many feeds are added.
         self.feeds = {k: _BUILTIN_FEEDS[k] for k in self.kinds if k in _BUILTIN_FEEDS}
@@ -1143,10 +1148,14 @@ class CuratedListSource(Source):
     def fetch(self) -> list[Posting]:
         import html as _html
 
+        # lazy imports: filters imports discovery (avoid an import cycle)
+        from .filters import _norm_title, is_staffing_spam
+
         def clean(s: str) -> str:
             return _html.unescape(s or "").strip()
 
         seen: set[str] = set()
+        seen_key: set[tuple[str, str]] = set()  # (company, norm-title) — collapse reposts
         listings: list[tuple[dict, str]] = []
         for name, feed in self.feeds.items():
             for e in self._listings(name, feed):
@@ -1156,7 +1165,24 @@ class CuratedListSource(Source):
                 ats = detect_ats_from_url(url)
                 if ats not in _CURATED_ATS or not url or url in seen:
                     continue
+                # Apply the cheap title/company/spam gates + repost dedup HERE — BEFORE the
+                # title-relevance sort below — so a staffing repost (keyword-stuffed OR a clean-
+                # titled Consultadd/DellFor dupe) never wins a max_resolve JD-fetch slot over a
+                # real role (decision 122 open item). apply_gates repeats these for other sources.
+                title = clean(e.get("title", ""))
+                company = clean(e.get("company_name", ""))
+                tl, cl = title.lower(), company.lower()
+                if self.title_exclude and any(x in tl for x in self.title_exclude):
+                    continue
+                if self.company_exclude and any(x in cl for x in self.company_exclude):
+                    continue
+                if self.filter_spam and is_staffing_spam(title):
+                    continue
+                key = (cl.strip(), _norm_title(title))
+                if key != ("", "") and key in seen_key:
+                    continue
                 seen.add(url)
+                seen_key.add(key)
                 listings.append((e, ats))
 
         listings.sort(

@@ -266,6 +266,48 @@ def test_dedup_collapses_same_company_title_reposts_with_distinct_urls():
     assert stats["gate_duplicate"] == 2
 
 
+# ---------------------------------------------------------------------------
+# staffing-spam title detector + gate
+# ---------------------------------------------------------------------------
+
+def test_is_staffing_spam_flags_bodyshop_tells_only():
+    from applicationbot.filters import is_staffing_spam
+    spam = [
+        "Java Developer - Need Locals - Need GC and USC",
+        "Python Developer (C2C)",
+        "Software Engineer - Corp to Corp",
+        "Data Engineer - W2 only",
+        "Developer - Multiple Positions",
+        "QA - USC and GC",
+    ]
+    real = [
+        "Associate Software Engineer - Java",     # 'usc'/'gc' NOT present as tokens
+        "Software Engineer, University Grad",
+        "Backend Developer (Options trading)",    # 'opt' inside 'options' must NOT match
+        "Full Stack Developer - React",
+        "New Grad Software Engineer",
+        "Software Engineer II",
+    ]
+    assert all(is_staffing_spam(t) for t in spam), [t for t in spam if not is_staffing_spam(t)]
+    assert not any(is_staffing_spam(t) for t in real), [t for t in real if is_staffing_spam(t)]
+
+
+def test_staffing_spam_gate_drops_and_toggles_off():
+    on = DiscoveryFilters()  # filter_staffing_spam defaults True
+    postings = [
+        _p("USM", "Java Developer - Need Locals - Need GC and USC", "https://x/1"),  # spam
+        _p("Real Co", "Associate Software Engineer - Java", "https://x/2"),          # kept
+    ]
+    stats = {}
+    kept = apply_gates(postings, on, stats=stats)
+    assert [p.url for p in kept] == ["https://x/2"]
+    assert stats["gate_spam"] == 1
+    # Toggle off → the spam posting passes (a contractor who wants C2C roles).
+    off = DiscoveryFilters(filter_staffing_spam=False)
+    kept_off = apply_gates(postings, off)
+    assert len(kept_off) == 2
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:

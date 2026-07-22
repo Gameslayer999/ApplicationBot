@@ -66,11 +66,13 @@ def test_builtin_and_dropped_in_feeds_merge_and_dedup(feeds):
 
 def test_max_resolve_is_a_global_budget_across_feeds(feeds):
     """max_resolve caps the whole run, not each feed — adding boards must not multiply cost."""
+    # Distinct titles so the repost-dedup pass (decision 123) never collapses these — this test
+    # is about the max_resolve budget, not dedup.
     feeds[discovery._BUILTIN_FEEDS["new-grad"]] = [
-        _listing(url=f"https://boards.greenhouse.io/a/jobs/{i}") for i in range(5)
+        _listing(title=f"SWE gh {i}", url=f"https://boards.greenhouse.io/a/jobs/{i}") for i in range(5)
     ]
     feeds["https://raw.githubusercontent.com/who/ever/main/listings.json"] = [
-        _listing(url=f"https://jobs.lever.co/b/{i:08x}") for i in range(5)
+        _listing(title=f"SWE lv {i}", url=f"https://jobs.lever.co/b/{i:08x}") for i in range(5)
     ]
     src = CuratedListSource(
         _resume(), kinds=("new-grad",), max_resolve=3,
@@ -148,9 +150,10 @@ def test_build_sources_passes_feeds_through_to_the_source():
 
 
 def test_workday_and_smartrecruiters_now_survive_the_curated_filter(feeds):
+    # Distinct titles so repost-dedup (decision 123) keeps both — this test is about ATS survival.
     feeds[discovery._BUILTIN_FEEDS["new-grad"]] = [
-        _listing(url="https://kla.wd1.myworkdayjobs.com/Search/job/Ann-Arbor-MI/Eng_1"),
-        _listing(url="https://jobs.smartrecruiters.com/Acme/743999"),
+        _listing(title="SWE Workday", url="https://kla.wd1.myworkdayjobs.com/Search/job/Ann-Arbor-MI/Eng_1"),
+        _listing(title="SWE SmartRecruiters", url="https://jobs.smartrecruiters.com/Acme/743999"),
     ]
     out = CuratedListSource(_resume(), kinds=("new-grad",)).fetch()
     assert sorted(p.ats for p in out) == ["smartrecruiters", "workday"]
