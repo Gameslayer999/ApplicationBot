@@ -97,6 +97,36 @@ and free-form notes.
 
 ## Now
 
+### Confirm Adzuna auto-apply click-through (decision 120) — BLOCKED ON USER
+
+The user flagged that Adzuna postings gate the real ATS behind an **"Apply for this job"** button.
+Live investigation showed the gate (`www.adzuna.com/land/…`) sits behind a **CloudFront WAF that
+403s "Access Denied"** to every automated client from the build environment — `urllib`, real
+headless Chromium, *and* headed Chromium with a warmed session; even the adzuna.com homepage 403s
+here, so it's an **IP/edge block**, not a UA issue. So the gate can't be resolved server-side
+(parsing its HTML would mean evading a WAF — Guideline #4). **Chosen fix (decision 120):** let the
+real browser click the gate at **apply time** — the bridge now tags Adzuna `browser_gated` and stops
+dropping it (`discovery.py` `_BROWSER_GATED_ATS`), and `_open_application_form` already clicks
+`\bapply\b` ("Apply for this job" matches) then re-derives the ATS from the resulting frame. Added a
+fail-fast `_is_adzuna_access_wall` check so a WAF-blocked user gets the real reason, not a 25s hang.
+**Could NOT verify the happy path from the build env (its IP is WAF-blocked).**
+
+- [ ] **USER (from your own residential network):** run a discovery pass that surfaces an Adzuna
+  posting, then dry-run apply to it and report which happens:
+  ```
+  python -m applicationbot.apply "<the adzuna redirect_url>" \
+      --pdf "<your résumé>.pdf" --resume profile/resume.yaml --headless --no-pause --no-record --dry-run
+  ```
+  - **Fields fill** → the click-through works end-to-end; decision 120 is complete. (If `report.ats`
+    still says "adzuna", the destination ATS wasn't one `_ats_from_frame` recognizes — generic
+    autofill handled it; consider extending `_ats_from_frame` if a common ATS shows up.)
+  - **"Adzuna blocked this browser … Access Denied"** → your IP is WAF-blocked too. Apply by hand;
+    **do not** build evasion (Guideline #4). If it's persistent, consider dropping Adzuna to
+    discovery/track-only (like USAJobs) so the pipeline stops queueing un-appliable Adzuna hits.
+  - **"form did not load" (no wall)** → the land page loaded but "Apply for this job" wasn't clicked
+    (different control text) or a later page gates the form — capture the land-page HTML/screenshot so
+    the reveal selector can be tuned.
+
 ### Confirm the SmartRecruiters "I'm interested" reveal fix (decision 098) — BLOCKED ON USER
 
 The user re-drove `jobs.smartrecruiters.com/Consultadd4/87644936` from their own network and got
@@ -506,6 +536,117 @@ value ÷ effort:
       fillability predicate (`pipeline._is_fillable`, `discovery.py`). Adding a
       discovery-only source to that dict would silently assert an apply adapter exists.
 
+### Discovery source expansion — research 2026-07-22 (free sources only; decision 114)
+
+> Turnkey catalog from the 2026-07-22 landscape research (live-tested endpoints where marked
+> ✅). **User's chosen order: widen the funnel FIRST, then wire these in. Free sources only.**
+> Reframe (confirms 073): source count is *not* today's bottleneck — throughput is. Do step 0
+> before adding sources, or the additions yield ~zero real gain (the pool is already ~50x
+> oversubscribed).
+
+**Step 0 — widen the funnel (do this first).** Extends the "Discovery funnel" tasks above:
+- [x] **Diagnose first: per-stage funnel breakdown (decision 115, 2026-07-22).** Before touching
+      any threshold, added a `funnel` dict on `PipelineResult` counting survivors after each stage
+      (discovered → per-gate drops → skip-seen → fillability → keyword `min_skills` → `top_n` judged),
+      surfaced by `pipeline._print_funnel()` in the CLI + runner and a collapsible `renderFunnel()`
+      in the Discover scan UI ("N of M postings reached the fit judge", each drop stage + count).
+      `apply_gates` gained an optional `stats` out-param for per-gate attribution. This is the
+      measurement baseline for the changes below — **run a real scan and read the funnel to see
+      where the user's postings actually die** before picking thresholds.
+- [ ] **Drop / relax the fillability gate** (user-approved 2026-07-22): stop silently setting aside
+      Workday/iCIMS postings pre-judge — the user wants to *see* apps we can't yet auto-apply to, to
+      train the software for them. Let them through to the matcher and surface them (judged, flagged
+      "manual apply for now") rather than hiding them. Measure the before/after with the funnel above.
+- [ ] **Lift the `top_n` cap / let high keyword-score postings qualify** (user-approved): rank #21+ is
+      currently dead on arrival (`cleared_queue` needs `fit_score is not None`). Raise `top_n` and/or
+      allow strong keyword-only matches to clear. The funnel's "matched but never judged" row measures this.
+- [ ] **Soften keyword matching** (user-approved): synonym/alias map + light stemming in
+      `relevance.mentions` so "React.js"/"Postgres"/"JS" match; consider `min_skills` 2→1. The funnel's
+      "under keyword floor" row measures this.
+- [ ] Raise / auto-tune `early_career.max_resolve` (default 40). It is *also* the Claude-judge
+      cost knob, so pair the bump with a cheaper judge and a visible count.
+- [ ] **Cheapen + batch the judge** so more postings clear per dollar: a Haiku pre-rank pass
+      over the resolved pool before the frontier judge, and/or batch the judge calls.
+- [x] **Surface "judged 40 of N"** in the CLI + Discover tab — done as the funnel breakdown above
+      (decision 115; UI Principle #5 — silent truncation reads as "we looked at everything").
+
+**Step 1 — wire in new FREE sources, tiered by bang-for-buck.** All keyless / free-tier. Fit
+the existing `Source` interface in `discovery.py`; most are **discovery/track-only** (see the
+apply-capability note at the end).
+
+*Tier 1 — new public ATS feeds (keyless JSON/XML, employer-direct apply URL, same lane we
+already trust). Highest breadth-per-effort:*
+
+| ATS | Endpoint (list → detail) | Format | Notes |
+|---|---|---|---|
+| **Workday CxS** | `POST https://{tenant}.wd{N}.myworkdayjobs.com/wday/cxs/{tenant}/{site}/jobs` (body `{"limit":20,"offset":0,"searchText":"","appliedFacets":{}}`) → `GET .../job/{path}` | JSON | **Biggest enterprise coverage.** We already resolve Workday JDs; complete it as a *discovery* source. Discovery per-tenant needs 3 vars: `tenant` + `wd{N}` cluster + `site` (parse all 3 from the `myworkdayjobs.com` URL). Rate-limit hard (429/IP-block). No clean submit. |
+| **BambooHR** ✅ | `https://{co}.bamboohr.com/careers/list` → `/careers/{id}/detail` | JSON | Huge SMB footprint. Detail has **comp**, `isRemote`, `datePosted`, and a `formFields` map of the apply form. Gotchas: **soft-404** (HTTP 200 + empty body — inspect JSON, not status), and **bot-UA detection** (blocks UA containing "JobBot" — use a normal UA). |
+| **Rippling** ✅ | `https://ats.rippling.com/api/v2/board/{slug}/jobs?page=0&pageSize=100` → `/jobs/{uuid}` | JSON | `workplaceType` = ON_SITE/REMOTE/HYBRID. Description only on detail. ~1.3k companies. |
+| **Breezy** ✅ | `https://{slug}.breezy.hr/json?verbose=true` (follow 302) | JSON | Single request returns full descriptions + `location.is_remote`. ~2k companies. |
+| **Personio** ✅ | `https://{co}.jobs.personio.de/xml?language=en` (also `.com` twin) | XML | **DACH-heavy.** `?language=en` may still return German. `search.json` is NOT public — use `/xml`. Blind slug guessing 307-redirects to personio.com (verify each). |
+| **Teamtailor** ✅ | `https://{slug}.teamtailor.com/jobs.rss?per_page=200&offset=N` | RSS/XML | JSON API is **token-only** (admin-minted) — RSS is the only third-party read. Needs per-company hostname (often a custom domain). |
+| **Comeet** | `https://www.comeet.co/careers-api/2.0/company/{uid}/positions?token={token}&details=true` | JSON | Documented public careers API, but needs `uid`+`token` — both are **non-secret**, scraped from the careers-page widget JS. Medium-high effort. |
+
+*Tier 2 — free aggregator / search APIs (keyword/salary/remote filters at the TOP of the
+funnel; these expose real apply links, unlike Adzuna/Jooble/Careerjet redirects):*
+
+| Source | Endpoint | Apply link | Notes |
+|---|---|---|---|
+| **JSearch** (RapidAPI) | `GET https://jsearch.p.rapidapi.com/search?query=...&remote_jobs_only=true` | ✅ `apply_options[]` (+`is_direct` flag) | Broadest — aggregates Google-for-Jobs (LinkedIn/Indeed/etc. *results*, not their APIs). **Free tier quota is tiny (~200–500/mo)** — use sparingly / cache hard. |
+| **USAJobs** ✅ | `GET https://data.usajobs.gov/api/search` (headers: `User-Agent: <your email>`, `Authorization-Key`) | ✅ `ApplyURI` | Free, unlimited, `RemoteIndicator` filter, `ResultsPerPage` max 500. **Federal only — routes into non-autofillable gov portals, so discovery/track-only** (matches the 030 note). |
+| **Himalayas** | `GET https://himalayas.app/jobs/api?limit=20&offset=0` | ✅ `applicationLink` | Remote, structured salary + seniority. |
+| **RemoteOK** | `GET https://remoteok.com/api?tag=python` (skip element 0 = legal notice) | ✅ `apply_url` | Remote/tech. Attribution + backlink required. |
+| **Findwork.dev** | `GET https://findwork.dev/api/jobs/?search=...&remote=true` (header `Authorization: Token KEY`) | ✅ often direct | Free key, daily cap. |
+| **The Muse** | `GET https://www.themuse.com/api/public/jobs?category=...&level=...` | ⚠ `landing_page` hop | Curated/narrow; 3,600/hr with a free key. Low priority (already noted in the Discover-stage section). |
+| **HN "Who is hiring"** | Algolia: find thread via `hn.algolia.com/api/v1/search?query=Ask HN Who is hiring&author_whoishiring` → `?tags=comment,story_{ID}&hitsPerPage=1000` | ❌ free text | High-signal startup/remote roles, **unstructured** — NLP-parse the email/URL out of each post. Free, ~10k req/hr. |
+
+> **Don't add more redirect-only aggregators.** Adzuna is already wired and the aggregator→ATS
+> bridge (decision 032) resolves its redirects; Jooble/Careerjet hide the real apply URL the
+> same way, so they add nothing the bridge doesn't already cover.
+
+**Step 2 — the durable scaling lever: a free-built `company → {ats, token, cluster, site}`
+table.** Every Tier-1 ATS needs per-company slugs and **there is no public tenant directory for
+any of them** — this table, not any single fetcher, is what unlocks reach beyond the ~handful of
+hand-listed boards in `profile/discovery.yaml`. Build it free, in leverage order:
+- [ ] **Common Crawl** — grep the index for `boards-api.greenhouse.io/v1/boards/`,
+      `api.lever.co/v0/postings/`, `myworkdayjobs.com/wday/cxs`, `.bamboohr.com/careers`,
+      `ats.rippling.com`, `.breezy.hr`, etc. → thousands of real tokens without touching a site
+      (free dataset; AWS compute only).
+- [ ] **Career-page fingerprinting** — given a company domain, fetch `/careers`, detect the ATS
+      from embed markers (`boards.greenhouse.io/embed`, `jobs.lever.co/{co}`,
+      `api.ashbyhq.com/posting-api`, `apply.workable.com/{co}`, `myworkdayjobs.com`,
+      `.recruitee.com`, …) and extract the token. Highest precision; turns "companies I care
+      about" → tokens.
+- [ ] **Seeds:** Google/Bing dorks (`site:boards.greenhouse.io`, `site:ats.rippling.com`, …),
+      **crt.sh / CT logs** for `careers.company.com → {ats}` CNAMEs, and OSS token lists.
+- [ ] **Validate every token live** before trusting it, and **re-validate on a schedule**
+      (companies switch ATS; lists rot). The per-ATS fetchers become thin wrappers over this
+      table.
+
+**Excluded — big consumer boards (do NOT build; unchanged from decisions 030/032).**
+LinkedIn / Indeed / Glassdoor / ZipRecruiter / Wellfound / Monster: public job-search APIs are
+dead or partner-gated (Indeed Publisher API retired ~2024, Glassdoor closed 2021, LinkedIn Jobs
+API is posting-only). Legally, scraping *public* pages survives CFAA (hiQ v. LinkedIn, Van
+Buren) but **breach-of-contract is a live, winning claim — hiQ paid LinkedIn $500k** — and these
+sit behind DataDome/Cloudflare whose defeat violates Guideline #4.
+
+**Engineering notes for the wire-in (carry over the 073/074 traps):**
+- **Don't overload `ATS_SOURCES`** — it doubles as the fillability predicate
+  (`pipeline._is_fillable`). Most new sources are **discovery/track-only**; adding them there
+  would silently assert an apply adapter exists. Separate "can discover" from "can autofill".
+- **Apply capability:** autofill still happens via the browser for the ATSs Apply already
+  handles. Only **Lever / SmartRecruiters / Recruitee** expose a public candidate-submit *API* —
+  and **Recruitee's public `POST .../offers/{slug}/candidates` is a real, irreversible submit
+  that emails the applicant**, so it must sit behind the `dry_run`/arm safety switch (Guideline
+  #3). Everything else = discovery/track-only until browser autofill covers its form.
+- **Salary is unreliable everywhere** except **Ashby** (structured) and, when the employer fills
+  it, **Lever**/**Recruitee** (often null). Parse from HTML or expect it absent.
+- **Unify the two ATS detectors** (`discovery.detect_ats_from_url` vs `apply.detect_ats`) before
+  adding sources — they already drift (073).
+- **Be a good citizen:** obey `robots.txt`, honest identifying User-Agent, ~1–2 req/s per host,
+  back off on 429/503, cache aggressively. These are careers-site/widget-backing surfaces (not
+  contractually-guaranteed APIs) — throttle conservatively; paths can change without notice.
+
 ### Test-suite hygiene (observed 2026-07-15)
 
 - [x] **`test_mailbox.py::test_load_config_needs_all_three` leaked a real secret when it
@@ -643,6 +784,57 @@ Posted to the agent bus 2026-07-06; independent of the engine work above.
 ---
 
 ## Recently added (this session, latest first)
+
+- 2026-07-22 — **Goal mode for the web auto-apply loop (decision 121).** The loop can now run
+  until **N applications are ready to review + submit** (the decision-069 Ready-to-apply queue),
+  with a user-chosen behaviour when N is reached: **Stop** (end the loop) or **Maintain N** (keep
+  topping up as you apply to ready ones, until you Stop or the boards run dry). Discover-tab panel
+  gained a "Goal: stop when N application(s) are ready" number input (blank = prepare everything, the
+  old behaviour) + a "Keep topping up to the goal" toggle; the Ready header shows "(2 of 5 goal)".
+  Core: `autoloop.auto_apply_loop` took four optional injected params (`ready_count`, `goal`,
+  `maintain`, `wait`) + a `goal_reached` return — `goal=None` is byte-identical to before, so the
+  CLI runner and every other caller are untouched. `web.py` supplies `ready_count`/`wait` (a
+  stop-responsive `_LOOP_STOP.wait(2.0)`), stores `goal`/`maintain` in loop state, and messages the
+  `holding`/`goal_reached` phases. 7 new tests (5 core + 2 web); full suite **396 passed** (2
+  pre-existing bot_wall failures unrelated); served JS `node --check` clean. **Open:** goal counts
+  only *this run's* ready queue (matches the panel, which resets each Start) — pre-existing clean
+  dry-run rows from an earlier run aren't pre-seeded into the count. If the user wants "N ready total
+  across runs," pre-seed `ready_ids` at Start from the tracker's clean dry-run rows.
+
+- 2026-07-22 — **"Test aggregators" live probe + editable remote-board toggles (decision 119).**
+  New **Test aggregators** button in Discovery settings: `POST /aggregators/test` builds only the
+  aggregator sources (current form values merged over saved config), clamps breadth so it's fast,
+  and renders one ✓/✗ row per source — sample count + a sample title, or the exact error. Also
+  added the Himalayas/RemoteOK toggles (+ `max_results`) to the form and to `collectDisc`, closing a
+  latent bug where saving the form silently reset decision-117's `remote_boards` to off. Live-probed:
+  Himalayas 20, RemoteOK 25, early-career 5; Adzuna reachable/0 under clamp; Google surfaced its
+  non-functional error. The read-only "Where your postings come from" panel now also lists the
+  **Remote aggregators (keyless)** row and, when hand-enabled, a **Google Jobs** (non-functional)
+  row — every configurable source now appears in both the editor and the overview. **Open:** Google
+  Jobs stays hidden from the editor form (non-functional by design).
+
+- 2026-07-22 — **Discovery-settings UI clarity: "Target companies" rename, aggregators-first order,
+  pinned Save (decision 118).** Renamed the "Target boards" field to **Target companies** everywhere
+  user-facing (it's one company's ATS board per row, which read like a general job board). Reordered
+  the Discovery-settings modal so **broad aggregators** (Adzuna + early-career feeds, with a lead
+  intro) come first and the specific **Target companies** list + Filters + Matching follow. Pinned
+  "Save settings" to a non-scrolling modal footer (flex-column modal, internally-scrolling body) so
+  users no longer scroll to the bottom to save. UI-only — the `boards` YAML key / `Board` model are
+  unchanged, so existing `profile/discovery.yaml` files keep working.
+
+- 2026-07-22 — **Discovery-source landscape research → free-only expansion roadmap (decision 114).**
+  Researched job APIs / boards / crawling to broaden discovery (four+ agents, live-tested
+  endpoints). Recorded as a turnkey catalog under **Next → "Discovery source expansion — research
+  2026-07-22"** and logged decision 114. Headline: the bottleneck is **funnel throughput, not
+  source count** (confirms 073) — so the plan is **widen the funnel first** (raise `max_resolve`,
+  cheapen/batch the judge, surface "40 of N judged"), **then** wire in **free** sources
+  (Tier-1 keyless ATS: Workday CxS / BambooHR / Rippling / Breezy / Personio-XML / Teamtailor-RSS;
+  Tier-2 aggregators with real apply links: JSearch free / USAJobs / Himalayas / RemoteOK /
+  Findwork / HN-hiring). The durable lever is a free-built **`company → {ats, token, cluster,
+  site}` table** (Common Crawl + career-page fingerprinting + dorks/crt.sh/OSS seeds) — no ATS
+  has a public tenant directory. Big consumer boards (LinkedIn/Indeed/Glassdoor/…) stay excluded
+  (030/032; hiQ paid LinkedIn $500k on contract grounds; Guideline #4). **Research only — no code
+  written.**
 
 - 2026-07-21 — **Sidebar logomark + browser-tab favicon; logomark unified into one `--lm` var.**
   Replaced the sidebar `📄` emoji with the real logomark (`<span class="brand-logo">`) and added a
@@ -1960,6 +2152,50 @@ Record each decision in [DECISIONS.md](DECISIONS.md) once the user chooses.
 
 ## Recently completed
 
+- 2026-07-22 — **Keyless remote aggregators: Himalayas + RemoteOK as opt-in sources** (decision 117).
+  Public JSON APIs, no signup, no scraping, no JS. `HimalayasSource`/`RemoteOKSource` in
+  `discovery.py`, tagged as aggregators (ride the existing bridge). New `RemoteBoardsConfig`
+  (`himalayas`/`remoteok`/`max_results`), opt-in/off by default. Himalayas salary is annualized so
+  monthly figures don't trip the salary gate; RemoteOK is filtered by profile-derived single-word
+  skill tags and uses the remoteok listing URL as the required attribution backlink. Live-verified
+  both return valid Postings. **Deferred (need API keys, not keyless):** USAJobs (federal, gov
+  portals) + Findwork — add later as opt-in-with-key sources if wanted.
+
+- 2026-07-22 — **Discovery fine-tuning: Adzuna multi-query expansion + Google Jobs scraper (found non-functional)** (decision 116).
+  Adzuna now runs each profile-derived term as its own focused `what` query (merged+deduped) with
+  server-side `max_days_old`/`sort_by=date`, defaults raised to `max_pages=3`/`max_queries=4` — the
+  aggregator was badly underused (one blob, 50 results). Vendored JobSpy's ~120-line Google Jobs
+  slice into `applicationbot/google_jobs.py` (MIT, proxy-free, no pandas) as an opt-in
+  `GoogleJobsSource` — **but a live test showed Google now renders the Jobs vertical client-side**,
+  so the keyless GET returns a JS shell with no job data. It fails loudly + is off by default +
+  documented non-functional. **Open decision:** to make Google Jobs work, either add a
+  headless-browser render path (Playwright is already a dep) or pivot to keyless JSON aggregators
+  that need no JS (Himalayas/RemoteOK/USAJobs/Findwork — decision 114 roadmap). See "Step 0 — widen
+  the funnel" and "Discovery source expansion" above.
+
+- 2026-07-22 — **Diagnose-first: per-stage discovery→match funnel breakdown** (decision 115).
+  First step of decision 114's "widen the funnel first" — but the user's call was to *diagnose with
+  logging first*. Added a `funnel` dict on `PipelineResult` counting survivors after each stage
+  (discovered → per-gate drops → skip-seen → fillability → keyword `min_skills` → `top_n` judged);
+  `apply_gates(postings, filters, stats=None)` gained an optional out-param for per-gate attribution
+  (back-compatible — all callers unchanged). Rendered by `pipeline._print_funnel()` in the CLI
+  preview + autonomous runner, and a collapsible `renderFunnel()` in the Discover scan UI
+  ("N of M postings reached the fit judge", each drop stage + count — UI Principle #5). Confirmed on
+  a synthetic 240-posting run that the biggest silent losses are the fillability gate and the `top_n`
+  cap. **No thresholds changed yet** — this is the measurement baseline for the fillability-gate
+  removal, keyword-softening, and `top_n` lift queued under "Step 0 — widen the funnel". Verified:
+  synthetic real-pipeline run attributes each stage correctly; `renderFunnel` JS unit-checked in node;
+  page serves 200; 85 pipeline/funnel/gate/discovery/match/web tests pass.
+
+- 2026-07-22 — **Tracker card blocker + description cleanup** (decision 113). Removed the
+  table-era description blurb under "Application tracker" (it described inline-edit / column
+  resize/hide, none of which apply to the default card feed). Blocked applications now show a
+  short "⚠ what blocked" line on their feed card (parking label + `blocked_detail` tooltip),
+  reusing `parking.describe(...)` — the same source as the Resolve cards — attached in `/track`
+  as `app.blocker`/`app.blocker_detail`. New `.fc-blocker` CSS. Also confirmed token tracking is
+  entirely local (all `usage_events` reads hit the git-ignored local `applications.db`) and
+  reworded the discovery/judging spend caption from "shared across candidates" to "Your Claude
+  spend … tracked locally on this machine".
 - 2026-07-21 — **Hybrid Claude connection: subscription primary, API-key fallback** (decision
   111). Verified (with sources) that a separate "log in with Claude" on the **subscription** is
   impossible + ToS-banned for a third-party app — the Messages API rejects subscription OAuth and

@@ -75,7 +75,7 @@ def _test_reset() -> dict:
     return {
         "phase": "running", "step": "start",
         "message": "Starting…", "elapsed_note": "",
-        "scanned": 0, "matched": 0, "judged": 0, "judged_total": 0,
+        "scanned": 0, "matched": 0, "judged": 0, "judged_total": 0, "funnel": {},
         "from_cache": False, "cache_age_min": None, "can_research": False,
         "chosen": None, "report": None, "errors": [],
     }
@@ -101,12 +101,12 @@ def _test_worker(force_fresh: bool = False) -> None:
             profile = None
 
         if not filters.boards and not filters.adzuna.app_id:
-            _set(phase="error", errors=["No target boards in profile/discovery.yaml. Add some in the Discover tab."])
+            _set(phase="error", errors=["No discovery sources configured. Add a broad aggregator or a target company in the Discover tab."])
             return
 
         use_claude = backends.claude_code_available()
-        _set(step="discover", message=("Re-searching every board (ignoring cache)…" if force_fresh
-                                       else "Discovering postings from your target boards…"))
+        _set(step="discover", message=("Re-searching every source (ignoring cache)…" if force_fresh
+                                       else "Discovering postings from your sources…"))
 
         def on_judge(done, total):
             _set(step="match", judged=done, judged_total=total,
@@ -136,7 +136,7 @@ def _test_worker(force_fresh: bool = False) -> None:
         _set(scanned=res.discovered, matched=len(res.matches), errors=res.errors,
              skipped_seen=res.skipped_seen, skipped_shown=res.skipped_shown, judged=judged,
              min_fit=min_fit, calib_note=calib_note, from_cache=res.from_cache,
-             cache_age_min=cache_age_min)
+             cache_age_min=cache_age_min, funnel=res.funnel)
         if not res.matches:
             extra = ["No new postings matched your qualifications."]
             if res.skipped_shown:
@@ -343,14 +343,14 @@ def start_reapply(app_id: int, *, arm: bool = False, retailor: bool = False) -> 
 
 _LOOP_LOCK = threading.Lock()
 _LOOP_STATE: dict = {"running": False, "phase": "idle", "message": "", "prepared": 0,
-                     "ready_ids": [], "current": None}
+                     "ready_ids": [], "current": None, "goal": None, "maintain": False}
 _LOOP_STOP = threading.Event()
 _LOOP_SUBMITS: list[int] = []  # app-ids the user clicked "Apply" on, awaiting the loop thread
 
 
 def _loop_reset() -> dict:
     return {"running": True, "phase": "starting", "message": "Starting…",
-            "prepared": 0, "ready_ids": [], "current": None}
+            "prepared": 0, "ready_ids": [], "current": None, "goal": None, "maintain": False}
 
 
 def _loop_set(**kw) -> None:
@@ -415,7 +415,8 @@ def _loop_take_submits() -> list[int]:
     return ids
 
 
-def _loop_worker(rescan: bool = False, force_retailor: bool = False) -> None:
+def _loop_worker(rescan: bool = False, force_retailor: bool = False,
+                 goal: int | None = None, maintain: bool = False) -> None:
     from . import autoloop, backends, pipeline
     from .filters import load_filters
     from .runner import cleared_queue
@@ -435,7 +436,7 @@ def _loop_worker(rescan: bool = False, force_retailor: bool = False) -> None:
             return
         if not filters.boards and not (filters.adzuna.app_id or os.environ.get("ADZUNA_APP_ID")):
             _loop_set(running=False, phase="error", message=(
-                "No target boards in Discovery settings. Add boards, then start the loop."))
+                "No discovery sources in Discovery settings. Add a broad aggregator or a target company, then start the loop."))
             return
 
         min_fit, _ = pipeline.effective_min_fit(filters)
@@ -496,6 +497,10 @@ def _loop_worker(rescan: bool = False, force_retailor: bool = False) -> None:
                 if row and row.get("status") == "dry-run" and row["id"] not in _LOOP_STATE["ready_ids"]:
                     _LOOP_STATE["ready_ids"].append(row["id"])
 
+        def ready_count() -> int:
+            with _LOOP_LOCK:
+                return len(_LOOP_STATE["ready_ids"])
+
         def on_event(kind, payload=None):
             if kind == "searching":
                 _loop_set(phase="searching", current=None,
@@ -503,16 +508,30 @@ def _loop_worker(rescan: bool = False, force_retailor: bool = False) -> None:
             elif kind == "caught_up":
                 _loop_set(phase="caught_up",
                           message="Caught up — no new matches to prepare.")
+            elif kind == "goal_reached" and maintain:
+                # Holding at the goal in maintain mode: idle until the user applies to some.
+                n = payload if isinstance(payload, int) else ready_count()
+                _loop_set(phase="holding", current=None, message=(
+                    f"Holding at your goal of {goal} ready — apply to some and the loop will "
+                    f"refill to keep {goal} ready. Stop anytime."))
 
         reason = autoloop.auto_apply_loop(
             discover_batch, prepare_one, _loop_take_submits, _loop_submit,
-            _LOOP_STOP.is_set, on_event=on_event)
+            _LOOP_STOP.is_set, on_event=on_event,
+            ready_count=ready_count, goal=goal, maintain=maintain,
+            # A stop-responsive idle for maintain mode: waits up to 2s, returns at once on Stop.
+            wait=lambda: _LOOP_STOP.wait(2.0))
 
-        with _LOOP_LOCK:
-            ready_n = len(_LOOP_STATE["ready_ids"])
-        if reason == "caught_up":
+        ready_n = ready_count()
+        if reason == "goal_reached":
+            _loop_set(running=False, phase="goal_reached", current=None, message=(
+                f"Reached your goal — {ready_n} application(s) ready for you to review and "
+                "apply. Apply to them below, or start the loop again to prepare more."))
+        elif reason == "caught_up":
+            short = (f" (fewer than your goal of {goal} — the boards had no more new matches)"
+                     if goal is not None and ready_n < goal else "")
             _loop_set(running=False, phase="caught_up", current=None, message=(
-                f"Caught up — no new matches. {ready_n} application(s) ready for you to apply. "
+                f"Caught up — no new matches. {ready_n} application(s) ready for you to apply{short}. "
                 "Start the loop again later to re-search."))
         else:
             _loop_set(running=False, phase="stopped", current=None,
@@ -521,7 +540,14 @@ def _loop_worker(rescan: bool = False, force_retailor: bool = False) -> None:
         _loop_set(running=False, phase="error", message=f"{type(e).__name__}: {e}")
 
 
-def start_loop(rescan: bool = False, force_retailor: bool = False) -> dict:
+def start_loop(rescan: bool = False, force_retailor: bool = False,
+               goal: int | None = None, maintain: bool = False) -> dict:
+    # Goal mode (decision 121): prepare until `goal` applications are ready to review/submit.
+    # None/0/negative ⇒ no target (run boards to exhaustion, the pre-goal behaviour).
+    if goal is not None and goal <= 0:
+        goal = None
+    if goal is None:
+        maintain = False  # "keep topping up" only means something with a target
     with _LOOP_LOCK:
         if _LOOP_STATE.get("running"):
             return {"ok": False, "error": "The auto-apply loop is already running."}
@@ -529,7 +555,10 @@ def start_loop(rescan: bool = False, force_retailor: bool = False) -> dict:
         _LOOP_SUBMITS.clear()
         _LOOP_STATE.clear()
         _LOOP_STATE.update(_loop_reset())
-    threading.Thread(target=_loop_worker, args=(rescan, force_retailor), daemon=True).start()
+        _LOOP_STATE["goal"] = goal
+        _LOOP_STATE["maintain"] = maintain
+    threading.Thread(target=_loop_worker, args=(rescan, force_retailor, goal, maintain),
+                     daemon=True).start()
     return {"ok": True}
 
 
@@ -551,6 +580,65 @@ def queue_submit(app_id: int) -> dict:
     if running:
         return {"ok": True, "queued": True}
     return start_reapply(app_id, arm=True)
+
+
+def test_aggregators(data: dict | None) -> dict:
+    """Live-probe every broad aggregator the user has configured (Adzuna, early-career feeds,
+    Google Jobs, Himalayas, RemoteOK) and report per source whether it's reachable and how many
+    postings a quick sample returned — or the exact error. Uses the settings passed from the
+    editor (so the user can test before saving), falling back to the saved config. Company ATS
+    boards are excluded: this tests only the aggregators. Expensive knobs (page/query/resolve
+    counts) are clamped low so the probe stays fast — it validates keys/connectivity/results,
+    not full volume."""
+    from .discovery import (AdzunaSource, CuratedListSource, DiscoveryError,
+                            GoogleJobsSource, HimalayasSource, RemoteOKSource)
+
+    try:
+        if data:
+            # Merge the editor's values OVER the saved config, so aggregators the form doesn't
+            # expose (e.g. Google Jobs) keep their saved settings and are still probed.
+            base = filters.load_filters().model_dump()
+            base.update(data)
+            f = filters.DiscoveryFilters.model_validate(base)
+        else:
+            f = filters.load_filters()
+    except Exception as e:
+        return {"error": f"invalid discovery settings: {type(e).__name__}: {e}"}
+    # Aggregators only, quick sample: never poll per-company boards here, and cap the expensive
+    # breadth knobs so a test returns in seconds instead of running a full discovery.
+    f = f.model_copy(deep=True)
+    f.boards = []
+    f.career_sites = []
+    f.adzuna.max_queries = min(f.adzuna.max_queries, 1)
+    f.adzuna.max_pages = min(f.adzuna.max_pages, 1)
+    f.google.max_queries = min(f.google.max_queries, 1)
+    f.google.results_wanted = min(f.google.results_wanted, 10)
+    f.remote_boards.max_results = min(f.remote_boards.max_results, 25)
+    f.early_career.max_resolve = min(f.early_career.max_resolve, 5)
+
+    try:
+        resume = load_resume("profile/resume.yaml")
+    except Exception:
+        resume = None
+    try:
+        profile = apply_profile.load_profile()
+    except Exception:
+        profile = None
+
+    AGG = (AdzunaSource, GoogleJobsSource, HimalayasSource, RemoteOKSource, CuratedListSource)
+    sources = [s for s in filters.build_sources(f, resume, profile) if isinstance(s, AGG)]
+    results = []
+    for src in sources:
+        try:
+            posts = src.fetch()
+            results.append({"name": src.name, "ok": True, "count": len(posts),
+                            "sample": (posts[0].title if posts else "")})
+        except DiscoveryError as e:
+            results.append({"name": src.name, "ok": False, "error": str(e)})
+        except Exception as e:  # defensive: a malformed field shouldn't 500 the test
+            results.append({"name": src.name, "ok": False,
+                            "error": f"unexpected {type(e).__name__}: {e}"})
+    return {"ok": True, "results": results, "resume": resume is not None}
 
 
 def list_resumes() -> list[dict[str, str]]:
@@ -803,6 +891,11 @@ class Handler(BaseHTTPRequestHandler):
                     "enabled": f.early_career.enabled,
                     "kinds": f.early_career.kinds,
                 },
+                "remote_boards": {
+                    "himalayas": f.remote_boards.himalayas,
+                    "remoteok": f.remote_boards.remoteok,
+                },
+                "google": {"enabled": f.google.enabled},
                 "bridge": {"enabled": True, "upgrade_ats": list(ATS_SOURCES)},
             })
             return
@@ -816,7 +909,7 @@ class Handler(BaseHTTPRequestHandler):
             # every run up front (the runs themselves are fetched lazily on expand, /track/runs).
             # `has_jd` gates the "Re-tailor" re-run option — true only when a saved JD lets it run
             # offline (decision 086); postings that predate the JD sidecar show reuse-only.
-            from . import resume_store
+            from . import resume_store, parking
             rc = tracker.run_counts()
             # Claude token spend per posting, keyed by source URL (decision 095) — attached so the
             # Track table can show a per-application Tokens column that expands to the in/out split
@@ -826,6 +919,12 @@ class Handler(BaseHTTPRequestHandler):
                 a["run_count"] = rc.get(a["id"], 0)
                 a["has_jd"] = resume_store.has_jd(a.get("resume_path", ""))
                 a["tokens"] = usage_by.get((a.get("source_url") or "").strip())
+                # A short "what blocked" line for the feed card, reusing the parking
+                # labels/details that drive the Resolve cards (single source of truth).
+                if a.get("status") == "blocked" and a.get("blocked_kind"):
+                    d = parking.describe(a["blocked_kind"], a.get("blocked_detail", ""))
+                    a["blocker"] = d["label"]
+                    a["blocker_detail"] = d["detail"]
             self._json(200, {
                 "applications": apps,
                 "counts": tracker.status_counts(),
@@ -1048,6 +1147,9 @@ class Handler(BaseHTTPRequestHandler):
                 p = json.loads(raw or b"{}")
                 filters.save_filters(filters.DiscoveryFilters.model_validate(p["data"]))
                 self._json(200, {"ok": True})
+            elif path == "/aggregators/test":
+                p = json.loads(raw or b"{}")
+                self._json(200, test_aggregators(p.get("data")))
             elif path == "/fit-insights/apply":
                 # One-click accept of a learned recommendation (decision 046): merge one
                 # {field: value} into discovery.yaml. Only fields the analyzer proposes
@@ -1094,7 +1196,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, {"ok": True})
             elif path == "/loop/start":
                 p = json.loads(raw or b"{}")
-                self._json(200, start_loop(bool(p.get("rescan")), bool(p.get("retailor"))))
+                try:
+                    goal = int(p["goal"]) if p.get("goal") not in (None, "") else None
+                except (TypeError, ValueError):
+                    goal = None
+                self._json(200, start_loop(bool(p.get("rescan")), bool(p.get("retailor")),
+                                           goal=goal, maintain=bool(p.get("maintain"))))
             elif path == "/loop/stop":
                 self._json(200, stop_loop())
             elif path == "/loop/apply":
@@ -1251,7 +1358,9 @@ INDEX_HTML = """<!doctype html>
      Apify/Bright Data "statistics" look. The value is proportional sans (big numbers read
      loose in tabular-nums); the sub-line + meter carry magnitude and stage conversion. */
   .mtiles { display:grid; grid-template-columns:repeat(auto-fit, minmax(118px, 1fr)); gap:10px; margin:4px 0 16px; }
-  .mtiles.tight { max-width:840px; }
+  /* Funnel/spend tiles fill the full track-view width — no mid-screen cap (they auto-fit more
+     tiles per row as the window widens). */
+  .mtiles.tight { max-width:none; }
   .mtile { border:1px solid var(--line); border-radius:10px; padding:11px 13px; background:var(--surface); }
   .mtile-label { font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:.03em; color:var(--muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .mtile-val { font-size:24px; font-weight:700; letter-spacing:-.02em; color:var(--strong); line-height:1.1; margin-top:3px; }
@@ -1530,6 +1639,24 @@ INDEX_HTML = """<!doctype html>
   .tmsg { margin-top:8px; font-size:14px; color:var(--ink); }
   .tmeta { margin-top:6px; font-size:12px; color:var(--muted); }
   .tmeta.cache { color:var(--ink); }
+  .sfunnel { margin-top:10px; font-size:12px; }
+  .sfunnel > summary { cursor:pointer; color:var(--muted); user-select:none; }
+  .sfunnel > summary:hover { color:var(--ink); }
+  .sfunnel > summary b { color:var(--ok-text); }
+  .sfbody { margin:8px 0 2px; }
+  /* Only two columns (label + main); the drop-reason stacks UNDER the bar inside .sfmain so it
+     never steals width from the track — that kept a longer reason from shrinking its own bar. */
+  .sfrow { display:grid; grid-template-columns:150px 1fr; gap:10px; align-items:center; padding:3px 0; }
+  .sflabel { color:var(--ink); text-align:right; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .sfmain { min-width:0; }
+  .sftrack { position:relative; background:var(--field); border-radius:4px; height:20px; width:100%; }
+  .sfbar { height:100%; border-radius:4px; background:var(--accent); transition:width .3s ease; }
+  .sfrow.sfkept .sfbar { background:var(--ok); }
+  .sfcount { position:absolute; left:8px; top:0; line-height:20px; font-family:var(--mono);
+             font-variant-numeric:tabular-nums; color:var(--strong); font-size:11px; }
+  .sfdrop { margin-top:3px; color:var(--bad); font-family:var(--mono); font-size:11px; }
+  .sfreason { color:var(--muted); font-family:inherit; margin-left:4px; }
+  @media (max-width:520px) { .sfrow { grid-template-columns:1fr; } .sflabel { text-align:left; } }
   .linklike { background:none; border:none; padding:0; margin-left:8px; color:var(--accent-text);
               font:inherit; text-decoration:underline; cursor:pointer; }
   .linklike:disabled { color:var(--muted); text-decoration:none; cursor:default; }
@@ -1579,6 +1706,11 @@ INDEX_HTML = """<!doctype html>
   .loopstat.err::before { color:var(--bad); }
   .loopstat .lp-count { margin-left:auto; font-weight:700; color:var(--muted); white-space:nowrap; }
   .loop-ready-head { font-weight:700; font-size:13.5px; margin:16px 0 8px; }
+  .loop-goal { display:flex; align-items:center; gap:6px; flex-wrap:wrap; margin-top:12px;
+               font-size:12.5px; color:var(--muted); text-transform:none; letter-spacing:normal;
+               font-weight:400; }
+  .loop-goal input[type=number] { width:64px; margin:0; padding:4px 6px; text-align:center;
+               font-size:13px; }
   .loop-apply { width:auto; margin:0; background:#b3261e; border-color:#b3261e; color:#fff; }
   .loop-apply:hover { background:#8f1e18; border-color:#8f1e18; }
   .loop-apply:disabled { opacity:.6; }
@@ -1670,6 +1802,9 @@ INDEX_HTML = """<!doctype html>
   .fcard .fc-main { flex:1; min-width:0; }
   .fcard .fc-title { font-size:14px; font-weight:600; color:var(--strong); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .fcard .fc-meta { font-size:12px; color:var(--muted); margin-top:3px; font-family:var(--mono); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  /* Why a blocked application is parked — a short "what blocked" line under the metadata. */
+  .fcard .fc-blocker { font-size:12px; color:var(--warn); margin-top:4px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .fcard .fc-blocker::before { content:"⚠ "; }
   .fcard .fc-fit { font-size:12px; font-weight:700; color:var(--muted); font-family:var(--mono); flex:none; }
   /* Metadata string — tight, borderless, •-separated (e.g. greenhouse • dry-run • 2 runs). */
   .metaline { color:var(--muted); font-size:12px; }
@@ -1723,14 +1858,21 @@ INDEX_HTML = """<!doctype html>
   /* Centered modal (Discovery settings). */
   .modal-scrim { position:fixed; inset:0; background:rgba(0,0,0,.45); z-index:112; display:flex; align-items:flex-start; justify-content:center; padding:44px 20px; overflow:auto; }
   .modal-scrim.hidden { display:none; }
-  .modal { background:var(--surface); border:1px solid var(--line); border-radius:12px; width:740px; max-width:100%; box-shadow:var(--shadow); }
-  .modal-head { display:flex; align-items:center; gap:10px; padding:15px 20px; border-bottom:1px solid var(--line); position:sticky; top:0; background:var(--surface); border-radius:12px 12px 0 0; z-index:1; }
+  /* Flex column with a capped height: the head and the save footer stay put while only
+     the body scrolls, so "Save settings" is always pinned within reach (no scroll-to-bottom). */
+  .modal { display:flex; flex-direction:column; max-height:calc(100vh - 88px); background:var(--surface); border:1px solid var(--line); border-radius:12px; width:740px; max-width:100%; box-shadow:var(--shadow); }
+  .modal-head { flex:0 0 auto; display:flex; align-items:center; gap:10px; padding:15px 20px; border-bottom:1px solid var(--line); background:var(--surface); border-radius:12px 12px 0 0; }
   .modal-head h3 { margin:0; flex:1; font-size:16px; }
   .modal-x { width:auto; margin:0; padding:4px 10px; background:var(--surface-2); color:var(--muted); border:1px solid var(--line); font-size:15px; line-height:1; }
   .modal-x:hover { color:var(--ink); border-color:var(--muted); filter:none; }
-  .modal-body { padding:18px 20px; }
-  .modal-body .saverow { position:static; background:transparent; padding:14px 0 0; }
-  .modal-body .saverow::after { display:none; }
+  .modal-body { flex:1 1 auto; overflow-y:auto; padding:18px 20px; }
+  .modal-foot { flex:0 0 auto; display:flex; align-items:center; gap:12px; padding:14px 20px; border-top:1px solid var(--line); background:var(--surface); border-radius:0 0 12px 12px; }
+  .modal-foot button { width:auto; margin:0; }
+  /* Per-aggregator test results (Discovery settings): one ✓/✗ row per probed source. */
+  .agg-test-out { margin-top:8px; display:flex; flex-direction:column; gap:5px; }
+  .agg-res { font-size:12.5px; line-height:1.4; display:flex; align-items:baseline; gap:7px; }
+  .agg-dot { width:8px; height:8px; border-radius:50%; flex:0 0 auto; align-self:center; }
+  .agg-dot.ok { background:var(--ok); } .agg-dot.err { background:var(--bad); }
   /* Accessibility: a clearly visible keyboard-focus ring on every interactive control
      (mouse clicks don't trigger :focus-visible, so this never shows on click). */
   a:focus-visible, button:focus-visible, .tab:focus-visible, [tabindex]:focus-visible,
@@ -1801,6 +1943,15 @@ INDEX_HTML = """<!doctype html>
           background dry-run — they stack up below as <b>Ready to apply</b>. Click <b>Apply&nbsp;▶</b>
           on one to submit just that application (confirms first). Stop anytime.</p>
         <span id="loop-msg" class="msg"></span>
+        <div class="loop-goal">
+          <label>Goal: stop when
+            <input type="number" id="loop-goal" min="1" step="1" placeholder="∞" inputmode="numeric">
+            application(s) are ready to apply</label>
+          <span class="rl-h" id="loop-goal-hint">Leave blank to prepare every match the boards return.</span>
+        </div>
+        <label class="loop-rescan" id="loop-maintain-wrap"><input type="checkbox" id="loop-maintain">
+          <span class="rl-main"><span class="rl-t">Keep topping up to the goal</span>
+          <span class="rl-h">As you apply to ready ones, keep discovering &amp; preparing so the goal-many stay ready. Off = stop once the goal is reached.</span></span></label>
         <label class="loop-rescan"><input type="checkbox" id="loop-rescan">
           <span class="rl-main"><span class="rl-t">Re-prepare postings I've already seen</span>
           <span class="rl-h">Re-fills every match from the last search, reusing cached fit scores &amp; tailored résumés — no Claude spend when nothing changed.</span></span></label>
@@ -1832,8 +1983,8 @@ INDEX_HTML = """<!doctype html>
       <div class="disc-grid">
         <div class="editor" id="sources-overview">
           <h3 style="margin-top:0">Where your postings come from</h3>
-          <p class="editing tight">Every source feeding discovery — target boards by ATS, the
-            aggregator, early-career feeds, and the aggregator→ATS bridge.</p>
+          <p class="editing tight">Every source feeding discovery — broad aggregators, early-career
+            feeds, target companies by ATS, and the aggregator→ATS bridge.</p>
           <div id="sources-body">Loading…</div>
         </div>
         <div class="editor" id="fit-insights" style="display:none">
@@ -1946,11 +2097,6 @@ INDEX_HTML = """<!doctype html>
       <div class="editor track-editor">
         <header class="page-head">
           <h2 class="page-title">Application tracker</h2>
-          <p class="page-sub">Every application the pipeline discovered, tailored, and (in
-            <code>dry_run</code>) would have submitted — the local system of record
-            (<code>applications.db</code>, git-ignored). Edit any cell inline; changes save
-            as you go. <b>Drag a column's right edge to resize it</b>, and use <b>Columns</b>
-            to hide any you don't need — your layout is remembered on this browser.</p>
         </header>
         <div id="track-scores" class="scorecards"></div>
         <div id="track-counts" class="tcounts"></div>
@@ -2001,10 +2147,10 @@ INDEX_HTML = """<!doctype html>
       <p class="editing tight">Control what the bot searches and how it filters matches — no config
         files to touch. Saved to <code>profile/discovery.yaml</code> (git-ignored).</p>
       <div id="disc-form">Loading…</div>
-      <div class="saverow">
-        <button id="save-disc">Save settings</button>
-        <span id="disc-msg" class="msg"></span>
-      </div>
+    </div>
+    <div class="modal-foot">
+      <button id="save-disc">Save settings</button>
+      <span id="disc-msg" class="msg"></span>
     </div>
   </div>
 </div>
@@ -2438,6 +2584,53 @@ function testStepList(s) {
   }).join("");
 }
 
+function renderScanFunnel(f, judged, minFit) {
+  // Visual bar funnel: one horizontal bar per stage, width ∝ postings still alive, with the drop
+  // (−N + reason) called out at each narrowing. Shows WHERE postings are lost (diagnose-first).
+  // No-op on cache hits (funnel isn't recomputed) or before a run has data.
+  if (!f || !f.discovered) return "";
+  const disc = f.discovered;
+  const stages = [{label:"Discovered", count:disc, drop:0, reason:""}];
+  if (f.after_gates != null) {
+    const gmap = {gate_title:"title-exclude", gate_level:"experience level", gate_remote:"remote-only",
+                  gate_salary:"below min salary", gate_stale:"too old"};
+    const parts = [];
+    for (const k in gmap) if (f[k]) parts.push(`${f[k]} ${gmap[k]}`);
+    stages.push({label:"Passed coarse gates", count:f.after_gates, drop:disc - f.after_gates,
+                 reason:parts.join(" · ") || "gates"});
+  }
+  if (f.skipped_seen) stages.push({label:"Not already in tracker", count:f.after_seen,
+                 drop:f.skipped_seen, reason:"already in your tracker"});
+  if (f.non_fillable) stages.push({label:"On a fillable portal", count:f.into_matcher,
+                 drop:f.non_fillable, reason:"Workday / iCIMS — can't auto-fill yet"});
+  const nSkills = f.min_skills != null ? f.min_skills : 1;
+  stages.push({label:`Matched your skills (≥${nSkills})`, count:f.matched != null ? f.matched : 0,
+                 drop:f.keyword_dropped || 0, reason:"too few skill keywords in the posting"});
+  const nJudged = f.judged != null ? f.judged : 0;
+  stages.push({label:`Judged for fit by Claude`, count:nJudged,
+                 drop:Math.max(0, (f.matched || 0) - nJudged),
+                 reason:`past the top-${f.top_n != null ? f.top_n : "N"} judge cap — never scored`});
+  // Final stage: of those judged, how many cleared the fit bar (the number that actually "gets through").
+  if (Array.isArray(judged) && minFit != null) {
+    const cleared = judged.filter(j => j.cleared).length;
+    stages.push({label:`Cleared min-fit ≥${minFit}`, count:cleared, drop:Math.max(0, nJudged - cleared),
+                 reason:`judged below ${minFit}/100`, kept:true});
+  }
+  const rows = stages.map(s => {
+    const pct = Math.max(1.5, Math.round(100 * s.count / disc));  // keep a sliver visible even at ~0
+    const drop = s.drop ? `<div class="sfdrop">−${s.drop} <span class="sfreason">${escapeHtml(s.reason)}</span></div>` : "";
+    return `<div class="sfrow${s.kept ? " sfkept" : ""}">`
+         + `<div class="sflabel">${escapeHtml(s.label)}</div>`
+         + `<div class="sfmain"><div class="sftrack"><div class="sfbar" style="width:${pct}%"></div>`
+         + `<span class="sfcount">${s.count}</span></div>${drop}</div></div>`;
+  }).join("");
+  const lost = disc - (stages[stages.length-1].count);
+  return `<details class="sfunnel" open><summary>Search funnel — `
+       + `<b>${stages[stages.length-1].count}</b> of ${disc} postings got through`
+       + `${lost>0 ? ` · ${lost} dropped along the way` : ""}</summary>`
+       + `<div class="sfbody">${rows}</div></details>`;
+}
+
 function renderChosen(s) {
   const c = s.chosen; if (!c) return "";
   const fit = (c.fit_score!=null) ? `<span class="fitpill">fit ${c.fit_score}/100 ${c.qualified?'✓ qualified':'✗ not qualified'}</span>` : "";
@@ -2492,6 +2685,7 @@ async function pollTest() {
     body += `<div class="tbar"><div class="tbarfill" style="width:${pct}%"></div></div>`;
   }
   if (s.scanned) body += `<div class="tmeta">Scanned ${s.scanned} postings · ${s.matched} matched your skills${s.skipped_seen ? ` · ${s.skipped_seen} already in tracker skipped` : ""}</div>`;
+  body += renderScanFunnel(s.funnel, s.judged, s.min_fit);
   if (s.from_cache) {
     const m = s.cache_age_min || 0;
     const age = m < 90 ? `${m} min ago` : `${Math.round(m/60)}h ago`;
@@ -2553,6 +2747,9 @@ function renderLoop(s) {
   stop.classList.toggle("hidden", !running);
   $("loop-rescan").disabled = running;
   $("loop-retailor").disabled = running;
+  $("loop-goal").disabled = running;
+  // "Keep topping up" only means something with a goal set; disable it otherwise.
+  $("loop-maintain").disabled = running || !$("loop-goal").value.trim();
   if (running || (s.message && s.phase !== "idle")) {
     status.classList.remove("hidden");
     status.className = "loopstat" + (s.phase === "error" ? " err" : "");
@@ -2566,7 +2763,11 @@ function renderLoop(s) {
   const list = (s && s.ready) || [];
   ready.innerHTML = "";
   if (list.length) {
-    ready.appendChild(el("div", {class:"loop-ready-head", text:"Ready to apply (" + list.length + ")"}));
+    // With a goal, show progress toward it (e.g. "Ready to apply (2 of 5 goal)").
+    const head = s.goal ? "Ready to apply (" + list.length + " of " + s.goal + " goal"
+                          + (s.maintain ? ", topping up)" : ")")
+                        : "Ready to apply (" + list.length + ")";
+    ready.appendChild(el("div", {class:"loop-ready-head", text: head}));
     list.forEach(a => ready.appendChild(loopReadyCard(a)));
   }
 }
@@ -2613,13 +2814,23 @@ async function applyReady(id, btn, who) {
   }
 }
 
+// "Keep topping up" is meaningless without a goal — gate it on the goal input live.
+$("loop-goal").addEventListener("input", () => {
+  const noGoal = !$("loop-goal").value.trim();
+  $("loop-maintain").disabled = noGoal;
+  if (noGoal) $("loop-maintain").checked = false;
+});
+
 $("loop-start").addEventListener("click", async () => {
   const btn = $("loop-start"), msg = $("loop-msg");
   msg.className = "msg"; msg.textContent = "";
   btnBusy(btn, "Starting…");
   try {
     const rescan = $("loop-rescan").checked, retailor = $("loop-retailor").checked;
-    const r = await (await fetch("/loop/start", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({rescan, retailor})})).json();
+    const goalRaw = $("loop-goal").value.trim();
+    const goal = goalRaw ? parseInt(goalRaw, 10) : null;
+    const maintain = $("loop-maintain").checked;
+    const r = await (await fetch("/loop/start", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({rescan, retailor, goal, maintain})})).json();
     btnDone(btn);
     if (!r.ok) { msg.className = "msg err"; msg.textContent = r.error || "Could not start."; return; }
     pollLoop();
@@ -2853,7 +3064,10 @@ function feedCard(app) {
   const title = (app.company || "—") + (app.role ? "  ·  " + app.role : "");
   const meta = el("div", {class:"fc-meta"}, [metaString([
     app.portal, app.location, app.run_count ? app.run_count + (app.run_count == 1 ? " run" : " runs") : null])]);
-  const kids = [el("div", {class:"fc-main"}, [el("div", {class:"fc-title", text:title}), meta])];
+  const mainKids = [el("div", {class:"fc-title", text:title}), meta];
+  if (app.blocker)
+    mainKids.push(el("div", {class:"fc-blocker", title:app.blocker_detail || "", text:app.blocker}));
+  const kids = [el("div", {class:"fc-main"}, mainKids)];
   if (app.fit_score != null && app.fit_score !== "") kids.push(el("span", {class:"fc-fit", text:"fit " + app.fit_score}));
   kids.push(stbadge(app.status));
   const card = el("button", {class:"fcard", type:"button", on:{click:() => openDrawer(app)}}, kids);
@@ -2968,7 +3182,8 @@ function renderUsageDiscovery(u) {
   const rows = Object.keys(u.by_activity || {}).map(k => [k, u.by_activity[k]])
     .sort((a, b) => b[1].total_tokens - a[1].total_tokens);
   const cap = el("div", {class:"tu-cap",
-    text:"Discovery & judging spend (all-time) — shared across candidates, not charged to any one application."});
+    text:"Your Claude spend on discovery & judging (all-time), tracked locally on this machine — "
+      + "it covers finding and scoring postings, so it isn't charged to any one application."});
   const tiles = el("div", {class:"mtiles tight"}, [
     mtile("Total tokens", fmtTokens(u.total_tokens), grp(u.total_tokens) + " · " + u.calls + (u.calls === 1 ? " call" : " calls")),
     mtile("Input", fmtTokens(u.input_tokens), grp(u.input_tokens)),
@@ -4016,21 +4231,74 @@ function boardRow(b) {
   b = b || {};
   const sel = el("select", {class:"f bd-ats"}, ["greenhouse","lever","ashby","smartrecruiters","recruitee","workable"].map(a => el("option", {value:a, text:a})));
   sel.value = b.ats || "greenhouse";
-  const tok = el("input", {class:"f bd-token", placeholder:"board token / company slug — e.g. stripe", value:b.token || ""});
+  const tok = el("input", {class:"f bd-token", placeholder:"company slug — e.g. stripe", value:b.token || ""});
   const row = el("div", {class:"brd-row"});
-  const del = el("button", {class:"del", type:"button", text:"✕", title:"Remove board", on:{click:()=>row.remove()}});
+  const del = el("button", {class:"del", type:"button", text:"✕", title:"Remove company", on:{click:()=>row.remove()}});
   row.append(sel, tok, del);
   return row;
 }
 function renderDiscForm(f, levels) {
   const form = $("disc-form"); form.innerHTML = "";
 
+  // Broad aggregators come first: they search across many companies and are the biggest lever
+  // on how much discovery surfaces. The specific target-company list comes after them.
+  const aggTestOut = el("div", {id:"agg-test-out", class:"agg-test-out"});
+  const aggTestBtn = el("button", {class:"addbtn", type:"button", text:"Test aggregators",
+    title:"Live-probe every configured aggregator with your current settings and report how many postings each returns — or the exact error",
+    on:{click:()=>testAggregators(aggTestBtn, aggTestOut)}});
+  form.appendChild(el("div", {class:"sec"}, [
+    el("h4", {text:"Broad aggregators"}),
+    el("div", {class:"editing", text:"Wide sources that search across many companies at once — the main drivers of how much discovery finds. Set these up first; your specific target companies come after."}),
+    aggTestBtn, aggTestOut,
+  ]));
+
+  const a = f.adzuna || {};
+  form.appendChild(el("div", {class:"sec"}, [
+    el("h4", {text:"Adzuna aggregator (optional)"}),
+    el("div", {class:"editing"}, [
+      "A broad job aggregator spanning many companies. Get a free key at ",
+      el("a", {href:"https://developer.adzuna.com", target:"_blank", rel:"noopener", text:"developer.adzuna.com"}),
+      " and paste it below — or use your own by setting the ",
+      el("code", {text:"ADZUNA_APP_ID"}), " / ", el("code", {text:"ADZUNA_APP_KEY"}),
+      " environment variables. Leave blank to search only your target companies below. Aggregator hits are auto-bridged to their real ATS and upgraded to the full job description.",
+    ]),
+    fld("App ID", "adz_app_id", a.app_id),
+    fld("App key", "adz_app_key", a.app_key),
+    fld("Country code — e.g. us", "adz_country", a.country || "us"),
+    numFld("Max pages to fetch (50 results each)", "adz_max_pages", a.max_pages==null?1:a.max_pages),
+  ]));
+
+  const ec = f.early_career || {};
+  const kinds = ec.kinds || ["new-grad","intern"];
+  const kindBox = (v,label) => { const i = mkChk(null, kinds.includes(v)); i.dataset.eck = v; return el("label", {class:"chkrow"}, [i, " " + label]); };
+  form.appendChild(el("div", {class:"sec"}, [
+    el("h4", {text:"Early-career feeds (new-grad & internships)"}),
+    el("div", {class:"editing", text:"Discover from community-curated GitHub lists of new-grad and internship roles — early-career by construction, no company list needed. Best when your target companies are senior-heavy. Only roles on ATSs we can fill (Greenhouse/Lever/Ashby/Workday/SmartRecruiters) are used."}),
+    chkRow("Enable early-career feeds", "ec_enabled", ec.enabled),
+    el("label", {text:"Include"}),
+    el("div", {class:"lvls"}, [kindBox("new-grad","new-grad"), kindBox("intern","internships")]),
+    numFld("How many top-matching listings to pull full descriptions for (per run)", "ec_max_resolve", ec.max_resolve==null?40:ec.max_resolve),
+    area("Extra GitHub job boards (one raw listings.json URL per line; any repo using the SimplifyJobs schema)", "ec_feeds",
+         (ec.feeds||[]).map(x => typeof x === "string" ? x : x.url).join("\\n"),
+         "https://raw.githubusercontent.com/<owner>/<repo>/<branch>/.github/scripts/listings.json"),
+  ]));
+
+  const rb = f.remote_boards || {};
+  form.appendChild(el("div", {class:"sec"}, [
+    el("h4", {text:"Remote aggregators (keyless)"}),
+    el("div", {class:"editing", text:"Public remote-job APIs — no signup, no key. Remote-only by construction, so most useful when you want remote roles; your filters still drop what doesn't fit."}),
+    chkRow("Himalayas", "rb_himalayas", rb.himalayas),
+    chkRow("RemoteOK", "rb_remoteok", rb.remoteok),
+    numFld("Max results each contributes before filtering", "rb_max_results", rb.max_results==null?100:rb.max_results),
+  ]));
+
+  // Specific target companies — each is one company's public ATS board, polled directly.
   const boards = el("div", {id:"disc-boards", class:"cards"}, (f.boards||[]).map(boardRow));
-  const addBoard = el("button", {class:"addbtn", type:"button", text:"+ Add board",
+  const addBoard = el("button", {class:"addbtn", type:"button", text:"+ Add company",
     on:{click:()=>boards.appendChild(boardRow({}))}});
   form.appendChild(el("div", {class:"sec"}, [
-    el("h4", {text:"Target boards"}), boards, addBoard,
-    el("div", {class:"editing", text:"Companies whose public ATS board to poll. Read the token/slug off the careers URL: boards.greenhouse.io/<token>, jobs.lever.co/<slug>, jobs.ashbyhq.com/<name>, jobs.smartrecruiters.com/<Company>, <company>.recruitee.com, apply.workable.com/<account>."}),
+    el("h4", {text:"Target companies"}), boards, addBoard,
+    el("div", {class:"editing", text:"Specific companies whose public ATS board we poll directly. Read the slug off the company's careers URL: boards.greenhouse.io/<token>, jobs.lever.co/<slug>, jobs.ashbyhq.com/<name>, jobs.smartrecruiters.com/<Company>, <company>.recruitee.com, apply.workable.com/<account>."}),
   ]));
 
   const lvlBoxes = el("div", {class:"lvls"}, levels.map(l => {
@@ -4054,37 +4322,6 @@ function renderDiscForm(f, levels) {
     chkRow("Auto-raise minimum fit above a score band your recorded outcomes prove gets no responses", "calibrate_min_fit", f.calibrate_min_fit),
     chkRow("Skip postings already in my tracker (don't re-surface)", "skip_seen", f.skip_seen),
     area("Aggregator search keywords (one per line; empty = derive from your résumé)", "keywords", (f.keywords||[]).join("\\n")),
-  ]));
-
-  const ec = f.early_career || {};
-  const kinds = ec.kinds || ["new-grad","intern"];
-  const kindBox = (v,label) => { const i = mkChk(null, kinds.includes(v)); i.dataset.eck = v; return el("label", {class:"chkrow"}, [i, " " + label]); };
-  form.appendChild(el("div", {class:"sec"}, [
-    el("h4", {text:"Early-career feeds (new-grad & internships)"}),
-    el("div", {class:"editing", text:"Discover from community-curated GitHub lists of new-grad and internship roles — early-career by construction, no company list needed. Best when your target boards are senior-heavy. Only roles on ATSs we can fill (Greenhouse/Lever/Ashby/Workday/SmartRecruiters) are used."}),
-    chkRow("Enable early-career feeds", "ec_enabled", ec.enabled),
-    el("label", {text:"Include"}),
-    el("div", {class:"lvls"}, [kindBox("new-grad","new-grad"), kindBox("intern","internships")]),
-    numFld("How many top-matching listings to pull full descriptions for (per run)", "ec_max_resolve", ec.max_resolve==null?40:ec.max_resolve),
-    area("Extra GitHub job boards (one raw listings.json URL per line; any repo using the SimplifyJobs schema)", "ec_feeds",
-         (ec.feeds||[]).map(x => typeof x === "string" ? x : x.url).join("\\n"),
-         "https://raw.githubusercontent.com/<owner>/<repo>/<branch>/.github/scripts/listings.json"),
-  ]));
-
-  const a = f.adzuna || {};
-  form.appendChild(el("div", {class:"sec"}, [
-    el("h4", {text:"Adzuna aggregator (optional)"}),
-    el("div", {class:"editing"}, [
-      "A broad job aggregator beyond your target boards. Get a free key at ",
-      el("a", {href:"https://developer.adzuna.com", target:"_blank", rel:"noopener", text:"developer.adzuna.com"}),
-      " and paste it below — or use your own by setting the ",
-      el("code", {text:"ADZUNA_APP_ID"}), " / ", el("code", {text:"ADZUNA_APP_KEY"}),
-      " environment variables. Leave blank to search only the boards above. Aggregator hits are auto-bridged to their real ATS and upgraded to the full job description.",
-    ]),
-    fld("App ID", "adz_app_id", a.app_id),
-    fld("App key", "adz_app_key", a.app_key),
-    fld("Country code — e.g. us", "adz_country", a.country || "us"),
-    numFld("Max pages to fetch (50 results each)", "adz_max_pages", a.max_pages==null?1:a.max_pages),
   ]));
 }
 const discEl = k => $("disc-form").querySelector('[data-k="' + k + '"]');
@@ -4118,6 +4355,11 @@ function collectDisc() {
       max_resolve: discInt("ec_max_resolve", 40),
       feeds: linesOf(discVal("ec_feeds")),
     },
+    remote_boards: {
+      himalayas: discChk("rb_himalayas"),
+      remoteok: discChk("rb_remoteok"),
+      max_results: discInt("rb_max_results", 100),
+    },
   };
 }
 async function loadDisc() {
@@ -4143,6 +4385,38 @@ async function saveDisc() {
 }
 $("save-disc").addEventListener("click", saveDisc);
 
+// Live-probe the configured aggregators (uses the CURRENT form values, so you can test before
+// saving). Renders one ✓/✗ row per source with its sample count or exact error (UI Principle #3/#5).
+async function testAggregators(btn, out) {
+  btnBusy(btn, "Testing…");
+  const stop = busyInto(out, "Probing each aggregator…", true);
+  try {
+    const r = await (await fetch("/aggregators/test", { method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ data: collectDisc() }) })).json();
+    stop(); out.innerHTML = "";
+    if (r.error) throw new Error(r.error);
+    const res = r.results || [];
+    if (!res.length) {
+      out.appendChild(el("div", {class:"editing", text:"No aggregators configured to test. Add an Adzuna key, or enable early-career feeds / Himalayas / RemoteOK, then test again."}));
+      return;
+    }
+    for (const s of res) {
+      const row = el("div", {class:"agg-res"});
+      const detail = s.ok
+        ? (s.count > 0
+            ? s.count + " posting" + (s.count === 1 ? "" : "s") + " in a quick sample" + (s.sample ? " — e.g. “" + s.sample + "”" : "")
+            : "reachable, but 0 postings for your profile in a quick sample")
+        : s.error;
+      row.append(el("span", {class:"agg-dot " + (s.ok ? "ok" : "err")}),
+                 el("b", {text:s.name}), el("span", {text:" — " + detail}));
+      out.appendChild(row);
+    }
+    if (r.resume === false)
+      out.appendChild(el("div", {class:"editing", text:"No profile/resume.yaml found — Adzuna, Google, RemoteOK and early-career feeds need a résumé to derive search terms, so they were skipped."}));
+  } catch (e) { stop(); out.innerHTML = ""; out.appendChild(el("div", {class:"msg err", text:String(e.message || e)})); }
+  finally { btnDone(btn); }
+}
+
 // ---- Sources overview (read-only "where & how" for the Discover tab) ----
 function srcRow(label, text){ return el("div", {class:"editing"}, [el("b", {text: label + ": "}), text]); }
 async function loadSources(){
@@ -4153,7 +4427,7 @@ async function loadSources(){
     if (s.error) throw new Error(s.error);
     box.innerHTML = "";
     const bk = Object.keys(s.boards_by_ats || {});
-    box.appendChild(srcRow("Target boards",
+    box.appendChild(srcRow("Target companies",
       bk.length ? bk.map(a => a + " (" + s.boards_by_ats[a].join(", ") + ")").join("  ·  ")
                 : "none yet — add some in Discovery settings below"));
     const agg = s.aggregator || {};
@@ -4163,6 +4437,14 @@ async function loadSources(){
     const ec = s.early_career || {};
     box.appendChild(srcRow("New-grad & internship feeds",
       ec.enabled ? ("on (" + (ec.kinds || []).join(", ") + ")") : "off"));
+    const rb = s.remote_boards || {};
+    const rbOn = [rb.himalayas && "Himalayas", rb.remoteok && "RemoteOK"].filter(Boolean);
+    box.appendChild(srcRow("Remote aggregators (keyless)",
+      rbOn.length ? ("on — " + rbOn.join(", ")) : "off"));
+    // Google Jobs is off by design (non-functional, decision 116) — only surface it if hand-enabled.
+    if ((s.google || {}).enabled)
+      box.appendChild(srcRow("Google Jobs",
+        "on — but currently non-functional (Google renders Jobs client-side); use another aggregator"));
     box.appendChild(srcRow("Aggregator→ATS bridge",
       "on — aggregator hits are resolved to their real ATS and upgraded to the full job description"));
     box.appendChild(el("div", {class:"editing", text:"Forms we can auto-fill: " + (s.fillable_ats || []).join(", ") + "."}));

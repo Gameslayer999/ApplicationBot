@@ -73,6 +73,30 @@ def test_loop_prepares_batch_and_reaches_caught_up(fake_pipeline):
         assert web._LOOP_STATE["phase"] == "caught_up"
 
 
+def test_goal_stops_after_reaching_target(fake_pipeline):
+    # goal=1 (decision 121): prepare until one application is ready, then stop — the second
+    # match in the batch is never prepared, and the phase is goal_reached (not caught_up).
+    assert web.start_loop(goal=1)["ok"] is True
+    assert _wait_until(lambda: not web._loop_running()), "loop did not finish"
+    assert fake_pipeline["prepared"] == ["http://x/1"]
+    with web._LOOP_LOCK:
+        assert web._LOOP_STATE["ready_ids"] == [1]
+        assert web._LOOP_STATE["phase"] == "goal_reached"
+        assert web._LOOP_STATE["goal"] == 1
+
+
+def test_goal_zero_and_negative_mean_no_target(fake_pipeline):
+    # A non-positive goal is treated as "no target" (runs the boards to exhaustion), and
+    # maintain is forced off when there's no goal.
+    assert web.start_loop(goal=0, maintain=True)["ok"] is True
+    assert _wait_until(lambda: not web._loop_running()), "loop did not finish"
+    assert fake_pipeline["prepared"] == ["http://x/1", "http://x/2"]
+    with web._LOOP_LOCK:
+        assert web._LOOP_STATE["phase"] == "caught_up"
+        assert web._LOOP_STATE["goal"] is None
+        assert web._LOOP_STATE["maintain"] is False
+
+
 def test_rescan_reuses_cached_scores_without_rejudging(fake_pipeline):
     # rescan=True re-prepares the whole cached set once, reusing cached fit scores — it must
     # NOT call the Claude judge (discover_and_match) and must be a bounded one-shot.

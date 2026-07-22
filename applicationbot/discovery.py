@@ -407,21 +407,30 @@ class AdzunaSource(Source):
         app_key: str,
         *,
         what: str = "",
+        whats: list[str] | None = None,
         where: str = "",
         country: str = "us",
         results_per_page: int = 50,
         max_pages: int = 1,
         salary_min: int = 0,
+        max_days_old: int = 0,
+        sort_by: str = "",
     ) -> None:
         self.app_id = app_id
         self.app_key = app_key
-        self.what = what
+        # Run each query as its OWN focused `what` search (e.g. "Backend Engineer", "Python") and
+        # merge+dedup, instead of one broad `what_or` blob — each query returns results ranked for
+        # that term, widening real coverage of the candidate's profile. `whats` (the focused list)
+        # takes precedence; `what` stays for single-query back-compat.
+        self.whats = [q for q in (whats if whats is not None else [what]) if q]
         self.where = where
         self.country = country.lower()
         self.results_per_page = results_per_page
         self.max_pages = max_pages
         self.salary_min = salary_min
-        self.name = f"adzuna:{country}:{what[:30]}"
+        self.max_days_old = max_days_old  # server-side recency gate (Adzuna `max_days_old`); 0 = off
+        self.sort_by = sort_by  # e.g. "date" for freshest-first when paginating; "" = Adzuna default
+        self.name = f"adzuna:{country}:{','.join(self.whats)[:40]}"
 
     def fetch(self) -> list[Posting]:
         if not (self.app_id and self.app_key):
@@ -429,46 +438,240 @@ class AdzunaSource(Source):
         from urllib.parse import urlencode
 
         out: list[Posting] = []
-        for page in range(1, self.max_pages + 1):
-            params = {
-                "app_id": self.app_id,
-                "app_key": self.app_key,
-                "results_per_page": self.results_per_page,
-                "content-type": "application/json",
-            }
-            if self.what:
-                params["what_or"] = self.what  # match ANY of the space-separated terms
-            if self.where:
-                params["where"] = self.where
-            if self.salary_min:
-                params["salary_min"] = self.salary_min
-            url = f"https://api.adzuna.com/v1/api/jobs/{self.country}/search/{page}?{urlencode(params)}"
-            data = fetch_json(url)
-            results = data.get("results", []) if isinstance(data, dict) else []
-            for j in results:
-                comp = ""
-                lo, hi = j.get("salary_min"), j.get("salary_max")
-                if lo and hi:
-                    comp = f"{int(lo):,}-{int(hi):,}"
-                elif lo:
-                    comp = f"from {int(lo):,}"
+        seen: set[str] = set()  # dedup across queries (the same job can match several terms)
+        for query in (self.whats or [""]):
+            for page in range(1, self.max_pages + 1):
+                params = {
+                    "app_id": self.app_id,
+                    "app_key": self.app_key,
+                    "results_per_page": self.results_per_page,
+                    "content-type": "application/json",
+                }
+                if query:
+                    params["what"] = query
+                if self.where:
+                    params["where"] = self.where
+                if self.salary_min:
+                    params["salary_min"] = self.salary_min
+                if self.max_days_old:
+                    params["max_days_old"] = self.max_days_old
+                if self.sort_by:
+                    params["sort_by"] = self.sort_by
+                url = f"https://api.adzuna.com/v1/api/jobs/{self.country}/search/{page}?{urlencode(params)}"
+                data = fetch_json(url)
+                results = data.get("results", []) if isinstance(data, dict) else []
+                for j in results:
+                    redirect = j.get("redirect_url", "")
+                    if redirect and redirect in seen:
+                        continue
+                    seen.add(redirect)
+                    comp = ""
+                    lo, hi = j.get("salary_min"), j.get("salary_max")
+                    if lo and hi:
+                        comp = f"{int(lo):,}-{int(hi):,}"
+                    elif lo:
+                        comp = f"from {int(lo):,}"
+                    out.append(
+                        Posting(
+                            company=(j.get("company") or {}).get("display_name", "") or "Unknown",
+                            title=j.get("title", "").strip(),
+                            body=html_to_text(j.get("description", "") or ""),
+                            url=redirect,
+                            ats="adzuna",
+                            location=(j.get("location") or {}).get("display_name", "") or "",
+                            compensation=comp,
+                            remote=None,
+                            apply_url=redirect,
+                            updated_at=j.get("created", ""),
+                            extra={"snippet_only": True},
+                        )
+                    )
+                if len(results) < self.results_per_page:
+                    break  # last page for this query
+        return out
+
+
+class GoogleJobsSource(Source):
+    """Broad aggregator via the Google Jobs vertical (google_jobs.py, vendored from JobSpy, MIT).
+    Like Adzuna it's a *search* — driven by profile-derived queries — but keyless: no app_id, no
+    scraping-evasion stack (proxy-free, one honest UA, backs off on 429). Runs each of `whats` as
+    its own focused Google query and merges+dedups. Tagged `ats="google"` so it flows through the
+    aggregator bridge → the bridge resolves each hit to its real ATS (Greenhouse/Lever/…) for a
+    fillable apply, and marks the unresolved ones the same as any other aggregator hit."""
+
+    def __init__(
+        self,
+        whats: list[str],
+        *,
+        location: str = "",
+        is_remote: bool = False,
+        max_days_old: int = 0,
+        results_wanted: int = 40,
+    ) -> None:
+        self.whats = [q for q in whats if q]
+        self.location = location
+        self.is_remote = is_remote
+        self.hours_old = max_days_old * 24 if max_days_old else 0
+        self.results_wanted = results_wanted
+        self.name = f"google:{','.join(self.whats)[:40]}"
+
+    def fetch(self) -> list[Posting]:
+        from . import google_jobs
+
+        out: list[Posting] = []
+        seen: set[str] = set()
+        errors: list[str] = []
+        for query in self.whats:
+            try:
+                rows = google_jobs.search(
+                    query, location=self.location, is_remote=self.is_remote,
+                    hours_old=self.hours_old, results_wanted=self.results_wanted,
+                )
+            except google_jobs.GoogleJobsError as e:
+                errors.append(str(e))
+                continue
+            for r in rows:
+                url = r.get("url", "")
+                if not url or url in seen:
+                    continue
+                seen.add(url)
                 out.append(
                     Posting(
-                        company=(j.get("company") or {}).get("display_name", "") or "Unknown",
-                        title=j.get("title", "").strip(),
-                        body=html_to_text(j.get("description", "") or ""),
-                        url=j.get("redirect_url", ""),
-                        ats="adzuna",
-                        location=(j.get("location") or {}).get("display_name", "") or "",
-                        compensation=comp,
-                        remote=None,
-                        apply_url=j.get("redirect_url", ""),
-                        updated_at=j.get("created", ""),
+                        company=r.get("company", "") or "Unknown",
+                        title=r.get("title", "").strip(),
+                        body=r.get("description", "") or "",
+                        url=url,
+                        ats="google",
+                        location=r.get("location", "") or "",
+                        compensation="",
+                        remote=r.get("is_remote"),
+                        apply_url=url,
+                        updated_at=r.get("date_posted") or "",
                         extra={"snippet_only": True},
                     )
                 )
-            if len(results) < self.results_per_page:
-                break  # last page
+        # If every query failed (e.g. Google rate-limited the whole run), surface it rather than a
+        # silent empty result (Agent Guideline #11) — discover() records source errors.
+        if errors and not out:
+            raise DiscoveryError("; ".join(errors[:2]))
+        return out
+
+
+def _annualize(amount, period: str) -> Optional[int]:
+    """Best-effort annualize a pay figure so the salary gate compares like-for-like (a monthly
+    2000-4000 must not read as a 4000/yr salary). Returns None if unparseable."""
+    try:
+        n = int(float(amount))
+    except (TypeError, ValueError):
+        return None
+    if n <= 0:
+        return None
+    mult = {"hourly": 2080, "weekly": 52, "monthly": 12, "yearly": 1, "annually": 1}.get(
+        (period or "").strip().lower(), 1
+    )
+    return n * mult
+
+
+class HimalayasSource(Source):
+    """Keyless remote-job aggregator (himalayas.app) — public JSON, no signup. Remote by
+    construction. Full description + structured salary/seniority; `applicationLink` is the apply
+    URL. Tagged `ats="himalayas"` so it rides the aggregator bridge/fillability path like Adzuna."""
+
+    def __init__(self, max_results: int = 100) -> None:
+        self.max_results = max_results
+        self.name = "himalayas"
+
+    def fetch(self) -> list[Posting]:
+        out: list[Posting] = []
+        page_size = 50
+        offset = 0
+        while len(out) < self.max_results:
+            data = fetch_json(f"https://himalayas.app/jobs/api?limit={page_size}&offset={offset}")
+            jobs = data.get("jobs", []) if isinstance(data, dict) else []
+            if not jobs:
+                break
+            for j in jobs:
+                lo = _annualize(j.get("minSalary"), j.get("salaryPeriod"))
+                hi = _annualize(j.get("maxSalary"), j.get("salaryPeriod"))
+                cur = j.get("currency") or ""
+                comp = f"{cur} {lo:,}-{hi:,}".strip() if lo and hi else (f"{cur} from {lo:,}".strip() if lo else "")
+                locs = j.get("locationRestrictions") or []
+                out.append(
+                    Posting(
+                        company=j.get("companyName", "") or "Unknown",
+                        title=(j.get("title", "") or "").strip(),
+                        body=html_to_text(j.get("description", "") or "") or (j.get("excerpt", "") or ""),
+                        url=j.get("applicationLink", "") or "",
+                        ats="himalayas",
+                        location=", ".join(locs) if locs else "Remote",
+                        compensation=comp,
+                        remote=True,
+                        apply_url=j.get("applicationLink", "") or "",
+                        updated_at=j.get("pubDate", "") or "",
+                        extra={"snippet_only": True},
+                    )
+                )
+            offset += page_size
+            if len(jobs) < page_size:
+                break
+        return out[: self.max_results]
+
+
+class RemoteOKSource(Source):
+    """Keyless remote-job aggregator (remoteok.com) — public JSON list, no signup. Filter by
+    `?tag=` (profile-derived single-word skill tags); results merged + deduped. Element 0 of the
+    response is a legal/attribution notice (skipped). Their terms require a backlink, so the
+    posting URL is the remoteok.com listing (which is that backlink). Tagged `ats="remoteok"`."""
+
+    def __init__(self, tags: list[str] | None = None, max_results: int = 100) -> None:
+        self.tags = [t for t in (tags or []) if t] or [""]  # [""] = one tagless "recent" query
+        self.max_results = max_results
+        self.name = "remoteok"
+
+    def fetch(self) -> list[Posting]:
+        from urllib.parse import quote
+
+        out: list[Posting] = []
+        seen: set = set()
+        for tag in self.tags:
+            url = "https://remoteok.com/api" + (f"?tag={quote(tag)}" if tag else "")
+            data = fetch_json(url)
+            if not isinstance(data, list):
+                continue
+            for j in data:
+                if not isinstance(j, dict) or "position" not in j:
+                    continue  # element 0 (legal notice) and any malformed entries
+                jid = j.get("id") or j.get("slug")
+                if jid in seen:
+                    continue
+                seen.add(jid)
+                lo, hi = j.get("salary_min"), j.get("salary_max")
+                comp = ""
+                try:
+                    lo, hi = int(lo or 0), int(hi or 0)
+                    if lo and hi:
+                        comp = f"{lo:,}-{hi:,}"
+                    elif lo:
+                        comp = f"from {lo:,}"
+                except (TypeError, ValueError):
+                    pass
+                out.append(
+                    Posting(
+                        company=j.get("company", "") or "Unknown",
+                        title=(j.get("position", "") or "").strip(),
+                        body=html_to_text(j.get("description", "") or ""),
+                        url=j.get("url", "") or j.get("apply_url", ""),  # remoteok listing = required backlink
+                        ats="remoteok",
+                        location=j.get("location", "") or "Remote",
+                        compensation=comp,
+                        remote=True,
+                        apply_url=j.get("apply_url", "") or j.get("url", ""),
+                        updated_at=j.get("date", "") or "",
+                        extra={"snippet_only": True, "tags": j.get("tags")},
+                    )
+                )
+                if len(out) >= self.max_results:
+                    return out
         return out
 
 
@@ -1033,7 +1236,16 @@ def discover(sources: list[Source]) -> tuple[list[Posting], list[str]]:
 # ---------------------------------------------------------------------------
 
 # Aggregators whose apply links redirect through their own domain (need resolving to find the ATS).
-_AGGREGATOR_ATS = {"adzuna", "jooble"}
+_AGGREGATOR_ATS = {"adzuna", "jooble", "google", "himalayas", "remoteok"}
+# Aggregators whose apply link sits behind a BROWSER-ONLY gate we can't resolve server-side, so
+# the real ATS is unknowable at bridge time. Adzuna's www.adzuna.com/land/ page 403s every
+# non-browser client (CloudFront WAF — even real Chromium from a blocked IP) AND its "Apply for
+# this job" button is a real navigation, not an HTTP 30x. Rather than hammer a blocked endpoint
+# 60x/run, these are deferred to Apply: the real Chromium browser opens the land URL and
+# `apply._open_application_form` clicks the "Apply for this job" control (already matched by its
+# `\bapply\b` reveal regex), then re-derives the true ATS from the resulting form frame.
+# (DECISIONS.md #120.)
+_BROWSER_GATED_ATS = {"adzuna"}
 _BRIDGE_MAX = 60  # cap redirect resolutions per run (one network call each) — polite + bounded
 
 
@@ -1063,8 +1275,18 @@ def bridge_aggregator_postings(postings, *, limit: int = _BRIDGE_MAX, upgrade_jd
     and whether we have a dedicated adapter in `extra['auto_applyable']`. When `upgrade_jd` and
     the ATS exposes a public JD API (Greenhouse/Lever/Ashby/SmartRecruiters/Workable/Recruitee),
     replace the aggregator's *snippet* body with the full JD. Left untouched otherwise. Mutates and
-    returns (postings, n_bridged); bounded by `limit` redirect resolutions to stay polite."""
-    to_bridge = [p for p in postings if p.ats in _AGGREGATOR_ATS]
+    returns (postings, n_bridged); bounded by `limit` redirect resolutions to stay polite.
+
+    Browser-gated aggregators (`_BROWSER_GATED_ATS`, e.g. Adzuna) are NOT resolved here — their
+    gate 403s any server-side client — but are left flowing to Apply (ats/apply_url unchanged,
+    tagged `extra['browser_gated']`) so the real browser clicks through the gate at apply time.
+    They make no network call, so they don't consume the `limit` resolution budget."""
+    for p in (p for p in postings if p.ats in _BROWSER_GATED_ATS):
+        p.extra["bridged_from"] = p.ats
+        p.extra["browser_gated"] = True  # Apply resolves the real ATS by clicking the gate in-browser
+        # `auto_applyable` left unset on purpose: we have no dedicated adapter (the ATS is unknown
+        # until apply time), but `_is_fillable` keeps it in the funnel via `ats in _AGGREGATOR_ATS`.
+    to_bridge = [p for p in postings if p.ats in _AGGREGATOR_ATS and p.ats not in _BROWSER_GATED_ATS]
     ashby_cache: dict = {}
     bridged = 0
     for i, p in enumerate(to_bridge[:limit]):

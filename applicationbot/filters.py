@@ -39,6 +39,9 @@ from .discovery import (
     AdzunaSource,
     CareerSiteSource,
     CuratedListSource,
+    GoogleJobsSource,
+    HimalayasSource,
+    RemoteOKSource,
     Source,
     build_source,
 )
@@ -65,7 +68,33 @@ class AdzunaConfig(BaseModel):
     app_id: str = ""
     app_key: str = ""
     country: str = "us"
-    max_pages: int = 1  # 50 results/page; raise for more breadth
+    max_pages: int = 3  # 50 results/page/query; raise for more breadth
+    max_queries: int = 4  # how many focused profile-derived queries to run (each its own `what` search)
+    sort_by: str = "date"  # "date" = freshest-first when paginating; "" = Adzuna relevance default
+
+
+class GoogleJobsConfig(BaseModel):
+    """Discover from the Google Jobs vertical — keyless (no app_id) and proxy-free. Off by default.
+
+    ⚠ Currently NON-FUNCTIONAL via the keyless path: as of 2026-07 Google renders the Jobs vertical
+    client-side, so a plain HTTP GET returns a JavaScript shell with no readable job data. When
+    enabled it fails loudly (a source error) rather than silently returning nothing — it needs a
+    headless-browser render path to work. Kept opt-in/off so it never affects a default run."""
+
+    enabled: bool = False
+    results_wanted: int = 40  # per query, before cross-query dedup
+    max_queries: int = 2  # how many focused profile-derived queries to run (keep low — one IP, no proxies)
+
+
+class RemoteBoardsConfig(BaseModel):
+    """Keyless remote-job aggregators — public JSON APIs, no signup, no scraping. Opt-in per board
+    (off by default like every source). Remote-only by construction, so most useful when you want
+    remote roles; the gates still filter what doesn't fit. `max_results` caps what each board
+    contributes before the gates/matcher."""
+
+    himalayas: bool = False
+    remoteok: bool = False
+    max_results: int = 100
 
 
 class FeedSpec(BaseModel):
@@ -179,6 +208,8 @@ class DiscoveryFilters(BaseModel):
         "None (default) = no age gate. Missing/unparseable dates pass.",
     )
     adzuna: AdzunaConfig = Field(default_factory=AdzunaConfig)
+    google: GoogleJobsConfig = Field(default_factory=GoogleJobsConfig)
+    remote_boards: RemoteBoardsConfig = Field(default_factory=RemoteBoardsConfig)
     early_career: EarlyCareerConfig = Field(default_factory=EarlyCareerConfig)
 
 
@@ -209,6 +240,29 @@ def build_sources(
     agg = build_aggregator(filters, resume, profile)
     if agg is not None:
         sources.append(agg)
+    # Google Jobs vertical (keyless aggregator, opt-in). Profile-derived focused queries, same as
+    # Adzuna. Needs a résumé to derive the queries; self-skips otherwise.
+    if filters.google.enabled and resume is not None:
+        whats = derive_keywords(resume, profile or ApplicationProfile(), filters)[
+            : max(1, filters.google.max_queries)
+        ]
+        sources.append(GoogleJobsSource(
+            whats=whats,
+            location=(profile.location if profile else "") or "",
+            is_remote=filters.remote_only,
+            max_days_old=filters.max_posting_age_days or 0,
+            results_wanted=filters.google.results_wanted,
+        ))
+    # Keyless remote aggregators (opt-in). Himalayas needs no query; RemoteOK filters by single-word
+    # skill tags derived from the profile (multi-word role titles aren't valid RemoteOK tags).
+    if filters.remote_boards.himalayas:
+        sources.append(HimalayasSource(max_results=filters.remote_boards.max_results))
+    if filters.remote_boards.remoteok:
+        tags = []
+        if resume is not None:
+            tags = [t.lower() for t in derive_keywords(resume, profile or ApplicationProfile(), filters)
+                    if " " not in t][:4]
+        sources.append(RemoteOKSource(tags=tags, max_results=filters.remote_boards.max_results))
     # Early-career curated feeds (needs the résumé to rank listings by title-relevance).
     if filters.early_career.enabled and resume is not None:
         sources.append(CuratedListSource(
@@ -231,11 +285,15 @@ def build_aggregator(
     app_key = cfg.app_key or os.environ.get("ADZUNA_APP_KEY", "")
     if not (app_id and app_key and resume is not None):
         return None
-    what = " ".join(derive_keywords(resume, profile or ApplicationProfile(), filters)[:6])
+    # Run the top profile-derived terms as SEPARATE focused queries (breadth + relevance) rather
+    # than one broad blob; recency is pushed server-side via max_days_old when the staleness gate
+    # is set, so Adzuna returns fresh postings instead of us dropping stale ones after the fact.
+    whats = derive_keywords(resume, profile or ApplicationProfile(), filters)[: max(1, cfg.max_queries)]
     where = (profile.location if profile else "") or ""
     return AdzunaSource(
-        app_id, app_key, what=what, where=where,
+        app_id, app_key, whats=whats, where=where,
         country=cfg.country, max_pages=cfg.max_pages, salary_min=filters.min_salary,
+        max_days_old=filters.max_posting_age_days or 0, sort_by=cfg.sort_by,
     )
 
 
@@ -306,34 +364,46 @@ def _posting_datetime(raw) -> Optional[datetime]:
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
-def apply_gates(postings, filters: DiscoveryFilters):
+def apply_gates(postings, filters: DiscoveryFilters, stats: Optional[dict] = None):
     """Cheap pre-matcher gates from the filter config: remote_only, title_exclude, a salary
     floor when the posting states pay, an experience-level gate (by title), and — when
     max_posting_age_days is set — a staleness gate on updated_at. Returns the kept postings.
     Postings with no stated salary, no detectable level, or a missing/unparseable
-    updated_at pass their gate (we don't drop for missing data)."""
+    updated_at pass their gate (we don't drop for missing data).
+
+    When `stats` is given, it's populated with a per-gate drop count
+    (`gate_remote`/`gate_title`/`gate_level`/`gate_salary`/`gate_stale`) so the funnel
+    diagnostic can show which gate dropped how many — not just the collapsed total."""
     excl = [t.lower() for t in filters.title_exclude]
     want_levels = {_norm_level(l) for l in filters.experience_levels} & set(EXPERIENCE_LEVELS)
     now = datetime.now(timezone.utc)
+    drops = {"gate_remote": 0, "gate_title": 0, "gate_level": 0, "gate_salary": 0, "gate_stale": 0}
     kept = []
     for p in postings:
         if filters.remote_only and p.remote is False:
+            drops["gate_remote"] += 1
             continue
         if excl and any(x in p.title.lower() for x in excl):
+            drops["gate_title"] += 1
             continue
         if want_levels:
             # Lenient: drop only when the title clearly names a level and none is wanted;
             # a title with no detectable level passes through to the matcher.
             detected = detect_levels(p.title)
             if detected and detected.isdisjoint(want_levels):
+                drops["gate_level"] += 1
                 continue
         if filters.min_salary:
             sal = _annual_salary(p.compensation)
             if sal is not None and sal < filters.min_salary:
+                drops["gate_salary"] += 1
                 continue
         if filters.max_posting_age_days is not None:
             dt = _posting_datetime(p.updated_at)
             if dt is not None and (now - dt).days > filters.max_posting_age_days:
+                drops["gate_stale"] += 1
                 continue
         kept.append(p)
+    if stats is not None:
+        stats.update(drops)
     return kept

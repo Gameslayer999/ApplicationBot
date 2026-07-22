@@ -46,10 +46,13 @@ class PipelineResult:
     non_fillable: list = None  # postings on portals Apply can't fill (decision 035 gate)
     from_cache: bool = False  # matches came from the discovery snapshot, not a live search (decision 037)
     cache_age_seconds: float | None = None  # age of the reused snapshot, when from_cache
+    funnel: dict = None  # per-stage drop breakdown for the diagnostic (decision: diagnose-first). Empty on cache hits.
 
     def __post_init__(self):
         if self.non_fillable is None:
             self.non_fillable = []
+        if self.funnel is None:
+            self.funnel = {}
 
 
 def _is_fillable(p) -> bool:
@@ -166,7 +169,14 @@ def discover_and_match(
 
     postings, errors = discover(sources)
     discovered = len(postings)
-    postings = apply_gates(postings, filters)
+    # Per-stage funnel breakdown (diagnose-first): record how many postings survive each stage
+    # and which gate dropped how many, so "lots found, few through" points at a specific stage.
+    funnel: dict = {"discovered": discovered,
+                    "min_skills": filters.min_skills, "top_n": filters.top_n}
+    gate_stats: dict = {}
+    postings = apply_gates(postings, filters, stats=gate_stats)
+    funnel.update(gate_stats)
+    funnel["after_gates"] = len(postings)
 
     # Skip postings already in the tracker so we don't keep re-surfacing/re-applying to the
     # same roles (keyed on the posting URL, which is what the Apply stage records).
@@ -177,6 +187,8 @@ def discover_and_match(
         before = len(postings)
         postings = [p for p in postings if canonical_url(p.url) not in seen_canon]
         skipped_seen = before - len(postings)
+    funnel["skipped_seen"] = skipped_seen
+    funnel["after_seen"] = len(postings)
 
     # Bridge aggregator hits (Adzuna/Jooble) to their real ATS before matching, so the matcher
     # ranks them on the full JD and Apply lands on the fillable form (decision 032). No-op when
@@ -192,6 +204,8 @@ def discover_and_match(
     non_fillable = [p for p in postings if not _is_fillable(p)]
     if non_fillable:
         postings = [p for p in postings if _is_fillable(p)]
+    funnel["non_fillable"] = len(non_fillable)
+    funnel["into_matcher"] = len(postings)
 
     # Steer which top_n postings the judge scores toward past winners (decision 046). Built
     # from the accumulated fit history; a no-op until enough postings have been judged.
@@ -202,6 +216,11 @@ def discover_and_match(
         resume, postings, top_n=filters.top_n, use_claude=use_claude,
         min_skills=filters.min_skills, on_progress=on_progress, predictor=predictor,
     )
+    # Keyword pre-filter dropped everything scoring < min_skills; of the survivors, only the
+    # top_n get a Claude fit_score (the rest stay keyword-only and can never clear min_fit).
+    funnel["keyword_dropped"] = max(0, len(postings) - len(matches))
+    funnel["matched"] = len(matches)
+    funnel["judged"] = sum(1 for m in matches if m.fit_score is not None)
 
     # Record this run's judged verdicts so the next run's predictor learns from them
     # (decision 046). Best-effort; judged-only (keyword-only matches carry no fit signal).
@@ -233,6 +252,7 @@ def discover_and_match(
         skipped_shown=skipped_shown,
         bridged=bridged,
         non_fillable=non_fillable,
+        funnel=funnel,
     )
 
 
@@ -308,6 +328,43 @@ def effective_min_fit(filters: DiscoveryFilters) -> tuple[int, str | None]:
                    f"({reason}). Set min_fit ≥ {value} in the Discover settings to make "
                    "this permanent, or turn off its calibration toggle to keep "
                    f"{filters.min_fit}.")
+
+
+def _print_funnel(res: "PipelineResult", filters: DiscoveryFilters) -> None:
+    """Print the per-stage discovery→match funnel with the drop at each stage, so it's obvious
+    WHERE postings are lost (diagnose-first). No-op on cache hits (funnel isn't recomputed)."""
+    f = res.funnel
+    if not f:
+        return
+    rows: list[tuple[str, int, int]] = []  # (label, remaining, dropped-at-this-stage)
+
+    def add(label: str, remaining: int, dropped: int) -> None:
+        rows.append((label, remaining, dropped))
+
+    disc = f.get("discovered", 0)
+    add("discovered", disc, 0)
+    # Coarse gates, itemized — only the ones that actually dropped something.
+    gate_labels = {
+        "gate_remote": "remote_only", "gate_title": "title_exclude",
+        "gate_level": "experience_levels", "gate_salary": "min_salary", "gate_stale": "stale",
+    }
+    for key, label in gate_labels.items():
+        if f.get(key):
+            add(f"  ✗ {label}", -1, f[key])
+    add("after gates", f.get("after_gates", disc), disc - f.get("after_gates", disc))
+    if f.get("skipped_seen"):
+        add("after skip-seen", f.get("after_seen", 0), f["skipped_seen"])
+    if f.get("non_fillable"):
+        add("after fillability", f.get("into_matcher", 0), f["non_fillable"])
+    add(f"matched (≥{filters.min_skills} skills)", f.get("matched", 0), f.get("keyword_dropped", 0))
+    add(f"judged by Claude (top {filters.top_n})", f.get("judged", 0),
+        max(0, f.get("matched", 0) - f.get("judged", 0)))
+
+    print("\nSearch funnel (where postings are lost):")
+    for label, remaining, dropped in rows:
+        drop = f"  −{dropped}" if dropped else ""
+        count = "" if remaining < 0 else f"{remaining:>5}"
+        print(f"  {count:>5}  {label}{drop}")
 
 
 def _print_diagnosis(filters: DiscoveryFilters) -> None:
@@ -626,6 +683,8 @@ def main(argv: list[str] | None = None) -> int:
           f"{len(res.matches)} matched ≥{filters.min_skills} skill(s){shown_note}.")
     for e in res.errors:
         print(f"  ! {e}")
+
+    _print_funnel(res, filters)
 
     if not res.matches and res.skipped_shown:
         print("\nEvery match this run was already shown to you. Pass --all to see them again, "

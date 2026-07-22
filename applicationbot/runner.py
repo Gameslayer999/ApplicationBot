@@ -310,6 +310,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         manual = f" ({len(res.non_fillable)} set aside on non-fillable portals)" if res.non_fillable else ""
         print(f"{res.discovered} discovered → {len(res.matches)} matched{manual} → "
               f"{len(queue)} cleared min-fit {min_fit}.")
+        from .pipeline import _print_funnel
+        _print_funnel(res, filters)
         if not queue:
             best = max((m.fit_score for m in res.matches if m.fit_score is not None), default=None)
             print("Nothing cleared the bar."

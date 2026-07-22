@@ -1238,6 +1238,18 @@ def _ats_from_frame(frame, fallback: str) -> str:
     return fallback
 
 
+def _is_adzuna_access_wall(page) -> bool:
+    """True when the current page is Adzuna's CloudFront "Access Denied" wall on its land/apply
+    gate (decision 120). Gated on the adzuna.com host so a company page legitimately titled
+    "Access Denied" elsewhere can never trip it; the title check keeps it a cheap DOM read."""
+    try:
+        if "adzuna.com" not in (page.url or "").lower():
+            return False
+        return "access denied" in (page.title() or "").lower()
+    except Exception:
+        return False
+
+
 def _open_application_form(page, ats: str, report: "ApplyReport", timeout_ms: int = 25000):
     """Reveal the application form (click an Apply control if needed) and WAIT until it has
     actually rendered — IN WHICHEVER FRAME it lives (main page or an embedded iframe). Returns
@@ -1245,6 +1257,20 @@ def _open_application_form(page, ats: str, report: "ApplyReport", timeout_ms: in
     returns (False, main_frame, ats) with an actionable error, and the caller must not fill.
     This is what makes 'verify the application loaded before filling' true rather than assumed."""
     import time
+
+    # Adzuna gates its apply link behind www.adzuna.com/land/, which is fronted by a CloudFront
+    # WAF that hard-blocks some clients/IPs (403 "Access Denied") — including datacenter IPs and,
+    # in testing, headless Chromium. When that wall is what loaded, the "Apply for this job"
+    # control never exists, so the poll below would just spin for the full timeout. Detect it up
+    # front and fail fast with the actual reason + fix (decision 120).
+    if _is_adzuna_access_wall(page):
+        report.errors.append(
+            f"Adzuna blocked this browser at {page.url} (its CloudFront WAF returned "
+            '"Access Denied"), so the "Apply for this job" gate never loaded and no ATS could be '
+            "reached. This is an IP/bot block on Adzuna's side, not a form issue. Open the posting "
+            "URL in your own browser to apply manually, or retry from a residential network."
+        )
+        return False, page.main_frame, ats
 
     # Poll every frame until one holds a real form (covers navigation + async/iframe mounts).
     # If no form is visible yet, keep trying to reveal it via an "Apply" control on EACH pass:
