@@ -517,13 +517,19 @@ value ÷ effort:
       look like small real companies by title+company, so they can't be auto-detected without false
       positives. Handled by extending `company_exclude` (seeded in the user's config). A durable fix
       would need a maintained agency list or an external classifier — low priority.
-- [ ] **`top_n` is now THE binding lever** (confirms decisions 073/115; the spam work above cleared
-      the noise, so this is what's left): with `top_n: 10` the judged pool is dominated by the direct
-      ATS boards (Stripe/Ramp/cin7/Hartford/Motorola), so real curated roles (Canonical "Graduate
-      Level Python Cloud", Buyers Edge "Junior Developer Python & Go", Vestmark "Associate Java SWE")
-      rank 11+ and never get judged. Raising `top_n` is what turns "2 cleared" into "many" — pair it
-      with a **Haiku pre-rank** over the resolved pool (cheap first pass → frontier judge only the
-      finalists) so more get judged without a linear token cost. This is the highest-yield item left.
+- [x] **Two-stage judge (Haiku pre-rank → Sonnet judge) — done (decision 124).** New `prerank_n`
+      knob: a cheap Haiku pass coarse-scores the top `prerank_n` survivors and only the best `top_n`
+      go to the full Sonnet judge, so far more postings are considered for a fraction of the token
+      cost. `prerank_n=0` preserves single-stage behaviour; a Haiku failure falls back to keyword
+      order. Measured: cleared 2 → 3 at `prerank_n=50, top_n=20` (the new clear, Ramp Onboarding,
+      ranked outside the old keyword top-10). Also fixed a latent cache-fingerprint staleness bug
+      (company_exclude/filter_staffing_spam/prerank_n weren't invalidating the snapshot).
+- [ ] **Tune `prerank_n`/`top_n` + consider a Haiku batch size / cost cap.** The dial is live; the
+      user can push `top_n` higher for more clears at more Sonnet cost. Haiku's coarse scores are
+      noisy (it over-scores some senior roles — the Sonnet judge catches them, so precision is fine),
+      but a smarter pre-rank prompt or a 2-tier cutoff could raise coarse precision and let `top_n`
+      shrink. Also: surface the two-stage counts ("coarse-scored 50 → judged 20 → 3 cleared") in the
+      Discover funnel UI.
 
 ### Persist each posting's JD beside its tailored PDF (surfaced by decision 086)
 
@@ -805,6 +811,15 @@ Posted to the agent bus 2026-07-06; independent of the engine work above.
 ---
 
 ## Recently added (this session, latest first)
+
+- 2026-07-22 — **Two-stage judging: Haiku pre-rank → Sonnet judge (decision 124).** New `prerank_n`
+  knob — a cheap Haiku pass coarse-scores the top `prerank_n` survivors, and only the best `top_n`
+  reach the full Sonnet judge, so many more postings are considered for a fraction of the token cost
+  (`prerank_n=0` = old single-stage behaviour; a Haiku failure falls back to keyword order). Added
+  the missing `haiku` API-model mapping + folded `prerank_n`/`company_exclude`/`filter_staffing_spam`
+  into the cache fingerprint (latent staleness fix). **Measured: cleared 2 → 3** at `prerank_n=50,
+  top_n=20` — the new clear (Ramp Onboarding, coarse 80) ranked outside the old keyword top-10.
+  3 new tests (CLI stubbed, zero tokens); the `haiku` alias + discrimination verified live.
 
 - 2026-07-22 — **Staffing-spam down-ranking + cheap gates pushed into the curated source (decision 123).**
   `is_staffing_spam(title)` (high-precision body-shop title tells + word-boundary tokens) as a

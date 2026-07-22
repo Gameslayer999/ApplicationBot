@@ -34,6 +34,7 @@ class Match:
     keyword_score: int
     matched_skills: list[str]
     ats_score: int = 0  # 0-100 deterministic pre-score (ats_score.py) — orders the judge queue
+    prerank_score: Optional[int] = None  # 0-100 cheap Haiku coarse fit (decision 124); None if not preranked
     qualified: Optional[bool] = None  # None until Claude judges it
     fit_score: Optional[int] = None  # 0-100, computed from `dimensions` via FIT_WEIGHTS
     why: str = ""
@@ -180,6 +181,92 @@ def _posting_block(i: int, posting: Posting) -> str:
     )
 
 
+# ---- Cheap pre-rank (decision 124): a coarse Haiku pass that widens the judged pool ----
+# Haiku is ~1/3 the cost of the Sonnet judge and returns one number per posting, so we can
+# coarse-score a much larger survivor pool and spend the full judge only on the best of it.
+PRERANK_MODEL = "haiku"
+PRERANK_BATCH_SIZE = 12  # tiny output/posting (one int), so larger batches than the full judge
+
+_PRERANK_SYSTEM = (
+    "You are quickly screening job postings for a candidate to decide which ones deserve a "
+    "full review. For EACH posting give a single 0-100 fit score — how well the candidate's "
+    "résumé matches the role's requirements AND its level (an entry-level résumé scores low "
+    "on a senior role and vice-versa), judging ONLY from the résumé shown. Be fast and "
+    "approximate: this is a coarse filter, not the final decision. Judge each independently."
+)
+
+_PRERANK_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "scores": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"index": {"type": "integer"}, "fit": {"type": "integer"}},
+                "required": ["index", "fit"],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["scores"],
+    "additionalProperties": False,
+}
+
+
+def _prerank_block(i: int, posting: Posting) -> str:
+    # Shorter body than the full judge — the pre-rank only needs a coarse read, and a smaller
+    # prompt keeps the Haiku pass cheap and fast.
+    return (f"=== POSTING {i} ===\n{posting.title} at {posting.company} ({posting.location})\n\n"
+            f"{posting.body[:1800]}")
+
+
+def prerank_fit_batch(resume: Resume, postings: list[Posting], *, timeout: int = 180) -> dict[int, int]:
+    """Coarse 0-100 fit per posting from the cheap model, in ONE call. Returns
+    {index -> fit}; a posting the reply skipped is absent. Raises RuntimeError if the CLI fails."""
+    prompt = (
+        f"=== CANDIDATE RÉSUMÉ ===\n{_resume_summary(resume)}\n\n"
+        + "\n\n".join(_prerank_block(i, p) for i, p in enumerate(postings))
+        + f"\n\nScore all {len(postings)} posting(s) now."
+    )
+    text = run_claude_cli(prompt, model=PRERANK_MODEL, think=False, timeout=timeout,
+                          system=_PRERANK_SYSTEM, json_schema=_PRERANK_SCHEMA, activity="prerank")
+    data = json.loads(_extract_json(text))
+    out: dict[int, int] = {}
+    for s in data.get("scores") or []:
+        idx = int(s.get("index", -1))
+        if 0 <= idx < len(postings):
+            out[idx] = max(0, min(100, int(s.get("fit", 0))))
+    return out
+
+
+def _prerank_select(resume: Resume, ranked: list[Match], *, prerank_n: int, top_n: int,
+                    errors: list[str]) -> list[Match]:
+    """Coarse-score the top `prerank_n` survivors with the cheap model, then return the best
+    `top_n` by that score for the full judge. Curated early-career postings stay first (as
+    everywhere). Best-effort: if the cheap pass fails or returns nothing, fall back to the
+    incoming order (`ranked[:top_n]`) so a pre-rank hiccup never costs coverage."""
+    pool = ranked[:prerank_n]
+    scored = False
+    for start in range(0, len(pool), PRERANK_BATCH_SIZE):
+        chunk = pool[start : start + PRERANK_BATCH_SIZE]
+        try:
+            pre = prerank_fit_batch(resume, [m.posting for m in chunk])
+        except Exception as e:
+            errors.append(f"pre-rank failed for {len(chunk)} posting(s) (using keyword order): {e}")
+            continue
+        for i, m in enumerate(chunk):
+            if i in pre:
+                m.prerank_score = pre[i]
+                scored = True
+    if not scored:
+        return ranked[:top_n]
+    # A preranked posting outranks an un-preranked one (score -1 floor); curated stays first.
+    pool.sort(key=lambda m: (bool(m.posting.extra.get("curated")),
+                             m.prerank_score if m.prerank_score is not None else -1),
+              reverse=True)
+    return pool[:top_n]
+
+
 def judge_fit_batch(resume: Resume, postings: list[Posting], *, think: bool = False,
                     timeout: int = 300) -> dict[int, dict]:
     """Ask Claude (subscription) to judge a batch of postings in ONE call. Returns
@@ -219,6 +306,7 @@ def match(
     min_skills: int = 1,
     on_progress=None,
     predictor=None,
+    prerank_n: int = 0,
 ) -> tuple[list[Match], list[str]]:
     """Rank postings against the user's qualifications. Keyword-ranks all of them, then (if
     enabled and the Claude CLI is present) has Claude judge the top `top_n`. Returns
@@ -247,7 +335,15 @@ def match(
         )
 
     if use_claude and claude_code_available():
-        survivors = ranked[:top_n]
+        # Two-stage judging (decision 124): when prerank_n > top_n, a cheap Haiku pass
+        # coarse-scores the top prerank_n survivors and only the best top_n go to the full
+        # Sonnet judge — so we consider far more postings for a fraction of the token cost.
+        # prerank_n == 0 (or ≤ top_n) keeps the single-stage behaviour exactly.
+        if prerank_n and prerank_n > top_n and len(ranked) > top_n:
+            survivors = _prerank_select(resume, ranked, prerank_n=prerank_n, top_n=top_n,
+                                        errors=errors)
+        else:
+            survivors = ranked[:top_n]
         total = len(survivors)
         done = 0
         # Judge in chunks: one Claude call per JUDGE_BATCH_SIZE postings. A failed call (or

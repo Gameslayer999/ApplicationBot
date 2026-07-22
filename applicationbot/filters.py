@@ -209,7 +209,10 @@ class DiscoveryFilters(BaseModel):
         description="Optional aggregator search terms. Empty = derive from the résumé.",
     )
     min_skills: int = 2  # keyword pre-filter floor (raise to cut common-word false positives)
-    top_n: int = 20  # how many keyword-ranked survivors Claude judges (more = more chances to clear min_fit)
+    top_n: int = 20  # how many survivors the full (Sonnet) judge scores (more = more chances to clear min_fit)
+    prerank_n: int = 0  # 0 = off. When > top_n, a cheap Haiku pass coarse-scores this many keyword-ranked
+    #                     survivors first, and only the best top_n go to the full judge — widens coverage
+    #                     for a fraction of the token cost (decision 124).
     min_fit: int = 50  # only follow through (dry-run/apply) on matches Claude scores ≥ this (0-100)
     calibrate_min_fit: bool = True  # auto-raise min_fit above a fit band your recorded outcomes prove dead (decision 043)
     skip_seen: bool = True  # drop postings already in the tracker (don't re-apply to the same role)

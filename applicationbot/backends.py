@@ -54,7 +54,8 @@ DEFAULT_QUALITY = "balanced"
 # Map the CLI quality-tier model aliases ("sonnet"/"opus") to Anthropic API model IDs for the
 # API-key fallback backend (decision 111). The subscription path passes the alias to `claude
 # --model`; the API path needs the full ID.
-_API_MODELS = {"sonnet": "claude-sonnet-5", "opus": "claude-opus-4-8"}
+_API_MODELS = {"haiku": "claude-haiku-4-5-20251001",
+               "sonnet": "claude-sonnet-5", "opus": "claude-opus-4-8"}
 
 SYSTEM_PROMPT = """\
 You are a resume-tailoring assistant. You are given a candidate's BASE RESUME (the \

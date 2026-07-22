@@ -95,9 +95,9 @@ def _resume_fingerprint_parts(resume) -> list:
 # cache) — as opposed to downstream thresholds (min_fit) and load-time filters (skip_seen)
 # that are re-applied fresh each run and so must NOT invalidate it.
 _FILTER_FINGERPRINT_KEYS = (
-    "remote_only", "min_salary", "title_exclude", "experience_levels",
-    "keywords", "min_skills", "top_n", "max_posting_age_days",
-    "adzuna", "early_career",
+    "remote_only", "min_salary", "title_exclude", "company_exclude", "filter_staffing_spam",
+    "experience_levels", "keywords", "min_skills", "top_n", "prerank_n",
+    "max_posting_age_days", "adzuna", "early_career",
 )
 
 

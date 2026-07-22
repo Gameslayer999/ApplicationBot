@@ -215,6 +215,7 @@ def discover_and_match(
     matches, match_errors = match(
         resume, postings, top_n=filters.top_n, use_claude=use_claude,
         min_skills=filters.min_skills, on_progress=on_progress, predictor=predictor,
+        prerank_n=filters.prerank_n,
     )
     # Keyword pre-filter dropped everything scoring < min_skills; of the survivors, only the
     # top_n get a Claude fit_score (the rest stay keyword-only and can never clear min_fit).
