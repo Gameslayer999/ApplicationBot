@@ -120,6 +120,28 @@ def test_rescan_with_nothing_cached_bails_with_actionable_message(fake_pipeline,
         assert "normal auto-apply loop" in web._LOOP_STATE["message"]
 
 
+def test_rescan_cached_but_below_min_fit_names_the_real_reason(fake_pipeline, monkeypatch):
+    # The cache is full but nothing clears min_fit (best 41 < 70). The message must NOT claim
+    # "nothing scored" — it must name the min_fit gap + the fix (UI Principle #3).
+    import applicationbot.pipeline as pipeline
+    import applicationbot.runner as runner
+    from types import SimpleNamespace as NS
+    low = [NS(posting=NS(company="Acme", title="Sr Eng", url="http://x/9"), fit_score=41)]
+    monkeypatch.setattr(pipeline, "cached_matches", lambda *a, **k: low)
+    # Use the real min_fit filter here (the fixture stubs it to pass everything) so the
+    # below-bar match (41 < 70) is actually excluded and the below-bar branch is exercised.
+    monkeypatch.setattr(runner, "cleared_queue",
+                        lambda ms, mf: [m for m in ms if m.fit_score is not None and m.fit_score >= mf])
+    assert web.start_loop(rescan=True)["ok"] is True
+    assert _wait_until(lambda: not web._loop_running()), "loop did not finish"
+    assert fake_pipeline["prepared"] == []
+    with web._LOOP_LOCK:
+        msg = web._LOOP_STATE["message"]
+    assert "best fit" in msg and "41" in msg and "70" in msg
+    assert "min_fit" in msg
+    assert "nothing scored" not in msg.lower()
+
+
 def test_default_start_keeps_only_new(fake_pipeline):
     assert web.start_loop()["ok"] is True
     assert _wait_until(lambda: not web._loop_running()), "loop did not finish"

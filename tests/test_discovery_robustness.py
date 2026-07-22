@@ -200,8 +200,10 @@ def test_discover_dedups_two_url_spellings():
 # staleness gate (max_posting_age_days)
 # ---------------------------------------------------------------------------
 
-def _aged_posting(updated_at) -> Posting:
-    return Posting(company="Acme", title="SWE", body="jd",
+def _aged_posting(updated_at, title="SWE") -> Posting:
+    # Distinct titles so the repost-dedup pass never collapses these — this fixture isolates
+    # the staleness gate.
+    return Posting(company="Acme", title=title, body="jd",
                    url="https://x.com/j/1", ats="greenhouse", updated_at=updated_at)
 
 
@@ -218,14 +220,50 @@ def test_staleness_gate_drops_old_keeps_missing_unparseable_and_recent():
     old_zulu = (now - timedelta(days=60)).strftime("%Y-%m-%dT%H:%M:%SZ")
     recent_ms = str(int((now - timedelta(days=2)).timestamp() * 1000))  # Lever epoch-ms
     postings = [
-        _aged_posting(old_iso),        # dropped
-        _aged_posting(old_zulu),       # dropped ('Z' suffix parses)
-        _aged_posting(""),             # kept: missing date passes
-        _aged_posting("last Tuesday"), # kept: unparseable passes
-        _aged_posting(recent_ms),      # kept: recent ms-epoch parses
+        _aged_posting(old_iso, "SWE 1"),        # dropped
+        _aged_posting(old_zulu, "SWE 2"),       # dropped ('Z' suffix parses)
+        _aged_posting("", "SWE 3"),             # kept: missing date passes
+        _aged_posting("last Tuesday", "SWE 4"), # kept: unparseable passes
+        _aged_posting(recent_ms, "SWE 5"),      # kept: recent ms-epoch parses
     ]
     kept = apply_gates(postings, f)
     assert [p.updated_at for p in kept] == ["", "last Tuesday", recent_ms]
+
+
+# ---------------------------------------------------------------------------
+# company_exclude gate + repost dedup
+# ---------------------------------------------------------------------------
+
+def _p(company, title, url):
+    return Posting(company=company, title=title, body="jd", url=url, ats="greenhouse")
+
+
+def test_company_exclude_drops_by_company_substring():
+    f = DiscoveryFilters(company_exclude=["Consultadd", "DellFor"])
+    postings = [
+        _p("Consultadd Public Serv", "Python Developer", "https://x/1"),   # dropped
+        _p("DellFor Technologies", "Java Developer", "https://x/2"),       # dropped
+        _p("Dexcom", "Software Engineer", "https://x/3"),                  # kept
+    ]
+    stats = {}
+    kept = apply_gates(postings, f, stats=stats)
+    assert [p.company for p in kept] == ["Dexcom"]
+    assert stats["gate_company"] == 2
+
+
+def test_dedup_collapses_same_company_title_reposts_with_distinct_urls():
+    # A staffing agency posts one role three times under DISTINCT urls — dedup keeps the first.
+    postings = [
+        _p("Consultadd", "Python Developer", "https://x/a"),
+        _p("Consultadd", "python  developer", "https://x/b"),  # same after normalization
+        _p("Consultadd", "Python-Developer", "https://x/c"),   # same after normalization
+        _p("Consultadd", "Data Engineer", "https://x/d"),      # different title — kept
+        _p("Other Co", "Python Developer", "https://x/e"),     # different company — kept
+    ]
+    stats = {}
+    kept = apply_gates(postings, DiscoveryFilters(), stats=stats)
+    assert [p.url for p in kept] == ["https://x/a", "https://x/d", "https://x/e"]
+    assert stats["gate_duplicate"] == 2
 
 
 if __name__ == "__main__":

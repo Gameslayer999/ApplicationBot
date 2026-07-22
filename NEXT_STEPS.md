@@ -504,6 +504,23 @@ value ÷ effort:
 
 ## Next
 
+### Discovery quality: staffing-spam down-ranking (surfaced by decision 122)
+
+- [ ] The curated early-career feed, ranked by title-relevance to a Java/Python résumé, is
+      **saturated with staffing-agency reposts** ("Java Developer", "Python Developer",
+      "Java Developer - Need Locals - Need GC and USC") whose keyword-stuffed titles out-rank real
+      new-grad roles at good companies. `company_exclude` (decision 122) removes named agencies but
+      is whack-a-mole. Structural fix: a **heuristic spam detector** that down-ranks/drops on tells
+      — body-shop phrases ("Need Locals", "GC and USC", "C2C", "Corp to Corp", "W2", "Multiple
+      Teams/Positions"), agency-name patterns, and per-(company,title) repost frequency — applied
+      **before** the title-relevance selection so real roles fill the resolve + judge slots.
+      Measured impact of the current partial fix: best fit 41 → 72, but only 1 of 10 judged cleared;
+      the other 9 slots were still mostly spam.
+- [ ] **`top_n` is the binding throughput knob** (confirms decisions 073/115): with `top_n: 10`,
+      real roles (cin7 SWE, Ramp Core Product, Ciena intern) sometimes rank 11+ and never get judged
+      while spam fills the 10. Pair a `top_n` raise with the spam down-ranking above (raising it
+      alone just judges more spam) and a cheaper judge (Haiku pre-rank) to bound cost.
+
 ### Persist each posting's JD beside its tailored PDF (surfaced by decision 086)
 
 - [ ] Store the job description (or the tailored structured `TailoredResume`) next to each
@@ -784,6 +801,18 @@ Posted to the agent bus 2026-07-06; independent of the engine work above.
 ---
 
 ## Recently added (this session, latest first)
+
+- 2026-07-22 — **Honest loop messages + early-career match-quality fixes (decision 122).**
+  Fixed the misleading *"Nothing recently scored to re-prepare"* (it fired when the cache was
+  full but nothing cleared `min_fit`) — both loop paths now name the real reason + fix (best fit
+  seen vs your `min_fit`). Added a `company_exclude` gate + `(company, normalized-title)` repost
+  dedup to `apply_gates` (both funnel-counted as `gate_company`/`gate_duplicate`), to strip
+  staffing-agency spam that was eating the `top_n` judged slots. Tuned the user's git-ignored
+  `discovery.yaml` (explicit early-career `keywords`, `title_exclude += instructor/teacher/…`,
+  `company_exclude` seed). **Measured: best fit 41 → 72** — a real *Associate SWE - Java* role now
+  clears `min_fit` 60 (was 0 cleared). 4 new tests. **Still open:** the curated feed is saturated
+  with staffing spam whose keyword-stuffed titles out-rank real new-grad roles — see the new
+  "Discovery quality: staffing-spam down-ranking" item under **Next**.
 
 - 2026-07-22 — **Goal mode for the web auto-apply loop (decision 121).** The loop can now run
   until **N applications are ready to review + submit** (the decision-069 Ready-to-apply queue),

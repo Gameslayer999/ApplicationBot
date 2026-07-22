@@ -185,6 +185,12 @@ class DiscoveryFilters(BaseModel):
         description="Drop postings whose TITLE contains any of these (case-insensitive), "
         "e.g. 'sales', 'recruiter' — a cheap gate before the matcher.",
     )
+    company_exclude: list[str] = Field(
+        default_factory=list,
+        description="Drop postings whose COMPANY contains any of these (case-insensitive), "
+        "e.g. staffing agencies that repost the same role many times ('Consultadd', "
+        "'DellFor') — a cheap gate before the matcher.",
+    )
     experience_levels: list[str] = Field(
         default_factory=list,
         description="Keep only postings at these experience levels, detected from the TITLE: "
@@ -364,6 +370,15 @@ def _posting_datetime(raw) -> Optional[datetime]:
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
+_TITLE_NORM_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _norm_title(title: str) -> str:
+    """Normalize a title for dedup: lowercase, collapse every run of non-alphanumerics to a
+    single space, and trim. So 'Python Developer' == 'python  developer' == 'Python-Developer'."""
+    return _TITLE_NORM_RE.sub(" ", (title or "").lower()).strip()
+
+
 def apply_gates(postings, filters: DiscoveryFilters, stats: Optional[dict] = None):
     """Cheap pre-matcher gates from the filter config: remote_only, title_exclude, a salary
     floor when the posting states pay, an experience-level gate (by title), and — when
@@ -372,19 +387,27 @@ def apply_gates(postings, filters: DiscoveryFilters, stats: Optional[dict] = Non
     updated_at pass their gate (we don't drop for missing data).
 
     When `stats` is given, it's populated with a per-gate drop count
-    (`gate_remote`/`gate_title`/`gate_level`/`gate_salary`/`gate_stale`) so the funnel
-    diagnostic can show which gate dropped how many — not just the collapsed total."""
+    (`gate_remote`/`gate_title`/`gate_company`/`gate_level`/`gate_salary`/`gate_stale`/
+    `gate_duplicate`) so the funnel diagnostic can show which gate dropped how many — not just
+    the collapsed total. A final dedup pass collapses near-identical reposts (same company +
+    title, e.g. a staffing agency posting one role many times) to the first seen."""
     excl = [t.lower() for t in filters.title_exclude]
+    co_excl = [c.lower() for c in filters.company_exclude]
     want_levels = {_norm_level(l) for l in filters.experience_levels} & set(EXPERIENCE_LEVELS)
     now = datetime.now(timezone.utc)
-    drops = {"gate_remote": 0, "gate_title": 0, "gate_level": 0, "gate_salary": 0, "gate_stale": 0}
+    drops = {"gate_remote": 0, "gate_title": 0, "gate_company": 0, "gate_level": 0,
+             "gate_salary": 0, "gate_stale": 0, "gate_duplicate": 0}
     kept = []
+    seen_key: set[tuple[str, str]] = set()  # (company, title) already kept — collapse reposts
     for p in postings:
         if filters.remote_only and p.remote is False:
             drops["gate_remote"] += 1
             continue
         if excl and any(x in p.title.lower() for x in excl):
             drops["gate_title"] += 1
+            continue
+        if co_excl and any(x in (p.company or "").lower() for x in co_excl):
+            drops["gate_company"] += 1
             continue
         if want_levels:
             # Lenient: drop only when the title clearly names a level and none is wanted;
@@ -403,6 +426,14 @@ def apply_gates(postings, filters: DiscoveryFilters, stats: Optional[dict] = Non
             if dt is not None and (now - dt).days > filters.max_posting_age_days:
                 drops["gate_stale"] += 1
                 continue
+        # Collapse near-identical reposts: same company + normalized title. Staffing agencies
+        # post one role many times, which otherwise eats resolve + Claude-judge slots. Keyed on
+        # normalized text (not URL) precisely because the dups carry DISTINCT apply URLs.
+        key = ((p.company or "").strip().lower(), _norm_title(p.title))
+        if key != ("", "") and key in seen_key:
+            drops["gate_duplicate"] += 1
+            continue
+        seen_key.add(key)
         kept.append(p)
     if stats is not None:
         stats.update(drops)

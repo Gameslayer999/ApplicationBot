@@ -447,15 +447,43 @@ def _loop_worker(rescan: bool = False, force_retailor: bool = False,
         # snapshot; served as a single bounded batch so it re-prepares the set once, then
         # reports caught-up. If nothing is cached, bail with an actionable message rather than
         # silently doing nothing (UI principle #3).
+        # The best Claude fit score seen this run (even below the bar), so a "nothing to
+        # prepare" outcome can name the real reason + fix instead of implying the cache is
+        # empty (UI Principle #3). Updated by discover_batch / seeded from the cache on rescan.
+        best_seen = {"fit": None}
+
+        def _note_best(matches) -> None:
+            fits = [m.fit_score for m in matches if m.fit_score is not None]
+            if fits:
+                top = max(fits)
+                if best_seen["fit"] is None or top > best_seen["fit"]:
+                    best_seen["fit"] = top
+
+        def _below_bar_msg(prefix: str) -> str:
+            """Message for 'matches exist, but none clear min_fit' — the real reason, with the
+            one-click fix (lower min_fit in Discovery settings)."""
+            best = best_seen["fit"]
+            return (f"{prefix} the best fit Claude scored was {best}, below your min_fit of "
+                    f"{min_fit}. Lower min_fit in Discovery settings (try {max(1, best)}) to let "
+                    "these through, or broaden your boards to surface stronger matches." if best is not None
+                    else f"{prefix} nothing has been scored yet — start a normal loop to search and judge.")
+
         rescan_pool: list = []
         if rescan:
-            rescan_pool = cleared_queue(
-                pipeline.cached_matches(resume, filters, profile=profile), min_fit)
+            cached = pipeline.cached_matches(resume, filters, profile=profile)
+            _note_best(cached)
+            rescan_pool = cleared_queue(cached, min_fit)
             if not rescan_pool:
-                _loop_set(running=False, phase="caught_up", current=None, message=(
-                    "Nothing recently scored to re-prepare. Start a normal auto-apply loop "
-                    "first (it scores and caches matches); then re-check to re-prepare them "
-                    "without re-scoring, while the cache is fresh."))
+                # Distinguish an empty cache from a full cache where nothing clears the bar —
+                # the old message claimed "nothing scored" in BOTH cases, sending users to
+                # re-run a loop that can't help when the real problem is the min_fit threshold.
+                if not cached:
+                    msg = ("Nothing recently scored to re-prepare. Start a normal auto-apply "
+                           "loop first (it scores and caches matches); then re-check to "
+                           "re-prepare them without re-scoring, while the cache is fresh.")
+                else:
+                    msg = _below_bar_msg(f"Re-prepared nothing: {len(cached)} match(es) are cached, but")
+                _loop_set(running=False, phase="caught_up", current=None, message=msg)
                 return
 
         served = {"done": False}
@@ -474,6 +502,7 @@ def _loop_worker(rescan: bool = False, force_retailor: bool = False,
                                               use_claude=True, only_new=True)
             for e in res.errors:
                 _loop_set(message=f"discovery note: {e}")
+            _note_best(res.matches)
             return cleared_queue(res.matches, min_fit)
 
         def prepare_one(m):
@@ -528,11 +557,17 @@ def _loop_worker(rescan: bool = False, force_retailor: bool = False,
                 f"Reached your goal — {ready_n} application(s) ready for you to review and "
                 "apply. Apply to them below, or start the loop again to prepare more."))
         elif reason == "caught_up":
-            short = (f" (fewer than your goal of {goal} — the boards had no more new matches)"
-                     if goal is not None and ready_n < goal else "")
-            _loop_set(running=False, phase="caught_up", current=None, message=(
-                f"Caught up — no new matches. {ready_n} application(s) ready for you to apply{short}. "
-                "Start the loop again later to re-search."))
+            if ready_n == 0 and best_seen["fit"] is not None and best_seen["fit"] < min_fit:
+                # Postings WERE found and judged — none just cleared min_fit. Say that, with the
+                # fix, instead of "no new matches" (which reads as "the boards are empty").
+                _loop_set(running=False, phase="caught_up", current=None,
+                          message=_below_bar_msg("No applications were prepared:"))
+            else:
+                short = (f" (fewer than your goal of {goal} — the boards had no more new matches)"
+                         if goal is not None and ready_n < goal else "")
+                _loop_set(running=False, phase="caught_up", current=None, message=(
+                    f"Caught up — no new matches. {ready_n} application(s) ready for you to apply{short}. "
+                    "Start the loop again later to re-search."))
         else:
             _loop_set(running=False, phase="stopped", current=None,
                       message=f"Loop stopped. {ready_n} application(s) ready for you to apply.")
