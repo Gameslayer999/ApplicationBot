@@ -138,6 +138,16 @@ pipeline closer to working end-to-end.
     `git status` that no PII or secret paths appear. If `.gitignore` is missing such a
     location, add it before committing code that writes there.
 
+13. **Keep `README.md` truthful after every large functional change.** The README is the
+    first thing a user or contributor reads; it must describe the tool as it actually is,
+    not as it was planned. Any change that adds, removes, or materially alters
+    user-facing functionality — a new stage capability, a new source/ATS, a new command
+    or flag, a changed install/setup flow, a new safety behaviour — requires updating the
+    README in the same change: features it now supports, commands/flags in the reference,
+    requirements, install/quick-start steps, and the Status section. Like `DECISIONS.md`
+    (#9) and `NEXT_STEPS.md` (#10), if the README wasn't updated, the task isn't finished.
+    A change that only alters internals no user can observe does not need a README edit.
+
 ---
 
 ## UI Design Principles

@@ -1,208 +1,230 @@
-# ApplicationBot
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-darkmode.png">
+    <img src="assets/logo-lightmode.png" alt="ApplicationBot" width="200">
+  </picture>
+</p>
 
-A personalized, end-to-end job-application pipeline. **[Download the latest release](../../releases)**,
-set up your profile and filters, and ApplicationBot discovers matching job openings, tailors your
-resume to each one, applies with no human intervention, and tracks every application it submits.
+<h1 align="center">ApplicationBot</h1>
 
-> **Status:** Early development — high-level design only. Architecture, tech stack, and
-> module boundaries are still being defined.
+<p align="center"><b>The job search that runs on your machine.</b><br>
+Discovers matching openings, tailors your résumé to each one, applies for you, and tracks everything — with a dry-run safety switch so nothing is ever submitted until you say go.</p>
 
-## What it does
+<p align="center">
+  <img alt="Platform" src="https://img.shields.io/badge/platform-macOS%20app%20%C2%B7%20source%20anywhere-blue">
+  <img alt="Python" src="https://img.shields.io/badge/python-3-blue">
+  <img alt="Safety" src="https://img.shields.io/badge/submit-dry--run%20by%20default-brightgreen">
+  <img alt="Powered by Claude" src="https://img.shields.io/badge/powered%20by-Claude-8A63D2">
+</p>
 
-1. **Configure** — you supply a profile: contact details, a base resume, and filters
-   describing the jobs you want (roles, keywords, location/remote, pay range, seniority,
-   company type, etc.). Filters drive both discovery and auto-apply.
-2. **Discover** — scrapes job boards and company career pages for openings that match
-   your filters, extracting each posting's details (title, company, location,
-   description, requirements, pay, application portal, application method).
-3. **Tailor** — automatically customizes your resume (and optionally a cover letter) for
-   each posting based on its job description.
-4. **Apply** — fully fills out and submits the application through the posting's
-   form/portal, with no human intervention.
-5. **Track** — records every application with notes: pay rate, application portal,
-   location, company, role, status, date applied, and the tailored resume used.
+ApplicationBot is a personalized, end-to-end job-application pipeline you run yourself. You supply
+your profile, a base résumé, and filters describing the jobs you want; it finds matching postings,
+customizes your résumé for each, fills out and submits the applications, and records every one. It is
+built to be **downloaded and used by anyone** — nothing about you is baked into the repo; your data
+lives in a local, git-ignored folder and never leaves your machine except the minimal text a
+tailoring or matching call sends to Claude.
 
-## Built to be cloned
+> [!WARNING]
+> **Submitting an application is irreversible, so real submission is gated behind a deliberate safety switch.**
+> - **Dry-run is the default.** Out of the box, ApplicationBot does everything *except* the final submit — it
+>   discovers, tailors, fills the form, and records what it *would* have sent. Nothing is submitted.
+> - **Arming is explicit.** Real submission happens only after you set `armed: true` in `profile/safety.yaml`
+>   (with a per-run submission cap).
+> - **A global kill switch stops everything.** Creating a `profile/KILL` file halts all submission immediately;
+>   it is re-checked right before every click.
+>
+> You are responsible for how you use it. Automated applications may conflict with some job boards' terms of
+> service and can put your account at risk on those sites — review each site's rules and decide what you're
+> comfortable running.
 
-ApplicationBot is meant to be used by anyone. Nothing about a specific user is baked
-into the repo — your profile, resume, filters, and application history all live in your
-own local (git-ignored) config. Download a release, configure, run.
+---
 
-## Safety
+## How it works
 
-Real applications are irreversible, so submission is gated by a deliberate safety
-switch:
+Five stages, each of which you can run on its own or chain into one autonomous loop:
 
-- **`dry_run` is the default** — the pipeline does everything except the final submit,
-  recording what it *would* have sent. Real submission requires you to explicitly arm
-  the system.
-- A **global kill switch** halts all submission immediately.
+```
+Configure  →  Discover  →  Tailor  →  Apply  →  Track
+```
 
-See Agent Guideline #3 in [CLAUDE.md](CLAUDE.md).
+1. **Configure** — set up your profile: contact details, a base résumé (structured YAML, the source of
+   truth), and filters (roles, keywords, location/remote, pay range, seniority, company type). Filters
+   drive both what gets discovered and what gets auto-applied to. Edit it all from the web UI or in
+   `profile/*.yaml`.
+2. **Discover** — pull openings that match your filters from public ATS APIs
+   (Greenhouse · Lever · Ashby · SmartRecruiters · Recruitee · Workable), keyless aggregators
+   (Adzuna · Jooble · Remotive and other JSON sources), and forwarded job-alert emails. A cheap keyword
+   pre-filter narrows the pool, a two-stage judge (Haiku pre-rank → Sonnet) ranks the survivors by
+   qualification fit and names your missing requirements, and a funnel view shows exactly how many
+   postings reached each stage.
+3. **Tailor** — Claude rewrites your résumé for each posting — selecting, reordering, and rephrasing what
+   you already have. A drift check flags any skill, role, or certification that isn't in your base résumé,
+   so it stays factual, and every exported PDF is re-checked to confirm its text layer is machine-readable.
+4. **Apply** — a real browser (Playwright) fills and submits the application through the posting's own
+   ATS, including multi-page wizards and account-gated **Workday** (automated account creation, credentials
+   in your OS keychain). Applications that get blocked (a question it can't answer, a login, a CAPTCHA) are
+   *parked* so you can resolve and resume them. Every submit is gated by the safety switch above.
+5. **Track** — every application is recorded in a local SQLite database with company, role, location, pay,
+   portal, status, date, fit score, and the exact tailored résumé used — viewable and editable in the Track
+   tab, with funnel and calibration reports.
 
-## Repository docs
+Discovery, tailoring, filling, and submission run with **no human in the loop** once you arm the system —
+that is the point of the tool. Until then, everything is a dry run.
 
-- [CLAUDE.md](CLAUDE.md) — onboarding guide and working agreement for anyone (human or
-  agent) contributing to the project. Read this first.
-- [NEXT_STEPS.md](NEXT_STEPS.md) — living build queue: current state, what's next, and
-  open decisions.
-- [DECISIONS.md](DECISIONS.md) — architecture and tooling decisions with their rationale.
+---
 
-## Getting started
+## Requirements
 
-### Get it — download the latest release (recommended)
+- **macOS** to run the prebuilt app (Apple Silicon). Any OS to run from source.
+- **Python 3** for the from-source path. The prebuilt macOS app bundles its own — you need nothing installed.
+- **A browser for the Apply stage** — Chromium, downloaded automatically on first run.
+- **Claude, one of three ways** (for the Discover judge and Tailor stage):
+  - a **Claude Pro/Max subscription** via [Claude Code](https://claude.com/product/claude-code) — recommended, not metered;
+  - your own **Anthropic API key** — pay-per-token, stored in your OS keychain; or
+  - **nothing at all** — the built-in `rules` engine reorders/selects by keyword with no account and no network.
 
-**The easiest way to run ApplicationBot** — no need to clone the repo or build anything. Grab it
-from the **[latest release](../../releases)**:
+---
 
-- **macOS — the desktop app (no Python needed):** download **`ApplicationBot.app.zip`**, unzip, drag
-  **`ApplicationBot.app`** into your Applications folder, and double-click. First launch after
-  downloading needs one quick trust step — see [Install the desktop app](#install-the-desktop-app-macos)
-  below.
-- **Windows / Linux (or macOS from source):** download the release's **source zip**, unzip, and run
-  the launcher — **`ApplicationBot.bat`** (Windows), **`./scripts/run.sh`** (Linux), or
-  **`ApplicationBot.command`** (macOS; first launch: right-click → **Open**). Needs **Python 3**; the
-  launcher sets up the virtualenv, dependencies, and the automation browser (Chromium) on first run.
-  It's idempotent — safe to re-run any time.
+## Install
 
-Then, in the app, follow the **✨ Finish setup** walkthrough: add your details and résumé, choose what
-jobs to find, and run your first dry-run. Nothing is ever submitted until you deliberately arm the
-safety switch.
+### Option A — download the macOS app (recommended)
 
-> **Claude connection (optional).** Tailoring uses your **Claude subscription** via
-> [Claude Code](https://claude.com/product/claude-code) (recommended — not metered; sign in
-> inside Claude Code). No Claude Code? Add your own **Anthropic API key** as a fallback
-> (pay-per-token, kept in your OS keychain) from the app's bottom-left "Claude connection"
-> panel. With neither, the free `rules` engine works with no account at all.
+The easiest way to run ApplicationBot — no clone, no build, no Python.
 
-### Install the desktop app (macOS)
-
-ApplicationBot ships as a self-contained Mac app — its own window, no browser, no Python, no setup.
-
-**Option A — download the app (most people):**
-
-1. Download **`ApplicationBot.app.zip`** from the [latest release](../../releases).
-2. Double-click the zip to unzip it, then **drag `ApplicationBot.app` into your Applications folder**.
-3. **First launch only** — because the app isn't signed by an Apple-registered developer, macOS
-   blocks it once. Get past it one of these ways (after that it opens normally, forever):
+1. Download **`ApplicationBot.app.zip`** from the **[latest release](../../releases)**.
+2. Double-click to unzip, then **drag `ApplicationBot.app` into your Applications folder**.
+3. **First launch only** — because the app isn't signed by an Apple-registered developer, macOS blocks it
+   once. Get past it one of these ways (after that it opens normally, forever):
    - **Right-click** (or Control-click) the app → **Open** → **Open**; **or**
-   - if that's greyed out (macOS Sequoia and later): open **System Settings → Privacy & Security**,
-     scroll to *"ApplicationBot was blocked…"*, click **Open Anyway**, then confirm; **or**
+   - macOS Sequoia and later: open **System Settings → Privacy & Security**, scroll to
+     *"ApplicationBot was blocked…"*, click **Open Anyway**, then confirm; **or**
    - in Terminal: `xattr -dr com.apple.quarantine /Applications/ApplicationBot.app`
-4. Double-click to launch. The in-app **✨ walkthrough** sets you up (details, résumé, filters), and
-   the Apply-stage browser (Chromium) downloads quietly in the background on first run.
+4. Double-click to launch. It's fully self-contained (its own Python, all dependencies, the Apply-stage
+   Chromium downloads quietly on first run) and reads nothing from your Documents folder. Your data lives in
+   `~/Library/Application Support/ApplicationBot/`.
 
-> Why the block? The app is **ad-hoc signed** (free), which lets it run but isn't Apple-*notarized*
-> (which needs a paid Apple Developer account). Notarization would remove that first-launch prompt;
-> nothing else changes. The app is **Apple-Silicon (arm64)**.
+> The app is **ad-hoc signed** (free) — that first-launch prompt is the only cost of skipping Apple's paid
+> notarization; nothing else changes.
 
-**Option B — build it yourself from source:**
+### Option B — run from source (CLI + web UI, any OS)
 
-```bash
-./scripts/build_macapp.sh      # builds a self-contained ApplicationBot.app in this folder
-```
-
-A locally-built copy has no download quarantine, so it launches with no warning — just drag it to
-Applications (or double-click in place).
-
-**What the app is:**
-
-- **Fully self-contained** — bundles its own Python, all dependencies, and the code. No Python
-  install, no setup step, and **no file-access prompts** (it reads nothing from your Documents folder).
-- **Your data** lives in `~/Library/Application Support/ApplicationBot/` (profile, résumé, filters,
-  application history) — independent of any source checkout.
-- It's a **production snapshot**: it does *not* reflect live repo edits — rebuild (or ship a new
-  release) to update it.
-
-**Developing / testing?** Use localhost, which runs your *live* repo with auto-reload:
-`./scripts/dev.sh` (browser) or `./scripts/run.sh --window` (native window).
-
-To cut a release yourself: `./scripts/release.sh` (dry run — prints the plan and changes
-nothing) then `./scripts/release.sh --publish`.
-
-### For developers (CLI)
-
-The first stage — **resume customization (Tailor)** — is implemented. It takes a base
-resume (structured YAML, the source of truth) and a job description, produces a tailored
-resume that stays factual and keeps your resume's format, and renders it to Markdown.
+For developers, or Windows/Linux users.
 
 ```bash
-pip install -r requirements.txt
-
-python -m applicationbot.cli path/to/job_description.md \
-    --resume examples/sample_resume.yaml --out tailored.md
+git clone https://github.com/Gameslayer999/ApplicationBot.git
+cd ApplicationBot
+./scripts/run.sh            # sets up the venv + Chromium, starts http://127.0.0.1:8000, opens your browser
 ```
 
-- The base resume is structured data, so tailoring **selects, reorders, and rephrases** —
-  it can't invent experience. A drift check flags any skill/role/certification that
-  isn't in the base resume, whatever engine ran.
-- Output preserves your resume's section order, categorized skills, and layout.
-- `examples/sample_resume.yaml` is synthetic test data. Drop in your own resume in
-  `profile/` (git-ignored) and use `--resume profile/resume.yaml`.
+- **Windows:** run **`ApplicationBot.bat`**. **Linux:** `./scripts/run.sh`. **macOS from source:** `ApplicationBot.command`
+  (first launch: right-click → **Open**).
+- The launcher is idempotent — safe to re-run any time. It creates the virtualenv, installs dependencies, and
+  downloads the automation browser on first run.
+- Prefer a native desktop window over a browser tab? `./scripts/run.sh --window`.
 
-### Tailoring engines (`--backend`) — subscription primary, API key fallback
+---
 
-The engine is pluggable and defaults to `auto`:
+## Quick start
+
+Whichever way you installed, the flow is the same:
+
+1. **Finish setup.** Follow the in-app **✨ Finish setup** walkthrough — add your details and résumé, and choose
+   which jobs to find. (From source you can instead copy the templates in [`examples/`](examples/) into `profile/`:
+   `sample_resume.yaml`, `discovery.example.yaml`, `safety.example.yaml`.)
+2. **Connect Claude (optional but recommended).** Sign in with Claude Code for the best tailoring on your
+   subscription, or add an Anthropic API key in the bottom-left **"Claude connection"** panel. With neither, the
+   free `rules` engine works with no account.
+3. **Discover + dry-run apply.** Hit **Find & fill one application (dry-run)** in the Discover tab (or, from the
+   CLI, `python -m applicationbot.pipeline --apply-first`). Watch it discover a match, tailor your résumé, and
+   fill the form live. **It never submits.**
+4. **Arm it when you're ready.** Set `armed: true` in `profile/safety.yaml` (with a submission cap) to let it
+   submit for real. Drop a `profile/KILL` file to stop everything instantly.
+
+---
+
+## Command reference
+
+The web UI covers everything, but each stage is also a module you can run directly.
+
+| Command | What it does |
+|---|---|
+| `./scripts/run.sh [PORT]` | Set up and start the web UI (default `http://127.0.0.1:8000`) |
+| `./scripts/dev.sh` | Dev mode: auto-restart on save, page auto-reloads |
+| `./scripts/update.sh` / `restart.sh` / `stop.sh` | Pull latest + reinstall + restart · restart · stop |
+| `python -m applicationbot.web [--port 8000]` | Start the web UI directly (stdlib, binds `127.0.0.1` only) |
+| `python -m applicationbot.pipeline --apply-first` | Discover → judge → tailor → **dry-run** fill one top match |
+| `python -m applicationbot.runner [--max N] [--continuous]` | Autonomous loop over every cleared match (dry-run by default) |
+| `python -m applicationbot.cli JD.md --resume R.yaml --out out.pdf` | Tailor a résumé to one job description (CLI) |
+| `python -m applicationbot.apply URL --resume profile/resume.yaml --dry-run` | Fill one application by URL |
+| `python -m applicationbot.doctor` | Read-only health check (Claude sign-in, Chromium, résumé, safety state) |
+| `python -m applicationbot.tracker [funnel\|calibration]` | Inspect tracked applications and reports |
+| `python -m applicationbot.mailbox link\|status\|test` | Link the bot inbox (Workday email verification, job-alert ingest) |
+
+**Tailoring engines** (`--backend`, defaults to `auto`):
 
 | `--backend` | Needs | Quality |
 |---|---|---|
-| `claude-code` | Claude Code installed + signed in — uses your **Claude subscription** (Pro/Max), **not** the paid API | Best — rewrites bullets to match the posting |
-| `anthropic-api` | Your own **Anthropic API key** (console.anthropic.com), stored in the OS keychain — **metered**, pay-per-token | Same rewriting as `claude-code`, billed to your API account |
+| `claude-code` | Claude Code signed in — your **subscription**, not the metered API | Best — rewrites bullets to match the posting |
+| `anthropic-api` | Your own **Anthropic API key** (OS keychain) — **metered** | Same rewriting, billed to your API account |
 | `rules` | **Nothing** — no LLM, no account, no network | Reorders/selects by keyword; doesn't reword |
-| `auto` (default) | — | **Claude subscription** (Claude Code) → else your **API key** → else rules |
+| `auto` (default) | — | Subscription → else API key → else rules |
 
-**Claude subscription is primary.** The best path shells out to the Claude Code CLI
-(`claude -p`), which runs on your Claude Pro/Max **subscription** — not the metered API.
-Sign-in happens inside Claude Code (`claude`, then `/login`), **not** in this app: Anthropic
-restricts subscription login to Claude Code and Claude.ai, so a third-party app like this one
-**cannot "log in with Claude"** on your subscription (the Messages API rejects subscription
-OAuth). **The API key is the fallback.** If Claude Code isn't available, connect your own
-Anthropic API key in the app's bottom-left **"Claude connection"** panel — it's stored in your
-OS keychain (never in git or a config file) and billed pay-per-token to your API account,
-separate from your subscription. With neither, the `rules` engine needs nothing at all, so the
-tool works out of the box with zero setup.
+> **Why can't it "log in with Claude" in the app?** Anthropic restricts subscription login to Claude Code and
+> Claude.ai, so a third-party app can't use your subscription directly. The best path shells out to the Claude
+> Code CLI (which *is* on your subscription); the API key is the metered fallback.
 
-### Reviewing in the browser (web UI)
+---
 
-For easier review than the CLI, start the local web app:
+## Configuration & your data
 
-```bash
-./scripts/run.sh          # sets up the venv, starts on http://127.0.0.1:8000, opens your browser
-./scripts/run.sh 9000     # ...on a different port
-./scripts/dev.sh          # DEV: auto-restart on code changes; the browser refreshes itself
-./scripts/update.sh       # pull the latest from GitHub, reinstall deps, and restart
-./scripts/restart.sh      # stop + start again (picks up code changes)
-./scripts/stop.sh         # stop it
-```
+Everything specific to you lives in the git-ignored **`profile/`** folder (from source) or
+`~/Library/Application Support/ApplicationBot/` (the app):
 
-(Or run it directly: `python -m applicationbot.web [--port 8000]`.)
+- `resume.yaml` — your base résumé, the factual source of truth.
+- `discovery.yaml` — filters, boards, and sources (roles, keywords, location, pay, seniority, gates).
+- `safety.yaml` — the arm switch and per-run submission cap.
+- `notifications.yaml`, `mailbox.yaml` — optional desktop/phone push and the bot inbox link.
+- `applications.db` + `applications/` — your tracked history and per-application archives.
 
-**Editing the code?** Run `./scripts/dev.sh` (same as `run.sh --dev`). It watches
-`applicationbot/` and restarts the server on every save, and the open page reloads itself — so
-your changes show up without touching the terminal. The whole UI lives in
-[applicationbot/web.py](applicationbot/web.py); see [ui.md](ui.md) before changing it.
+Template versions of these live in [`examples/`](examples/). Run `python -m applicationbot.doctor` any time to
+confirm your setup is healthy.
 
-**Getting updates.** `./scripts/update.sh` fast-forwards your clone to the latest GitHub commit,
-reinstalls dependencies if they changed, and restarts (or lets the dev auto-reloader pick it up).
-It refuses to run if you have uncommitted local changes, so it never overwrites your work — `git
-stash` first, update, then `git stash pop`. (Windows: `git pull` then re-run `ApplicationBot.bat`.)
+---
 
-Pick a resume, pick a saved job fixture (or paste your own posting), choose an engine, and
-hit **Tailor** — the tailored resume renders in the browser (styled to resemble a real
-single-column resume) alongside the relevance notes, any factual-drift warnings, and which
-engine ran. Zero dependencies (Python stdlib), binds to `127.0.0.1` only, and only reads
-files from `profile/`, `examples/`, and `fixtures/job_descriptions/`.
+## Privacy & safety
 
-The **Résumé data** tab lets you grow your source-of-truth beyond the uploaded resume — add
-experience, activities, or projects that weren't on it, or add bullets to an existing entry.
-Tailoring then selects the relevant parts per job.
+Your résumé, contact details, credentials, and application history are sensitive and are treated that way:
 
-The other four stages (Configure, Discover, Apply, Track) are still design-only — see
-[NEXT_STEPS.md](NEXT_STEPS.md).
+- **Personal data never enters git.** Everything above is covered by `.gitignore` and stays on your machine.
+  Only the minimal text a matching or tailoring call needs is ever sent to Claude.
+- **Credentials go in your OS keychain**, never in plaintext YAML — the Anthropic API key, and any Workday
+  account passwords.
+- **Submission is safety-gated** — dry-run by default, explicit arming, global kill switch (see the warning at
+  the top).
+- **Scraping respects each site's terms and rate limits.** ApplicationBot does not build functionality whose
+  purpose is to evade bot detection.
 
-## Notes
+---
 
-- Your resume, contact details, application history, and account credentials are
-  sensitive and must never be committed to git. See `.gitignore` and Agent Guideline #12
-  in [CLAUDE.md](CLAUDE.md).
-- Scraping respects each site's terms of service and rate limits.
+## Project docs
+
+- [CLAUDE.md](CLAUDE.md) — onboarding guide and working agreement for anyone (human or agent) contributing. Read first.
+- [NEXT_STEPS.md](NEXT_STEPS.md) — living build queue: current state, what's next, open decisions.
+- [DECISIONS.md](DECISIONS.md) — every architecture and tooling decision with its rationale.
+
+## Status
+
+Actively developed. All five stages have working implementations; a few live paths (some Workday tenants, the
+Adzuna apply click-through) are verified against fixtures and pending confirmation on a real residential network
+— see [NEXT_STEPS.md](NEXT_STEPS.md).
+
+## License
+
+No license file is currently included, so default copyright applies. A license will be added before a public
+release — open an issue if you need clarity in the meantime.
+
+---
+
+<sub>ApplicationBot is an independent, open-source project. It is not affiliated with, endorsed by, or maintained
+by Anthropic; "Claude" and "Claude Code" are referenced only to describe the toolchain it runs on. There is no
+associated token, cryptocurrency, or paid offering.</sub>
