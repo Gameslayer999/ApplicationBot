@@ -34,7 +34,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from datetime import date
 from html.parser import HTMLParser
 from typing import Any, Optional
@@ -675,6 +675,134 @@ class RemoteOKSource(Source):
         return out
 
 
+# ---------------------------------------------------------------------------
+# Declarative JSON-API aggregator (DECISIONS.md #136)
+#
+# The keyless aggregators above (Himalayas/RemoteOK) are each a ~40-line class that GETs a JSON
+# endpoint, walks to the jobs array, and maps fields onto a Posting. `JsonApiSource` generalizes
+# exactly that shape into a spec, so a NEW public-JSON aggregator becomes validated DATA (an
+# `AggregatorSpec` in the committed registry) instead of a bespoke subclass + config field +
+# build_sources branch. Keyless only, by design (Guideline #4 / decision 026) — a platform that
+# needs auth or HTML scraping is the escape hatch: a hand-written adapter via PR, not a spec.
+# All specs emit `ats="jsonapi"` so ONE `_AGGREGATOR_ATS` entry rides them through the bridge +
+# fillability path; the real platform name lives in `Source.name` (logging) + `extra['platform']`.
+# ---------------------------------------------------------------------------
+
+JSONAPI_ATS = "jsonapi"
+# Posting fields a spec's `field_map` may target (source side is a dotted path into each job item).
+_JSONAPI_FIELDS = ("title", "company", "body", "url", "apply_url", "location", "compensation", "updated_at")
+
+
+def _dig(obj: Any, path: str) -> Any:
+    """Walk a dotted path (`a.b.c`) into nested dicts; '' returns obj unchanged. Returns '' if any
+    step is missing, so a spec that names a field a given posting lacks yields empty, not a crash."""
+    if not path:
+        return obj
+    cur = obj
+    for seg in path.split("."):
+        if isinstance(cur, dict) and seg in cur:
+            cur = cur[seg]
+        else:
+            return ""
+    return cur
+
+
+@dataclass
+class AggregatorSpec:
+    """Declarative spec for a public JSON job API. `endpoint` is a URL template with optional
+    `{q}` (keyword, URL-encoded), `{limit}`, `{offset}`, `{page}` placeholders; `list_path` is the
+    dotted path to the jobs array ('' = the response itself is the array); `field_map` maps each
+    Posting field to a dotted key in a job item. Usable iff it maps `title`, `company`, and one of
+    `url`/`apply_url` (enforced by source_scout.validate_spec)."""
+
+    name: str
+    endpoint: str
+    list_path: str = ""
+    field_map: dict = field(default_factory=dict)
+    paginate: str = "none"          # "none" | "offset" | "page"
+    page_size: int = 50
+    max_results: int = 100
+    query_required: bool = True     # endpoint uses {q}: fetch once per keyword; else a single fetch
+    remote: Optional[bool] = None   # fixed remote flag for remote-only boards (else inferred: None)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "AggregatorSpec":
+        known = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in (d or {}).items() if k in known})
+
+
+class JsonApiSource(Source):
+    def __init__(self, spec: AggregatorSpec, *, keywords: list[str] | None = None) -> None:
+        self.spec = spec
+        # [""] = a single query-less fetch when the endpoint has no {q} or no keywords are given.
+        self.keywords = [k for k in (keywords or []) if k] or [""]
+        self.name = f"jsonapi:{spec.name}"
+
+    def fetch(self) -> list[Posting]:
+        queries = self.keywords if self.spec.query_required else [""]
+        out: list[Posting] = []
+        seen: set = set()
+        for q in queries:
+            self._fetch_query(q, out, seen)
+            if len(out) >= self.spec.max_results:
+                break
+        return out[: self.spec.max_results]
+
+    def _url(self, q: str, offset: int, page: int) -> str:
+        return (self.spec.endpoint
+                .replace("{q}", urllib.parse.quote(q))
+                .replace("{limit}", str(self.spec.page_size))
+                .replace("{offset}", str(offset))
+                .replace("{page}", str(page)))
+
+    def _fetch_query(self, q: str, out: list[Posting], seen: set) -> None:
+        offset, page = 0, 1
+        while len(out) < self.spec.max_results:
+            data = fetch_json(self._url(q, offset, page))
+            items = _dig(data, self.spec.list_path)
+            if not isinstance(items, list) or not items:
+                break
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                p = self._map(item)
+                if not p:
+                    continue
+                key = canonical_url(p.url) if p.url else f"{p.company}|{p.title}"
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(p)
+                if len(out) >= self.spec.max_results:
+                    return
+            if self.spec.paginate == "none" or len(items) < self.spec.page_size:
+                break
+            offset += self.spec.page_size
+            page += 1
+
+    def _map(self, item: dict) -> Optional[Posting]:
+        g = lambda f: str(_dig(item, self.spec.field_map[f]) or "").strip() if f in self.spec.field_map else ""
+        title, company = g("title"), g("company")
+        apply_url = g("apply_url") or g("url")
+        url = g("url") or apply_url
+        if not title or not apply_url:
+            return None  # a job with no title or nowhere to apply is unusable; skip it
+        body_raw = g("body")
+        return Posting(
+            company=company or "Unknown",
+            title=title,
+            body=html_to_text(body_raw) if body_raw else "",
+            url=url,
+            ats=JSONAPI_ATS,
+            location=g("location") or ("Remote" if self.spec.remote else ""),
+            compensation=g("compensation"),
+            remote=self.spec.remote,
+            apply_url=apply_url,
+            updated_at=g("updated_at"),
+            extra={"snippet_only": True, "platform": self.spec.name},
+        )
+
+
 class SmartRecruitersSource(Source):
     """Public, no-auth SmartRecruiters postings API — a DIFFERENT ATS/form system than
     Greenhouse/Lever/Ashby, so the Apply stage gets exercised on new forms. The list
@@ -1211,6 +1339,171 @@ class CuratedListSource(Source):
         return out
 
 
+# ---------------------------------------------------------------------------
+# Job-alert emails as a discovery source (DECISIONS.md #132)
+#
+# Aggregators the user subscribes to (Lensa, LinkedIn) and single-company career sites (Aflac)
+# email periodic job alerts. Forwarding those alerts into the already-linked bot inbox (mailbox.py)
+# lets us ingest them with NO second account and NO site scraping — the ToS-safe path settled for
+# LinkedIn (decision 072), now generalized. Each alert email is a list of <a> links to postings;
+# this source pulls those links as **leads** (snippet_only; the apply link redirects out like an
+# aggregator's). Tagged `ats="email_alert"`, which is an `_AGGREGATOR_ATS`, so the existing
+# aggregator→ATS bridge resolves each redirect: a Lensa repost that lands on Greenhouse/Lever
+# becomes auto-applyable for free, and one whose redirect can't be resolved server-side is deferred
+# to apply-time browser click-through (`_BROWSER_GATED_FALLBACK`, decision 133) — a redirect is
+# normal navigation, not a reason to drop the posting. No new apply path.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class AlertProvider:
+    """One job-alert email sender. `sender` matches the forwarded email's From header; `url_contains`
+    identifies which <a> links in the body are real postings (vs nav/unsubscribe) by DESTINATION
+    domain — never by the email's card layout, which varies per sender and can't be guessed without
+    a real sample (decision 072). `company` is the default employer name (an aggregator's brand for
+    Lensa/LinkedIn; the actual employer for a single-company site like Aflac).
+
+    `auto_apply` marks whether the lead's link is a normal redirect the bot may drive to an apply
+    form (Lensa/Aflac → True: the browser follows the hop, decision 133). It is **False** for
+    LinkedIn: `linkedin.com/jobs/view/<id>` is LinkedIn's own login-walled, robots-disallowed page,
+    not a redirect to an external ATS — auto-driving it would cross the site's ToS (Guideline #4,
+    decision 072). Manual-only leads are still surfaced (discovery/track), just never auto-driven."""
+
+    key: str
+    sender: str
+    url_contains: str
+    company: str = ""
+    auto_apply: bool = True
+
+
+# Built-in providers. `url_contains` is a best-effort default keyed on each provider's job-link
+# domain — validated against real forwarded emails where available (LinkedIn, 2026-07-23: real
+# alerts link to `linkedin.com/comm/jobs/view/<id>`); override if a provider wraps links in a
+# mailer/tracking domain (decision 132 flagged live step for Lensa/Aflac — no samples yet).
+_BUILTIN_ALERT_PROVIDERS: dict[str, AlertProvider] = {
+    "lensa": AlertProvider("lensa", "lensa.com", "lensa.com", "Lensa"),
+    "aflac": AlertProvider("aflac", "aflac", "aflac.com", "Aflac"),
+    # `/view/` only — excludes the alert's own `/jobs/search-results/` link. Manual-only (ToS).
+    "linkedin": AlertProvider("linkedin", "jobalerts-noreply@linkedin.com",
+                              "linkedin.com/comm/jobs/view", "", auto_apply=False),
+}
+
+# Anchor text that marks a footer/nav link, never a posting — skipped so "Unsubscribe" / social
+# links on the provider's own domain don't become bogus leads.
+_ALERT_LINK_STOPWORDS = re.compile(
+    r"\b(unsubscribe|manage|preference|setting|privacy|terms|help|contact|view in browser|"
+    r"log ?in|sign ?in|download|app store|google play|facebook|twitter|linkedin|instagram|"
+    r"update your|edit|profile|feedback|report)\b", re.I)
+
+
+class _AnchorExtractor(HTMLParser):
+    """Collect (href, visible_text) for every <a> in an HTML email body."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.links: list[tuple[str, str]] = []
+        self._href: Optional[str] = None
+        self._buf: list[str] = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "a":
+            self._href = dict(attrs).get("href", "") or ""
+            self._buf = []
+
+    def handle_data(self, data):
+        if self._href is not None:
+            self._buf.append(data)
+
+    def handle_endtag(self, tag):
+        if tag == "a" and self._href is not None:
+            text = re.sub(r"\s+", " ", "".join(self._buf)).strip()
+            self.links.append((self._href, text))
+            self._href = None
+            self._buf = []
+
+
+def _extract_job_links(html: str, prov: AlertProvider) -> list[tuple[str, str]]:
+    """(href, title) for each <a> in an alert email that points at the provider's postings, deduped
+    by href. Skips empty-text links (logos/spacers) and footer/nav links (`_ALERT_LINK_STOPWORDS`)."""
+    parser = _AnchorExtractor()
+    try:
+        parser.feed(html)
+    except Exception:
+        pass
+    needle = prov.url_contains.lower()
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for href, text in parser.links:
+        if not href or not text or href in seen:
+            continue
+        if needle and needle not in href.lower():
+            continue
+        if _ALERT_LINK_STOPWORDS.search(text):
+            continue
+        seen.add(href)
+        out.append((href, text))
+    return out
+
+
+class EmailAlertSource(Source):
+    """Discover from job-alert emails forwarded into the linked bot inbox (decision 132).
+
+    See the module-section header above. Leads only: `ats="email_alert"` (an `_AGGREGATOR_ATS`),
+    `snippet_only`; the aggregator→ATS bridge decides auto-applyability by resolving each redirect.
+    `config` is a `mailbox.MailboxConfig` (None self-skips). `_fetch` injects `mailbox.fetch_alerts`
+    for tests."""
+
+    def __init__(self, config, providers: list[AlertProvider], *, limit_per_provider: int = 25,
+                 max_links: int = 80, _fetch=None) -> None:
+        self.config = config
+        self.providers = providers
+        self.limit_per_provider = limit_per_provider
+        self.max_links = max_links
+        self._fetch = _fetch
+        self.name = "email_alerts:" + ",".join(p.key for p in providers)
+
+    def fetch(self) -> list[Posting]:
+        if self.config is None or not self.providers:
+            raise DiscoveryError("email alerts not configured (no linked bot inbox / no providers)")
+        from . import mailbox
+
+        fetch_alerts = self._fetch or mailbox.fetch_alerts
+        out: list[Posting] = []
+        seen: set[str] = set()
+        for prov in self.providers:
+            try:
+                bodies = fetch_alerts(self.config, sender_contains=prov.sender,
+                                      limit=self.limit_per_provider)
+            except Exception as e:
+                raise DiscoveryError(f"email alerts ({prov.key}): {e}") from e
+            for body in bodies:
+                for href, title in _extract_job_links(body, prov):
+                    # Dedup on the query-stripped URL: the same posting recurs across alert emails
+                    # with a unique per-send trackingId, which canonical_url keeps.
+                    key = canonical_url(href).split("?", 1)[0]
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    extra = {"snippet_only": True, "alert_provider": prov.key}
+                    if not prov.auto_apply:
+                        # Manual-only (e.g. LinkedIn): surface as a lead, never auto-drive it
+                        # (login-walled / robots-disallowed — Guideline #4, decision 072).
+                        extra["auto_applyable"] = False
+                        extra["manual_only"] = True
+                    out.append(Posting(
+                        company=prov.company or "Unknown",
+                        title=title[:200],
+                        body=title,  # snippet only — the full JD is behind the redirect
+                        url=href,
+                        ats="email_alert",
+                        apply_url=href,
+                        extra=extra,
+                    ))
+                    if len(out) >= self.max_links:
+                        return out
+        return out
+
+
 # Map an ATS name to its source constructor, for building sources from config.
 ATS_SOURCES = {
     "greenhouse": GreenhouseSource,
@@ -1227,6 +1520,28 @@ def build_source(ats: str, token: str) -> Source:
     if ats not in ATS_SOURCES:
         raise DiscoveryError(f"unknown ATS '{ats}'. Known: {', '.join(ATS_SOURCES)}")
     return ATS_SOURCES[ats](token)
+
+
+# Committed, non-PII registry of validated declarative JSON-API aggregator specs (decision 136).
+# Shareable data (endpoint + field map), like `_BUILTIN_FEEDS`; the source-scout routine appends
+# here, the user enables names in discovery.yaml's `json_aggregators`.
+AGGREGATOR_SPECS_PATH = "data/aggregator_specs.json"
+
+
+def load_aggregator_specs(path: str = AGGREGATOR_SPECS_PATH) -> dict[str, AggregatorSpec]:
+    """Load the aggregator-spec registry as {name: AggregatorSpec}. Missing/empty file → {} so a
+    clone with no registry is unaffected."""
+    import os
+
+    if not os.path.exists(path):
+        return {}
+    with open(path) as fh:
+        raw = json.load(fh) or {}
+    out: dict[str, AggregatorSpec] = {}
+    for s in raw.get("specs", []):
+        if s.get("name") and s.get("endpoint"):
+            out[s["name"]] = AggregatorSpec.from_dict(s)
+    return out
 
 
 def discover(sources: list[Source]) -> tuple[list[Posting], list[str]]:
@@ -1262,7 +1577,12 @@ def discover(sources: list[Source]) -> tuple[list[Posting], list[str]]:
 # ---------------------------------------------------------------------------
 
 # Aggregators whose apply links redirect through their own domain (need resolving to find the ATS).
-_AGGREGATOR_ATS = {"adzuna", "jooble", "google", "himalayas", "remoteok"}
+# `email_alert` (forwarded job-alert emails, decision 132) rides the same bridge: each lead's link
+# redirects out, so resolving it upgrades a Lensa repost that lands on a supported ATS to
+# auto-applyable — and when it CAN'T be resolved server-side it is NOT dropped (a redirect is
+# normal; decision 133), just deferred to apply-time browser click-through (see
+# `_BROWSER_GATED_FALLBACK`).
+_AGGREGATOR_ATS = {"adzuna", "jooble", "google", "himalayas", "remoteok", "email_alert", JSONAPI_ATS}
 # Aggregators whose apply link sits behind a BROWSER-ONLY gate we can't resolve server-side, so
 # the real ATS is unknowable at bridge time. Adzuna's www.adzuna.com/land/ page 403s every
 # non-browser client (CloudFront WAF — even real Chromium from a blocked IP) AND its "Apply for
@@ -1272,6 +1592,13 @@ _AGGREGATOR_ATS = {"adzuna", "jooble", "google", "himalayas", "remoteok"}
 # `\bapply\b` reveal regex), then re-derives the true ATS from the resulting form frame.
 # (DECISIONS.md #120.)
 _BROWSER_GATED_ATS = {"adzuna"}
+# Aggregators we DO try to resolve server-side, but whose unresolved hits are deferred to apply-time
+# browser click-through rather than dropped as non-fillable — a redirect the real browser can follow
+# is not a reason to count a posting out (decision 133). `email_alert` leads (Lensa/Aflac/LinkedIn)
+# whose link is tracking-wrapped or lands on an ATS we don't detect server-side stay in the funnel,
+# tagged `browser_gated`, so Apply opens the link and clicks through the redirect like it does for
+# Adzuna. (Contrast `_BROWSER_GATED_ATS`, which is never resolved server-side at all.)
+_BROWSER_GATED_FALLBACK = {"email_alert"}
 _BRIDGE_MAX = 60  # cap redirect resolutions per run (one network call each) — polite + bounded
 
 
@@ -1306,13 +1633,21 @@ def bridge_aggregator_postings(postings, *, limit: int = _BRIDGE_MAX, upgrade_jd
     Browser-gated aggregators (`_BROWSER_GATED_ATS`, e.g. Adzuna) are NOT resolved here — their
     gate 403s any server-side client — but are left flowing to Apply (ats/apply_url unchanged,
     tagged `extra['browser_gated']`) so the real browser clicks through the gate at apply time.
-    They make no network call, so they don't consume the `limit` resolution budget."""
+    They make no network call, so they don't consume the `limit` resolution budget.
+
+    `_BROWSER_GATED_FALLBACK` aggregators (e.g. `email_alert` leads) ARE resolved server-side, but
+    an unresolved one is likewise deferred to apply-time browser click-through (tagged
+    `browser_gated`, kept fillable) instead of dropped — a redirect isn't a reason to count a
+    posting out (decision 133)."""
     for p in (p for p in postings if p.ats in _BROWSER_GATED_ATS):
         p.extra["bridged_from"] = p.ats
         p.extra["browser_gated"] = True  # Apply resolves the real ATS by clicking the gate in-browser
         # `auto_applyable` left unset on purpose: we have no dedicated adapter (the ATS is unknown
         # until apply time), but `_is_fillable` keeps it in the funnel via `ats in _AGGREGATOR_ATS`.
-    to_bridge = [p for p in postings if p.ats in _AGGREGATOR_ATS and p.ats not in _BROWSER_GATED_ATS]
+    # Skip anything already marked non-appliable (e.g. manual-only LinkedIn leads, decision 072) —
+    # don't spend a redirect resolution, and never hit a robots-disallowed site server-side.
+    to_bridge = [p for p in postings if p.ats in _AGGREGATOR_ATS and p.ats not in _BROWSER_GATED_ATS
+                 and p.extra.get("auto_applyable") is not False]
     ashby_cache: dict = {}
     bridged = 0
     for i, p in enumerate(to_bridge[:limit]):
@@ -1331,6 +1666,11 @@ def bridge_aggregator_postings(postings, *, limit: int = _BRIDGE_MAX, upgrade_jd
                     p.body = full
                     p.extra["jd_upgraded"] = True
             bridged += 1
+        elif p.ats in _BROWSER_GATED_FALLBACK:
+            # Couldn't resolve the redirect server-side (tracking-wrapped, JS interstitial, or an
+            # ATS we don't detect) — but a redirect is not a reason to drop it (decision 133). Keep
+            # it in the funnel; Apply opens the link in the real browser and clicks through the hop.
+            p.extra["browser_gated"] = True  # `auto_applyable` left unset → `_is_fillable` keeps it
         else:
             p.extra["auto_applyable"] = False
         if on_progress:

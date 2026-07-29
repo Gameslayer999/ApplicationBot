@@ -1,0 +1,405 @@
+{
+  "_comment": "ApplicationBot source-scout candidates \u2014 public company ATS slugs proposed for discovery, NOT r\u00e9sum\u00e9/profile data. Committed on purpose: it is how the cloud routine hands new sources back to the local app. Accept via the settings UI or `python -m applicationbot.source_scout --accept <ats>:<token>`.",
+  "candidates": [
+    {
+      "ats": "ashby",
+      "token": "cohere",
+      "provenance": "web-search: FAANG+ curated list",
+      "validated": true,
+      "n_postings": 139,
+      "sample_title": "Revenue Operations Analyst (Analytics)",
+      "sample_company": "cohere",
+      "error": ""
+    },
+    {
+      "ats": "ashby",
+      "token": "mistral.ai",
+      "provenance": "web-search: FAANG+ curated list",
+      "validated": true,
+      "n_postings": 169,
+      "sample_title": "Software Engineer, New Grad",
+      "sample_company": "mistral.ai",
+      "error": ""
+    },
+    {
+      "ats": "ashby",
+      "token": "notion",
+      "provenance": "web-search: FAANG+ curated list",
+      "validated": true,
+      "n_postings": 116,
+      "sample_title": "Business Development Representative, New York",
+      "sample_company": "notion",
+      "error": ""
+    },
+    {
+      "ats": "ashby",
+      "token": "openai",
+      "provenance": "web-search: FAANG+ curated list",
+      "validated": true,
+      "n_postings": 744,
+      "sample_title": "Technical Program Manager, Compute Infrastructure",
+      "sample_company": "openai",
+      "error": ""
+    },
+    {
+      "ats": "ashby",
+      "token": "perplexity",
+      "provenance": "web-search: FAANG+ curated list",
+      "validated": true,
+      "n_postings": 87,
+      "sample_title": "Partner Marketing Manager",
+      "sample_company": "perplexity",
+      "error": ""
+    },
+    {
+      "ats": "ashby",
+      "token": "ramp",
+      "provenance": "web-search: FAANG+ curated list",
+      "validated": true,
+      "n_postings": 121,
+      "sample_title": "Security Engineer, Cloud",
+      "sample_company": "ramp",
+      "error": ""
+    },
+    {
+      "ats": "ashby",
+      "token": "snowflake",
+      "provenance": "web-search: FAANG+ curated list",
+      "validated": true,
+      "n_postings": 402,
+      "sample_title": "Lead, Strategic Finance - Deals (International)",
+      "sample_company": "snowflake",
+      "error": ""
+    },
+    {
+      "ats": "greenhouse",
+      "token": "affirm",
+      "provenance": "web-search: FAANG+ seasonal grad watch",
+      "validated": true,
+      "n_postings": 177,
+      "sample_title": "Affirm Bank Compliance Lead, CRA and Complaints",
+      "sample_company": "Affirm",
+      "error": ""
+    },
+    {
+      "ats": "greenhouse",
+      "token": "airbnb",
+      "provenance": "web-search: FAANG+ seasonal grad watch",
+      "validated": true,
+      "n_postings": 191,
+      "sample_title": "Acquisition Manager",
+      "sample_company": "Airbnb",
+      "error": ""
+    },
+    {
+      "ats": "greenhouse",
+      "token": "andurilindustries",
+      "provenance": "web-search: FAANG+ curated list",
+      "validated": true,
+      "n_postings": 2132,
+      "sample_title": "2026 Early Career Electrical Engineer",
+      "sample_company": "Anduril Industries",
+      "error": ""
+    },
+    {
+      "ats": "greenhouse",
+      "token": "anthropic",
+      "provenance": "web-search: FAANG+ seasonal grad watch",
+      "validated": true,
+      "n_postings": 415,
+      "sample_title": "Account Executive, Public Sector",
+      "sample_company": "Anthropic",
+      "error": ""
+    },
+    {
+      "ats": "greenhouse",
+      "token": "asana",
+      "provenance": "web-search: FAANG+ curated list",
+      "validated": true,
+      "n_postings": 146,
+      "sample_title": "AI Implementation Manager, Service Management",
+      "sample_company": "Asana",
+      "error": ""
+    },
+    {
+      "ats": "greenhouse",
+      "token": "brex",
+      "provenance": "web-search: FAANG+ seasonal grad watch",
+      "validated": true,
+      "n_postings": 270,
+      "sample_title": "Account Executive, Mid Market",
+      "sample_company": "Brex",
+      "error": ""
+    },
+    {
+      "ats": "greenhouse",
+      "token": "cloudflare",
+      "provenance": "web-search: FAANG+ curated list",
+      "validated": true,
+      "n_postings": 275,
+      "sample_title": "Accounts Payable Specialist",
+      "sample_company": "Cloudflare",
+      "error": ""
+    },
+    {
+      "ats": "greenhouse",
+      "token": "coinbase",
+      "provenance": "web-search: FAANG+ seasonal grad watch",
+      "validated": true,
+      "n_postings": 155,
+      "sample_title": "Accounting Manager, GL Operations & Intercompany",
+      "sample_company": "Coinbase",
+      "error": ""
+    },
+    {
+      "ats": "greenhouse",
+      "token": "databricks",
+      "provenance": "web-search: FAANG+ curated list",
+      "validated": true,
+      "n_postings": 811,
+      "sample_title": "\u30bd\u30ea\u30e5\u30fc\u30b7\u30e7\u30f3\u30a2\u30fc\u30ad\u30c6\u30af\u30c8 (\u30d7\u30ea\u30bb\u30fc\u30eb\u30b9)",
+      "sample_company": "Databricks",
+      "error": ""
+    },
+    {
+      "ats": "greenhouse",
+      "token": "datadog",
+      "provenance": "web-search: FAANG+ seasonal grad watch",
+      "validated": true,
+      "n_postings": 423,
+      "sample_title": "AI Research Engineer - Datadog AI Research (DAIR)",
+      "sample_company": "Datadog",
+      "error": ""
+    },
+    {
+      "ats": "greenhouse",
+      "token": "discord",
+      "provenance": "web-search: FAANG+ seasonal grad watch",
+      "validated": true,
+      "n_postings": 45,
+      "sample_title": "Account Executive - Tech",
+      "sample_company": "Discord",
+      "error": ""
+    },
+    {
+      "ats": "greenhouse",
+      "token": "doordashusa",
+      "provenance": "web-search: FAANG+ curated list",
+      "validated": true,
+      "n_postings": 468,
+      "sample_title": "Account Executive",
+      "sample_company": "DoorDash USA",
+      "error": ""
+    },
+    {
+      "ats": "greenhouse",
+      "token": "duolingo",
+      "provenance": "web-search: FAANG+ seasonal grad watch",
+      "validated": true,
+      "n_postings": 60,
+      "sample_title": "Ad Sales Lead, Central",
+      "sample_company": "Duolingo",
+      "error": ""
+    },
+    {
+      "ats": "greenhouse",
+      "token": "figma",
+      "provenance": "web-search: FAANG+ curated list",
+      "validated": true,
+      "n_postings": 178,
+      "sample_title": "Account Executive, Emerging Enterprise (Berlin, Germany)",
+      "sample_company": "Figma",
+      "error": ""
+    },
+    {
+      "ats": "greenhouse",
+      "token": "gemini",
+      "provenance": "web-search: FAANG+ curated list",
+      "validated": true,
+      "n_postings": 45,
+      "sample_title": "Accounting Manager",
+      "sample_company": "Gemini",
+      "error": ""
+    },
+    {
+      "ats": "greenhouse",
+      "token": "gusto",
+      "provenance": "web-search: FAANG+ seasonal grad watch",
+      "validated": true,
+      "n_postings": 75,
+      "sample_title": "Benefit Customer Care Advocate",
+      "sample_company": "Gusto, Inc.",
+      "error": ""
+    },
+    {
+      "ats": "greenhouse",
+      "token": "instacart",
+      "provenance": "web-search: FAANG+ seasonal grad watch",
+      "validated": true,
+      "n_postings": 120,
+      "sample_title": "Account Manager",
+      "sample_company": "Instacart",
+      "error": ""
+    },
+    {
+      "ats": "greenhouse",
+      "token": "lyft",
+      "provenance": "web-search: FAANG+ curated list",
+      "validated": true,
+      "n_postings": 160,
+      "sample_title": "Account Manager, Healthcare & Transit Partnerships",
+      "sample_company": "Lyft",
+      "error": ""
+    },
+    {
+      "ats": "greenhouse",
+      "token": "pinterest",
+      "provenance": "web-search: FAANG+ seasonal grad watch",
+      "validated": true,
+      "n_postings": 201,
+      "sample_title": "Agency Lead",
+      "sample_company": "Pinterest",
+      "error": ""
+    },
+    {
+      "ats": "greenhouse",
+      "token": "reddit",
+      "provenance": "web-search: FAANG+ seasonal grad watch",
+      "validated": true,
+      "n_postings": 192,
+      "sample_title": "Acquisition Account Manager, Mid-Market (Southern Europe)",
+      "sample_company": "Reddit",
+      "error": ""
+    },
+    {
+      "ats": "greenhouse",
+      "token": "robinhood",
+      "provenance": "web-search: FAANG+ seasonal grad watch",
+      "validated": true,
+      "n_postings": 125,
+      "sample_title": "Android Engineer, Government Products",
+      "sample_company": "Robinhood",
+      "error": ""
+    },
+    {
+      "ats": "greenhouse",
+      "token": "roblox",
+      "provenance": "web-search: FAANG+ curated list",
+      "validated": true,
+      "n_postings": 221,
+      "sample_title": "[2026] Data Scientist, Social",
+      "sample_company": "Roblox",
+      "error": ""
+    },
+    {
+      "ats": "greenhouse",
+      "token": "samsara",
+      "provenance": "web-search: FAANG+ curated list",
+      "validated": true,
+      "n_postings": 327,
+      "sample_title": "Account Development Representative - BeNeLux",
+      "sample_company": "Samsara",
+      "error": ""
+    },
+    {
+      "ats": "greenhouse",
+      "token": "scaleai",
+      "provenance": "web-search: FAANG+ curated list",
+      "validated": true,
+      "n_postings": 208,
+      "sample_title": "AI Advisory Consultant",
+      "sample_company": "Scale AI",
+      "error": ""
+    },
+    {
+      "ats": "greenhouse",
+      "token": "sofi",
+      "provenance": "web-search: FAANG+ curated list",
+      "validated": true,
+      "n_postings": 59,
+      "sample_title": "AI Financial Planning Analyst",
+      "sample_company": "SoFi",
+      "error": ""
+    },
+    {
+      "ats": "greenhouse",
+      "token": "stripe",
+      "provenance": "web-search: FAANG+ curated list",
+      "validated": true,
+      "n_postings": 533,
+      "sample_title": "Account Executive, AI Sales (Grower)",
+      "sample_company": "Stripe",
+      "error": ""
+    },
+    {
+      "ats": "greenhouse",
+      "token": "toast",
+      "provenance": "web-search: FAANG+ seasonal grad watch",
+      "validated": true,
+      "n_postings": 287,
+      "sample_title": "Android Software Engineer",
+      "sample_company": "Toast",
+      "error": ""
+    },
+    {
+      "ats": "greenhouse",
+      "token": "twilio",
+      "provenance": "web-search: FAANG+ curated list",
+      "validated": true,
+      "n_postings": 184,
+      "sample_title": "Account Executive 4",
+      "sample_company": "Twilio",
+      "error": ""
+    },
+    {
+      "ats": "greenhouse",
+      "token": "vercel",
+      "provenance": "web-search: FAANG+ seasonal grad watch",
+      "validated": true,
+      "n_postings": 78,
+      "sample_title": "Account Executive, Majors",
+      "sample_company": "Vercel",
+      "error": ""
+    },
+    {
+      "ats": "greenhouse",
+      "token": "verkada",
+      "provenance": "web-search: FAANG+ curated list",
+      "validated": true,
+      "n_postings": 278,
+      "sample_title": "Account Executive, France",
+      "sample_company": "Verkada",
+      "error": ""
+    },
+    {
+      "ats": "lever",
+      "token": "palantir",
+      "provenance": "web-search: FAANG+ curated list",
+      "validated": true,
+      "n_postings": 287,
+      "sample_title": "Administrative Business Partner",
+      "sample_company": "palantir",
+      "error": ""
+    },
+    {
+      "ats": "smartrecruiters",
+      "token": "BoschGroup",
+      "provenance": "web-search: FAANG+ curated list",
+      "validated": true,
+      "n_postings": 100,
+      "sample_title": "Buyer \u2013 Mobility Aftermarket",
+      "sample_company": "Bosch Group",
+      "error": ""
+    },
+    {
+      "ats": "smartrecruiters",
+      "token": "Ubisoft2",
+      "provenance": "web-search: FAANG+ curated list",
+      "validated": true,
+      "n_postings": 100,
+      "sample_title": "Artiste de niveau (Unreal)",
+      "sample_company": "Ubisoft",
+      "error": ""
+    }
+  ]
+}

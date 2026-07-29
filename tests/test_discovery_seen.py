@@ -155,6 +155,53 @@ def test_show_all_ignores_ledger_and_does_not_record():
         assert again.matches == [] and again.skipped_shown == 2
 
 
+def test_unjudged_postings_are_not_burned_and_get_judged_next_pass():
+    """Decision 146: the judge only scores `top_n` per run. Recording the unjudged remainder as
+    "shown" hid postings Claude never scored — the bug that made a goal-mode loop report "no new
+    matches" with a pool of never-considered roles behind the ledger. Now each pass judges the
+    next-best slice, and only judged postings are recorded."""
+    postings = [_posting(n) for n in range(1, 6)]
+    with tempfile.TemporaryDirectory() as d, _Env(Path(d), postings) as env:
+        judged: list = []
+
+        def top_2_judged(resume, ps, **kw):
+            # Stand-in for match(): returns ALL keyword survivors, but only the top 2 get a
+            # fit_score (what top_n does in the real matcher).
+            out = []
+            for i, p in enumerate(ps):
+                m = Match(posting=p, keyword_score=3, matched_skills=["python"])
+                if i < 2:
+                    m.fit_score, m.qualified, m.judged_by = 80, True, "claude"
+                    judged.append(p.company)
+                out.append(m)
+            return out, []
+
+        pipeline.match = top_2_judged
+        r, f = _resume(), _filters()
+
+        first = _run(r, f, only_new=True)
+        assert judged == ["Co1", "Co2"]
+        assert len(first.matches) == 5                    # unjudged ones still returned to the UI
+        assert discovery_seen.seen_urls() == {
+            m.posting.url for m in first.matches if m.fit_score is not None}
+
+        # Second pass over the SAME boards: the two judged ones are hidden before the judge, so
+        # the next two get scored instead of re-scoring Co1/Co2 or reporting nothing new.
+        judged.clear()
+        second = _run(r, f, only_new=True, force_fresh=True)
+        assert judged == ["Co3", "Co4"]
+        assert second.skipped_shown == 2
+        assert [m.posting.company for m in second.matches] == ["Co3", "Co4", "Co5"]
+
+        # Third pass finishes the pool; a fourth has genuinely nothing left.
+        judged.clear()
+        third = _run(r, f, only_new=True, force_fresh=True)
+        assert judged == ["Co5"]
+        judged.clear()
+        fourth = _run(r, f, only_new=True, force_fresh=True)
+        assert judged == [] and fourth.matches == [] and fourth.skipped_shown == 5
+
+
 def test_off_by_default_writes_no_ledger():
     with tempfile.TemporaryDirectory() as d, _Env(Path(d), [_posting(1)]) as env:
         r, f = _resume(), _filters()

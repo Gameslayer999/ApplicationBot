@@ -1,0 +1,4 @@
+{
+  "_comment": "ApplicationBot declarative JSON-API aggregator registry \u2014 validated specs (endpoint + field map) for public job APIs. Shareable, non-PII. The source-scout routine appends here; enable a spec by adding its name to profile/discovery.yaml `json_aggregators`.",
+  "specs": []
+}

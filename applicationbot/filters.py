@@ -35,15 +35,19 @@ import os
 
 from .apply_profile import ApplicationProfile
 from .discovery import (
+    _BUILTIN_ALERT_PROVIDERS,
     _BUILTIN_FEEDS,
     AdzunaSource,
     CareerSiteSource,
     CuratedListSource,
+    EmailAlertSource,
     GoogleJobsSource,
     HimalayasSource,
+    JsonApiSource,
     RemoteOKSource,
     Source,
     build_source,
+    load_aggregator_specs,
 )
 from .models import Resume
 
@@ -141,6 +145,29 @@ class EarlyCareerConfig(BaseModel):
         return v
 
 
+class EmailAlertsConfig(BaseModel):
+    """Ingest job-alert emails forwarded into the linked bot inbox (decision 132). Off by default.
+    Turn on the providers you're subscribed to (`lensa` | `aflac` | `linkedin`) and forward their
+    alerts to the bot inbox (a Gmail filter → Forward). Needs a linked inbox (mailbox.py); self-skips
+    otherwise. Leads only: apply links redirect out like an aggregator, so a lead is auto-applyable
+    only if the aggregator→ATS bridge resolves it to a supported ATS."""
+
+    enabled: bool = False
+    providers: list[str] = Field(default_factory=list)  # built-ins: lensa | aflac | linkedin
+    limit_per_provider: int = 25  # newest N alert emails scanned per provider
+
+    @field_validator("providers")
+    @classmethod
+    def _known(cls, v: list[str]) -> list[str]:
+        for p in v:
+            if p not in _BUILTIN_ALERT_PROVIDERS:
+                raise ValueError(
+                    f"email_alerts.providers: '{p}' is not a built-in provider "
+                    f"({', '.join(_BUILTIN_ALERT_PROVIDERS)})."
+                )
+        return v
+
+
 # Experience-level taxonomy (Configure/Discover gate). Each level maps to a regex matched
 # against the posting TITLE — where seniority reliably appears (same signal as title_exclude).
 # Word-boundaried so "intern" doesn't hit "international", "lead" doesn't hit "leading", etc.
@@ -226,6 +253,19 @@ class DiscoveryFilters(BaseModel):
     google: GoogleJobsConfig = Field(default_factory=GoogleJobsConfig)
     remote_boards: RemoteBoardsConfig = Field(default_factory=RemoteBoardsConfig)
     early_career: EarlyCareerConfig = Field(default_factory=EarlyCareerConfig)
+    email_alerts: EmailAlertsConfig = Field(default_factory=EmailAlertsConfig)
+    json_aggregators: list[str] = Field(
+        default_factory=list,
+        description="Names of declarative JSON-API aggregators (from the data/aggregator_specs.json "
+        "registry) to search — the source-scout routine (decision 136) discovers and validates these; "
+        "enable by name here. Empty (default) = none. Query-based specs need a résumé to derive terms.",
+    )
+    contrib_sources: list[str] = Field(
+        default_factory=list,
+        description="Names of bespoke drop-in adapters in applicationbot/sources_contrib/ to run "
+        "(decision 139 — the escape hatch for platforms a declarative spec can't express). Each is a "
+        "hand-written Source added via a reviewed PR; enable by NAME here. Empty (default) = none.",
+    )
 
 
 def load_filters(path: str | Path = DEFAULT_PATH) -> DiscoveryFilters:
@@ -278,6 +318,43 @@ def build_sources(
             tags = [t.lower() for t in derive_keywords(resume, profile or ApplicationProfile(), filters)
                     if " " not in t][:4]
         sources.append(RemoteOKSource(tags=tags, max_results=filters.remote_boards.max_results))
+    # Declarative JSON-API aggregators (opt-in by name, decision 136). Each enabled name is looked
+    # up in the committed spec registry and instantiated as a JsonApiSource with profile-derived
+    # keywords. A query-based spec self-skips without a résumé, like the other aggregators.
+    if filters.json_aggregators:
+        specs = load_aggregator_specs()
+        kws = (derive_keywords(resume, profile or ApplicationProfile(), filters)
+               if resume is not None else [])
+        for name in filters.json_aggregators:
+            spec = specs.get(name)
+            if spec is None or (spec.query_required and not kws):
+                continue
+            sources.append(JsonApiSource(spec, keywords=kws))
+    # Bespoke drop-in adapters (opt-in by name, decision 139 — the escape hatch). Each enabled name
+    # is looked up in the sources_contrib registry and built with profile-derived keywords. A
+    # missing name or an adapter that raises on build is skipped, never breaking the run.
+    if filters.contrib_sources:
+        from .sources_contrib import load_contrib_sources
+        registry = load_contrib_sources()
+        kws = derive_keywords(resume, profile or ApplicationProfile(), filters) if resume is not None else []
+        for name in filters.contrib_sources:
+            mod = registry.get(name)
+            if mod is None:
+                continue
+            try:
+                sources.append(mod.build(kws))
+            except Exception:
+                continue  # a broken adapter never breaks discovery
+    # Forwarded job-alert emails (opt-in). Needs a linked bot inbox (mailbox.py); self-skips if the
+    # inbox isn't linked, so it never breaks a keyless clone. Leads ride the aggregator→ATS bridge.
+    if filters.email_alerts.enabled and filters.email_alerts.providers:
+        from . import mailbox
+        cfg = mailbox.load_config()
+        provs = [_BUILTIN_ALERT_PROVIDERS[p] for p in filters.email_alerts.providers
+                 if p in _BUILTIN_ALERT_PROVIDERS]
+        if cfg is not None and provs:
+            sources.append(EmailAlertSource(
+                cfg, provs, limit_per_provider=filters.email_alerts.limit_per_provider))
     # Early-career curated feeds (needs the résumé to rank listings by title-relevance).
     if filters.early_career.enabled and resume is not None:
         sources.append(CuratedListSource(

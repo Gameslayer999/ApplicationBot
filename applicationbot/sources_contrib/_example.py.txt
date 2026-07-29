@@ -1,0 +1,72 @@
+# TEMPLATE — bespoke Source adapter (the escape hatch, DECISIONS.md #139).
+#
+# Copy this to applicationbot/sources_contrib/<name>.py and fill it in ONLY when a platform can't
+# be a declarative AggregatorSpec (decision 136) — i.e. it needs custom auth headers, HTML parsing,
+# or non-standard pagination. If the platform is a plain public JSON API, DON'T write an adapter;
+# use `python -m applicationbot.source_scout --add-spec '<spec>'` instead.
+#
+# Contract (all the loader needs):
+#   NAME                    unique slug; the user enables it via filters.contrib_sources
+#   DESCRIPTION             one line shown in the UI (optional)
+#   build(keywords) -> Source   returns a ready Source; `keywords` are profile-derived search terms
+#
+# Rules:
+#   - Keep it in THIS one file. A PR that adds an adapter must touch no core files.
+#   - fetch() returns list[Posting] or raises discovery.DiscoveryError; one failing source is
+#     caught by discover() and never aborts the run.
+#   - Set ats="jsonapi" so the posting rides the aggregator→ATS bridge + fillability path (the real
+#     apply URL is resolved from apply_url at bridge time). Mark extra={"snippet_only": True} when
+#     the body is only a teaser so the bridge upgrades it to the full JD.
+#   - Be polite: reuse discovery.fetch_text/fetch_json (they rate-limit per host) and cap results.
+#   - Respect the site's ToS/robots (Guideline #4). No bot-detection evasion.
+
+from applicationbot.discovery import DiscoveryError, Posting, Source, fetch_text, html_to_text
+
+NAME = "example_board"
+DESCRIPTION = "Example: an API needing an auth header + total-pages pagination"
+
+
+class ExampleSource(Source):
+    def __init__(self, keywords):
+        self.keywords = keywords or [""]
+        self.name = NAME  # shown in discovery logs/errors
+
+    def fetch(self):
+        import json
+        import urllib.request
+
+        out = []
+        for q in self.keywords:
+            page, total_pages = 1, 1
+            while page <= total_pages and len(out) < 100:
+                # Custom headers are exactly why this isn't a declarative spec:
+                req = urllib.request.Request(
+                    f"https://api.example.com/jobs?query={urllib.parse.quote(q)}&page={page}",
+                    headers={"User-Agent": "ApplicationBot/0.1", "Authorization-Key": "PUBLIC-DEMO"},
+                )
+                try:
+                    with urllib.request.urlopen(req, timeout=20) as r:
+                        data = json.loads(r.read())
+                except Exception as e:
+                    raise DiscoveryError(f"{NAME}: {e}") from e
+                total_pages = int(data.get("numberOfPages", 1))  # non-standard pagination
+                for j in data.get("results", []):
+                    apply_url = j.get("applyUrl") or j.get("url") or ""
+                    if not j.get("title") or not apply_url:
+                        continue
+                    out.append(Posting(
+                        company=(j.get("company") or {}).get("name", "") or "Unknown",
+                        title=j["title"].strip(),
+                        body=html_to_text(j.get("descriptionHtml", "") or ""),
+                        url=apply_url,
+                        ats="jsonapi",                     # ride the bridge → fillability
+                        location=j.get("location", "") or "",
+                        apply_url=apply_url,
+                        extra={"snippet_only": True, "platform": NAME},
+                    ))
+                page += 1
+        return out[:100]
+
+
+def build(keywords):
+    return ExampleSource(keywords)
