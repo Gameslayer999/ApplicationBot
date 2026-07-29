@@ -1,0 +1,92 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>School dropdowns that spell it differently / don't list it</title></head>
+<body>
+<h1>Education</h1>
+<p>Four school pickers for the two ways a school dropdown fails the applicant (decision 154):
+the list spells the same school differently ("Penn State University-University Park" for a résumé
+that says "The Pennsylvania State University"), or it doesn't carry the school at all and offers
+"Other" instead. Two native &lt;select&gt;s and two react-select-shaped comboboxes, since ATSs use
+both. Nothing here matches by equality or substring, so every fill exercises the new paths.</p>
+
+<label for="school-select">School</label>
+<select id="school-select">
+  <option value="">Select…</option>
+  <option value="1">Pennsylvania College of Technology</option>
+  <option value="2">Penn State University-University Park</option>
+  <option value="3">Princeton University</option>
+  <option value="4">Other</option>
+</select>
+
+<label for="school-select-missing">University attended</label>
+<select id="school-select-missing">
+  <option value="">Select…</option>
+  <option value="1">Princeton University</option>
+  <option value="2">Rutgers University-New Brunswick</option>
+  <option value="3">Temple University</option>
+  <option value="4">Other</option>
+</select>
+
+<div id="specify-row" hidden>
+  <label for="school-other">If other, please specify your school</label>
+  <input id="school-other" type="text">
+</div>
+
+<div class="select-shell" data-options="Adelphi University|Penn State University-University Park|Princeton University|Rutgers University-New Brunswick">
+  <label id="combo-label">Undergraduate school</label>
+  <div class="select__control">
+    <input id="combo--0" role="combobox" aria-labelledby="combo-label" autocomplete="off">
+  </div>
+  <div class="menu" hidden></div>
+</div>
+
+<div class="select-shell" data-options="Princeton University|Rutgers University-New Brunswick|Temple University|Other">
+  <label id="combo2-label">Graduate school</label>
+  <div class="select__control">
+    <input id="combo2--0" role="combobox" aria-labelledby="combo2-label" autocomplete="off">
+  </div>
+  <div class="menu" hidden></div>
+</div>
+
+<script>
+// Picking "Other" reveals the free-text box the form wants the real name in.
+const missing = document.getElementById("school-select-missing");
+missing.addEventListener("change", () => {
+  document.getElementById("specify-row").hidden =
+    missing.options[missing.selectedIndex].textContent.trim() !== "Other";
+});
+
+// Static react-select: the menu shows every option, and typing filters by substring — so a
+// résumé value the list spells differently filters to NOTHING (the real-world failure).
+document.querySelectorAll(".select-shell").forEach(shell => {
+  const all = shell.dataset.options.split("|");
+  const input = shell.querySelector("input");
+  const menu = shell.querySelector(".menu");
+
+  function render() {
+    const q = (input.value || "").trim().toLowerCase();
+    menu.innerHTML = "";
+    all.filter(o => !q || o.toLowerCase().includes(q)).forEach(text => {
+      const d = document.createElement("div");
+      d.className = "select__option";
+      d.textContent = text;
+      d.addEventListener("click", () => {
+        input.value = text;
+        input.dataset.committed = text;
+        menu.hidden = true;
+      });
+      menu.appendChild(d);
+    });
+    menu.hidden = false;
+  }
+
+  shell.querySelector(".select__control").addEventListener("click", () => {
+    document.querySelectorAll(".menu").forEach(m => { if (m !== menu) m.hidden = true; });
+    render();
+  });
+  input.addEventListener("input", render);
+  input.addEventListener("keydown", e => { if (e.key === "Escape") menu.hidden = true; });
+});
+</script>
+</body>
+</html>

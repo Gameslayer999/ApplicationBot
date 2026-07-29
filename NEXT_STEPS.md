@@ -2460,6 +2460,20 @@ Record each decision in [DECISIONS.md](DECISIONS.md) once the user chooses.
 
 ## Recently completed
 
+- 2026-07-29 — **School dropdowns: fuzzy identity-token matching, then "Other" when the school
+  really isn't listed (decision 154).** User: "we dont know what to do if the school dropdown doesnt
+  have an option for Penn state." Option matching was equality-or-substring, so a list spelling it
+  "Penn State University-University Park" matched nothing, and a list without Penn State left the
+  field blank (which blocks an armed submit). New `_fuzzy_option_index` in `apply.py` matches on
+  identity tokens with abbreviation + typo tolerance, prefers the main campus (fewest leftover
+  tokens), and refuses type conflicts ("Boston University" ≠ "Boston College"), ambiguous ties, and
+  short answers ("US"). Wired into `_fill_select`, `_pick_from_open`, and `_fill_combobox` phases
+  1/2b — deterministic, so it runs before any Claude call and is learned; phase 2b now also runs
+  with generation off. When nothing matches, a school-only `_accepts_other` gate clicks the form's
+  own "Other"/"Not listed" option and records a needs-attention line naming the answer that wasn't
+  offered. New `tests/test_school_fuzzy_other.py` + `fixtures/apply_forms/school_not_listed.html`
+  (4 controls, generation off); `test_required_input_mirror` / `test_combobox_fill` updated where a
+  Penn State fill is now tier `option:fuzzy` instead of `option:claude`. Suite: 589 passed.
 - 2026-07-29 — **Answers are editable in Review, and the edit is what gets submitted (decision 153).**
   User: "lets include the ability to edit answers that the bot will submit when user is reviewing."
   The last checkpoint before an irreversible submit was read-only. New `answer_overrides.py` stores

@@ -2,7 +2,8 @@
 
 Verifies the decide-with-menu-CLOSED restructure: a Claude option pick (stubbed) happens only
 while the menu is shut, the chosen option is recommitted by exact text, the mapping is learned
-(except generic booleans), and every fill reports its matched tier (literal/hint/claude).
+(except generic booleans), and every fill reports its matched tier (literal/hint/fuzzy/claude) —
+including the identity-token match that resolves a differently-spelled school with no model call.
 
 Run:  python -m tests.test_combobox_fill   (also pytest-compatible; needs chromium installed)
 """
@@ -70,17 +71,35 @@ def test_claude_pick_decides_with_menu_closed_and_recommits():
     def run(page):
         r = _resolver()
         menu_open_at_decide: list = []
-        restore = _stub_pick(lambda opts: "Pennsylvania State University-Main Campus",
-                             menu_state=menu_open_at_decide, page=page, menu_id="menu-cb3")
+        want = "I am authorized to work in the United States for any employer"
+        restore = _stub_pick(want, menu_state=menu_open_at_decide, page=page, menu_id="menu-cb2")
+        try:
+            got = _fill_combobox(page, page.locator("#cb2"), "Yes", resolver=r, label="Work auth")
+        finally:
+            restore()
+        assert got == (want, "claude")
+        assert _committed(page, "cb2") == want  # recommitted by exact text after the decision
+        assert menu_open_at_decide == [True]  # hidden=True — the menu was CLOSED while deciding
+    _drive(run)
+
+
+def test_school_spelled_differently_matches_without_calling_claude():
+    """The list says "Pennsylvania State University-Main Campus", the résumé says "The
+    Pennsylvania State University" — no equality, no substring. Identity-token matching resolves
+    it deterministically (decision 154), so Claude is never called and the branch campus loses."""
+    def run(page):
+        r = _resolver()
+        called: list = []
+        restore = _stub_pick(lambda opts: called.append(opts) or "Harvard University")
         try:
             got = _fill_combobox(page, page.locator("#cb3"), "The Pennsylvania State University",
                                  resolver=r, label="School")
         finally:
             restore()
-        assert got == ("Pennsylvania State University-Main Campus", "claude")
+        assert got == ("Pennsylvania State University-Main Campus", "fuzzy")
+        assert called == [], called
         assert _committed(page, "cb3") == "Pennsylvania State University-Main Campus"
-        assert menu_open_at_decide == [True]  # hidden=True — the menu was CLOSED while deciding
-        # The vetted pick is learned for instant matching next time.
+        # The vetted match is learned for instant matching next time.
         assert r.learned_option_hints("the pennsylvania state university") \
             == ["Pennsylvania State University-Main Campus"]
     _drive(run)

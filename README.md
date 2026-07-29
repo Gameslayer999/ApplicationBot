@@ -76,6 +76,11 @@ Configure  →  Discover  →  Tailor  →  Apply  →  Track
    ATS, including multi-page wizards and account-gated **Workday** (automated account creation, credentials
    in your OS keychain). Applications that get blocked (a question it can't answer, a login, a CAPTCHA) are
    *parked* so you can resolve and resume them. Every submit is gated by the safety switch above.
+   Dropdowns don't have to spell things your way: a school picker that lists *"Penn State
+   University-University Park"* still matches a résumé that says *"The Pennsylvania State University"*
+   (abbreviations and typos included, main campus preferred over a branch), and when a school genuinely
+   isn't in the list it picks the form's own **"Other"** — then tells you in Review that your real answer
+   wasn't offered, instead of leaving a required field blank.
    Before you sign off, **Review** shows the exact answers it will submit — and every one of them is
    **editable**. Type over any answer (or fill in one it couldn't answer) and that value is what gets
    submitted the next time this application is filled, including the real submit; unsaved edits are saved

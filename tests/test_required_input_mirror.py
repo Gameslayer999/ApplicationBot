@@ -78,8 +78,13 @@ def test_mirror_skipped_dropdown_commits_the_real_selection():
         # Committed through the real dropdown — NOT the plain-text mirror .fill() (source
         # 'resolver', control 'text') that left the widget on 'Select…'.
         assert f.control == "combobox", f
-        assert f.source == "option:claude", f
+        # Tier is 'fuzzy' since decision 154: "The Pennsylvania State University" now matches
+        # "…-Main Campus" on identity tokens, so the pick no longer needs the batch (the batched
+        # route stays covered by test_two_pass_fill / test_async_school_pick). What this test
+        # guards is unchanged: the fill went through the real dropdown, not the mirror.
+        assert f.source == "option:fuzzy", f
         assert f.value == MAIN_CAMPUS, f
+        assert stub.calls == [], stub.calls  # resolved with no model call at all
         # The selection is actually committed on the visible combobox input.
         assert page.locator("#school--0").evaluate("el => el.dataset.committed || ''") == MAIN_CAMPUS
         # The aria-hidden mirror was never typed into.

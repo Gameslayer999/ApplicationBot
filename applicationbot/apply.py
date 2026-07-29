@@ -16,6 +16,7 @@ chromium`. The resolver needs no browser.
 
 from __future__ import annotations
 
+import difflib
 import json
 import re
 from dataclasses import dataclass, field
@@ -1374,6 +1375,107 @@ def _matches(option: str, want: str) -> bool:
     return o == w or w in o or (len(o) >= 3 and o in w)
 
 
+# --------------------------------------------------------- fuzzy option matching (decision 154)
+#
+# `_matches` only sees an option that EQUALS or CONTAINS the answer, so a list that spells the
+# same institution differently never matched: résumé "The Pennsylvania State University" vs the
+# option "Penn State University-University Park". These helpers compare the two as TOKEN SETS,
+# tolerating abbreviation ("Penn" ↔ "Pennsylvania") and typos ("Pennsylvnia"), while refusing
+# anything that would change which institution is named.
+_TOKEN_SPLIT = re.compile(r"[^a-z0-9]+")
+# Words that carry no identity: dropping them lets "The Pennsylvania State University - Main
+# Campus" and "Pennsylvania State University" reduce to the same two tokens.
+_FUZZY_FILLER = {"the", "of", "at", "and", "a", "an", "in", "for", "campus", "main"}
+# Institution TYPE words. Not identity either — but two options with DIFFERENT types are
+# different schools, which is what stops "Boston University" from matching "Boston College".
+_FUZZY_TYPE = {"university", "college", "institute", "institution", "school", "academy",
+               "polytechnic", "seminary", "conservatory"}
+_FUZZY_SYN = {"univ": "university", "uni": "university", "inst": "institute", "coll": "college",
+              "tech": "technology", "st": "saint", "&": "and"}
+
+
+def _fuzzy_parts(text: str) -> tuple[list[str], set]:
+    """(identity tokens, type words) for `text` — filler dropped, abbreviations expanded."""
+    toks = [_FUZZY_SYN.get(t, t) for t in _TOKEN_SPLIT.split((text or "").lower()) if t]
+    return ([t for t in toks if t not in _FUZZY_FILLER and t not in _FUZZY_TYPE],
+            {t for t in toks if t in _FUZZY_TYPE})
+
+
+def _tokens_agree(a: str, b: str) -> bool:
+    """Same word allowing a truncation ("penn" → "pennsylvania") or a typo ("pennsylvnia").
+    Both guards are length-gated: 2–3 letter tokens ("us", "nj", "no") must match exactly, and
+    the typo test needs 5+ letters so near-opposites like "male"/"female" (ratio .80) can't pass."""
+    if a == b:
+        return True
+    if len(a) >= 4 and len(b) >= 4 and (a.startswith(b) or b.startswith(a)):
+        return True
+    return min(len(a), len(b)) >= 5 and difflib.SequenceMatcher(None, a, b).ratio() >= 0.88
+
+
+def _fuzzy_option_index(texts: list[str], want: str) -> Optional[int]:
+    """Index of the option that names the same thing as `want`, or None.
+
+    An option qualifies only when EVERY identity token of `want` is accounted for in it — so a
+    match never drops part of the answer — and its type word (if both have one) agrees. Among
+    qualifying options the one with the fewest LEFTOVER tokens wins, which is how the main
+    campus beats "…- Schuylkill Campus" (0 leftovers vs 1). A tie between options that are
+    genuinely different text is AMBIGUOUS and returns None rather than guess (e.g. "Miss State"
+    against both "Mississippi State" and "Missouri State") — same rule as `_pick_from_open`:
+    an unfilled field surfaces for review, a confidently-wrong one does not."""
+    w_core, w_type = _fuzzy_parts(want)
+    if not w_core:
+        return None
+    best: Optional[int] = None
+    best_extra = -1
+    ambiguous = False
+    for i, t in enumerate(texts):
+        o_core, o_type = _fuzzy_parts(t)
+        if not o_core or (w_type and o_type and not (w_type & o_type)):
+            continue
+        used: set[int] = set()
+        for w in w_core:
+            hit = next((j for j, o in enumerate(o_core) if j not in used and _tokens_agree(w, o)),
+                       None)
+            if hit is None:
+                break
+            used.add(hit)
+        else:
+            extra = len(o_core) - len(used)
+            if best is None or extra < best_extra:
+                best, best_extra, ambiguous = i, extra, False
+            elif extra == best_extra and _fuzzy_parts(texts[best])[0] != o_core:
+                ambiguous = True
+    return None if ambiguous else best
+
+
+# An escape hatch these lists offer when the applicant's own answer isn't among the options.
+# Matched on the option text, not invented: we only ever click something the form already offers.
+def _other_option_index(texts: list[str]) -> Optional[int]:
+    for i, t in enumerate(texts):
+        s = " ".join((t or "").lower().split()).strip(" *:-—")
+        if s.startswith("other") or "not listed" in s or s.startswith("none of the above"):
+            return i
+    return None
+
+
+# Fields whose real-world answer is a long tail no dropdown can fully enumerate — the only ones
+# allowed to fall back to "Other". Deliberately narrow: answering a demographic, work-authorisation
+# or country question with "Other" would be a wrong answer, not a graceful degradation.
+_OTHER_OK_LABELS = ("school", "university", "college", "institution", "alma mater")
+
+
+def _accepts_other(label: str) -> bool:
+    low = (label or "").lower()
+    return any(k in low for k in _OTHER_OK_LABELS)
+
+
+def _note_other(report: "ApplyReport", label: str, value: Optional[str], chosen: str) -> None:
+    """Say that the applicant's real answer wasn't offered. The field IS filled, but silently
+    substituting "Other" for what the user told us would read as "it ignored my input"
+    (UI Principle #5), so the review panel lists it under needs-attention."""
+    report.skipped.append(f'{label} — {value!r} is not in the list; selected "{chosen}"')
+
+
 def _fill_select(loc, value: Optional[str], hints: Optional[list[str]] = None) -> str:
     """Native <select>: try the answer, then each ranked hint. Return the chosen option text."""
     opts = loc.evaluate(
@@ -1388,6 +1490,13 @@ def _fill_select(loc, value: Optional[str], hints: Optional[list[str]] = None) -
             if _matches(o["t"], want):
                 loc.select_option(value=o["v"], timeout=5000)
                 return o["t"]
+    # Last: same institution spelled differently ("Penn State University-University Park"),
+    # which neither equality nor substring containment can see (decision 154).
+    for want in ([value] if value else []) + (hints or []):
+        i = _fuzzy_option_index([o["t"] for o in opts], want)
+        if i is not None:
+            loc.select_option(value=opts[i]["v"], timeout=5000)
+            return opts[i]["t"]
     raise RuntimeError(f"no <option> matching {value!r} or hints {hints!r}")
 
 
@@ -1480,7 +1589,11 @@ def _pick_from_open(page, want: str, want_full: Optional[str] = None) -> Optiona
         if _matches(t, target):
             opts.nth(i).click(timeout=4000)
             return t
-    bi, score = _best_by_tokens(texts, target)  # 2) best token overlap (Edison, NJ → New Jersey)
+    fi = _fuzzy_option_index(texts, target)  # 2) same name, different spelling (decision 154)
+    if fi is not None:
+        opts.nth(fi).click(timeout=4000)
+        return texts[fi]
+    bi, score = _best_by_tokens(texts, target)  # 3) best token overlap (Edison, NJ → New Jersey)
     if bi >= 0 and score > 0:
         opts.nth(bi).click(timeout=4000)
         return texts[bi]
@@ -1692,6 +1805,15 @@ def _fill_combobox(page, loc, value: Optional[str], hints: Optional[list[str]] =
                     if tier == "claude":
                         resolver.learn_option(value, t)  # a committed batch pick is learned too
                     return t, tier
+        # Same institution, different spelling — deterministic, so it runs before any model call
+        # (and before the round-1 defer): a list that shows "Penn State University-University
+        # Park" for "The Pennsylvania State University" needs no Claude to resolve (decision 154).
+        fi = _fuzzy_option_index(texts, value) if value else None
+        if fi is not None:
+            opts.nth(fi).click(timeout=4000)
+            if resolver is not None:
+                resolver.learn_option(value, texts[fi])
+            return texts[fi], "fuzzy"
         try:
             loc.press("Escape")  # close before any Claude call / Phase 2 typing
         except Exception:
@@ -1724,25 +1846,32 @@ def _fill_combobox(page, loc, value: Optional[str], hints: Optional[list[str]] =
     # main campus, not whichever campus appears first. Learns the vetted mapping for next time.
     # Gated on `gen_on`, NOT `use_claude`: a searchable picker the batch already declined (from its
     # unrelated open list) must still get this per-query pick in round 2 (decision 080).
-    if gen_on:
-        for q in _search_queries(value):
-            if not _open_combobox(page, loc):
-                break
-            try:
-                loc.fill(q, timeout=4000)
-            except Exception:
-                continue
-            page.wait_for_timeout(900)
-            _, texts = _open_options_and_texts(page)
-            try:
-                loc.press("Escape")  # decide with the menu closed; recommit retypes the query
-            except Exception:
-                pass
-            chosen = answer_bank.pick_dropdown_option(label, value, texts, model=resolver.model) \
-                if texts else None
-            if chosen and _commit_option_text(page, loc, chosen, query=q):
-                resolver.learn_option(value, chosen)
-                return chosen, "claude"
+    # The loop itself is NOT gated on `gen_on` — with generation off (or after Claude declines)
+    # each query's results still get the deterministic spelling-tolerant match (decision 154),
+    # which is a vetted mapping worth learning, unlike the first-substring guess in 2c.
+    for q in (_search_queries(value) if value else []):
+        if not _open_combobox(page, loc):
+            break
+        try:
+            loc.fill(q, timeout=4000)
+        except Exception:
+            continue
+        page.wait_for_timeout(900)
+        _, texts = _open_options_and_texts(page)
+        try:
+            loc.press("Escape")  # decide with the menu closed; recommit retypes the query
+        except Exception:
+            pass
+        chosen = answer_bank.pick_dropdown_option(label, value, texts, model=resolver.model) \
+            if (gen_on and texts) else None
+        if chosen and _commit_option_text(page, loc, chosen, query=q):
+            resolver.learn_option(value, chosen)
+            return chosen, "claude"
+        fi = _fuzzy_option_index(texts, value)
+        if fi is not None and _commit_option_text(page, loc, texts[fi], query=q):
+            if resolver is not None:
+                resolver.learn_option(value, texts[fi])
+            return texts[fi], "fuzzy"
 
     # Phase 2c — no Claude (or it declined): best-effort substring match on the shortened queries
     # for a comma-free name value (e.g. a school), so the field still fills when generation is off.
@@ -1753,6 +1882,29 @@ def _fill_combobox(page, loc, value: Optional[str], hints: Optional[list[str]] =
             chosen = _combo_try(page, loc, q)
             if chosen:
                 return chosen, "substring"
+
+    # Phase 2d — the answer really is not in this list. For a long-tail field (a school picker
+    # that doesn't carry the applicant's university), take the escape hatch the form itself
+    # offers: "Other" / "Not listed". Better a truthful "Other" — with the real name typed into
+    # the "please specify" box the form reveals next — than a required field left blank, which
+    # blocks the submit, or a wrong school picked to fill the slot (decision 154).
+    if value and _accepts_other(label):
+        for q in ("", "Other"):  # the unfiltered list, then a typed search for an async one
+            if not _open_combobox(page, loc):
+                break
+            try:
+                loc.fill(q, timeout=4000)  # always clear: earlier phases left a typed query
+            except Exception:
+                continue
+            page.wait_for_timeout(900)
+            _, texts = _open_options_and_texts(page)
+            try:
+                loc.press("Escape")
+            except Exception:
+                pass
+            oi = _other_option_index(texts)
+            if oi is not None and _commit_option_text(page, loc, texts[oi], query=q):
+                return texts[oi], "other"
 
     try:
         loc.fill("", timeout=2000)  # discard any typed-but-uncommitted text
@@ -1885,9 +2037,12 @@ def _fill_all_fields(page, resolver: AnswerResolver, report: "ApplyReport", done
                 if got:
                     text, tier = got
                     # source records HOW the option matched (option:literal | option:learned |
-                    # option:hint | option:claude | option:substring) — the determinism audit
-                    # trail: anything but option:claude was resolved without a model call.
+                    # option:hint | option:fuzzy | option:claude | option:substring | option:other)
+                    # — the determinism audit trail: anything but option:claude was resolved
+                    # without a model call.
                     report.filled.append(FilledField(label, text, "combobox", source=f"option:{tier}"))
+                    if tier == "other":
+                        _note_other(report, label, value, text)
                 elif resolver.pending is not None and resolver.pending.has(label):
                     continue  # pick deferred to the batch — round 2 recommits by exact text
                 else:
@@ -1901,9 +2056,16 @@ def _fill_all_fields(page, resolver: AnswerResolver, report: "ApplyReport", done
                     opts = _field_options(page, loc, tag, role)
                     chosen = (answer_bank.pick_dropdown_option(label, value, opts, model=resolver.model)
                               if resolver.enable_generation and value else None)
+                    oi = _other_option_index(opts) if (chosen is None and _accepts_other(label)) else None
                     if chosen:
                         report.filled.append(FilledField(
                             label, _fill_select(loc, chosen), "select", source="option:claude"))
+                    elif oi is not None:
+                        # The list doesn't carry this school — take the form's own escape hatch
+                        # rather than leave a required field blank (decision 154).
+                        report.filled.append(FilledField(
+                            label, _fill_select(loc, opts[oi]), "select", source="option:other"))
+                        _note_other(report, label, value, opts[oi])
                     else:
                         report.skipped.append(f"{label} — no <option> matched {value!r}")
             elif is_free:
