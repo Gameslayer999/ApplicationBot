@@ -1,0 +1,26 @@
+# Push notifications for the auto-apply loop (decision 135).
+#
+# Copy to profile/notifications.yaml (git-ignored) — or just use the Settings tab's
+# Notifications panel, which reads and writes this file for you and has a "Send test" button.
+#
+# The loop prepares each match then waits for your approval before it submits, and pauses any
+# application that needs your input. These settings decide how you get told about those two
+# moments. Defaults if the file is absent: desktop on, ntfy off, both events on.
+
+# A native desktop notification on the Mac running the app/server. Works for both the packaged
+# app and a localhost browser session (the loop runs on your Mac either way).
+desktop: true
+
+# Push to your phone via ntfy (https://ntfy.sh) — free, no account. Install the ntfy app,
+# subscribe to the SAME topic below, and your phone buzzes even with nothing open on the Mac.
+ntfy:
+  enabled: false
+  # A topic is a shared secret — anyone who knows it can read your alerts. Pick something long
+  # and random, e.g. applicationbot-8f3k2q7v.
+  topic: ""
+  server: https://ntfy.sh   # only change for a self-hosted ntfy server
+
+# Which moments to be notified about.
+events:
+  approval_needed: true       # an application is prepared and ready for you to review + submit
+  intervention_needed: true   # an application is blocked and needs your input (answer/login/CAPTCHA)

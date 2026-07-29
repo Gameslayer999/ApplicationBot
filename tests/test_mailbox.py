@@ -164,6 +164,60 @@ def test_save_load_link_password_in_keychain_only():
     assert cfg and cfg.password == "app-pw-123" and cfg.source == "linked"
 
 
+class _DroppingKeyring(_FakeKeyring):
+    """A keychain that accepts writes and keeps nothing — what a locked login keychain or a
+    `keyring` fallback backend looks like from the caller's side."""
+
+    def set_password(self, service, user, pw):
+        pass
+
+
+def _raises(fn) -> str:
+    """The RuntimeError message `fn()` raises (fails if it doesn't) — this file runs standalone
+    too, so no pytest.raises."""
+    try:
+        fn()
+    except RuntimeError as e:
+        return str(e)
+    raise AssertionError("expected a RuntimeError")
+
+
+def test_save_link_fails_loudly_when_the_password_does_not_persist():
+    """The password must be proven stored before the link file is written, so the inbox is never
+    recorded as connected with no app password behind it."""
+    p = _link_path()
+    msg = _raises(lambda: mailbox.save_link("imap.gmail.com", "bot@x.com", "app-pw-123",
+                                            backend=_DroppingKeyring(), path=p))
+    assert "did not persist" in msg and "Keychain Access" in msg  # actionable
+    assert not p.exists()  # no link recorded
+
+
+def test_save_gmail_link_fails_loudly_when_the_token_does_not_persist():
+    p = _link_path()
+    _raises(lambda: mailbox.save_gmail_link("bot@x.com", "rt", "cid.apps", "csec",
+                                            backend=_DroppingKeyring(), path=p))
+    assert not p.exists()
+
+
+def test_link_status_reports_a_missing_app_password():
+    """Secret gone from the keychain but the link file still there: the UI must say the app
+    password is what's missing, not just 'not connected'."""
+    kr, p = _FakeKeyring(), _link_path()
+    mailbox.save_link("imap.gmail.com", "bot@x.com", "pw", backend=kr, path=p)
+    kr.delete_password(mailbox._KEYRING_SERVICE, "bot@x.com")
+    st = mailbox.link_status(backend=kr, path=p, env={})
+    assert st["linked"] is False
+    assert "bot@x.com" in st["problem"] and "app password" in st["problem"]
+
+
+def test_link_status_reports_a_missing_google_authorization():
+    kr, p = _FakeKeyring(), _link_path()
+    mailbox.save_gmail_link("bot@x.com", "rt", "cid.apps", "csec", backend=kr, path=p)
+    kr.delete_password(mailbox._GMAIL_OAUTH_SERVICE, "bot@x.com")
+    st = mailbox.link_status(backend=kr, path=p, env={})
+    assert st["linked"] is False and "Google authorization" in st["problem"]
+
+
 def test_load_config_prefers_link_over_env():
     kr, p = _FakeKeyring(), _link_path()
     mailbox.save_link("imap.gmail.com", "bot@x.com", "linkpw", backend=kr, path=p)
@@ -181,7 +235,7 @@ def test_link_status_and_clear():
     mailbox.save_link("imap.gmail.com", "bot@x.com", "pw", backend=kr, path=p)
     st = mailbox.link_status(backend=kr, path=p, env={})
     assert st == {"linked": True, "host": "imap.gmail.com", "email": "bot@x.com", "port": 993,
-                  "source": "linked", "auth": "password"}
+                  "source": "linked", "auth": "password", "problem": ""}
     assert "password" not in st  # never exposed
     assert mailbox.clear_link(backend=kr, path=p) is True
     assert mailbox.load_link(backend=kr, path=p) is None

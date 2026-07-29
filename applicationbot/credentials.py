@@ -22,8 +22,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from .paths import DATA_ROOT
+
 SERVICE = "applicationbot-workday"
-DEFAULT_INDEX = Path("profile/workday_accounts.json")
+DEFAULT_INDEX = DATA_ROOT / "profile" / "workday_accounts.json"
 
 
 @dataclass

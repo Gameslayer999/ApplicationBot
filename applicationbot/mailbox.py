@@ -32,6 +32,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from .paths import DATA_ROOT
+
 # A verification link (prefer one that looks like the portal's) or a 6–8 digit code.
 _LINK_RE = re.compile(r"""https?://[^\s"'<>)]+""", re.IGNORECASE)
 _CODE_RE = re.compile(r"\b(\d{6,8})\b")
@@ -39,7 +41,7 @@ _LINK_HINTS = ("verify", "verification", "activate", "confirm", "myworkdayjobs",
 
 # Where a linked account is stored: the PASSWORD goes in the OS keychain (never on disk —
 # Guideline #12), and only host/email/port land in this git-ignored file (profile/ is ignored).
-_LINK_PATH = Path("profile/mailbox.yaml")
+_LINK_PATH = DATA_ROOT / "profile" / "mailbox.yaml"
 _KEYRING_SERVICE = "applicationbot-mailbox"
 
 # Gmail OAuth (decision 065): the true one-click connect. We read only the verification emails, so
@@ -101,12 +103,35 @@ def _env_config(env) -> Optional[MailboxConfig]:
     return MailboxConfig(host=host, email=email, password=pw, port=port, source="env")
 
 
+def _verify_saved(backend, service: str, key: str, value: str, what: str) -> None:
+    """Read a just-written secret back, and raise an actionable RuntimeError if it isn't there.
+
+    A keychain write can silently no-op — a locked login keychain, or `keyring` falling back to a
+    backend that stores nothing. Without this read-back the link file gets written anyway and the
+    inbox reads as connected until the next run, when the secret turns out to be missing."""
+    try:
+        stored = backend.get_password(service, key)
+    except Exception as e:
+        raise RuntimeError(
+            f"Saved the {what} for {key} but could not read it back from the OS keychain: "
+            f"{type(e).__name__}: {e}. Unlock your login keychain in Keychain Access, then "
+            "connect again.") from e
+    if stored != value:
+        raise RuntimeError(
+            f"The {what} for {key} did not persist to the OS keychain — nothing came back after "
+            "writing it. Unlock your login keychain in Keychain Access, then connect again.")
+
+
 def save_link(host: str, email: str, password: str, port: int = 993, *, backend=None,
               path: str | Path = _LINK_PATH) -> None:
-    """Link the bot inbox: password → OS keychain, host/email/port → the git-ignored file."""
+    """Link the bot inbox: password → OS keychain, host/email/port → the git-ignored file.
+    Raises if the password did not persist to the keychain — the file is written only after the
+    secret is proven stored, so a link is never recorded without its password."""
     import yaml
 
-    (backend or _keyring()).set_password(_KEYRING_SERVICE, email, password)
+    kr = backend or _keyring()
+    kr.set_password(_KEYRING_SERVICE, email, password)
+    _verify_saved(kr, _KEYRING_SERVICE, email, password, "app password")
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(yaml.safe_dump({"host": host, "email": email, "port": int(port)}, sort_keys=False),
@@ -116,13 +141,15 @@ def save_link(host: str, email: str, password: str, port: int = 993, *, backend=
 def save_gmail_link(email: str, refresh_token: str, client_id: str, client_secret: str, *,
                     backend=None, path: str | Path = _LINK_PATH) -> None:
     """Link Gmail via OAuth: refresh token + client secret → keychain; email/client_id/auth flag →
-    the git-ignored yaml. host/port are the Gmail defaults (display only — reads use the REST API)."""
+    the git-ignored yaml. host/port are the Gmail defaults (display only — reads use the REST API).
+    Raises if the keychain write didn't stick (same read-back guarantee as `save_link`)."""
     import json
     import yaml
 
-    (backend or _keyring()).set_password(
-        _GMAIL_OAUTH_SERVICE, email,
-        json.dumps({"refresh_token": refresh_token, "client_secret": client_secret}))
+    kr = backend or _keyring()
+    blob = json.dumps({"refresh_token": refresh_token, "client_secret": client_secret})
+    kr.set_password(_GMAIL_OAUTH_SERVICE, email, blob)
+    _verify_saved(kr, _GMAIL_OAUTH_SERVICE, email, blob, "Google authorization")
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(yaml.safe_dump(
@@ -171,14 +198,40 @@ def load_link(*, backend=None, path: str | Path = _LINK_PATH) -> Optional[Mailbo
                          source="linked")
 
 
+def link_problem(*, backend=None, path: str | Path = _LINK_PATH) -> str:
+    """'' normally. If the link file records an account but its keychain secret can't be read, an
+    actionable message naming the account and the fix — the one way a link looks saved on disk yet
+    fails to load (a cleared or locked login keychain). Without this the UI would just say "not
+    connected", hiding that only the secret is gone (UI Principle #3)."""
+    import yaml
+
+    p = Path(path)
+    if not p.exists():
+        return ""
+    try:
+        data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return f"{p} is not readable as YAML — click Disconnect, then connect the inbox again."
+    email = data.get("email")
+    if not email or load_link(backend=backend, path=path) is not None:
+        return ""
+    if data.get("auth") == "oauth":
+        return (f"{email} is linked but its Google authorization is missing from your OS keychain — "
+                "click Connect with Google to re-authorize.")
+    return (f"{email} is linked but its app password is missing from your OS keychain — re-enter "
+            "the 16-character app password below and click Connect.")
+
+
 def link_status(*, backend=None, path: str | Path = _LINK_PATH, env=None) -> dict:
-    """Non-secret status for the UI: {linked, host, email, port, source}. Never returns the
-    password. `linked` is True if either a stored link OR the env vars provide a full config."""
+    """Non-secret status for the UI: {linked, host, email, port, source, auth, problem}. Never
+    returns the password. `linked` is True if either a stored link OR the env vars provide a full
+    config; `problem` explains a link whose keychain secret went missing."""
     cfg = load_link(backend=backend, path=path) or _env_config(env if env is not None else os.environ)
     if cfg is None:
-        return {"linked": False, "host": "", "email": "", "port": 993, "source": "", "auth": ""}
+        return {"linked": False, "host": "", "email": "", "port": 993, "source": "", "auth": "",
+                "problem": link_problem(backend=backend, path=path)}
     return {"linked": True, "host": cfg.host, "email": cfg.email, "port": cfg.port,
-            "source": cfg.source, "auth": cfg.auth}
+            "source": cfg.source, "auth": cfg.auth, "problem": ""}
 
 
 def gmail_client_id(*, path: str | Path = _LINK_PATH) -> str:
@@ -346,6 +399,218 @@ def _connect_imap(config: MailboxConfig):
     return m
 
 
+def _body_html(msg) -> str:
+    """Best-effort HTML (or plaintext) body of an email.message.Message. Prefers text/html so a
+    job-alert parser can read the posting <a href=…> links (unlike `_body_text`, which strips the
+    hrefs out); falls back to text/plain when there is no HTML part."""
+    html, plain = [], []
+    parts = msg.walk() if msg.is_multipart() else [msg]
+    for part in parts:
+        ctype = part.get_content_type()
+        if ctype not in ("text/plain", "text/html"):
+            continue
+        try:
+            payload = part.get_payload(decode=True)
+            if payload is None:
+                continue
+            text = payload.decode(part.get_content_charset() or "utf-8", errors="replace")
+        except Exception:
+            continue
+        (html if ctype == "text/html" else plain).append(text)
+    if html and "".join(html).strip():
+        return "\n".join(html)
+    return "\n".join(plain)
+
+
+def _gmail_fetch_alerts(config: MailboxConfig, *, sender_contains: str, limit: int = 25,
+                        _token=None, _get=None) -> list[str]:
+    """OAuth read: newest-first HTML/plaintext bodies (up to `limit`) of Gmail messages whose From
+    matches `sender_contains`. Sibling of `_gmail_fetch_verification` that returns whole bodies.
+    Never raises (returns [] on error)."""
+    import base64
+    import email as email_mod
+
+    token = _token or _gmail_access_token
+    get = _get or _gmail_get
+    try:
+        access = token(config)
+        q = f"from:{sender_contains}" if sender_contains else ""
+        listing = get(access, "/messages", {"q": q, "maxResults": max(1, limit)})
+    except Exception:
+        return []
+    out: list[str] = []
+    for meta in listing.get("messages", []):  # already newest-first from the API
+        if len(out) >= limit:
+            break
+        try:
+            full = get(access, f"/messages/{meta['id']}", {"format": "raw"})
+            raw = base64.urlsafe_b64decode(full["raw"])
+            msg = email_mod.message_from_bytes(raw)
+        except Exception:
+            continue
+        body = _body_html(msg)
+        if body.strip():
+            out.append(body)
+    return out
+
+
+def fetch_alerts(config: MailboxConfig, *, sender_contains: str, limit: int = 25,
+                 mailbox: str = "INBOX", _connect=_connect_imap) -> list[str]:
+    """Newest-first, up to `limit`, the HTML (or plaintext) bodies of inbox messages whose From
+    matches `sender_contains` — the raw material a job-alert parser turns into leads (decision 132).
+    Sibling of `fetch_verification`: same sender-filtered, newest-first scan, but returns whole
+    bodies instead of a single verification token. OAuth reads via the Gmail REST API; a
+    password/env link reads via IMAP. Never raises (returns [] on any error)."""
+    if config.auth == "oauth":
+        return _gmail_fetch_alerts(config, sender_contains=sender_contains, limit=limit)
+    import email as email_mod
+
+    try:
+        m = _connect(config)
+    except Exception:
+        return []
+    out: list[str] = []
+    try:
+        m.select(mailbox)
+        typ, data = m.search(None, "ALL")
+        ids = (data[0].split() if data and data[0] else [])
+        for mid in reversed(ids):  # newest last in IMAP sequence → iterate reversed
+            if len(out) >= limit:
+                break
+            try:
+                typ, msg_data = m.fetch(mid, "(RFC822)")
+                raw = msg_data[0][1]
+                msg = email_mod.message_from_bytes(raw)
+            except Exception:
+                continue
+            frm = (msg.get("From") or "").lower()
+            if sender_contains and sender_contains.lower() not in frm:
+                continue
+            body = _body_html(msg)
+            if body.strip():
+                out.append(body)
+        return out
+    except Exception:
+        return out
+    finally:
+        try:
+            m.logout()
+        except Exception:
+            pass
+
+
+def _decode_header(raw: str) -> str:
+    """An RFC-2047 encoded header (`=?utf-8?B?…?=`) as plain text; the raw value on failure."""
+    from email.header import decode_header, make_header
+
+    if not raw:
+        return ""
+    try:
+        return str(make_header(decode_header(raw))).strip()
+    except Exception:
+        return raw.strip()
+
+
+def _message_record(msg) -> dict:
+    """One parsed email as the inbox importer consumes it: {message_id, sender, subject, date,
+    body}. `date` is the ISO date from the Date header ('' if unparseable); `body` is plaintext
+    (HTML stripped) — a forwarded message's original From/Subject/Date live inside it."""
+    from email.utils import parsedate_to_datetime
+
+    date_iso = ""
+    if msg.get("Date"):
+        try:
+            date_iso = parsedate_to_datetime(msg["Date"]).date().isoformat()
+        except Exception:
+            date_iso = ""
+    return {
+        "message_id": (msg.get("Message-ID") or "").strip(),
+        "sender": _decode_header(msg.get("From") or ""),
+        "subject": _decode_header(msg.get("Subject") or ""),
+        "date": date_iso,
+        "body": _body_text(msg),
+    }
+
+
+def _gmail_fetch_messages(config: MailboxConfig, *, limit: int, newer_than_days: int,
+                          _token=None, _get=None) -> list[dict]:
+    """OAuth read: newest-first message records (see `_message_record`) from the Gmail account,
+    limited to the last `newer_than_days` days. Never raises (returns [] on error)."""
+    import base64
+    import email as email_mod
+
+    token = _token or _gmail_access_token
+    get = _get or _gmail_get
+    try:
+        access = token(config)
+        q = f"newer_than:{newer_than_days}d" if newer_than_days else ""
+        listing = get(access, "/messages", {"q": q, "maxResults": max(1, limit)})
+    except Exception:
+        return []
+    out: list[dict] = []
+    for meta in listing.get("messages", []):  # already newest-first from the API
+        if len(out) >= limit:
+            break
+        try:
+            full = get(access, f"/messages/{meta['id']}", {"format": "raw"})
+            msg = email_mod.message_from_bytes(base64.urlsafe_b64decode(full["raw"]))
+        except Exception:
+            continue
+        rec = _message_record(msg)
+        if not rec["message_id"]:  # no stable id → the importer could not dedup it
+            rec["message_id"] = f"gmail:{meta.get('id', '')}"
+        out.append(rec)
+    return out
+
+
+def fetch_messages(config: MailboxConfig, *, limit: int = 50, newer_than_days: int = 30,
+                   mailbox: str = "INBOX", _connect=_connect_imap) -> list[dict]:
+    """Newest-first, up to `limit`, every inbox message from the last `newer_than_days` days as
+    a record dict (`_message_record`) — the raw material the inbox importer turns into tracker
+    rows (decision 151). Unlike `fetch_alerts` this keeps the HEADERS and does not filter by
+    sender: a forwarded email's From is the forwarder, not the employer, so sender filtering
+    would drop exactly the messages we want. OAuth reads via the Gmail REST API; a
+    password/env link reads via IMAP. Never raises (returns [] on any error)."""
+    if config.auth == "oauth":
+        return _gmail_fetch_messages(config, limit=limit, newer_than_days=newer_than_days)
+    import email as email_mod
+    from datetime import date as _date, timedelta
+
+    try:
+        m = _connect(config)
+    except Exception:
+        return []
+    out: list[dict] = []
+    try:
+        m.select(mailbox)
+        if newer_than_days:
+            since = (_date.today() - timedelta(days=newer_than_days)).strftime("%d-%b-%Y")
+            typ, data = m.search(None, "SINCE", since)
+        else:
+            typ, data = m.search(None, "ALL")
+        ids = (data[0].split() if data and data[0] else [])
+        for mid in reversed(ids):  # newest last in IMAP sequence → iterate reversed
+            if len(out) >= limit:
+                break
+            try:
+                typ, msg_data = m.fetch(mid, "(RFC822)")
+                msg = email_mod.message_from_bytes(msg_data[0][1])
+            except Exception:
+                continue
+            rec = _message_record(msg)
+            if not rec["message_id"]:
+                rec["message_id"] = f"imap:{config.email}:{mid.decode() if isinstance(mid, bytes) else mid}"
+            out.append(rec)
+        return out
+    except Exception:
+        return out
+    finally:
+        try:
+            m.logout()
+        except Exception:
+            pass
+
+
 def _gmail_fetch_verification(config: MailboxConfig, *, sender_contains: str = "workday",
                               _token=None, _get=None) -> str:
     """OAuth read: newest-first, return the verification link/code from the most recent Gmail
@@ -479,7 +744,10 @@ def connect_gmail(client_id: str, client_secret: str, *, open_browser: bool = Tr
     ok, msg = test_connection(cfg)
     if not ok:
         return False, msg
-    save_gmail_link(email, refresh_token, client_id, client_secret, backend=backend, path=path)
+    try:
+        save_gmail_link(email, refresh_token, client_id, client_secret, backend=backend, path=path)
+    except Exception as e:
+        return False, f"Google approved the access but it could not be saved: {e}"
     return True, f"Connected {email} — Gmail read-only access stored in your OS keychain."
 
 
@@ -524,7 +792,11 @@ def main(argv=None) -> int:
             print(msg)
             if not ok:
                 return 1
-        save_link(host, args.email, password, args.port)
+        try:
+            save_link(host, args.email, password, args.port)
+        except Exception as e:
+            print(f"Not linked — {e}")
+            return 1
         print(f"Linked {args.email} ({host}:{args.port}). Password stored in the OS keychain.")
         return 0
     if args.cmd == "test":
@@ -542,6 +814,8 @@ def main(argv=None) -> int:
     if s["linked"]:
         how = "Gmail OAuth (read-only)" if s.get("auth") == "oauth" else f"{s['host']}:{s['port']}"
         print(f"Linked: {s['email']} via {how} ({s['source']}).")
+    elif s.get("problem"):
+        print(s["problem"])
     else:
         print("No inbox linked. Gmail one-click:  python -m applicationbot.mailbox connect-gmail "
               "--client-id … --client-secret …\n"
