@@ -35,14 +35,25 @@ def fake_pipeline(monkeypatch):
     monkeypatch.setattr(web, "load_resume", lambda *a, **k: NS())
     monkeypatch.setattr(web.apply_profile, "load_profile", lambda *a, **k: NS())
 
-    calls = {"discover": 0, "cached": 0, "prepared": [], "only_new": []}
-    matches = [NS(posting=NS(company="Acme", title="Backend Eng", url="http://x/1"), fit_score=88),
-               NS(posting=NS(company="Bolt", title="Full-Stack", url="http://x/2"), fit_score=81)]
+    calls = {"discover": 0, "cached": 0, "prepared": [], "only_new": [], "force_fresh": [],
+             "revisit": []}
+    # Shaped like a real Match/Posting: the loop publishes a search breakdown (decision 149),
+    # which reads the same judged-row fields the dry-run panel shows.
+    def _match(n, company, title, fit):
+        return NS(posting=NS(company=company, title=title, url=f"http://x/{n}",
+                             location="Remote", compensation="", ats="lever"),
+                  fit_score=fit, qualified=True, dimensions=None, why="", missing=[])
+
+    matches = [_match(1, "Acme", "Backend Eng", 88), _match(2, "Bolt", "Full-Stack", 81)]
 
     def discover(*a, **k):
         calls["discover"] += 1
         calls["only_new"].append(k.get("only_new"))
-        return NS(matches=matches if calls["discover"] == 1 else [], errors=[])
+        calls["force_fresh"].append(k.get("force_fresh"))
+        calls["revisit"].append(k.get("revisit"))
+        found = matches if calls["discover"] == 1 else []
+        return NS(matches=found, errors=[], from_cache=False, discovered=len(found),
+                  funnel={"discovered": len(found), "matched": len(found), "judged": len(found)})
 
     def cached(*a, **k):
         calls["cached"] += 1
@@ -60,6 +71,11 @@ def fake_pipeline(monkeypatch):
     # Each prepared posting yields a clean dry-run tracker row (id derived from the URL tail).
     monkeypatch.setattr(web.tracker, "find_by_source_url",
                         lambda url, **k: {"id": int(url[-1]), "status": "dry-run"})
+    # Neutralize the notification side effect (decision 145): the real _record_and_push writes to
+    # the default (real) tracker DB and fires a real desktop notification. These tests exercise the
+    # loop mechanics only — notifications are covered in test_notifications.py — so stub it, or
+    # running this file would spam the developer with pushes and pollute applications.db.
+    monkeypatch.setattr(web, "_record_and_push", lambda *a, **k: None)
     return calls
 
 
@@ -142,6 +158,57 @@ def test_rescan_cached_but_below_min_fit_names_the_real_reason(fake_pipeline, mo
     assert "nothing scored" not in msg.lower()
 
 
+def test_unmet_goal_keeps_searching_live_until_it_is_met(fake_pipeline, monkeypatch):
+    """Decision 146 (the reported bug): with goal=2, a search that finds nothing must not end the
+    run with "no new matches" — the loop backs off and searches again until the goal is met. The
+    retries must go LIVE (force_fresh), since replaying the cached snapshot can only re-serve
+    postings the seen-ledger already hides."""
+    import applicationbot.pipeline as pipeline
+
+    monkeypatch.setattr(web, "_hunt_backoff", lambda n: 0.01)  # no real 60s backoff in tests
+    first = [NS(posting=NS(company="Acme", title="Backend Eng", url="http://x/1"), fit_score=88)]
+    later = [NS(posting=NS(company="Bolt", title="Full-Stack", url="http://x/2"), fit_score=81)]
+
+    def discover(*a, **k):
+        fake_pipeline["discover"] += 1
+        fake_pipeline["force_fresh"].append(k.get("force_fresh"))
+        n = fake_pipeline["discover"]
+        batch = first if n == 1 else (later if n == 4 else [])  # passes 2 and 3 find nothing
+        return NS(matches=batch, errors=[], from_cache=False)
+
+    monkeypatch.setattr(pipeline, "discover_and_match", discover)
+
+    assert web.start_loop(goal=2)["ok"] is True
+    assert _wait_until(lambda: not web._loop_running(), timeout=5.0), "loop did not finish"
+    assert fake_pipeline["prepared"] == ["http://x/1", "http://x/2"]
+    assert fake_pipeline["discover"] == 4          # kept hunting through two empty passes
+    assert fake_pipeline["force_fresh"] == [False, True, True, True]
+    with web._LOOP_LOCK:
+        assert web._LOOP_STATE["phase"] == "goal_reached"
+        assert sorted(web._LOOP_STATE["ready_ids"]) == [1, 2]
+
+
+def test_hunt_message_names_progress_and_the_next_search(fake_pipeline, monkeypatch):
+    # While hunting, the status must say how far along the goal is and when the next pass runs
+    # (UI Principles #3/#5) — never "caught up, no new matches", which is what looked broken.
+    import applicationbot.pipeline as pipeline
+
+    monkeypatch.setattr(web, "_hunt_backoff", lambda n: 120)
+    monkeypatch.setattr(pipeline, "discover_and_match",
+                        lambda *a, **k: NS(matches=[], errors=[], from_cache=False))
+    assert web.start_loop(goal=5)["ok"] is True
+    assert _wait_until(lambda: web._LOOP_STATE.get("phase") == "hunting", timeout=5.0), \
+        "loop never reported hunting"
+    msg = web._LOOP_STATE["message"]
+    web.stop_loop()
+    assert _wait_until(lambda: not web._loop_running(), timeout=5.0)
+    assert "0 of 5 ready" in msg and "2 min" in msg and "caught up" not in msg.lower()
+
+
+def test_hunt_backoff_escalates_then_caps():
+    assert [web._hunt_backoff(n) for n in (1, 2, 3, 4, 5, 9)] == [60, 120, 300, 900, 1800, 1800]
+
+
 def test_default_start_keeps_only_new(fake_pipeline):
     assert web.start_loop()["ok"] is True
     assert _wait_until(lambda: not web._loop_running()), "loop did not finish"
@@ -193,3 +260,30 @@ def test_queue_submit_enqueues_while_loop_running():
         with web._LOOP_LOCK:
             web._LOOP_STATE["running"] = False
             web._LOOP_SUBMITS.clear()
+
+
+def test_watch_keeps_running_after_caught_up_then_stops(fake_pipeline):
+    # Watch mode (decision 143): after preparing the first batch and exhausting the boards, the
+    # loop must NOT stop — it enters the "watching" phase and idles, re-checking on the interval.
+    # It ends only when the user stops it. This is the "autofill new roles, hold for review,
+    # never submit, forever" watch.
+    assert web.start_loop(watch=True, watch_interval=1)["ok"] is True
+    assert _wait_until(lambda: web._LOOP_STATE.get("phase") == "watching"), "never entered watch idle"
+    assert web._loop_running()  # still alive, unlike the non-watch caught_up path
+    assert fake_pipeline["prepared"] == ["http://x/1", "http://x/2"]
+    with web._LOOP_LOCK:
+        assert web._LOOP_STATE["watch"] is True
+        assert web._LOOP_STATE["watch_interval"] == 1
+    # Re-searched the boards fresh each poll so a newly-posted role would be seen.
+    assert fake_pipeline["discover"] >= 2
+    web.stop_loop()  # wakes the idle immediately
+    assert _wait_until(lambda: not web._loop_running()), "watch loop did not stop"
+
+
+def test_rescan_forces_watch_off(fake_pipeline):
+    # A one-shot rescan can't also "keep watching" — watch is forced off so it stays bounded.
+    assert web.start_loop(rescan=True, watch=True)["ok"] is True
+    assert _wait_until(lambda: not web._loop_running()), "loop did not finish"
+    with web._LOOP_LOCK:
+        assert web._LOOP_STATE["watch"] is False
+        assert web._LOOP_STATE["phase"] == "caught_up"

@@ -50,23 +50,47 @@ Configure  →  Discover  →  Tailor  →  Apply  →  Track
 1. **Configure** — set up your profile: contact details, a base résumé (structured YAML, the source of
    truth), and filters (roles, keywords, location/remote, pay range, seniority, company type). Filters
    drive both what gets discovered and what gets auto-applied to. Edit it all from the web UI or in
-   `profile/*.yaml`.
+   `profile/*.yaml`. Already have a résumé? **Upload the PDF or Word (.docx) file** on the Profile page and
+   Claude reads it into your sections — merging in anything new and leaving what you've already filled
+   untouched (or import from a LinkedIn data export).
 2. **Discover** — pull openings that match your filters from public ATS APIs
    (Greenhouse · Lever · Ashby · SmartRecruiters · Recruitee · Workable), keyless aggregators
    (Adzuna · Jooble · Remotive and other JSON sources), and forwarded job-alert emails. A cheap keyword
    pre-filter narrows the pool, a two-stage judge (Haiku pre-rank → Sonnet) ranks the survivors by
    qualification fit and names your missing requirements, and a funnel view shows exactly how many
-   postings reached each stage.
+   postings reached each stage — during the auto-apply loop as well as a one-off dry run.
+   A posting whose application you **never opened** is brought back by the next search rather than
+   buried, so anything prepared while you were away gets a second look. When the source scout stages
+   new company boards, **Add all** wires every one of them into discovery in a single click.
 3. **Tailor** — Claude rewrites your résumé for each posting — selecting, reordering, and rephrasing what
    you already have. A drift check flags any skill, role, or certification that isn't in your base résumé,
    so it stays factual, and every exported PDF is re-checked to confirm its text layer is machine-readable.
+   To save tokens, when a new posting demands essentially the same skills as one it already tailored for,
+   it **reuses that résumé** instead of making another Claude call (use "Re-tailor" to force a fresh pass).
+   **Your own résumé outranks any generated one:** upload a PDF résumé on the Profile tab and any job whose
+   demanded skills it already covers is sent that exact file — no tailoring at all. Kept résumés are listed
+   under the upload box and removable in one click.
+   Track, the ready-to-apply notification, and the review panel each show whether a submission used a
+   **freshly tailored** résumé, a **reused** one, or **your uploaded file**, so it is never a surprise.
 4. **Apply** — a real browser (Playwright) fills and submits the application through the posting's own
    ATS, including multi-page wizards and account-gated **Workday** (automated account creation, credentials
    in your OS keychain). Applications that get blocked (a question it can't answer, a login, a CAPTCHA) are
    *parked* so you can resolve and resume them. Every submit is gated by the safety switch above.
+   Before you sign off, **Review** shows the exact answers it will submit — and every one of them is
+   **editable**. Type over any answer (or fill in one it couldn't answer) and that value is what gets
+   submitted the next time this application is filled, including the real submit; unsaved edits are saved
+   for you when you click *Watch it fill* or *Apply*. Clearing a box hands the field back to the bot.
+   The web UI's **auto-apply loop** can run to a goal — *"keep going until 5 applications are ready for me"* —
+   and it means it: when a pass turns up nothing new it backs off (1 min, then longer, up to 30 min) and
+   searches again, each pass judging the next-best postings it hasn't scored yet, until that many are ready
+   or you hit **Stop**. The status line always says how close it is and when the next pass runs, and each
+   pass shows its own search breakdown — the funnel plus every posting Claude judged, accepted or denied.
 5. **Track** — every application is recorded in a local SQLite database with company, role, location, pay,
    portal, status, date, fit score, and the exact tailored résumé used — viewable and editable in the Track
-   tab, with funnel and calibration reports.
+   tab, with funnel and calibration reports. Applied to things by hand, or before you started using this?
+   Forward those emails to your linked inbox and click **Import from inbox**: every "thank you for applying"
+   becomes a row, and every rejection or interview invite moves an existing one's status. Imported rows are
+   flagged with the email they came from, and the whole import undoes in one click.
 
 Discovery, tailoring, filling, and submission run with **no human in the loop** once you arm the system —
 that is the point of the tool. Until then, everything is a dry run.
@@ -153,12 +177,14 @@ The web UI covers everything, but each stage is also a module you can run direct
 | `./scripts/update.sh` / `restart.sh` / `stop.sh` | Pull latest + reinstall + restart · restart · stop |
 | `python -m applicationbot.web [--port 8000]` | Start the web UI directly (stdlib, binds `127.0.0.1` only) |
 | `python -m applicationbot.pipeline --apply-first` | Discover → judge → tailor → **dry-run** fill one top match |
-| `python -m applicationbot.runner [--max N] [--continuous]` | Autonomous loop over every cleared match (dry-run by default) |
+| `python -m applicationbot.runner [--max N] [--continuous]` | Autonomous loop over every cleared match (dry-run by default). `--continuous` = a **watch**: re-checks your boards every `--interval` min and sends a desktop/phone notification each cycle a role is ready to apply |
 | `python -m applicationbot.cli JD.md --resume R.yaml --out out.pdf` | Tailor a résumé to one job description (CLI) |
 | `python -m applicationbot.apply URL --resume profile/resume.yaml --dry-run` | Fill one application by URL |
 | `python -m applicationbot.doctor` | Read-only health check (Claude sign-in, Chromium, résumé, safety state) |
+| `python -m scripts.prune_seen_ledger [--apply]` | One-time repair: drop postings from the "already shown" ledger that Claude never actually judged, so discovery can consider them again (dry-run without `--apply`) |
 | `python -m applicationbot.tracker [funnel\|calibration]` | Inspect tracked applications and reports |
-| `python -m applicationbot.mailbox link\|status\|test` | Link the bot inbox (Workday email verification, job-alert ingest) |
+| `python -m applicationbot.inbox_import run [--days 30] [--limit 50]` | Import application emails from the linked inbox into the tracker; `status` shows what's been imported, `undo RUN_ID` reverses one run |
+| `python -m applicationbot.mailbox link\|status\|test` | Link the bot inbox (Workday email verification, job-alert ingest, application-email import) |
 
 **Tailoring engines** (`--backend`, defaults to `auto`):
 
@@ -183,8 +209,13 @@ Everything specific to you lives in the git-ignored **`profile/`** folder (from 
 - `resume.yaml` — your base résumé, the factual source of truth.
 - `discovery.yaml` — filters, boards, and sources (roles, keywords, location, pay, seniority, gates).
 - `safety.yaml` — the arm switch and per-run submission cap.
-- `notifications.yaml`, `mailbox.yaml` — optional desktop/phone push and the bot inbox link.
+- `notifications.yaml`, `mailbox.yaml` — optional desktop/phone push (also logged in the
+  **Notifications** tab, so every alert is kept and dismissible) and the bot inbox link.
 - `applications.db` + `applications/` — your tracked history and per-application archives.
+- `uploads/` — the PDF résumés you uploaded, kept so a closely-matching job can be sent your own file
+  instead of a tailored one (remove any of them under the Profile tab's upload box).
+- `inbox_import_seen.json` — which inbox messages have already been imported into the tracker, so a
+  re-scan never duplicates a row (and each import stays undoable).
 
 Template versions of these live in [`examples/`](examples/). Run `python -m applicationbot.doctor` any time to
 confirm your setup is healthy.

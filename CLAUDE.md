@@ -301,27 +301,13 @@ When you encounter a choice during development, follow this process:
 
 ---
 
-## Parallel agents (Cursor ↔ Claude VS Code)
+## Parallel agents — not in use
 
-When working alongside Cursor in parallel, use the **agent bus** — git-ignored
-`.agent-bus/` plus the committed CLI in `applicationbot/agent_bus.py`. Full guide:
-[docs/AGENT_COLLAB.md](docs/AGENT_COLLAB.md).
+There is **no parallel Cursor agent and no agent-bus ritual**. Do not run
+`applicationbot.agent_bus`, do not post handoffs or claim paths, and do not mention
+coordinating with another agent in messages, commits, `DECISIONS.md`, or `NEXT_STEPS.md`.
+You are the only agent on this repo; work directly.
 
-**Start of every session (Claude in VS Code):**
-
-```bash
-python -m applicationbot.agent_bus context --agent claude
-python -m applicationbot.agent_bus read --agent claude --unread
-```
-
-**While working:** claim paths before editing shared files; post `handoff` / `task` /
-`blocker` messages to `cursor` or `broadcast`; run `watch --agent claude` in a side
-terminal for canary alerts.
-
-**End of a chunk:** ack handled messages, release claims, set status idle:
-
-```bash
-python -m applicationbot.agent_bus ack <id>
-python -m applicationbot.agent_bus release --agent claude
-python -m applicationbot.agent_bus status --agent claude --set-status idle
-```
+The bus CLI (`applicationbot/agent_bus.py`), [docs/AGENT_COLLAB.md](docs/AGENT_COLLAB.md),
+and `.cursor/hooks/` remain on disk as dormant tooling from decision 014. Use them only if
+the user explicitly asks to run parallel agents again.

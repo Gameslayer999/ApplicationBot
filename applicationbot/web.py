@@ -34,8 +34,15 @@ from .pdf import render_pdf
 from .render import render_html, render_markdown
 from .resume import load_resume
 from .tailor import tailor_resume
+from .paths import DATA_ROOT
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# User-saved job fixtures (added from the Track tab). These live under the writable data root
+# (`profile/*` is git-ignored, and in the packaged app DATA_ROOT is the per-user support dir), so
+# they never touch the read-only shipped `fixtures/` bundle and are never committed. They show up
+# in the Review-tab fixture picker alongside the shipped example postings.
+USER_FIXTURES_DIR = DATA_ROOT / "profile" / "job_fixtures"
 
 # Dev auto-reload (set by `scripts/dev_reload.py`, i.e. `run.sh --dev`). When on, the page polls
 # /dev/reload-token; the token is this process's boot time, so a supervisor restart after a code
@@ -86,6 +93,21 @@ def _set(**kw) -> None:
         _TEST_STATE.update(kw)
 
 
+def _judged_rows(matches, min_fit: int) -> list[dict]:
+    """Every Claude-judged posting of a search — accepted AND denied, ranked best-first — as the
+    rows the search-breakdown UI shows, so the user can see what the boards returned and why each
+    was rejected. Shared by the test run and the auto-apply loop (decision 149)."""
+    return [{
+        "company": m.posting.company, "title": m.posting.title,
+        "location": m.posting.location, "compensation": m.posting.compensation,
+        "url": m.posting.url, "ats": m.posting.ats,
+        "fit_score": m.fit_score, "qualified": m.qualified,
+        "dimensions": m.dimensions or None,
+        "why": m.why, "missing": (m.missing or [])[:3],
+        "cleared": (m.fit_score is not None and m.fit_score >= min_fit),
+    } for m in matches if m.fit_score is not None]
+
+
 def _test_worker(force_fresh: bool = False) -> None:
     """Run the full testing-mode pipeline in the background, updating _TEST_STATE.
     `force_fresh` bypasses the discovery snapshot cache and re-searches every board."""
@@ -123,15 +145,7 @@ def _test_worker(force_fresh: bool = False) -> None:
         min_fit, calib_note = pipeline.effective_min_fit(filters)
         # Surface every Claude-judged posting — accepted AND denied — so the user can see what
         # the searches return and why each is rejected (ranked best-first).
-        judged = [{
-            "company": m.posting.company, "title": m.posting.title,
-            "location": m.posting.location, "compensation": m.posting.compensation,
-            "url": m.posting.url, "ats": m.posting.ats,
-            "fit_score": m.fit_score, "qualified": m.qualified,
-            "dimensions": m.dimensions or None,
-            "why": m.why, "missing": (m.missing or [])[:3],
-            "cleared": (m.fit_score is not None and m.fit_score >= min_fit),
-        } for m in res.matches if m.fit_score is not None]
+        judged = _judged_rows(res.matches, min_fit)
         cache_age_min = int((res.cache_age_seconds or 0) // 60) if res.from_cache else None
         _set(scanned=res.discovered, matched=len(res.matches), errors=res.errors,
              skipped_seen=res.skipped_seen, skipped_shown=res.skipped_shown, judged=judged,
@@ -292,10 +306,14 @@ def _reapply_worker(app_id: int, *, arm: bool = False, retailor: bool = False) -
                          "url": report.url, "screenshot": report.screenshot})
 
         _TEST_HOLD.clear()
+        from . import reuse
         report = run_apply(
             url, pdf, resolver, headed=True, pause=True,
             meta={"company": company, "role": role, "source_url": url,
-                  "fit_score": app.get("fit_score") or None},
+                  "fit_score": app.get("fit_score") or None,
+                  # Re-tailor regenerated the résumé; otherwise this run reuses the stored PDF
+                  # as-is — record which (decision 144).
+                  "resume_source": reuse.FRESH if retailor else reuse.stored_reuse_label()},
             hold=_TEST_HOLD, on_filled=on_filled, gate=gate,
         )
         from . import parking
@@ -343,14 +361,108 @@ def start_reapply(app_id: int, *, arm: bool = False, retailor: bool = False) -> 
 
 _LOOP_LOCK = threading.Lock()
 _LOOP_STATE: dict = {"running": False, "phase": "idle", "message": "", "prepared": 0,
-                     "ready_ids": [], "current": None, "goal": None, "maintain": False}
+                     "ready_ids": [], "current": None, "goal": None, "maintain": False,
+                     "watch": False, "watch_interval": 30,
+                     # Last search's breakdown, same shape the test run reports (decision 149),
+                     # so the loop shows WHERE its postings went instead of a bare "searching…".
+                     "funnel": {}, "judged": [], "min_fit": None, "scanned": 0, "matched": 0,
+                     "cleared": 0, "searches": 0, "from_cache": False}
 _LOOP_STOP = threading.Event()
 _LOOP_SUBMITS: list[int] = []  # app-ids the user clicked "Apply" on, awaiting the loop thread
+_LOOP_WATCHES: list[int] = []  # app-ids the user clicked "Watch the autofill" on, awaiting the thread
+_LOOP_WATCH_HOLD = threading.Event()  # set to release an in-progress watch (window close or Stop)
+
+# Goal mode keeps hunting when a pass finds nothing new (decision 146). How long it idles before
+# the n-th consecutive empty pass — short at first (a fresh board search may well turn something
+# up), then escalating to a 30-min ceiling so a long hunt doesn't hammer the boards (Guideline #4).
+_HUNT_BACKOFF_SECONDS = (60, 120, 300, 900, 1800)
+
+
+def _hunt_backoff(n: int) -> int:
+    return _HUNT_BACKOFF_SECONDS[min(max(n, 1), len(_HUNT_BACKOFF_SECONDS)) - 1]
+
+
+def _build_inbox(ready_ids, *, path=None) -> dict:
+    """The Notifications action center payload (decisions 138 + 145). Everything needing the user
+    now — applications ready to submit + blocked ones needing a fix — as ACTION cards, with the
+    durable notification LOG below. Pure over the tracker so it's unit-testable.
+
+    `ready` is unioned from the in-memory loop queue (`ready_ids`) AND the `dry-run` applications
+    named by `approval_needed` log rows, so a ready application stays reviewable/submittable here
+    even after a server restart cleared the in-memory queue (else the user sees the notification
+    but has no card to act on). Each log row is tagged `actionable` — whether its application is
+    currently shown as a card above — so the feed can hide those and be the record of PAST
+    notifications only, never a duplicate. `count` (ready + parked) drives the nav badge."""
+    from . import parking
+    kw = {"path": path} if path is not None else {}
+    log = tracker.list_notifications(limit=100, **kw)
+    ids = list(ready_ids) + [n["application_id"] for n in log
+                             if n["event"] == "approval_needed" and n.get("application_id")]
+    ready, seen = [], set()
+    for aid in ids:
+        if aid in seen:
+            continue
+        seen.add(aid)
+        a = tracker.get_application(aid, **kw)
+        if a and a.get("status") == "dry-run":
+            ready.append({"id": aid, "company": a["company"], "role": a["role"],
+                          "fit": a.get("fit_score"), "portal": a["portal"], "url": a["source_url"],
+                          "resume_source": a.get("resume_source", "")})
+    parked = []
+    for a in tracker.parked_applications(**kw):
+        d = parking.describe(a.get("blocked_kind", ""), a.get("blocked_detail", ""))
+        parked.append({"id": a["id"], "company": a["company"], "role": a["role"],
+                       "portal": a["portal"], "source_url": a["source_url"],
+                       "status": a["status"], **d})
+    actionable_ids = {a["id"] for a in ready} | {a["id"] for a in parked}
+    for n in log:
+        aid = n.get("application_id")
+        app = tracker.get_application(aid, **kw) if aid else None
+        n["app_status"] = app.get("status") if app else None
+        n["actionable"] = aid in actionable_ids
+    return {"ready": ready, "parked": parked, "count": len(ready) + len(parked),
+            "notifications": log, "unread": tracker.unread_notification_count(**kw)}
+
+
+def _record_and_push(notifier, note, app_id: int | None = None) -> None:
+    """Record every fired notification in the durable log (so the Notifications tab shows it and
+    it survives the app being submitted/cleared or the loop resetting), THEN push it via the
+    configured transports (desktop/ntfy). Gated by the event toggle — a disabled event neither
+    logs nor pushes. Recording is best-effort: a DB hiccup must never break the loop (decision 145)."""
+    if not notifier.cfg.event_enabled(note.event):
+        return
+    try:
+        tracker.add_notification(
+            note.event, note.title, note.body, link=note.link, application_id=app_id,
+            urgent=note.urgent, channels=",".join(c.name for c in notifier.channels))
+    except Exception:
+        pass  # a logging failure must not stop the loop or suppress the push
+    notifier.notify(note)
+
+
+def _notify_config_from_payload(d: dict):
+    """Build a NotifyConfig from the settings-panel payload. Accepts the same nested shape the
+    GET returns (``{desktop, ntfy:{enabled,topic,server}, events:{...}}``) so the round-trip is
+    symmetric."""
+    from . import notifications as notif
+    ntfy = d.get("ntfy") or {}
+    events = d.get("events") or {}
+    return notif.NotifyConfig(
+        desktop=bool(d.get("desktop", True)),
+        ntfy_enabled=bool(ntfy.get("enabled", False)),
+        ntfy_topic=str(ntfy.get("topic", "") or "").strip(),
+        ntfy_server=str(ntfy.get("server") or "https://ntfy.sh").strip(),
+        approval_needed=bool(events.get(notif.APPROVAL_NEEDED, True)),
+        intervention_needed=bool(events.get(notif.INTERVENTION_NEEDED, True)),
+    )
 
 
 def _loop_reset() -> dict:
     return {"running": True, "phase": "starting", "message": "Starting…",
-            "prepared": 0, "ready_ids": [], "current": None, "goal": None, "maintain": False}
+            "prepared": 0, "ready_ids": [], "current": None, "goal": None, "maintain": False,
+            "watch": False, "watch_interval": 30,
+            "funnel": {}, "judged": [], "min_fit": None, "scanned": 0, "matched": 0,
+            "cleared": 0, "searches": 0, "from_cache": False}
 
 
 def _loop_set(**kw) -> None:
@@ -392,7 +504,9 @@ def _loop_submit(app_id: int) -> None:
     report = run_apply(
         url, pdf, resolver, headed=False, pause=False,
         meta={"company": company, "role": role, "source_url": url,
-              "fit_score": app.get("fit_score") or None},
+              "fit_score": app.get("fit_score") or None,
+              # Submit reuses the prepared PDF as-is — carry its provenance (decision 144).
+              "resume_source": app.get("resume_source", "")},
         gate=_reapply_gate(True))
     if report.submitted and report.submit_state == "submitted":
         _loop_set(message=f"Submitted to {who} — {report.confirmation or 'confirmation seen'}.")
@@ -415,15 +529,67 @@ def _loop_take_submits() -> list[int]:
     return ids
 
 
+def _loop_watch(app_id: int) -> None:
+    """Visible DRY-RUN of one prepared application on the loop thread, so the user can watch the
+    autofill before signing off (decision 125). Never submits (gate=None). The browser opens and
+    stays up until the user closes it (or Stop sets _LOOP_WATCH_HOLD); the loop resumes preparing
+    afterward. The re-fill also refreshes this application's archived screenshot + field capture,
+    so the review panel reflects what the user just watched."""
+    from . import backends
+    from .apply import AnswerResolver, run_apply
+
+    app = tracker.get_application(app_id)
+    if not app:
+        _loop_set(message="That application is no longer in the tracker.")
+        return
+    url = (app.get("source_url") or "").strip()
+    pdf = (app.get("resume_path") or "").strip()
+    company, role = app.get("company", ""), app.get("role", "")
+    who = f"{company} — {role}".strip(" —")
+    if not url or not pdf or not Path(pdf).is_file():
+        _loop_set(message=f"Can't watch {who}: its URL or tailored PDF is missing.")
+        return
+    _loop_set(phase="watching",
+              current={"company": company, "role": role, "fit": app.get("fit_score")},
+              message=f"Watching {who} fill — a browser opened; close it when you're done and the "
+                      "loop resumes. Nothing is submitted.")
+    resolver = AnswerResolver(
+        resume=load_resume("profile/resume.yaml"),
+        profile=apply_profile.load_profile(),
+        enable_generation=backends.claude_code_available(),
+    )
+    _LOOP_WATCH_HOLD.clear()
+    run_apply(
+        url, pdf, resolver, headed=True, pause=True,
+        meta={"company": company, "role": role, "source_url": url,
+              "fit_score": app.get("fit_score") or None,
+              # Visible dry-run reuses the prepared PDF — carry its provenance (decision 144).
+              "resume_source": app.get("resume_source", "")},
+        hold=_LOOP_WATCH_HOLD, gate=None)
+    _loop_set(message=f"Done watching {who}. Back to preparing.")
+
+
+def _loop_take_watches() -> list[int]:
+    with _LOOP_LOCK:
+        ids = list(_LOOP_WATCHES)
+        _LOOP_WATCHES.clear()
+    return ids
+
+
 def _loop_worker(rescan: bool = False, force_retailor: bool = False,
-                 goal: int | None = None, maintain: bool = False) -> None:
-    from . import autoloop, backends, pipeline
+                 goal: int | None = None, maintain: bool = False,
+                 watch: bool = False, watch_interval_min: int = 30) -> None:
+    from . import autoloop, backends, notifications, pipeline
     from .filters import load_filters
     from .runner import cleared_queue
 
     try:
         resume = load_resume("profile/resume.yaml")
         filters = load_filters()
+        # Push "ready for your approval" / "needs your input" to the user wherever they are
+        # (decision 135). Best-effort: a channel failing is swallowed so it never disrupts the
+        # loop — the user proves a channel works with the Notifications "Send test" button.
+        notifier = notifications.build_notifier()
         try:
             profile = apply_profile.load_profile()
         except Exception:
@@ -473,6 +639,14 @@ def _loop_worker(rescan: bool = False, force_retailor: bool = False,
             cached = pipeline.cached_matches(resume, filters, profile=profile)
             _note_best(cached)
             rescan_pool = cleared_queue(cached, min_fit)
+            # Re-check has no funnel (nothing was searched), but it still has a judged list —
+            # show it so the breakdown isn't blank in this mode either. Best-effort, like every
+            # other breakdown write: describing the pool must never block re-preparing it.
+            try:
+                _loop_set(judged=_judged_rows(cached, min_fit), min_fit=min_fit,
+                          matched=len(cached), cleared=len(rescan_pool), from_cache=True)
+            except Exception:
+                pass
             if not rescan_pool:
                 # Distinguish an empty cache from a full cache where nothing clears the bar —
                 # the old message claimed "nothing scored" in BOTH cases, sending users to
@@ -487,6 +661,22 @@ def _loop_worker(rescan: bool = False, force_retailor: bool = False,
                 return
 
         served = {"done": False}
+        passes = {"n": 0, "judged": 0}
+        prepared_urls: set[str] = set()   # postings this run already prepared — never re-serve
+
+        def _report_scan(res, min_fit_now, batch) -> None:
+            """Publish this search's breakdown to the loop status — the same funnel + judged list
+            the one-shot test run shows (decision 149), so a running loop reports WHERE its
+            postings went instead of only "searching…". Best-effort: this is a display path, and
+            failing to describe a search must never stop the loop from preparing it."""
+            try:
+                _loop_set(funnel=getattr(res, "funnel", {}) or {},
+                          judged=_judged_rows(res.matches, min_fit_now), min_fit=min_fit_now,
+                          scanned=getattr(res, "discovered", 0), matched=len(res.matches),
+                          from_cache=bool(getattr(res, "from_cache", False)),
+                          searches=passes["n"], cleared=len(batch))
+            except Exception:
+                pass
 
         def discover_batch():
             if rescan:
@@ -497,13 +687,35 @@ def _loop_worker(rescan: bool = False, force_retailor: bool = False,
                 return rescan_pool
             # only_new=True (decision 053/056): each search returns ONLY postings not judged
             # before, so no posting is ever re-judged — the loop spends judge tokens only on
-            # genuinely new openings and stops when nothing new remains (user's token cap).
-            res = pipeline.discover_and_match(resume, filters, profile=profile,
-                                              use_claude=True, only_new=True)
+            # genuinely new openings. Since decision 146 the ledger is applied before the judge
+            # and records judged postings only, so each pass scores the next-best unjudged slice.
+            # Watch mode, and every pass after the first (the goal-mode hunt), re-search the
+            # boards fresh (force_fresh) — replaying the cached snapshot would just re-serve
+            # postings the ledger already hides.
+            passes["n"] += 1
+            fresh = watch or passes["n"] > 1
+            # Bring back never-reviewed applications (decision 149) on the FIRST pass only: the
+            # user gets another chance at what was prepared while they were away, but a
+            # multi-pass hunt doesn't re-judge those same postings on every pass.
+            revisit = passes["n"] == 1
+            res = pipeline.discover_and_match(resume, filters, profile=profile, use_claude=True,
+                                              only_new=True, force_fresh=fresh, revisit=revisit)
+            if not fresh and res.from_cache and not res.matches:
+                # The cached snapshot holds nothing this run hasn't already judged. Go live now
+                # rather than reporting "no new matches" off a stale snapshot.
+                res = pipeline.discover_and_match(resume, filters, profile=profile,
+                                                  use_claude=True, only_new=True, force_fresh=True,
+                                                  revisit=revisit)
             for e in res.errors:
                 _loop_set(message=f"discovery note: {e}")
             _note_best(res.matches)
-            return cleared_queue(res.matches, min_fit)
+            passes["judged"] = sum(1 for m in res.matches if m.fit_score is not None)
+            # Never re-serve a posting this run already prepared — a re-surfaced unreviewed one
+            # would otherwise be prepared again on every pass without moving the ready count.
+            batch = [m for m in cleared_queue(res.matches, min_fit)
+                     if m.posting.url not in prepared_urls]
+            _report_scan(res, min_fit, batch)
+            return batch
 
         def prepare_one(m):
             p = m.posting
@@ -518,13 +730,40 @@ def _loop_worker(rescan: bool = False, force_retailor: bool = False,
                 resume, m, "profile/resume.yaml", apply_profile.DEFAULT_PATH,
                 backend="auto", headed=False, slow_mo=0, pause=False, gate=None,
                 force_retailor=force_retailor)
+            prepared_urls.add(p.url)
             row = tracker.find_by_source_url(p.url)
+            newly_ready = False
             with _LOOP_LOCK:
                 _LOOP_STATE["prepared"] += 1
                 # A clean dry-run row is "ready to apply"; a blocked one goes to the parked
                 # panel instead (parking.py), so it never shows as ready.
                 if row and row.get("status") == "dry-run" and row["id"] not in _LOOP_STATE["ready_ids"]:
                     _LOOP_STATE["ready_ids"].append(row["id"])
+                    newly_ready = True
+            # Push the human-in-the-loop moments (decision 135): a fresh app awaiting the user's
+            # approval, or a blocked one needing intervention. Fired once per app (newly_ready
+            # guards the approval ping; only blocked rows ping intervention).
+            who = f"{p.company} — {p.title}".strip(" —")
+            app_id = row["id"] if row else None
+            if newly_ready:
+                # Tell the user up front whether this one rode a fresh tailor or a reused résumé
+                # (decision 144), so "reused" is never a surprise discovered only after applying.
+                src = (row or {}).get("resume_source", "")
+                src_line = f" Résumé: {src}." if src else ""
+                _record_and_push(notifier, notifications.Notification(
+                    event=notifications.APPROVAL_NEEDED,
+                    title="Ready to apply",
+                    body=f"{who} (fit {m.fit_score}) is ready.{src_line} Open ApplicationBot → "
+                         f"Notifications to review and submit.",
+                    link="/#notifications"), app_id)
+            elif row and row.get("status") == "blocked":
+                detail = row.get("blocked_detail") or row.get("blocked_kind") or "needs your input"
+                _record_and_push(notifier, notifications.Notification(
+                    event=notifications.INTERVENTION_NEEDED,
+                    title="Application needs you",
+                    body=f"{who} is blocked: {detail}. Open ApplicationBot → Notifications on your "
+                         f"Mac to resolve it.",
+                    link="/#notifications", urgent=True), app_id)
 
         def ready_count() -> int:
             with _LOOP_LOCK:
@@ -535,8 +774,30 @@ def _loop_worker(rescan: bool = False, force_retailor: bool = False,
                 _loop_set(phase="searching", current=None,
                           message="Searching every board for new matches…")
             elif kind == "caught_up":
-                _loop_set(phase="caught_up",
-                          message="Caught up — no new matches to prepare.")
+                if watch:
+                    n = ready_count()
+                    _loop_set(phase="watching", current=None, message=(
+                        f"Watching — no new matches right now; re-checking every "
+                        f"{watch_interval_min} min. {n} ready for you to review. Stop anytime."))
+                elif goal is not None and ready_count() < goal:
+                    pass  # short of the goal — the "hunting" event below reports it with the plan
+                else:
+                    _loop_set(phase="caught_up",
+                              message="Caught up — no new matches to prepare.")
+            elif kind == "hunting":
+                # Goal not met and this pass surfaced nothing new. Say exactly what the pass did,
+                # why nothing cleared, and when the next one runs (UI Principle #3/#5).
+                n = payload if isinstance(payload, int) else 1
+                mins = _hunt_backoff(n) // 60
+                judged = passes["judged"]
+                best = best_seen["fit"]
+                why = (f"judged {judged} posting(s), best fit {best} vs your min_fit of {min_fit}"
+                       if judged and best is not None else
+                       "the boards returned nothing that hasn't already been judged")
+                _loop_set(phase="hunting", current=None, message=(
+                    f"{ready_count()} of {goal} ready — pass {n} found no new matches ({why}). "
+                    f"Searching again in {mins} min. Stop anytime, or lower min_fit / add boards "
+                    f"in Discovery settings to widen the net."))
             elif kind == "goal_reached" and maintain:
                 # Holding at the goal in maintain mode: idle until the user applies to some.
                 n = payload if isinstance(payload, int) else ready_count()
@@ -549,7 +810,14 @@ def _loop_worker(rescan: bool = False, force_retailor: bool = False,
             _LOOP_STOP.is_set, on_event=on_event,
             ready_count=ready_count, goal=goal, maintain=maintain,
             # A stop-responsive idle for maintain mode: waits up to 2s, returns at once on Stop.
-            wait=lambda: _LOOP_STOP.wait(2.0))
+            wait=lambda: _LOOP_STOP.wait(2.0),
+            take_watch_requests=_loop_take_watches, watch_one=_loop_watch,
+            # Watch mode: keep re-checking the boards on an interval instead of stopping when
+            # caught up. The wait is stop-responsive (_LOOP_STOP.wait returns at once on Stop).
+            watch=watch, watch_wait=lambda: _LOOP_STOP.wait(max(1, watch_interval_min) * 60),
+            # Goal mode (decision 146): an empty pass while short of the goal backs off and
+            # searches again instead of ending the run. Stop-responsive, so Stop ends it at once.
+            hunt_wait=lambda n: _LOOP_STOP.wait(_hunt_backoff(n)))
 
         ready_n = ready_count()
         if reason == "goal_reached":
@@ -576,23 +844,34 @@ def _loop_worker(rescan: bool = False, force_retailor: bool = False,
 
 
 def start_loop(rescan: bool = False, force_retailor: bool = False,
-               goal: int | None = None, maintain: bool = False) -> dict:
+               goal: int | None = None, maintain: bool = False,
+               watch: bool = False, watch_interval: int = 30) -> dict:
     # Goal mode (decision 121): prepare until `goal` applications are ready to review/submit.
     # None/0/negative ⇒ no target (run boards to exhaustion, the pre-goal behaviour).
     if goal is not None and goal <= 0:
         goal = None
     if goal is None:
         maintain = False  # "keep topping up" only means something with a target
+    # Watch mode (decision 143): keep re-checking the boards on an interval and holding each new
+    # match for review — never submits on its own. A one-shot rescan can't also "keep watching".
+    if rescan:
+        watch = False
+    watch_interval = max(1, int(watch_interval or 30))
     with _LOOP_LOCK:
         if _LOOP_STATE.get("running"):
             return {"ok": False, "error": "The auto-apply loop is already running."}
         _LOOP_STOP.clear()
         _LOOP_SUBMITS.clear()
+        _LOOP_WATCHES.clear()
+        _LOOP_WATCH_HOLD.clear()
         _LOOP_STATE.clear()
         _LOOP_STATE.update(_loop_reset())
         _LOOP_STATE["goal"] = goal
         _LOOP_STATE["maintain"] = maintain
-    threading.Thread(target=_loop_worker, args=(rescan, force_retailor, goal, maintain),
+        _LOOP_STATE["watch"] = watch
+        _LOOP_STATE["watch_interval"] = watch_interval
+    threading.Thread(target=_loop_worker,
+                     args=(rescan, force_retailor, goal, maintain, watch, watch_interval),
                      daemon=True).start()
     return {"ok": True}
 
@@ -601,13 +880,25 @@ def stop_loop() -> dict:
     if not _loop_running():
         return {"ok": True, "already": True}
     _LOOP_STOP.set()
+    _LOOP_WATCH_HOLD.set()  # release an in-progress watch so a Stop isn't blocked behind it
     _loop_set(message="Stopping after the current step finishes…")
     return {"ok": True}
+
+
+def _mark_reviewed(app_id: int) -> None:
+    """Stamp that the user has now SEEN this application (decision 149) — opening its review
+    panel, or clicking Apply/Watch on it. Until that happens discovery keeps re-surfacing the
+    posting. Best-effort: a DB hiccup must never block a review or a submit."""
+    try:
+        tracker.mark_reviewed(app_id)
+    except Exception:
+        pass
 
 
 def queue_submit(app_id: int) -> dict:
     """Apply to one prepared application. While the loop runs, enqueue it for the loop thread
     (which owns the browser); otherwise submit directly via the per-click armed re-apply."""
+    _mark_reviewed(app_id)
     with _LOOP_LOCK:
         running = bool(_LOOP_STATE.get("running"))
         if running and app_id not in _LOOP_SUBMITS:
@@ -615,6 +906,125 @@ def queue_submit(app_id: int) -> dict:
     if running:
         return {"ok": True, "queued": True}
     return start_reapply(app_id, arm=True)
+
+
+def queue_watch(app_id: int) -> dict:
+    """Watch one prepared application autofill — a VISIBLE dry-run that never submits. While the
+    loop runs, enqueue it for the loop thread (which owns the browser) so it's serialized with
+    preparation; otherwise run it directly via the visible re-apply (dry-run, arm=False)."""
+    _mark_reviewed(app_id)
+    with _LOOP_LOCK:
+        running = bool(_LOOP_STATE.get("running"))
+        if running and app_id not in _LOOP_WATCHES:
+            _LOOP_WATCHES.append(app_id)
+    if running:
+        return {"ok": True, "queued": True}
+    return start_reapply(app_id, arm=False)
+
+
+def _review_data(app_id: int) -> dict | None:
+    """Everything the "Review before you apply" panel shows for one prepared application, joined
+    by app id: the posting metadata from the tracker, and the exact fill outcome (field values
+    the bot will submit, plus the JD it tailored against) from the per-application archive
+    (decision 043) that the headless dry-run already wrote. Returns None if the id is unknown.
+    The résumé PDF and the filled-form screenshot are large, so they are NOT inlined here — the
+    panel fetches them lazily from /track/resume and /track/screenshot by the same id."""
+    a = tracker.get_application(app_id)
+    if not a:
+        return None
+    from . import archive
+    adir = archive.dir_for(a["company"], a["role"], a["source_url"])
+    filled: list[dict] = []
+    skipped: list[str] = []
+    when = ""
+    rj = adir / "report.json"
+    if rj.is_file():
+        try:
+            data = json.loads(rj.read_text(encoding="utf-8"))
+            filled = data.get("filled", []) or []
+            # A file-upload answer's value is the local PDF path we upload — show just the file
+            # name in the preview (the full path is noise; the résumé button opens the file).
+            for f in filled:
+                v = str(f.get("value", ""))
+                if v.startswith("/") and Path(v).suffix.lower() in (".pdf", ".doc", ".docx"):
+                    f["value"] = Path(v).name
+            # report.skipped mixes genuinely-unanswered fields with a bracketed "[answer bank]"
+            # learning-summary line (apply.py) — drop the diagnostic so the panel's "needs
+            # attention" list is only real unanswered fields.
+            skipped = [s for s in (data.get("skipped", []) or []) if not str(s).startswith("[")]
+            when = data.get("when", "") or ""
+        except (ValueError, OSError):
+            pass
+    jd_body = ""
+    pm = adir / "posting.md"
+    if pm.is_file():
+        try:
+            # posting.md is "<header>\n\n---\n\n<JD body>" (archive._posting_md); show the body.
+            jd_body = pm.read_text(encoding="utf-8").split("\n\n---\n\n", 1)[-1].strip()
+            if jd_body == "(no posting text captured)":  # archive placeholder — treat as no JD
+                jd_body = ""
+        except OSError:
+            pass
+    # Answers the user edited here previously (decision 153) override what the fill produced —
+    # show what WILL be submitted, not the superseded original, and flag each edited row.
+    from . import answer_overrides
+    edits = answer_overrides.load(a["company"], a["role"], a["source_url"])
+    by_key = {answer_overrides.key(k): v for k, v in edits.items()}
+    for f in filled:
+        v = by_key.get(answer_overrides.key(f.get("label", "")))
+        if v is not None and f.get("control") != "file":
+            f["value"], f["edited"] = v, True
+    # Unanswered fields as editable rows (label + why it was skipped), so the user can answer a
+    # blocking field right here instead of only reading that it's blocked (UI Principle #2).
+    # skipped strings are "<label> — <reason>"; dedupe by label, keeping the first reason.
+    unanswered: list[dict] = []
+    seen_labels: set[str] = set()
+    filled_keys = {answer_overrides.key(f.get("label", "")) for f in filled}
+    for s in skipped:
+        label, _, detail = str(s).partition(" — ")
+        k = answer_overrides.key(label)
+        if not k or k in seen_labels or k in filled_keys:
+            continue
+        seen_labels.add(k)
+        unanswered.append({"label": label.strip(), "detail": detail.strip(),
+                           "value": by_key.get(k, ""), "edited": k in by_key})
+    rp = a.get("resume_path", "")
+    has_resume = bool(rp) and Path(rp).suffix.lower() == ".pdf" and Path(rp).is_file()
+    return {
+        "id": app_id,
+        "posting": {
+            "company": a["company"], "role": a["role"], "location": a.get("location", ""),
+            "remote": a.get("remote", ""), "pay": a.get("pay", ""), "portal": a.get("portal", ""),
+            "url": a.get("source_url", ""), "fit": a.get("fit_score"), "status": a.get("status", ""),
+            "resume_source": a.get("resume_source", ""),  # freshly tailored vs reused (decision 144)
+        },
+        "jd": jd_body,
+        "filled": filled,
+        "skipped": skipped,
+        "unanswered": unanswered,
+        "when": when,
+        "has_resume": has_resume,
+        "has_screenshot": (adir / "filled.png").is_file(),
+    }
+
+
+def save_answers(app_id: int, answers: dict) -> dict:
+    """Persist the answers the user edited in one application's review panel (decision 153).
+
+    Stored against the posting, not the form: the next fill of this application — the dry-run
+    re-fill, "Watch it fill", and the real submit alike — resolves these labels to these values.
+    A blank value clears that edit, so the bot answers the field from the profile again."""
+    a = tracker.get_application(app_id)
+    if not a:
+        return {"ok": False, "error": "That application is no longer in the tracker."}
+    if not isinstance(answers, dict) or not answers:
+        return {"ok": False, "error": "No answers were sent to save."}
+    from . import answer_overrides
+    try:
+        saved = answer_overrides.save(a["company"], a["role"], a["source_url"], answers)
+    except OSError as e:
+        return {"ok": False, "error": f"Could not write the edited answers: {e}"}
+    return {"ok": True, "saved": len(saved)}
 
 
 def test_aggregators(data: dict | None) -> dict:
@@ -697,12 +1107,97 @@ def list_resumes() -> list[dict[str, str]]:
 
 
 def list_fixtures() -> list[dict[str, str]]:
-    out = []
+    """Job postings selectable in the Review tab: the shipped example fixtures plus any the user
+    saved from the Track tab. A shipped fixture's `path` is relative to REPO_ROOT; a saved one's
+    is relative to DATA_ROOT (they resolve in different roots — see `_fixture_path`). User-saved
+    ones are labeled "· saved" and listed first so they're easy to find."""
+    saved = []
+    if USER_FIXTURES_DIR.is_dir():
+        for p in sorted(USER_FIXTURES_DIR.glob("*.md")):
+            saved.append({"path": f"profile/job_fixtures/{p.name}", "label": _saved_label(p)})
+    shipped = []
     for p in sorted((REPO_ROOT / "fixtures" / "job_descriptions").glob("*.md")):
         if p.name.lower() == "readme.md":
             continue
-        out.append({"path": str(p.relative_to(REPO_ROOT)), "label": p.name})
-    return out
+        shipped.append({"path": str(p.relative_to(REPO_ROOT)), "label": p.name})
+    return saved + shipped
+
+
+def _saved_label(p: Path) -> str:
+    """A friendly picker label for a saved fixture — "Company — Title · saved" from its front
+    matter, falling back to the filename if it can't be read (the hash-suffixed stem is ugly)."""
+    try:
+        jd = load_job_description(p)
+        bits = [b for b in (jd.meta.get("company"), jd.meta.get("title")) if b]
+        if bits:
+            return " — ".join(str(b) for b in bits) + " · saved"
+    except Exception:
+        pass
+    return f"{p.stem} · saved"
+
+
+def _fixture_path(token: str) -> Path:
+    """Resolve an allow-listed fixture token to its file. Saved fixtures live under DATA_ROOT,
+    shipped ones under REPO_ROOT; both must be a member of `list_fixtures()` (so the token can't
+    read an arbitrary file off disk)."""
+    if token not in {f["path"] for f in list_fixtures()}:
+        raise ValueError(f"Not an allowed fixture: {token!r}")
+    root = DATA_ROOT if token.startswith("profile/job_fixtures/") else REPO_ROOT
+    return root / token
+
+
+def save_job_fixture(*, title: str, company: str, body: str, source_url: str = "") -> dict[str, str]:
+    """Write a job posting to the user's saved-fixtures folder as a load_job_description-compatible
+    Markdown file (YAML front matter + body). The filename keys on company/title + a short hash of
+    the source URL (or body), so re-saving the same posting overwrites in place rather than
+    duplicating. Returns {"path": <token>, "label": ...} for the new fixture."""
+    import hashlib
+    from datetime import date
+
+    from .resume_store import _slug
+
+    body = (body or "").strip()
+    if not body:
+        raise ValueError("No job description text to save.")
+    title = (title or "").strip() or "Saved posting"
+    company = (company or "").strip()
+    USER_FIXTURES_DIR.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha1((source_url or body).encode("utf-8")).hexdigest()[:8]
+    stem = "-".join(s for s in (_slug(company), _slug(title), digest) if s)
+    path = USER_FIXTURES_DIR / f"{stem}.md"
+    front = f"company: {company}\ntitle: {title}\n"
+    if source_url:
+        front += f"source_url: {source_url}\n"
+    front += f"saved_from: tracker\ndate_captured: {date.today().isoformat()}\n"
+    path.write_text(f"---\n{front}---\n\n{body}\n", encoding="utf-8")
+    return {"path": f"profile/job_fixtures/{path.name}", "label": _saved_label(path)}
+
+
+def add_fixture_from_application(payload: dict) -> dict:
+    """Save a Track-tab application's posting to the user's fixtures list. Pulls the JD, company,
+    and role from the application's archived posting.md (decision 043) by id; falls back to any
+    title/company/body passed directly. Returns the new fixture plus the refreshed fixture list so
+    the Review-tab picker can add it without a page reload."""
+    body = (payload.get("body") or "").strip()
+    title = (payload.get("title") or "").strip()
+    company = (payload.get("company") or "").strip()
+    source_url = (payload.get("source_url") or "").strip()
+    app_id = payload.get("id")
+    if app_id is not None:
+        rv = _review_data(int(app_id))
+        if not rv:
+            raise ValueError(f"No such application: {app_id!r}")
+        body = body or (rv.get("jd") or "")
+        p = rv.get("posting") or {}
+        title = title or p.get("role", "")
+        company = company or p.get("company", "")
+        source_url = source_url or p.get("url", "")
+    if not body:
+        raise ValueError(
+            "This application has no saved job description to add. Re-run it as a dry-run first "
+            "so its posting is captured, then try again.")
+    fixture = save_job_fixture(title=title, company=company, body=body, source_url=source_url)
+    return {"ok": True, "fixture": fixture, "fixtures": list_fixtures()}
 
 
 def _allowlisted(rel_path: str, allowed: list[dict[str, str]]) -> Path:
@@ -750,7 +1245,7 @@ def do_tailor(payload: dict) -> dict:
             },
         )
     else:
-        jd = load_job_description(_allowlisted(job["fixture"], list_fixtures()))
+        jd = load_job_description(_fixture_path(job["fixture"]))
 
     pages = float(payload.get("pages") or 1.0)
     line_chars = int(payload.get("line_chars") or 100)
@@ -838,6 +1333,14 @@ class Handler(BaseHTTPRequestHandler):
     def _json(self, code: int, obj: dict) -> None:
         self._send(code, json.dumps(obj).encode("utf-8"), "application/json; charset=utf-8")
 
+    def _link_base(self) -> str:
+        """The address this server is reachable at, for notification click-through back into
+        the app. Uses the bound port so a --port override is honored."""
+        host, port = self.server.server_address[0], self.server.server_address[1]
+        if host in ("0.0.0.0", ""):
+            host = "127.0.0.1"
+        return f"http://{host}:{port}"
+
     def do_GET(self) -> None:  # noqa: N802
         path = self.path.split("?")[0]
         if path == "/auth/status":
@@ -857,6 +1360,13 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, {"resume": resume.model_dump()})
             except Exception as e:
                 self._json(400, {"error": f"{type(e).__name__}: {e}"})
+            return
+        if path == "/resume/uploads":
+            # Résumé documents the user uploaded and we kept (decision 152). These are sent to
+            # postings as-is when they already cover the demanded skills, so the user must be able
+            # to see exactly which files are in play and remove any of them.
+            from . import resume_docs
+            self._json(200, {"docs": resume_docs.listing()})
             return
         if path == "/profile":
             # Never serve the MyGreenhouse password to the browser (decision 060) — it lives in
@@ -879,6 +1389,13 @@ class Handler(BaseHTTPRequestHandler):
                 "filters": filters.load_filters().model_dump(),
                 "levels": filters.EXPERIENCE_LEVELS,
             })
+            return
+        if path == "/notifications":
+            # Push-notification settings (decision 135). No secret to hide — an ntfy topic is a
+            # user-chosen capability string, returned so the panel can show it.
+            from . import notifications as notif
+            self._json(200, {"config": notif.load_config().to_dict(),
+                             "desktop_click": notif.desktop_click_status()})
             return
         if path == "/fit-insights":
             # What the discovery feedback loop has learned + recommends (decision 046).
@@ -906,6 +1423,7 @@ class Handler(BaseHTTPRequestHandler):
             # target boards grouped by ATS, the optional Adzuna aggregator + how it's
             # configured, early-career feeds, and the aggregator→ATS bridge.
             from .discovery import ATS_SOURCES
+            from . import mailbox
 
             f = filters.load_filters()
             adz = f.adzuna
@@ -930,9 +1448,49 @@ class Handler(BaseHTTPRequestHandler):
                     "himalayas": f.remote_boards.himalayas,
                     "remoteok": f.remote_boards.remoteok,
                 },
+                "email_alerts": {
+                    "enabled": f.email_alerts.enabled,
+                    "providers": f.email_alerts.providers,
+                    "linked": mailbox.link_status().get("linked", False),
+                },
                 "google": {"enabled": f.google.enabled},
+                "json_aggregators": list(f.json_aggregators),
+                "contrib_sources": list(f.contrib_sources),
                 "bridge": {"enabled": True, "upgrade_ats": list(ATS_SOURCES)},
             })
+            return
+        if path == "/candidates":
+            # Discovery-source candidates staged by the source-scout routine (decision 135):
+            # companies on an ATS we already support, verified live. Surface only VALIDATED ones
+            # not already configured, so the panel is a clean one-click add-list (no dead tokens,
+            # no re-proposing a board you already run).
+            from . import source_scout
+
+            f = filters.load_filters()
+            known = source_scout.known_boards(f.boards)
+            out = [
+                {"ats": c.ats, "token": c.token, "provenance": c.provenance,
+                 "n_postings": c.n_postings, "sample_title": c.sample_title,
+                 "sample_company": c.sample_company}
+                for c in source_scout.load_candidates()
+                if c.validated and c.key not in known
+            ]
+            # Declarative JSON-API aggregator specs (decision 135): registry entries not yet enabled
+            # in json_aggregators. All registry specs are pre-validated (stage_spec gates on that).
+            enabled = set(f.json_aggregators)
+            specs = [
+                {"name": s.get("name"), "endpoint": s.get("endpoint", ""),
+                 "n_postings": s.get("n_postings", 0), "sample_title": s.get("sample_title", "")}
+                for s in source_scout.load_registry_specs()
+                if s.get("name") and s.get("name") not in enabled
+            ]
+            # Bespoke drop-in adapters (decision 139): merged sources_contrib modules not yet enabled.
+            from .sources_contrib import load_contrib_sources
+
+            on = set(f.contrib_sources)
+            contrib = [{"name": n, "description": getattr(m, "DESCRIPTION", "")}
+                       for n, m in load_contrib_sources().items() if n not in on]
+            self._json(200, {"candidates": out, "specs": specs, "contrib": contrib})
             return
         if path == "/track":
             q = parse_qs(urlparse(self.path).query)
@@ -1019,6 +1577,47 @@ class Handler(BaseHTTPRequestHandler):
                        {"Content-Disposition": 'inline; filename="' + f.name + '"',
                         "Cache-Control": "no-store"})
             return
+        if path == "/track/screenshot":
+            # The filled-form screenshot the dry-run captured for this application (decision 043),
+            # stored per-application at profile/applications/<key>/filled.png. Served so the review
+            # panel can show the form as the site rendered it. Path comes from our own DB.
+            q = parse_qs(urlparse(self.path).query)
+            try:
+                app = tracker.get_application(int(q.get("id", ["0"])[0]))
+            except (ValueError, TypeError):
+                app = None
+            if not app:
+                self._json(404, {"error": "No such application."})
+                return
+            from . import archive
+            shot = archive.dir_for(app["company"], app["role"], app["source_url"]) / "filled.png"
+            if not shot.is_file():
+                self._json(404, {"error":
+                    "No filled-form screenshot for this application yet. It's captured on the "
+                    "next dry-run/preparation of this posting."})
+                return
+            # no-store: same rationale as the résumé — the file is overwritten in place on each
+            # re-fill of the same posting, so a cached image would show a stale form.
+            self._send(200, shot.read_bytes(), "image/png", {"Cache-Control": "no-store"})
+            return
+        if path == "/track/review":
+            # Preview one prepared application before signing off (decision 125): the exact field
+            # values the bot will submit + the JD it tailored against, joined by app id from the
+            # dry-run's archive. Read-only; the id comes from our own DB (localhost-only server).
+            q = parse_qs(urlparse(self.path).query)
+            try:
+                app_id = int(q.get("id", ["0"])[0])
+                rev = _review_data(app_id)
+            except (ValueError, TypeError):
+                rev = None
+            if rev is None:
+                self._json(404, {"error": "No such application."})
+                return
+            # Opening this panel IS the review (decision 149): stamp it so discovery stops
+            # re-surfacing this posting.
+            _mark_reviewed(app_id)
+            self._json(200, rev)
+            return
         if path == "/test-run/status":
             with _TEST_LOCK:
                 self._json(200, dict(_TEST_STATE))
@@ -1036,9 +1635,14 @@ class Handler(BaseHTTPRequestHandler):
                 if a and a.get("status") == "dry-run":
                     ready.append({"id": aid, "company": a["company"], "role": a["role"],
                                   "fit": a.get("fit_score"), "portal": a["portal"],
-                                  "url": a["source_url"]})
+                                  "url": a["source_url"], "resume_source": a.get("resume_source", "")})
             st["ready"] = ready
             self._json(200, st)
+            return
+        if path == "/inbox":
+            with _LOOP_LOCK:
+                ready_ids = list(_LOOP_STATE.get("ready_ids", []))
+            self._json(200, _build_inbox(ready_ids))
             return
         if path != "/":
             self._json(404, {"error": "not found"})
@@ -1093,6 +1697,34 @@ class Handler(BaseHTTPRequestHandler):
                 data = base64.b64decode(p["data_b64"])
                 result = linkedin.import_into(rp, p.get("filename", "upload"), data)
                 self._json(200, {"ok": True, **result})
+            elif path == "/resume/import-file":
+                # Upload a résumé document (PDF/DOCX/TXT): Claude parses it and MERGES new
+                # entries into the user's résumé (decision — DECISIONS.md). Import into the
+                # selected résumé only if it's an existing profile/ one; otherwise into the
+                # canonical profile/resume.yaml (created if absent) — so an upload also works
+                # as the very first résumé, and can never write a shipped examples/ file.
+                from . import resume_import
+                p = json.loads(raw or b"{}")
+                sel = (p.get("resume") or "").strip()
+                if sel.startswith("profile/") and sel in {a["path"] for a in list_resumes()}:
+                    target = REPO_ROOT / sel
+                else:
+                    target = REPO_ROOT / resume_import.DEFAULT_RESUME
+                data = base64.b64decode(p["data_b64"])
+                result = resume_import.import_resume(target, p.get("filename", "upload"), data)
+                self._json(200, {"ok": True, **result})
+            elif path == "/resume/uploads/delete":
+                # Stop sending a kept résumé document to postings (decision 152). Deletes only the
+                # file itself; whatever it merged into the résumé stays.
+                from . import resume_docs
+                p = json.loads(raw or b"{}")
+                name = (p.get("name") or "").strip()
+                if resume_docs.delete(name):
+                    self._json(200, {"ok": True, "docs": resume_docs.listing()})
+                else:
+                    self._json(400, {"ok": False,
+                                     "error": f"Couldn't remove {name or 'that file'} — it is no "
+                                              "longer in your kept résumé files. Reload the page."})
             elif path == "/profile/update":
                 p = json.loads(raw or b"{}")
                 data = p.get("data") or {}
@@ -1152,7 +1784,12 @@ class Handler(BaseHTTPRequestHandler):
                     ok, msg = mailbox.test_connection(
                         mailbox.MailboxConfig(host=host, email=email, password=password, port=port))
                     if ok:
-                        mailbox.save_link(host, email, password, port)
+                        # The keychain write is verified inside save_link; report a failed save as
+                        # a failed link rather than 500ing, so the user sees the actual reason.
+                        try:
+                            mailbox.save_link(host, email, password, port)
+                        except Exception as e:
+                            ok, msg = False, f"Signed in to {host} as {email}, but {e}"
                     self._json(200, {"ok": ok, "message": msg, "status": mailbox.link_status()})
             elif path == "/mailbox/gmail/connect":
                 # One-click Gmail connect (decision 065): run the OAuth loopback flow, which opens
@@ -1178,10 +1815,87 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, {"ok": True, "existed": existed,
                                  "status": {**mailbox.link_status(),
                                             "client_id": mailbox.gmail_client_id()}})
+            elif path == "/track/import-inbox":
+                # Fold application emails in the linked inbox into the tracker (decision 151):
+                # confirmations become rows, rejections/interview invites move an existing row's
+                # status. Returns the full summary so the UI can say exactly what changed and
+                # offer the one-click undo.
+                from . import inbox_import
+                p = json.loads(raw or b"{}")
+                out = inbox_import.run_import(
+                    limit=int(p.get("limit") or 50), newer_than_days=int(p.get("days") or 30))
+                self._json(200, {"ok": not (out["errors"] and not (out["created"] or out["updated"])),
+                                 **out})
+            elif path == "/track/import-undo":
+                from . import inbox_import
+                p = json.loads(raw or b"{}")
+                res = inbox_import.undo_run(str(p.get("run_id") or ""))
+                self._json(200, {"ok": True, **res})
+            elif path == "/track/enable-email-alerts":
+                # The importer found forwarded job-alert emails but discovery's alert source is
+                # off, so those openings are going unused. One click switches it on for exactly
+                # the providers whose emails are actually in the inbox (UI Principle #2).
+                p = json.loads(raw or b"{}")
+                providers = [s for s in (p.get("providers") or []) if isinstance(s, str)]
+                f = filters.load_filters()
+                f.email_alerts.enabled = True
+                f.email_alerts.providers = sorted(set(f.email_alerts.providers) | set(providers))
+                filters.save_filters(f)
+                self._json(200, {"ok": True, "providers": f.email_alerts.providers})
             elif path == "/discovery/update":
                 p = json.loads(raw or b"{}")
                 filters.save_filters(filters.DiscoveryFilters.model_validate(p["data"]))
                 self._json(200, {"ok": True})
+            elif path == "/notifications/update":
+                from . import notifications as notif
+                p = json.loads(raw or b"{}")
+                notif.save_config(_notify_config_from_payload(p.get("data") or {}))
+                self._json(200, {"ok": True, "config": notif.load_config().to_dict()})
+            elif path == "/notifications/test":
+                # Fire a real test notification through the POSTED (possibly unsaved) config, so
+                # the user proves a channel works before relying on it (UI Principle #1/#5). Sends
+                # to every configured channel regardless of the per-event toggles, and reports
+                # per-channel success/failure with the exact error on failure (Principle #3).
+                from . import notifications as notif
+                p = json.loads(raw or b"{}")
+                cfg = _notify_config_from_payload(p.get("data") or {})
+                n = notif.build_notifier(cfg, link_base=self._link_base())
+                note = notif.Notification(
+                    event=notif.APPROVAL_NEEDED, title="ApplicationBot test",
+                    body="If you can see this, notifications are working.", link="/#notifications")
+                results, errors = [], []
+                for ch in n.channels:
+                    try:
+                        ch.send(note)
+                        results.append(ch.name)
+                    except Exception as e:  # noqa: BLE001
+                        errors.append(f"{ch.name}: {type(e).__name__}: {e}")
+                if not n.channels:
+                    self._json(200, {"ok": False, "message": (
+                        "No channels enabled. Turn on desktop notifications, or enable ntfy and "
+                        "enter a topic, then test again.")})
+                elif errors:
+                    self._json(200, {"ok": False, "message": (
+                        f"Sent via {', '.join(results) or 'nothing'}. Failed — {'; '.join(errors)}")})
+                else:
+                    self._json(200, {"ok": True, "message": (
+                        f"Test sent via {', '.join(results)}. Check your "
+                        + ("Mac and phone." if "ntfy" in results else "Mac's Notification Center."))})
+            elif path == "/notifications/read":
+                # Mark logged notifications seen (decision 145) — clears the nav badge. Called when
+                # the Notifications tab opens; ids=null marks all read.
+                p = json.loads(raw or b"{}")
+                ids = p.get("ids")
+                tracker.mark_notifications_read(ids if ids else None)
+                self._json(200, {"ok": True, "unread": tracker.unread_notification_count()})
+            elif path == "/notifications/dismiss":
+                # Remove notifications from the tab (decision 145). ids=null clears them all. The
+                # rows stay in the DB (dismissed=1) as an audit trail.
+                p = json.loads(raw or b"{}")
+                ids = p.get("ids")
+                n = tracker.dismiss_notifications(ids if ids else None)
+                self._json(200, {"ok": True, "dismissed": n,
+                                 "unread": tracker.unread_notification_count()})
             elif path == "/aggregators/test":
                 p = json.loads(raw or b"{}")
                 self._json(200, test_aggregators(p.get("data")))
@@ -1199,6 +1913,44 @@ class Handler(BaseHTTPRequestHandler):
                     data[fld] = val
                     filters.save_filters(filters.DiscoveryFilters.model_validate(data))
                     self._json(200, {"ok": True, "field": fld, "value": val})
+            elif path == "/candidates/accept":
+                # One-click add of a scouted source (decision 135): append {ats, token} to
+                # discovery.yaml boards via the same idempotent path the CLI --accept uses.
+                # `added=False` means it was already configured (e.g. added in another tab) —
+                # still a success from the user's view.
+                from . import source_scout
+
+                p = json.loads(raw or b"{}")
+                ats, token = (p.get("ats") or "").strip(), (p.get("token") or "").strip()
+                if not ats or not token:
+                    self._json(400, {"error": "ats and token are required"})
+                else:
+                    added = source_scout.merge_into_filters(ats, token)
+                    self._json(200, {"ok": True, "added": added})
+            elif path == "/candidates/accept-spec":
+                # One-click enable of a declarative JSON-API aggregator (decision 135): add its name
+                # to json_aggregators. `added=False` = already enabled or not in the registry.
+                from . import source_scout
+
+                p = json.loads(raw or b"{}")
+                name = (p.get("name") or "").strip()
+                if not name:
+                    self._json(400, {"error": "name is required"})
+                else:
+                    added = source_scout.enable_json_aggregator(name)
+                    self._json(200, {"ok": True, "added": added})
+            elif path == "/candidates/accept-contrib":
+                # One-click enable of a merged drop-in adapter (decision 139): add its name to
+                # contrib_sources. `added=False` = already enabled or not a loaded adapter.
+                from . import source_scout
+
+                p = json.loads(raw or b"{}")
+                name = (p.get("name") or "").strip()
+                if not name:
+                    self._json(400, {"error": "name is required"})
+                else:
+                    added = source_scout.enable_contrib_source(name)
+                    self._json(200, {"ok": True, "added": added})
             elif path == "/track/add":
                 p = json.loads(raw or b"{}")
                 app_id = tracker.add_application(p.get("data", {}))
@@ -1207,10 +1959,17 @@ class Handler(BaseHTTPRequestHandler):
                 p = json.loads(raw or b"{}")
                 changed = tracker.update_application(int(p["id"]), p.get("changes", {}))
                 self._json(200, {"ok": True, "changed": changed})
+            elif path == "/track/answers":
+                # Save the answers edited in a review panel (decision 153) — used by the next
+                # fill/submit of that application.
+                p = json.loads(raw or b"{}")
+                self._json(200, save_answers(int(p["id"]), p.get("answers", {})))
             elif path == "/track/delete":
                 p = json.loads(raw or b"{}")
                 deleted = tracker.delete_application(int(p["id"]))
                 self._json(200, {"ok": True, "deleted": deleted})
+            elif path == "/fixtures/add":
+                self._json(200, add_fixture_from_application(json.loads(raw or b"{}")))
             elif path == "/pdf":
                 p = json.loads(raw or b"{}")
                 base = load_resume(_allowlisted(p["resume"], list_resumes()))
@@ -1235,8 +1994,13 @@ class Handler(BaseHTTPRequestHandler):
                     goal = int(p["goal"]) if p.get("goal") not in (None, "") else None
                 except (TypeError, ValueError):
                     goal = None
+                try:
+                    watch_interval = int(p["watch_interval"]) if p.get("watch_interval") not in (None, "") else 30
+                except (TypeError, ValueError):
+                    watch_interval = 30
                 self._json(200, start_loop(bool(p.get("rescan")), bool(p.get("retailor")),
-                                           goal=goal, maintain=bool(p.get("maintain"))))
+                                           goal=goal, maintain=bool(p.get("maintain")),
+                                           watch=bool(p.get("watch")), watch_interval=watch_interval))
             elif path == "/loop/stop":
                 self._json(200, stop_loop())
             elif path == "/loop/apply":
@@ -1244,6 +2008,10 @@ class Handler(BaseHTTPRequestHandler):
                 # do_POST origin guard (decision 062) — an armed submit is doubly safe there.
                 p = json.loads(raw or b"{}")
                 self._json(200, queue_submit(int(p["id"])))
+            elif path == "/loop/watch":
+                # Watch one prepared application autofill — a visible dry-run, never submits.
+                p = json.loads(raw or b"{}")
+                self._json(200, queue_watch(int(p["id"])))
             else:
                 self._json(404, {"error": "not found"})
         except Exception as e:  # surface a readable message to the UI
@@ -1325,6 +2093,9 @@ INDEX_HTML = """<!doctype html>
   .tab.active { background:var(--accent-weak); color:var(--accent-text); }
   .tab .ic { width:17px; height:17px; flex:none; opacity:.9; }
   .tab.active .ic { opacity:1; }
+  /* Count of items needing the user, on the Notifications tab. Hidden (via [hidden]) when zero. */
+  .nav-badge { margin-left:auto; min-width:18px; height:18px; padding:0 5px; border-radius:9px; background:var(--warn-line,#d97706); color:#fff; font-size:11px; font-weight:700; line-height:18px; text-align:center; }
+  .nav-badge[hidden] { display:none; }
   .nav-foot { margin-top:auto; display:flex; flex-direction:column; gap:10px; padding:12px 0; }
   #theme-toggle { width:100%; margin:0; padding:9px; display:flex; align-items:center; justify-content:center; gap:7px; background:var(--surface-2); color:var(--muted); font-weight:600; font-size:13px; border:1px solid var(--line); border-radius:8px; cursor:pointer; }
   #theme-toggle:hover { color:var(--ink); border-color:var(--muted); filter:none; }
@@ -1412,6 +2183,10 @@ INDEX_HTML = """<!doctype html>
   .trackbar input { flex:1; min-width:200px; margin:0; }
   .trackbar select { width:auto; margin:0; }
   .tbtn { width:auto; margin:0; padding:8px 14px; }
+  /* Inbox-import result strip: what the run did, plus its undo / enable-alerts actions. */
+  .importout { margin:-4px 0 12px; padding:10px 12px; border:1px solid var(--line); border-radius:8px; background:var(--surface); font-size:13px; }
+  .impmsg { color:var(--fg); }
+  .impacts { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:8px; }
   /* Track view uses the full screen width — no 640px editor cap. */
   .track-editor { max-width:none; }
   .track-editor .editing { max-width:820px; }
@@ -1594,6 +2369,13 @@ INDEX_HTML = """<!doctype html>
   .linkedin input[type=file] { width:auto; border:0; padding:0; }
   .linkedin button { width:auto; margin:8px 8px 0 0; padding:7px 14px; }
   .linkedin code { background:var(--surface-2); padding:1px 4px; border-radius:3px; font-size:12px; }
+  /* Kept résumé files (decision 152): one row per uploaded PDF that jobs may be sent as-is. */
+  .kept-row { display:flex; align-items:center; justify-content:space-between; gap:10px;
+    border:1px solid var(--line); border-radius:8px; padding:7px 11px; margin-top:6px;
+    background:var(--surface-2); font-size:12.5px; }
+  .kept-row .kept-when { color:var(--muted); }
+  .kept-row button { width:auto; margin:0; padding:5px 11px; font-size:12px;
+    background:var(--surface); color:var(--accent-text); border:1px solid var(--line); }
   .meta { margin-bottom:16px; }
   .badge { display:inline-block; padding:2px 8px; border-radius:99px; background:var(--accent-weak); color:var(--accent-text); font-size:12px; font-weight:600; }
   #dl-pdf { width:auto; margin:0 0 16px; padding:8px 14px; background:var(--btn-dark); }
@@ -1723,6 +2505,12 @@ INDEX_HTML = """<!doctype html>
   .pk-title { font-weight:700; font-size:14px; }
   .pk-tag { font-size:11.5px; font-weight:700; color:var(--warn); background:var(--warn-chip); border-radius:10px; padding:2px 9px; }
   .pk-detail { font-size:12.5px; color:var(--muted); margin:6px 0 8px; line-height:1.4; }
+  /* Résumé provenance chip (decision 144): green = freshly tailored, amber = reused. */
+  .rsrc { font-size:11px; font-weight:700; border-radius:10px; padding:2px 8px; white-space:nowrap; cursor:default; }
+  .rsrc-fresh { color:var(--ok-text); background:var(--ok-bg); }
+  .rsrc-reuse { color:var(--warn-strong); background:var(--warn-bg); }
+  .rv-src, .drawer-src { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+  .drawer-src { margin-top:8px; }
   .pk-actions { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
   .pk-fix { width:auto; margin:0; }
   .pk-submit { background:#b3261e; border-color:#b3261e; color:#fff; }
@@ -1741,6 +2529,33 @@ INDEX_HTML = """<!doctype html>
   .loopstat.err::before { color:var(--bad); }
   .loopstat .lp-count { margin-left:auto; font-weight:700; color:var(--muted); white-space:nowrap; }
   .loop-ready-head { font-weight:700; font-size:13.5px; margin:16px 0 8px; }
+  /* Notification feed (decision 145): the durable log of every push, below the live action cards. */
+  .nf-head { display:flex; align-items:center; justify-content:space-between; gap:8px; }
+  .nf-clear { width:auto; margin:0; font:inherit; font-size:12px; font-weight:500; color:var(--accent-text);
+              background:none; border:none; cursor:pointer; padding:2px 4px; }
+  .nf-clear:hover { text-decoration:underline; }
+  .nflist { display:flex; flex-direction:column; border:1px solid var(--border); border-radius:8px; overflow:hidden; }
+  .nfrow { display:flex; align-items:flex-start; gap:10px; padding:10px 12px; border-top:1px solid var(--border); }
+  .nfrow:first-child { border-top:none; }
+  .nfrow.unread { background:color-mix(in srgb, var(--accent) 8%, transparent); }
+  .nf-dot { flex:0 0 auto; width:8px; height:8px; border-radius:50%; margin-top:5px; background:var(--faint); }
+  .nf-dot.unread { background:var(--accent); }
+  .nf-dot.urgent { background:var(--bad); }
+  .nf-main { flex:1 1 auto; min-width:0; }
+  .nf-meta { display:flex; align-items:baseline; gap:8px; flex-wrap:wrap; }
+  .nf-title { font-weight:600; font-size:13px; }
+  .nf-time { font-size:11.5px; color:var(--muted); }
+  .nf-tag { font-size:11px; color:var(--muted); border:1px solid var(--border); border-radius:10px; padding:0 6px; text-transform:capitalize; }
+  .nf-body { font-size:12.5px; color:var(--muted); margin-top:2px; line-height:1.45; }
+  .nf-x { flex:0 0 auto; width:auto; margin:0; font:inherit; font-size:13px; line-height:1; color:var(--faint);
+          background:none; border:none; cursor:pointer; padding:2px 4px; border-radius:4px; }
+  .nf-x:hover { color:var(--text); background:var(--hover, rgba(127,127,127,.12)); }
+  .nf-act { width:auto; margin:6px 0 0; padding:4px 10px; font:inherit; font-size:12px; font-weight:600;
+            color:#fff; background:var(--accent); border:none; border-radius:6px; cursor:pointer; }
+  .nf-act:hover { filter:brightness(1.06); }
+  /* Brief highlight when a feed row jumps to its action card. */
+  .nf-flash { animation:nfflash 1.4s ease-out; }
+  @keyframes nfflash { 0%,40% { box-shadow:0 0 0 2px var(--accent); } 100% { box-shadow:0 0 0 2px transparent; } }
   .loop-goal { display:flex; align-items:center; gap:6px; flex-wrap:wrap; margin-top:12px;
                font-size:12.5px; color:var(--muted); text-transform:none; letter-spacing:normal;
                font-weight:400; }
@@ -1749,6 +2564,44 @@ INDEX_HTML = """<!doctype html>
   .loop-apply { width:auto; margin:0; background:#b3261e; border-color:#b3261e; color:#fff; }
   .loop-apply:hover { background:#8f1e18; border-color:#8f1e18; }
   .loop-apply:disabled { opacity:.6; }
+  /* Review-before-you-apply panel (expands a ready card in place) */
+  .review-toggle { width:auto; margin:0; background:var(--btn-dark); border-color:var(--btn-dark); color:var(--accent-ink); }
+  .review { margin-top:10px; padding-top:10px; border-top:1px dashed var(--line); }
+  .review.hidden { display:none; }
+  .rv-sec { margin:10px 0; }
+  .rv-h { font-weight:700; font-size:12.5px; margin-bottom:6px; }
+  .rv-h.rv-warn { color:var(--bad); margin-top:10px; }
+  .rv-metas { display:flex; flex-wrap:wrap; gap:4px 18px; font-size:12.5px; }
+  .rv-meta { display:flex; gap:6px; }
+  .rv-k { color:var(--muted); min-width:64px; }
+  .rv-acts { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+  .rv-btn { width:auto; margin:0; padding:5px 11px; font-size:12.5px; display:inline-block;
+            background:var(--btn-dark); border:1px solid var(--btn-dark); border-radius:6px;
+            color:var(--accent-ink); text-decoration:none; cursor:pointer; }
+  .rv-btn:hover { filter:brightness(1.08); }
+  .rv-note { font-size:12.5px; color:var(--muted); }
+  .rv-fields { width:100%; border-collapse:collapse; font-size:12.5px; }
+  .rv-fields td { padding:4px 8px; border-top:1px solid var(--line); vertical-align:top; }
+  .rv-fl { color:var(--muted); width:38%; word-break:break-word; }
+  .rv-fv { font-family:var(--mono); word-break:break-word; }
+  /* Editable answers (decision 153): the input IS the value that will be submitted. */
+  .rv-edit { width:100%; margin:0; padding:4px 7px; font-size:12.5px; font-family:var(--mono);
+             background:var(--field); border:1px solid var(--line); border-radius:5px;
+             color:inherit; line-height:1.45; }
+  .rv-edit:focus { outline:2px solid var(--accent); outline-offset:1px; }
+  .rv-ctl, .rv-edited { display:inline-block; margin-top:3px; font-size:11px; font-weight:700;
+                        border-radius:9px; padding:1px 7px; }
+  .rv-ctl { color:var(--muted); background:var(--field); border:1px solid var(--line); }
+  .rv-edited { color:var(--accent-text); background:var(--accent-weak); border:1px solid var(--accent); }
+  .rv-save { margin-top:10px; }
+  .rv-note.rv-ok { color:var(--ok-text); font-weight:700; }
+  .rv-note.rv-err { color:var(--bad); font-weight:700; }
+  .rv-jd { margin-top:8px; padding:10px; max-height:280px; overflow:auto; background:var(--field);
+           border:1px solid var(--line); border-radius:6px; font-size:12px; white-space:pre-wrap;
+           font-family:var(--mono); line-height:1.5; }
+  .rv-jd.hidden { display:none; }
+  .rv-signoff { margin-top:12px; padding-top:10px; border-top:1px solid var(--line);
+                display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
   .loop-rescan { display:flex; gap:8px; align-items:flex-start; margin-top:10px; font-size:12.5px;
                  color:var(--muted); line-height:1.4; max-width:560px;
                  text-transform:none; letter-spacing:normal; font-weight:400; }
@@ -1859,7 +2712,15 @@ INDEX_HTML = """<!doctype html>
   .drawer-body { padding:16px 18px; overflow-y:auto; flex:1; display:flex; flex-direction:column; gap:16px; }
   .drawer-sec-label { font-size:11px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); font-weight:600; margin-bottom:8px; }
   .drawer-actions { display:flex; flex-wrap:wrap; gap:8px; }
-  .drawer-actions button, .drawer-actions a { width:auto; margin:0; padding:8px 14px; }
+  /* One shared secondary-button look for every drawer action, whether it's a <button> (Re-run,
+     Retailor, Save to fixtures) or an <a> (Open posting, View résumé) — otherwise buttons fall
+     through to the solid-accent base style and links render as bare text (inconsistent row). */
+  .drawer-actions button, .drawer-actions a { width:auto; margin:0; padding:7px 13px;
+    display:inline-flex; align-items:center; gap:6px; background:var(--surface);
+    color:var(--accent-text); border:1px solid var(--line); border-radius:8px; font-size:12.5px;
+    font-weight:600; white-space:nowrap; text-decoration:none; cursor:pointer; transition:filter .12s; }
+  .drawer-actions button:hover, .drawer-actions a:hover { filter:brightness(1.06); }
+  .drawer-actions button:disabled { opacity:.6; cursor:default; filter:none; }
   /* Active terminal window — a code block for run logs (dim lines, colored levels). */
   .terminal { background:var(--field); border:1px solid var(--line); border-radius:8px; font-family:var(--mono);
     font-size:11.5px; line-height:1.55; padding:11px 13px; overflow:auto; max-height:300px; }
@@ -1942,6 +2803,8 @@ INDEX_HTML = """<!doctype html>
       <button class="tab" data-view="discover"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>Discover</button>
       <button class="tab" data-view="profile"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="8" r="5"/><path d="M20 21a8 8 0 0 0-16 0"/></svg>Profile</button>
       <button class="tab" data-view="track"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 3v16a2 2 0 0 0 2 2h16"/><path d="M18 17V9"/><path d="M13 17V5"/><path d="M8 17v-3"/></svg>Track</button>
+      <button class="tab" data-view="notifications"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg>Notifications<span class="nav-badge" id="notif-badge" hidden></span></button>
+      <button class="tab" data-view="settings"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="21" x2="14" y1="4" y2="4"/><line x1="10" x2="3" y1="4" y2="4"/><line x1="21" x2="12" y1="12" y2="12"/><line x1="8" x2="3" y1="12" y2="12"/><line x1="21" x2="16" y1="20" y2="20"/><line x1="12" x2="3" y1="20" y2="20"/><line x1="14" x2="14" y1="2" y2="6"/><line x1="8" x2="8" y1="10" y2="14"/><line x1="16" x2="16" y1="18" y2="22"/></svg>Settings</button>
     </nav>
     <div class="nav-foot">
       <button id="tour-open" type="button"><svg class="btn-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9.937 15.5A2 2 0 0 0 8.5 14.063l-6.135-1.582a.5.5 0 0 1 0-.962L8.5 9.936A2 2 0 0 0 9.937 8.5l1.582-6.135a.5.5 0 0 1 .963 0L14.063 8.5A2 2 0 0 0 15.5 9.937l6.135 1.581a.5.5 0 0 1 0 .964L15.5 14.063a2 2 0 0 0-1.437 1.437l-1.582 6.135a.5.5 0 0 1-.963 0z"/><path d="M20 3v4"/><path d="M22 5h-4"/></svg>Take the tour</button>
@@ -1987,13 +2850,25 @@ INDEX_HTML = """<!doctype html>
         <label class="loop-rescan" id="loop-maintain-wrap"><input type="checkbox" id="loop-maintain">
           <span class="rl-main"><span class="rl-t">Keep topping up to the goal</span>
           <span class="rl-h">As you apply to ready ones, keep discovering &amp; preparing so the goal-many stay ready. Off = stop once the goal is reached.</span></span></label>
+        <label class="loop-rescan" id="loop-watch-wrap"><input type="checkbox" id="loop-watch">
+          <span class="rl-main"><span class="rl-t">Keep watching — re-check the boards on a schedule</span>
+          <span class="rl-h">Don't stop when caught up: re-search every
+            <input type="number" id="loop-watch-interval" min="1" step="1" value="30" inputmode="numeric"
+              style="width:52px;text-align:center;margin:0 3px;padding:2px 4px"> min and autofill each
+            newly-posted match into <b>Ready to apply</b> for your review. It never submits on its own —
+            you still click Apply. Best for watching seasonal roles show up over time.</span></span></label>
         <label class="loop-rescan"><input type="checkbox" id="loop-rescan">
           <span class="rl-main"><span class="rl-t">Re-prepare postings I've already seen</span>
           <span class="rl-h">Re-fills every match from the last search, reusing cached fit scores &amp; tailored résumés — no Claude spend when nothing changed.</span></span></label>
         <label class="loop-rescan"><input type="checkbox" id="loop-retailor">
           <span class="rl-main"><span class="rl-t">Re-tailor from scratch</span>
           <span class="rl-h">Regenerate every résumé with Claude even when nothing changed — spends Claude usage on every posting.</span></span></label>
+        <p class="editing tight" style="margin-top:8px">Want a ping when a match is ready or an
+          application needs you — even with this window in the background?
+          <a href="#" id="loop-notify-link" class="linklike">Set up notifications in Settings →</a></p>
         <div id="loop-status" class="loopstat hidden"></div>
+        <div id="loop-scan" class="testprog hidden"></div>
+        <div id="loop-judged" class="testjudged hidden"></div>
         <div id="loop-ready"></div>
       </div>
       <div class="editor" id="dry-run-panel">
@@ -2027,6 +2902,12 @@ INDEX_HTML = """<!doctype html>
           <p class="editing tight">Every posting Claude judges is remembered, so runs steer scarce
             judge slots toward what scored highest for you. Below: what it learned and recommends.</p>
           <div id="fit-insights-body">Loading…</div>
+        </div>
+        <div class="editor" id="new-sources" style="display:none">
+          <h3 style="margin-top:0">New sources found</h3>
+          <p class="editing tight">Companies a source-scout run found on an ATS you already
+            support and verified are live. Add one and the next discovery run searches it.</p>
+          <div id="candidates-body">Loading…</div>
         </div>
       </div>
     </div>
@@ -2108,6 +2989,22 @@ INDEX_HTML = """<!doctype html>
 
         <div id="profile-form">Loading…</div>
 
+        <div id="s-upload" class="linkedin">
+          <h3 style="margin-top:0">Upload your résumé</h3>
+          <p class="editing">Have a résumé already? Upload the <b>PDF or Word (.docx)</b> file and
+            Claude reads it into the sections above — experience, projects, education, and skills.
+            New entries are merged in; anything you've already filled is left untouched. No résumé
+            file? Fill the fields directly, or import from LinkedIn below.</p>
+          <input id="rf-file" type="file" accept=".pdf,.docx,.txt,.md">
+          <button id="rf-import" type="button">Upload &amp; parse</button>
+          <span id="rf-msg" class="msg"></span>
+          <p class="editing" style="margin-bottom:0">A <b>PDF</b> you upload is also kept as a file:
+            when a job asks for essentially only skills that résumé already shows, we send it
+            as-is instead of a tailored one — your real résumé beats a generated one. Word and text
+            uploads are parsed but not kept (an application form needs a PDF).</p>
+          <div id="rf-kept"></div>
+        </div>
+
         <div id="s-linkedin" class="linkedin">
           <h3 style="margin-top:0">Import from LinkedIn</h3>
           <p class="editing">LinkedIn can't be linked live (their API restricts it and
@@ -2153,10 +3050,87 @@ INDEX_HTML = """<!doctype html>
             <div id="track-cols-menu" class="menu hidden"></div>
           </div>
           <button id="track-add" type="button" class="tbtn">+ Add application</button>
+          <button id="track-import" type="button" class="tbtn"
+                  title="Read the linked inbox and add every application you were emailed about">Import from inbox</button>
           <span id="track-msg" class="msg"></span>
         </div>
+        <div id="track-import-out" class="importout hidden"></div>
         <div id="track-feed" class="feed"></div>
         <div id="track-body" class="hidden">Loading…</div>
+      </div>
+    </div>
+
+    <div id="view-notifications" class="hidden">
+      <header class="page-head">
+        <h2 class="page-title">Notifications</h2>
+        <p class="page-sub">Everything that needs you, in one place — applications the loop
+          prepared and is holding for your approval, and any it paused because a step needs you.
+          Act on them right here. The list updates itself as you submit and resolve.</p>
+      </header>
+      <div class="editor" id="notif-center">
+        <div id="notif-body">Loading…</div>
+      </div>
+    </div>
+
+    <div id="view-settings" class="hidden">
+      <header class="page-head">
+        <h2 class="page-title">Settings</h2>
+        <p class="page-sub">Set-once configuration — how Claude tailors your résumé, how you're
+          notified, your linked inbox, and appearance. The auto-apply loop and discovery filters
+          live in Discover.</p>
+      </header>
+
+      <div class="editor" id="set-claude">
+        <h3 style="margin-top:0">Claude connection</h3>
+        <p class="editing tight" id="claude-active"></p>
+        <div class="conn-sec" id="claude-sub"></div>
+        <div class="conn-sec" id="claude-key"></div>
+      </div>
+
+      <div class="editor" id="set-notify">
+        <h3 style="margin-top:0">Notifications</h3>
+        <p class="editing tight">The loop prepares each match then waits for your OK before it
+          submits, and pauses any application that needs your input. Get pinged for those the
+          moment they happen — even with this window in the background.</p>
+        <label class="loop-rescan"><input type="checkbox" id="ntf-desktop">
+          <span class="rl-main"><span class="rl-t">Desktop notification on this Mac</span>
+          <span class="rl-h">A native macOS notification — works for both the app and the browser (the loop runs on this Mac).</span></span></label>
+        <div class="subhint" id="ntf-desktop-hint" hidden style="margin:2px 0 6px 34px">
+          Clicking one won't open the app yet — the browser build can't deep-link on its own. To
+          make desktop notifications clickable, install <b>terminal-notifier</b>:
+          <code id="ntf-tn-cmd">brew install terminal-notifier</code>
+          <button type="button" class="linklike" id="ntf-tn-copy" style="width:auto;margin:0 0 0 8px">Copy</button></div>
+        <label class="loop-rescan"><input type="checkbox" id="ntf-ntfy">
+          <span class="rl-main"><span class="rl-t">Push to my phone (ntfy)</span>
+          <span class="rl-h">Install the free <b>ntfy</b> app, subscribe to a topic you choose below, and your phone buzzes even away from the Mac.</span></span></label>
+        <div class="fld" id="ntf-topic-wrap" style="margin:2px 0 6px 34px">
+          <label>ntfy topic</label>
+          <input type="text" id="ntf-topic" placeholder="e.g. applicationbot-8f3k2q (pick something unguessable)">
+          <div class="subhint">Anyone who knows the topic can read your alerts, so make it long &amp; random. Subscribe to the same topic in the ntfy phone app.</div>
+        </div>
+        <div class="ntf-events" style="margin-left:34px">
+          <label class="loop-rescan"><input type="checkbox" id="ntf-ev-approval">
+            <span class="rl-main"><span class="rl-t">When one is ready for my approval</span></span></label>
+          <label class="loop-rescan"><input type="checkbox" id="ntf-ev-intervention">
+            <span class="rl-main"><span class="rl-t">When one is blocked and needs my input</span></span></label>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center;margin-top:6px">
+          <button id="ntf-save" type="button" class="addbtn">Save</button>
+          <button id="ntf-test" type="button" class="addbtn">Send test</button>
+          <span id="ntf-msg" class="subhint"></span>
+        </div>
+      </div>
+
+      <div class="editor" id="set-mailbox"><div id="set-mailbox-mount">Loading…</div></div>
+
+      <div class="editor" id="set-appearance">
+        <h3 style="margin-top:0">Appearance</h3>
+        <p class="editing tight">Theme for this app. Follows your system setting by default.</p>
+        <div class="viewtog" id="theme-seg" role="group" aria-label="Theme">
+          <button type="button" data-mode="system">System</button>
+          <button type="button" data-mode="light">Light</button>
+          <button type="button" data-mode="dark">Dark</button>
+        </div>
       </div>
     </div>
   </main>
@@ -2186,19 +3160,6 @@ INDEX_HTML = """<!doctype html>
     <div class="modal-foot">
       <button id="save-disc">Save settings</button>
       <span id="disc-msg" class="msg"></span>
-    </div>
-  </div>
-</div>
-<div id="claude-modal" class="modal-scrim hidden" role="dialog" aria-modal="true" aria-labelledby="claude-modal-title">
-  <div class="modal">
-    <div class="modal-head">
-      <h3 id="claude-modal-title">Claude connection</h3>
-      <button id="claude-modal-x" class="modal-x" type="button" aria-label="Close">✕</button>
-    </div>
-    <div class="modal-body">
-      <p class="editing tight" id="claude-active"></p>
-      <div class="conn-sec" id="claude-sub"></div>
-      <div class="conn-sec" id="claude-key"></div>
     </div>
   </div>
 </div>
@@ -2237,7 +3198,18 @@ function renderAccount(a) {
     + `<div class="acc-sub">${escapeHtml(sub)}</div><div class="acc-manage">Manage connection →</div>`;
 }
 renderAccount(OPTS.auth);
-$("account").addEventListener("click", openClaudeModal);
+renderClaudeModal(OPTS.auth);   // paint the Settings → Claude connection section on first load
+// Footer connection chip → Settings, landing on the Claude section (UI Principle #2: the fix, one click).
+$("account").addEventListener("click", () => goSettings("set-claude"));
+
+// Switch to Settings and scroll a section into view. Used by the footer chip and the loop's
+// "Set up notifications" link so both land on the exact panel that unblocks the user.
+function goSettings(anchorId) {
+  const tab = document.querySelector('.tab[data-view="settings"]');
+  if (tab) tab.click();
+  if (anchorId) { const t = $(anchorId); if (t) t.scrollIntoView({behavior:"smooth", block:"start"}); }
+}
+$("loop-notify-link").addEventListener("click", (e) => { e.preventDefault(); goSettings("set-notify"); });
 
 async function refreshAuth() {
   try { const a = await (await fetch("/auth/status")).json(); renderAccount(a); renderClaudeModal(a); } catch (e) {}
@@ -2301,24 +3273,6 @@ async function disconnectKey() {
     btnDone(btn); renderAccount(d.status); renderClaudeModal(d.status);
   } catch (e) { btnDone(btn); }
 }
-
-// Claude-connection modal (reuses the centered-modal pattern; re-checks status on open).
-let CLAUDE_MODAL_PREV = null;
-function openClaudeModal() {
-  renderClaudeModal(AUTH); refreshAuth();
-  CLAUDE_MODAL_PREV = document.activeElement;
-  $("claude-modal").classList.remove("hidden");
-  $("claude-modal-x").focus();
-}
-function closeClaudeModal() {
-  $("claude-modal").classList.add("hidden");
-  if (CLAUDE_MODAL_PREV && CLAUDE_MODAL_PREV.focus) CLAUDE_MODAL_PREV.focus();
-}
-$("claude-modal-x").addEventListener("click", closeClaudeModal);
-$("claude-modal").addEventListener("click", (e) => { if (e.target === $("claude-modal")) closeClaudeModal(); });
-document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape" && !$("claude-modal").classList.contains("hidden")) closeClaudeModal();
-});
 
 $("jobmode").addEventListener("change", () => {
   const custom = $("jobmode").value === "custom";
@@ -2546,11 +3500,33 @@ document.querySelectorAll(".tab").forEach(t => t.addEventListener("click", () =>
   $("view-discover").classList.toggle("hidden", v !== "discover");
   $("view-profile").classList.toggle("hidden", v !== "profile");
   $("view-track").classList.toggle("hidden", v !== "track");
+  $("view-notifications").classList.toggle("hidden", v !== "notifications");
+  $("view-settings").classList.toggle("hidden", v !== "settings");
   if (v === "profile") loadProfile();
   if (v === "track") loadTrack();
-  if (v === "discover") { pollLoop(); loadParked(); loadSources(); loadFitInsights(); loadDisc(); pollTest(); }
+  if (v === "discover") { pollLoop(); loadParked(); loadSources(); loadFitInsights(); loadCandidates(); loadDisc(); pollTest(); }
+  if (v === "notifications") loadInbox();
+  if (v === "settings") loadSettings();
   maybeShowNudge(v);
 }));
+
+// Deep-link support: /#<view> selects that tab on load and on hash change. The loop's push
+// notifications link to /#notifications (decision 138), and a desktop notification that opens the
+// app lands there too. Previously the #hash in those links did nothing (no router existed).
+function applyHash() {
+  const h = (location.hash || "").replace(/^#/, "");
+  const t = h && document.querySelector('.tab[data-view="' + h + '"]');
+  if (t) t.click();
+}
+window.addEventListener("hashchange", applyHash);
+
+// Nav badge = count of items needing the user; keep it live in the background (cheap /inbox poll).
+refreshBadge();
+setInterval(refreshBadge, 30000);
+// Honor an initial /#notifications (etc.). Deferred a tick so it runs AFTER the whole script has
+// initialized — a tab click reaches maybeShowNudge, which reads TOUR_ACTIVE (declared later); firing
+// during synchronous init would hit that binding in its temporal dead zone.
+setTimeout(applyHash, 0);
 
 // ---- First-visit nudges — the one thing to do in Profile / Discover, shown once per section --
 // (moved out of the old up-front checklist: résumé import auto-fills the Profile fields, so the
@@ -2581,7 +3557,7 @@ $("profile-nudge-x").addEventListener("click", () => dismissNudge("profile"));
 $("discover-nudge-x").addEventListener("click", () => dismissNudge("discover"));
 $("profile-nudge-go").addEventListener("click", () => {
   dismissNudge("profile");
-  const e = $("s-linkedin"); if (e) e.scrollIntoView({behavior:"smooth", block:"center"});
+  const e = $("s-upload"); if (e) e.scrollIntoView({behavior:"smooth", block:"center"});
 });
 $("discover-nudge-go").addEventListener("click", () => {
   dismissNudge("discover");
@@ -2660,9 +3636,12 @@ function renderScanFunnel(f, judged, minFit) {
          + `<span class="sfcount">${s.count}</span></div>${drop}</div></div>`;
   }).join("");
   const lost = disc - (stages[stages.length-1].count);
+  // Postings back only because their prepared application was never reviewed (decision 149) —
+  // named here so "why is this one back?" is answered on the breakdown itself.
+  const back = f.revisited ? ` · ${f.revisited} brought back (prepared but never reviewed)` : "";
   return `<details class="sfunnel" open><summary>Search funnel — `
        + `<b>${stages[stages.length-1].count}</b> of ${disc} postings got through`
-       + `${lost>0 ? ` · ${lost} dropped along the way` : ""}</summary>`
+       + `${lost>0 ? ` · ${lost} dropped along the way` : ""}${back}</summary>`
        + `<div class="sfbody">${rows}</div></details>`;
 }
 
@@ -2766,6 +3745,7 @@ async function pollTest() {
 // background (no window pops up); each prepared application appears as a "Ready to apply" card
 // with an Apply ▶ button that submits just that one (armed, one-shot, confirmed first).
 let LOOP_TIMER = null;
+let LOOP_CARDS = new Map();  // app id -> {sig, node}: cards persist across polls so Review stays open
 async function pollLoop() {
   if (LOOP_TIMER) { clearTimeout(LOOP_TIMER); LOOP_TIMER = null; }
   let s;
@@ -2785,6 +3765,9 @@ function renderLoop(s) {
   $("loop-goal").disabled = running;
   // "Keep topping up" only means something with a goal set; disable it otherwise.
   $("loop-maintain").disabled = running || !$("loop-goal").value.trim();
+  $("loop-watch").disabled = running;
+  // The re-check interval only applies when "Keep watching" is on.
+  $("loop-watch-interval").disabled = running || !$("loop-watch").checked;
   if (running || (s.message && s.phase !== "idle")) {
     status.classList.remove("hidden");
     status.className = "loopstat" + (s.phase === "error" ? " err" : "");
@@ -2795,7 +3778,20 @@ function renderLoop(s) {
   } else {
     status.classList.add("hidden");
   }
+  renderLoopScan(s);
   const list = (s && s.ready) || [];
+  // Reuse each card's DOM node across the 2s poll instead of rebuilding the list. Rebuilding
+  // wiped an open Review panel (and its in-flight fetch) every tick, so a review could not be
+  // read while the loop ran. A card is rebuilt only when its own facts change.
+  const keep = new Map();
+  const nodes = list.map(a => {
+    const sig = JSON.stringify([a.company, a.role, a.fit, a.portal, a.resume_source]);
+    const prev = LOOP_CARDS.get(a.id);
+    const node = (prev && prev.sig === sig) ? prev.node : loopReadyCard(a);
+    keep.set(a.id, {sig, node});
+    return node;
+  });
+  LOOP_CARDS = keep;
   ready.innerHTML = "";
   if (list.length) {
     // With a goal, show progress toward it (e.g. "Ready to apply (2 of 5 goal)").
@@ -2803,8 +3799,47 @@ function renderLoop(s) {
                           + (s.maintain ? ", topping up)" : ")")
                         : "Ready to apply (" + list.length + ")";
     ready.appendChild(el("div", {class:"loop-ready-head", text: head}));
-    list.forEach(a => ready.appendChild(loopReadyCard(a)));
+    nodes.forEach(n => ready.appendChild(n));
   }
+}
+
+// Search breakdown for the loop (decision 149) — the same funnel + judged list the one-shot dry
+// run shows, so a running loop reports WHERE its postings went instead of only "searching…".
+// Rendered from the last search's stats, and only when they CHANGE: the panel is polled every 2s
+// and a blind re-render would re-open a funnel the user just collapsed.
+let LOOP_SCAN_SIG = "";
+function renderLoopScan(s) {
+  const scan = $("loop-scan"), judged = $("loop-judged");
+  const rows = (s && s.judged) || [], f = (s && s.funnel) || {};
+  if (!s || (!rows.length && !f.discovered)) {
+    scan.classList.add("hidden"); judged.classList.add("hidden"); LOOP_SCAN_SIG = ""; return;
+  }
+  const sig = JSON.stringify([s.searches, s.scanned, s.matched, s.cleared, s.min_fit, f, rows.length]);
+  if (sig === LOOP_SCAN_SIG) return;
+  LOOP_SCAN_SIG = sig;
+  const bits = [];
+  if (s.searches) bits.push("Search " + s.searches);
+  if (s.scanned) bits.push("scanned " + s.scanned + " postings");
+  if (s.matched != null) bits.push(s.matched + " matched your skills");
+  bits.push(rows.length + " judged by Claude");
+  bits.push((s.cleared || 0) + " cleared your cutoff → prepared");
+  scan.classList.remove("hidden");
+  scan.innerHTML = `<div class="tmeta">${escapeHtml(bits.join(" · "))}</div>`
+                 + (s.from_cache ? `<div class="tmeta cache">♻ Re-used the last saved search — no boards were re-read and nothing was re-judged.</div>` : "")
+                 + renderScanFunnel(s.funnel, rows, s.min_fit);
+  if (rows.length) { judged.classList.remove("hidden"); judged.innerHTML = renderJudged(s); }
+  else judged.classList.add("hidden");
+}
+
+// Résumé provenance chip (decision 144): a small badge saying whether a run's résumé was freshly
+// tailored or reused. `source` is the human string persisted on the tracker row; empty → no chip
+// (older rows / not yet run). "Reused …" → amber "Reused" badge; anything else → green "Tailored".
+// The full sentence is the hover title so the user can see exactly which résumé and why.
+function resumeSrcChip(source) {
+  if (!source) return null;
+  const reused = String(source).startsWith("Reused");
+  return el("span", {class: "rsrc " + (reused ? "rsrc-reuse" : "rsrc-fresh"),
+    title: source, text: reused ? "Reused résumé" : "Tailored résumé"});
 }
 
 function loopReadyCard(a) {
@@ -2814,11 +3849,245 @@ function loopReadyCard(a) {
   if (a.portal) tags.push(a.portal);
   const head = el("div", {class:"pk-head"}, [
     el("span", {class:"pk-title", text:title}),
-    tags.length ? el("span", {class:"pk-tag", text:tags.join(" · ")}) : null]);
-  const apply = el("button", {class:"loop-apply", type:"button", text:"Apply ▶",
-    title:"Submit this one application (irreversible) — confirms first",
-    on:{click:(ev)=>applyReady(a.id, ev.target, title)}});
-  return el("div", {class:"pkcard"}, [head, el("div", {class:"pk-actions"}, [apply])]);
+    tags.length ? el("span", {class:"pk-tag", text:tags.join(" · ")}) : null,
+    // Résumé provenance (decision 144): a chip so "reused" is visible before the user opens Review.
+    resumeSrcChip(a.resume_source)]);
+  // Review before you sign off: the Apply button lives inside the reviewed panel, so a real
+  // submit is always one deliberate step past seeing exactly what will be sent.
+  const panel = el("div", {class:"review hidden"});
+  const review = el("button", {class:"review-toggle", type:"button", text:"Review ▾",
+    title:"See the exact answers, résumé and posting before you submit",
+    on:{click:(ev)=>toggleReview(a.id, panel, ev.target, title)}});
+  return el("div", {class:"pkcard"}, [head, el("div", {class:"pk-actions"}, [review]), panel]);
+}
+
+// Expand a ready card into its review panel (lazy-loaded once). The heavy artifacts — résumé
+// PDF, filled-form screenshot — are opened on demand from their own routes, never inlined.
+async function toggleReview(id, panel, btn, title, signoff) {
+  if (!panel.classList.contains("hidden")) {  // collapse
+    panel.classList.add("hidden"); btn.textContent = "Review ▾"; return;
+  }
+  btn.textContent = "Review ▴";
+  panel.classList.remove("hidden");
+  if (panel.dataset.loaded) return;  // already rendered — just re-show
+  panel.innerHTML = "";
+  panel.appendChild(el("div", {class:"loopstat"}, [el("span", {class:"spin"}),
+    el("span", {text:"Loading review…"})]));
+  try {
+    const r = await (await fetch("/track/review?id=" + id)).json();
+    if (r.error) { panel.innerHTML = ""; panel.appendChild(el("div", {class:"msg err", text:r.error})); return; }
+    renderReview(panel, r, title, signoff);
+    panel.dataset.loaded = "1";
+  } catch (e) {
+    panel.innerHTML = "";
+    panel.appendChild(el("div", {class:"msg err", text:"Could not load the review: " + (e.message||e)}));
+  }
+}
+
+// signoff: optional (r, title) => [Element] building the sign-off row (Watch/Submit buttons),
+// so each card type keeps its own submit endpoint + messaging. Defaults to the goal-loop actions.
+function renderReview(panel, r, title, signoff) {
+  panel.innerHTML = "";
+  const p = r.posting || {};
+  // Posting details — the facts we matched and are applying against.
+  const meta = [];
+  const addMeta = (label, v) => { if (v) meta.push(el("div", {class:"rv-meta"}, [
+    el("span", {class:"rv-k", text:label}), el("span", {text:String(v)})])); };
+  addMeta("Location", p.location);
+  addMeta("Remote", p.remote);
+  addMeta("Pay", p.pay);
+  addMeta("Portal", p.portal);
+  addMeta("Fit", p.fit);
+  if (p.url) meta.push(el("div", {class:"rv-meta"}, [el("span", {class:"rv-k", text:"Link"}),
+    el("a", {href:p.url, target:"_blank", rel:"noopener", text:"open posting ↗"})]));
+  panel.appendChild(el("div", {class:"rv-sec"}, [
+    el("div", {class:"rv-h", text:"Posting"}), el("div", {class:"rv-metas"}, meta)]));
+
+  // Artifact buttons: résumé (lazy — opens the PDF in a new tab; never rendered inline).
+  const acts = [];
+  if (r.has_resume) acts.push(el("a", {class:"rv-btn", href:"/track/resume?id=" + r.id,
+    target:"_blank", rel:"noopener", text:"View tailored résumé ↗"}));
+  else acts.push(el("span", {class:"rv-note", text:"No tailored résumé stored yet."}));
+  if (r.has_screenshot) acts.push(el("a", {class:"rv-btn", href:"/track/screenshot?id=" + r.id,
+    target:"_blank", rel:"noopener", text:"View filled form ↗"}));
+  panel.appendChild(el("div", {class:"rv-sec"}, [el("div", {class:"rv-acts"}, acts)]));
+  // Résumé provenance (decision 144): state whether this run reuses a résumé or tailored a fresh
+  // one, before the user signs off — so a reused résumé is never a surprise found post-submit.
+  if (p.resume_source) panel.appendChild(el("div", {class:"rv-sec"}, [
+    el("div", {class:"rv-src"}, [resumeSrcChip(p.resume_source),
+      el("span", {class:"rv-note", text:p.resume_source})])]));
+
+  // The exact answers the bot will submit — every one EDITABLE (decision 153). An edit is saved
+  // against this posting and replaces the bot's answer on the next fill, including the real
+  // submit, so what is left in these boxes is what actually gets sent.
+  const filled = r.filled || [];
+  const unanswered = r.unanswered || [];
+  const fieldWrap = el("div", {class:"rv-sec"});
+  const edits = [];  // {label, inp, initial} — collected for save + the pre-submit auto-save
+  fieldWrap.appendChild(el("div", {class:"rv-h",
+    text:"Answers it will submit (" + filled.length + ")"}));
+  if (filled.length) {
+    const tbl = el("table", {class:"rv-fields"});
+    filled.forEach(f => tbl.appendChild(answerRow(f.label, f.value, f.control, f.edited, edits)));
+    fieldWrap.appendChild(tbl);
+  } else {
+    fieldWrap.appendChild(el("div", {class:"rv-note",
+      text:"No filled fields recorded yet — re-fill this posting (dry-run) to capture what it will submit."}));
+  }
+  // Fields it could NOT answer — the pre-submit check blocks a real submit while any of these
+  // is required. Editable too, so the fix is right here instead of a read-only warning.
+  if (unanswered.length) {
+    const open = unanswered.filter(u => !(u.value || "").trim()).length;
+    fieldWrap.appendChild(el("div", {class:"rv-h rv-warn",
+      text:"Needs attention — unanswered (" + open + " of " + unanswered.length + ")"}));
+    const tbl = el("table", {class:"rv-fields"});
+    unanswered.forEach(u => tbl.appendChild(
+      answerRow(u.label, u.value, u.detail, u.edited, edits, true)));
+    fieldWrap.appendChild(tbl);
+  }
+  if (edits.length) {
+    const status = el("span", {class:"rv-note"});
+    const save = el("button", {class:"rv-btn", type:"button", text:"Save answers",
+      title:"Save your edits — the next fill of this application submits these values",
+      on:{click:()=>saveAnswers(r.id)}});
+    REVIEW_EDITS[r.id] = {edits: edits, btn: save, status: status};
+    fieldWrap.appendChild(el("div", {class:"rv-acts rv-save"}, [save, status]));
+    fieldWrap.appendChild(el("div", {class:"rv-note",
+      text:"Edit any answer above — it replaces the bot's own answer the next time this "
+         + "application is filled, including the real submit. Unsaved edits are saved for you "
+         + "when you click Watch it fill or Apply."}));
+  }
+  panel.appendChild(fieldWrap);
+
+  // The JD it tailored against (collapsible — long).
+  if (r.jd) {
+    const body = el("pre", {class:"rv-jd hidden", text:r.jd});
+    const tog = el("button", {class:"rv-btn", type:"button", text:"Show job description ▾",
+      on:{click:(ev)=>{ const h = body.classList.toggle("hidden");
+        ev.target.textContent = (h ? "Show" : "Hide") + " job description " + (h ? "▾" : "▴"); }}});
+    panel.appendChild(el("div", {class:"rv-sec"}, [tog, body]));
+  }
+
+  // Sign-off: a dry-run "watch it fill" and the real submit — both live INSIDE the reviewed
+  // panel, so a submit is always one step past seeing the answers. The buttons (and which
+  // endpoint they hit) are card-type specific, supplied by `signoff`.
+  panel.appendChild(el("div", {class:"rv-signoff"}, (signoff || loopSignoff)(r, title)));
+}
+
+// Editable answers per open review panel: id -> {edits, btn, status}, so the submit/watch
+// buttons can flush unsaved edits before the browser re-fills the form (decision 153).
+const REVIEW_EDITS = {};
+
+// One answer row: the label (plus how it was filled, or why it wasn't) and an input holding the
+// value that will be submitted. The résumé upload is not editable — the file is the answer.
+function answerRow(label, value, note, edited, edits, isBlank) {
+  const v = (value == null) ? "" : String(value);
+  if (note === "file") return el("tr", {}, [
+    el("td", {class:"rv-fl", text:label || "—"}),
+    el("td", {class:"rv-fv", text:v || "—"})]);
+  const long = v.length > 60;
+  const inp = long ? el("textarea", {class:"rv-edit", rows:"3", value:v})
+                   : el("input", {class:"rv-edit", type:"text", value:v});
+  inp.placeholder = isBlank ? "Type the answer to submit…" : "";
+  edits.push({label: label, inp: inp, initial: v});
+  const marks = [el("div", {text: label || "—"})];
+  if (edited) marks.push(el("span", {class:"rv-edited", text:"your edit"}));
+  else if (note && note !== "text") marks.push(el("span", {class:"rv-ctl", text:note}));
+  return el("tr", {}, [el("td", {class:"rv-fl"}, marks), el("td", {class:"rv-fv"}, [inp])]);
+}
+
+// Save a review panel's changed answers. `quiet` = the pre-submit auto-save (no "nothing to
+// save" chatter). Resolves {ok, changed} so a submit can abort if the save failed — submitting
+// answers the user thinks they edited would be exactly the wrong outcome.
+async function saveAnswers(id, quiet) {
+  const st = REVIEW_EDITS[id];
+  if (!st) return {ok:true, changed:0};
+  const changed = {};
+  st.edits.forEach(e => { const v = e.inp.value.trim();
+    if (v !== e.initial.trim()) changed[e.label] = v; });
+  const n = Object.keys(changed).length;
+  if (!n) {
+    if (!quiet) { st.status.className = "rv-note"; st.status.textContent = "No changes to save."; }
+    return {ok:true, changed:0};
+  }
+  const label = st.btn.textContent;
+  st.btn.disabled = true; st.btn.textContent = "Saving…";
+  st.status.className = "rv-note"; st.status.textContent = "";
+  try {
+    const r = await (await fetch("/track/answers", {method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ id: id, answers: changed })})).json();
+    st.btn.disabled = false; st.btn.textContent = label;
+    if (!r.ok) {
+      st.status.className = "rv-note rv-err";
+      st.status.textContent = r.error || "Could not save the answers.";
+      return {ok:false, changed:0};
+    }
+    st.edits.forEach(e => { e.initial = e.inp.value; });
+    st.status.className = "rv-note rv-ok";
+    st.status.textContent = "Saved ✓ — " + n + " edited answer" + (n === 1 ? "" : "s")
+      + " will be submitted instead of the bot's.";
+    return {ok:true, changed:n};
+  } catch (e) {
+    st.btn.disabled = false; st.btn.textContent = label;
+    st.status.className = "rv-note rv-err";
+    st.status.textContent = "Could not save the answers: " + (e.message || e);
+    return {ok:false, changed:0};
+  }
+}
+
+// Goal-loop Ready cards: watch via /loop/watch, submit via /loop/apply (armed, decision 058).
+function loopSignoff(r, title) {
+  return [
+    el("button", {class:"rv-btn", type:"button", text:"Watch it fill",
+      title:"Open a browser and watch the autofill — a dry-run; nothing is submitted",
+      on:{click:(ev)=>watchReady(r.id, ev.target, title)}}),
+    el("button", {class:"loop-apply", type:"button", text:"Apply ▶",
+      title:"Submit this one application (irreversible) — confirms first",
+      on:{click:(ev)=>applyReady(r.id, ev.target, title)}})];
+}
+
+// Parked ("waiting on you") cards: the same preview, but the buttons drive the parked flow
+// (/parked/reapply) — dry-run re-fill (visible, so it doubles as "watch it fill") and the
+// per-click armed "Submit for real" (decision 058). Keeps each flow's endpoint + messaging.
+function parkedSignoff(r, title) {
+  return [
+    el("button", {class:"rv-btn", type:"button", text:"Re-apply (dry-run) ▶",
+      title:"Re-fill this posting in a browser you can watch — never submits",
+      on:{click:(ev)=>reapplyParked(r.id, ev.target, false)}}),
+    el("button", {class:"loop-apply", type:"button", text:"Submit for real ▶",
+      title:"Actually submit this application (irreversible) — confirms first",
+      on:{click:(ev)=>reapplyParked(r.id, ev.target, true, title)}})];
+}
+
+// Watch one prepared application autofill: a visible dry-run that never submits. Routed through
+// the loop's queue while it runs (the loop opens the browser at its next step); run directly when
+// the loop is idle (drives the shared test-progress panel below).
+async function watchReady(id, btn, who) {
+  ensureDiscoverVisible();  // progress + the browser-fill status render in Discover — show them
+  const label = btn ? btn.textContent : "";
+  if (btn) { btn.disabled = true; btn.textContent = "Opening…"; }
+  const msg = $("loop-msg"); msg.className = "msg"; msg.textContent = "";
+  // Fill with what the user sees in the review panel — save any unsaved edits first (decision 153).
+  const saved = await saveAnswers(id, true);
+  if (!saved.ok) {
+    if (btn) { btn.disabled = false; btn.textContent = label; }
+    msg.className = "msg err";
+    msg.textContent = "Your edited answers could not be saved, so nothing was filled. Fix the error above the Save answers button, then try again.";
+    return;
+  }
+  try {
+    const r = await (await fetch("/loop/watch", {method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ id })})).json();
+    if (btn) { btn.disabled = false; btn.textContent = label; }
+    if (!r.ok) { msg.className = "msg err"; msg.textContent = r.error || "Could not start the watch."; return; }
+    if (r.queued) { msg.textContent = "Queued — the loop will open the browser to fill this one at its next step. Nothing is submitted."; }
+    else { pollTest(); }  // loop idle → start_reapply drives the shared progress panel
+    pollLoop();
+  } catch (e) {
+    if (btn) { btn.disabled = false; btn.textContent = label; }
+    msg.className = "msg err"; msg.textContent = String(e.message || e);
+  }
 }
 
 // Submit one prepared application. While the loop runs it's queued for the loop thread (which owns
@@ -2829,9 +4098,18 @@ async function applyReady(id, btn, who) {
     + "This is a real, irreversible submission. The bot fills the form and clicks Submit; the "
     + "pre-submit check still stops it if a required field is unanswered.");
   if (!ok) return;
+  ensureDiscoverVisible();  // the submit progress renders in Discover — show it, never submit silently
   const label = btn ? btn.textContent : "";
   if (btn) { btn.disabled = true; btn.textContent = "Submitting…"; }
   const msg = $("loop-msg"); msg.className = "msg"; msg.textContent = "";
+  // A real submit must send exactly the answers shown — save unsaved edits or stop (decision 153).
+  const saved = await saveAnswers(id, true);
+  if (!saved.ok) {
+    if (btn) { btn.disabled = false; btn.textContent = label; }
+    msg.className = "msg err";
+    msg.textContent = "Your edited answers could not be saved, so nothing was submitted. Fix the error above the Save answers button, then try again.";
+    return;
+  }
   try {
     const r = await (await fetch("/loop/apply", {method:"POST", headers:{"Content-Type":"application/json"},
       body: JSON.stringify({ id })})).json();
@@ -2856,6 +4134,11 @@ $("loop-goal").addEventListener("input", () => {
   if (noGoal) $("loop-maintain").checked = false;
 });
 
+$("loop-watch").addEventListener("change", () => {
+  // The re-check interval only applies when "Keep watching" is on.
+  $("loop-watch-interval").disabled = !$("loop-watch").checked;
+});
+
 $("loop-start").addEventListener("click", async () => {
   const btn = $("loop-start"), msg = $("loop-msg");
   msg.className = "msg"; msg.textContent = "";
@@ -2865,7 +4148,10 @@ $("loop-start").addEventListener("click", async () => {
     const goalRaw = $("loop-goal").value.trim();
     const goal = goalRaw ? parseInt(goalRaw, 10) : null;
     const maintain = $("loop-maintain").checked;
-    const r = await (await fetch("/loop/start", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({rescan, retailor, goal, maintain})})).json();
+    const watch = $("loop-watch").checked;
+    const wiRaw = $("loop-watch-interval").value.trim();
+    const watch_interval = wiRaw ? parseInt(wiRaw, 10) : 30;
+    const r = await (await fetch("/loop/start", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({rescan, retailor, goal, maintain, watch, watch_interval})})).json();
     btnDone(btn);
     if (!r.ok) { msg.className = "msg err"; msg.textContent = r.error || "Could not start."; return; }
     pollLoop();
@@ -2879,6 +4165,204 @@ $("loop-stop").addEventListener("click", async () => {
   btnDone(btn);
   pollLoop();
 });
+
+// ---- Settings: push-notification settings (decision 135) ----
+function ntfCollect() {
+  return {
+    desktop: $("ntf-desktop").checked,
+    ntfy: {enabled: $("ntf-ntfy").checked, topic: $("ntf-topic").value.trim()},
+    events: {approval_needed: $("ntf-ev-approval").checked,
+             intervention_needed: $("ntf-ev-intervention").checked},
+  };
+}
+function ntfSyncTopic() {
+  // The topic field is only meaningful when ntfy is on — dim it otherwise.
+  $("ntf-topic-wrap").style.opacity = $("ntf-ntfy").checked ? "1" : ".5";
+  $("ntf-topic").disabled = !$("ntf-ntfy").checked;
+}
+function ntfDesktopHint(dc) {
+  // Show the "install terminal-notifier" tip only when clicking a desktop notification can't open
+  // the app (from source, terminal-notifier absent). Hidden in the packaged app / when installed.
+  const hint = $("ntf-desktop-hint"); if (!hint) return;
+  const show = dc && dc.applicable && !dc.clickable;
+  hint.hidden = !show;
+  if (show && dc.install) $("ntf-tn-cmd").textContent = dc.install;
+}
+async function loadNotifications() {
+  try {
+    const {config: c, desktop_click: dc} = await (await fetch("/notifications")).json();
+    ntfDesktopHint(dc);
+    $("ntf-desktop").checked = !!c.desktop;
+    $("ntf-ntfy").checked = !!(c.ntfy && c.ntfy.enabled);
+    $("ntf-topic").value = (c.ntfy && c.ntfy.topic) || "";
+    $("ntf-ev-approval").checked = !!(c.events && c.events.approval_needed);
+    $("ntf-ev-intervention").checked = !!(c.events && c.events.intervention_needed);
+    ntfSyncTopic();
+  } catch (e) { /* leave defaults; the panel is optional */ }
+}
+async function saveNotifications(btn) {
+  const msg = $("ntf-msg"); msg.textContent = ""; msg.style.color = "";
+  const data = ntfCollect();
+  if (data.ntfy.enabled && !data.ntfy.topic) {
+    msg.textContent = "Enter an ntfy topic, or turn off phone push."; msg.style.color = "var(--bad)"; return; }
+  btnBusy(btn, "Saving…");
+  try {
+    const r = await (await fetch("/notifications/update", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({data})})).json();
+    msg.textContent = r.ok ? "Saved ✓" : "Could not save."; msg.style.color = r.ok ? "var(--ok-text)" : "var(--bad)";
+  } catch (e) { msg.textContent = "Failed: " + e.message; msg.style.color = "var(--bad)"; }
+  finally { btnDone(btn); }
+}
+async function testNotifications(btn) {
+  const msg = $("ntf-msg"); msg.textContent = ""; msg.style.color = "";
+  const data = ntfCollect();
+  if (data.ntfy.enabled && !data.ntfy.topic) {
+    msg.textContent = "Enter an ntfy topic first, or turn off phone push."; msg.style.color = "var(--bad)"; return; }
+  btnBusy(btn, "Sending…");
+  try {
+    const r = await (await fetch("/notifications/test", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({data})})).json();
+    msg.textContent = (r.ok ? "✓ " : "⚠ ") + (r.message || ""); msg.style.color = r.ok ? "var(--ok-text)" : "var(--bad)";
+  } catch (e) { msg.textContent = "Failed: " + e.message; msg.style.color = "var(--bad)"; }
+  finally { btnDone(btn); }
+}
+$("ntf-ntfy").addEventListener("change", ntfSyncTopic);
+$("ntf-save").addEventListener("click", () => saveNotifications($("ntf-save")));
+$("ntf-test").addEventListener("click", () => testNotifications($("ntf-test")));
+$("ntf-tn-copy").addEventListener("click", async (e) => {
+  try { await navigator.clipboard.writeText($("ntf-tn-cmd").textContent); e.target.textContent = "Copied ✓"; }
+  catch (err) { e.target.textContent = "Copy failed"; }
+  setTimeout(() => { e.target.textContent = "Copy"; }, 1500);
+});
+
+// ---- Settings tab loader: Claude connection, notifications, linked inbox, and appearance ----
+let SETTINGS_MB_MOUNTED = false;
+function loadSettings() {
+  refreshAuth();          // Claude connection section (also refreshes the footer chip)
+  loadNotifications();    // notification toggles
+  reflectTheme();         // highlight the active theme button
+  // Inbox panel: build it once into the Settings mount (its buttons bind at build time), then
+  // (re)load its live connection status each visit.
+  if (!SETTINGS_MB_MOUNTED) {
+    const mount = $("set-mailbox-mount");
+    if (mount) { mount.innerHTML = ""; mount.appendChild(mailboxPanel()); SETTINGS_MB_MOUNTED = true; }
+  }
+  loadMailbox();
+}
+
+// ---- Notifications tab: one action center for everything needing the user (decision 138) ----
+// Reuses the exact Discover cards (parkedCard / loopReadyCard) so a fix here is identical to a fix
+// there; the count feeds the nav badge. The submit/watch/resolve actions run through the shared
+// Discover progress panels, so those functions hop to Discover first (ensureDiscoverVisible) —
+// never a silent submit into a hidden panel (UI Principle #5).
+function updateBadge(n) {
+  const b = $("notif-badge"); if (!b) return;
+  if (n > 0) { b.textContent = n > 99 ? "99+" : String(n); b.hidden = false; }
+  else b.hidden = true;
+}
+async function refreshBadge() {
+  // The badge counts things needing you NOW — applications ready to submit + blocked ones needing
+  // a fix (decision 138). It falls as you submit/resolve them; it does not clear just from opening
+  // the tab (the notification LOG below the cards is a separate, dismissible record — decision 145).
+  try { const d = await (await fetch("/inbox")).json(); updateBadge(d.count || 0); } catch (e) {}
+}
+function ensureDiscoverVisible() {
+  if ($("view-discover").classList.contains("hidden")) {
+    const t = document.querySelector('.tab[data-view="discover"]'); if (t) t.click();
+  }
+}
+function nfRelTime(iso) {
+  if (!iso) return "";
+  const t = new Date(String(iso).replace(" ", "T")); const s = (Date.now() - t.getTime()) / 1000;
+  if (isNaN(s)) return "";
+  if (s < 60) return "just now";
+  if (s < 3600) return Math.floor(s / 60) + "m ago";
+  if (s < 86400) return Math.floor(s / 3600) + "h ago";
+  return Math.floor(s / 86400) + "d ago";
+}
+async function dismissNotif(id, rowEl) {
+  try {
+    await fetch("/notifications/dismiss", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ids:[id]})});
+    if (rowEl) rowEl.remove();
+    refreshBadge();
+  } catch (e) {}
+}
+async function clearNotifs() {
+  try {
+    await fetch("/notifications/dismiss", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ids:null})});
+    loadInbox();
+  } catch (e) {}
+}
+function notifRow(n) {
+  const dot = el("span", {class:"nf-dot" + (n.urgent ? " urgent" : "") + (n.read ? "" : " unread")});
+  const meta = el("div", {class:"nf-meta"}, [
+    el("span", {class:"nf-title", text:n.title}),
+    el("span", {class:"nf-time", text:nfRelTime(n.created_at)})]);
+  // If the application this notification was about is already handled (submitted/applied/skipped),
+  // say so — the record stays, but it's clearly no longer awaiting action.
+  const st = n.app_status;
+  if (st && st !== "dry-run" && st !== "blocked")
+    meta.appendChild(el("span", {class:"nf-tag", text:st}));
+  const main = el("div", {class:"nf-main"}, [meta, el("div", {class:"nf-body", text:n.body})]);
+  // Actionable → an inline jump to this application's card at the top, where Review/Submit/Resolve
+  // live. This is the "review and submit" the push promised, from the notification itself.
+  if (n.actionable && n.application_id) {
+    const label = st === "blocked" ? "Resolve →" : "Review & submit →";
+    main.appendChild(el("button", {class:"nf-act", type:"button", text:label,
+      on:{click:()=>jumpToCard(n.application_id)}}));
+  }
+  const x = el("button", {class:"nf-x", type:"button", title:"Dismiss", "aria-label":"Dismiss", text:"✕"});
+  const row = el("div", {class:"nfrow" + (n.read ? "" : " unread")}, [dot, main, x]);
+  x.addEventListener("click", () => dismissNotif(n.id, row));
+  return row;
+}
+async function loadInbox() {
+  const body = $("notif-body");
+  body.innerHTML = ""; body.appendChild(el("div", {class:"loopstat"}, [el("span", {class:"spin"}), el("span", {text:"Loading…"})]));
+  let d;
+  try { d = await (await fetch("/inbox")).json(); }
+  catch (e) { body.innerHTML = ""; body.appendChild(el("div", {class:"msg err", text:"Could not load your notifications: " + String(e.message || e)})); return; }
+  const ready = d.ready || [], parked = d.parked || [];
+  // Every notification is shown (decision 145) — a push that says "open Notifications to review
+  // and submit" must actually appear here. Actionable ones get an inline "Review/Resolve →" that
+  // jumps to their card at the top (tagged with an id below); handled ones are a plain record.
+  const feed = d.notifications || [];
+  body.innerHTML = "";
+  if (!ready.length && !parked.length && !feed.length) {
+    body.appendChild(el("p", {class:"editing tight", text:"You're all caught up — nothing needs you right now."}));
+    body.appendChild(el("p", {class:"subhint", text:"When the auto-apply loop prepares an application for your approval, or pauses one on a step it needs you for, it shows up here (and pushes to your Mac/phone). Start or check the loop in Discover."}));
+    updateBadge(0);
+    return;
+  }
+  // Still-actionable items first — blocked (more urgent) then ready-to-submit — with the exact
+  // Discover cards, so Review / Apply / Resolve work identically to Discover. Each card gets an id
+  // so a feed row can scroll to it.
+  if (parked.length) {
+    body.appendChild(el("div", {class:"loop-ready-head", text:"Blocked — needs you (" + parked.length + ")"}));
+    parked.forEach(p => { const c = parkedCard(p); c.id = "inbox-app-" + p.id; body.appendChild(c); });
+  }
+  if (ready.length) {
+    body.appendChild(el("div", {class:"loop-ready-head", text:"Ready to submit (" + ready.length + ")"}));
+    ready.forEach(a => { const c = loopReadyCard(a); c.id = "inbox-app-" + a.id; body.appendChild(c); });
+  }
+  // The full record of every push (decision 145).
+  if (feed.length) {
+    const head = el("div", {class:"loop-ready-head nf-head"}, [
+      el("span", {text:"Recent notifications (" + feed.length + ")"}),
+      el("button", {class:"nf-clear", type:"button", text:"Clear all", on:{click:()=>clearNotifs()}})]);
+    body.appendChild(head);
+    const list = el("div", {class:"nflist"});
+    feed.forEach(n => list.appendChild(notifRow(n)));
+    body.appendChild(list);
+  }
+  // Mark the log seen so the "new" dots clear next time; the badge reflects actionable count.
+  try { await fetch("/notifications/read", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ids:null})}); } catch (e) {}
+  updateBadge(d.count || 0);
+}
+function jumpToCard(appId) {
+  const c = document.getElementById("inbox-app-" + appId);
+  if (!c) return;
+  c.scrollIntoView({behavior:"smooth", block:"center"});
+  c.classList.add("nf-flash"); setTimeout(() => c.classList.remove("nf-flash"), 1400);
+}
 
 // ---- Discover: applications parked on a user-resolvable block (park & resume) ----
 async function loadParked() {
@@ -2912,19 +4396,19 @@ function parkedCard(p) {
     actions.append(el("span", {class:"pk-note", text:"The site refused us as automated traffic and never showed the form — nothing to fix on your side. Try again later or from a different network, or apply by hand."}));
   else
     actions.append(el("span", {class:"pk-note", text:"This is a site error, not something you can answer — skip it or try again later."}));
-  if (p.resumable) {
-    actions.append(el("button", {class:"pk-fix pk-reapply", type:"button", text:"Re-apply (dry-run) ▶",
-      title:"Re-fill this posting with your updated answers — never submits",
-      on:{click:(ev)=>reapplyParked(p.id, ev.target, false)}}));
-    // Per-click armed submit (decision 058): really submits THIS one application, with a confirm.
-    // Independent of profile/safety.yaml; the KILL file + the pre-submit required-field gate still apply.
-    actions.append(el("button", {class:"pk-fix pk-submit", type:"button", text:"Submit for real ▶",
-      title:"Actually submit this application (irreversible) — confirms first",
-      on:{click:(ev)=>reapplyParked(p.id, ev.target, true, title)}}));
-  }
+  // A resumable parked app has a real "Submit for real" — gate it behind the same review panel
+  // as the loop's ready cards (decision 125), so the submit is one step past seeing the answers,
+  // résumé, filled-form screenshot, and the still-unanswered fields. The dry-run re-fill and the
+  // armed submit (decision 058) live inside the panel via parkedSignoff.
+  const panel = el("div", {class:"review hidden"});
+  if (p.resumable)
+    actions.append(el("button", {class:"review-toggle", type:"button", text:"Review ▾",
+      title:"See the exact answers, résumé and posting before you submit",
+      on:{click:(ev)=>toggleReview(p.id, panel, ev.target, title, parkedSignoff)}}));
   const kids = [head];
   if (p.detail) kids.push(el("div", {class:"pk-detail", text:p.detail}));
   kids.push(actions);
+  if (p.resumable) kids.push(panel);
   return el("div", {class:"pkcard"}, kids);
 }
 
@@ -2940,9 +4424,18 @@ async function reapplyParked(id, btn, arm, who, retailor) {
       + "field is unanswered.");
     if (!ok) return;
   }
+  ensureDiscoverVisible();  // the re-fill / submit progress renders in Discover — show it
   const msg = $("test-msg");
   if (btn) { btn.disabled = true; btn.textContent = arm ? "Submitting…" : (retailor ? "Re-tailoring…" : "Starting…"); }
   if (msg) { msg.className = "msg"; msg.textContent = ""; }
+  // Never fill with answers the user edited but didn't save (decision 153).
+  const saved = await saveAnswers(id, true);
+  if (!saved.ok) {
+    if (msg) { msg.className = "msg err";
+      msg.textContent = "Your edited answers could not be saved, so nothing was filled. Fix the error above the Save answers button, then try again."; }
+    if (btn) { btn.disabled = false; btn.textContent = label; }
+    return;
+  }
   try {
     const r = await (await fetch("/parked/reapply", {method:"POST", headers:{"Content-Type":"application/json"},
       body: JSON.stringify({ id, arm: !!arm, retailor: !!retailor })})).json();
@@ -3104,6 +4597,8 @@ function feedCard(app) {
     mainKids.push(el("div", {class:"fc-blocker", title:app.blocker_detail || "", text:app.blocker}));
   const kids = [el("div", {class:"fc-main"}, mainKids)];
   if (app.fit_score != null && app.fit_score !== "") kids.push(el("span", {class:"fc-fit", text:"fit " + app.fit_score}));
+  const rsc = resumeSrcChip(app.resume_source);  // freshly tailored vs reused (decision 144)
+  if (rsc) kids.push(rsc);
   kids.push(stbadge(app.status));
   const card = el("button", {class:"fcard", type:"button", on:{click:() => openDrawer(app)}}, kids);
   card.dataset.id = app.id;
@@ -3123,6 +4618,11 @@ function openDrawer(app) {
   if (app.fit_score != null && app.fit_score !== "")
     statusRow.append(el("span", {class:"fc-fit", style:"margin-left:10px", text:"fit " + app.fit_score}));
   body.append(statusRow);
+  // Résumé provenance (decision 144): the chip + its full sentence, so the drawer says exactly
+  // which résumé this application used and why.
+  if (app.resume_source)
+    body.append(el("div", {class:"drawer-src"}, [resumeSrcChip(app.resume_source),
+      el("span", {class:"rv-note", text:app.resume_source})]));
   const acts = el("div", {class:"drawer-actions"});
   if (app.source_url && /^https?:/i.test(app.source_url))
     acts.append(el("a", {href:app.source_url, target:"_blank", class:"tbtn", text:"Open posting ↗"}));
@@ -3132,6 +4632,12 @@ function openDrawer(app) {
     acts.append(el("button", {class:"rerun", type:"button", text:"Re-run ▶",
       title:"Re-fill this posting in a watchable browser (dry-run — nothing is submitted)",
       on:{click:(ev) => rerunDry(app, ev.target, false)}}));
+  acts.append(el("button", {class:"tbtn", type:"button", text:"Retailor résumé →",
+    title:"Open the Review tab with this posting loaded and tailor a résumé to it — with the option to save it to your reusable fixtures first",
+    on:{click:(ev) => retailorApp(app, ev.target)}}));
+  acts.append(el("button", {class:"tbtn", type:"button", text:"Save to fixtures",
+    title:"Add this posting to your saved fixtures so you can tailor against it anytime from the Review tab",
+    on:{click:(ev) => saveAppFixture(app, ev.target)}}));
   if (acts.childElementCount)
     body.append(el("div", {}, [el("div", {class:"drawer-sec-label", text:"Actions"}), acts]));
   const termWrap = el("div", {}, [el("div", {class:"drawer-sec-label", text:"Run log"})]);
@@ -3169,6 +4675,60 @@ async function loadDrawerRuns(app, term) {
   } catch (e) {
     term.innerHTML = ""; term.append(el("div", {class:"tl err", text:"Couldn't load runs: " + (e.message || e)}));
   }
+}
+
+// Add this application's posting to the saved-fixtures list (POST /fixtures/add pulls the JD
+// from its archived posting.md by id). On success the fixture picker is refreshed in place and
+// the button latches to "Saved ✓" so the user knows it's reusable now.
+async function saveAppFixture(app, btn) {
+  btnBusy(btn, "Saving…");
+  try {
+    const res = await fetch("/fixtures/add", {method:"POST",
+      headers:{"Content-Type":"application/json"}, body: JSON.stringify({id: app.id})});
+    const d = await res.json();
+    if (!res.ok || d.error) throw new Error(d.error || "could not save");
+    OPTS.fixtures = d.fixtures; fill($("fixture"), OPTS.fixtures);
+    btn.disabled = true; btn._orig = null; btn.textContent = "Saved to fixtures ✓";
+  } catch (e) {
+    btnDone(btn);
+    alert("Couldn't save to fixtures: " + (e.message || e));
+  }
+}
+
+// Retailor this application's résumé: optionally save its posting to fixtures, then jump to the
+// Review tab with the posting loaded so the user is one click from re-tailoring. If saved, the
+// new fixture is selected; otherwise the posting is dropped into the "paste a posting" box.
+async function retailorApp(app, btn) {
+  btnBusy(btn, "Loading…");
+  let rv = {};
+  try { rv = await (await fetch("/track/review?id=" + app.id)).json(); } catch (e) { rv = {}; }
+  btnDone(btn);
+  const jd = (rv && rv.jd) || "";
+  let fixtureToken = null;
+  if (jd && confirm("Add this posting to your saved fixtures so you can reuse it anytime?\\n\\n" +
+      "OK — save it, then tailor\\nCancel — tailor once without saving")) {
+    try {
+      const res = await fetch("/fixtures/add", {method:"POST",
+        headers:{"Content-Type":"application/json"}, body: JSON.stringify({id: app.id})});
+      const d = await res.json();
+      if (!res.ok || d.error) throw new Error(d.error || "could not save");
+      OPTS.fixtures = d.fixtures; fill($("fixture"), OPTS.fixtures);
+      fixtureToken = d.fixture && d.fixture.path;
+    } catch (e) {
+      alert("Couldn't save to fixtures: " + (e.message || e) + "\\nContinuing to tailor without saving.");
+    }
+  }
+  document.querySelector('.tab[data-view="review"]').click();
+  closeDrawer();
+  if (fixtureToken) {
+    $("jobmode").value = "fixture"; $("jobmode").dispatchEvent(new Event("change"));
+    $("fixture").value = fixtureToken;
+  } else {
+    $("jobmode").value = "custom"; $("jobmode").dispatchEvent(new Event("change"));
+    $("title").value = app.role || ""; $("company").value = app.company || ""; $("body").value = jd;
+  }
+  $("go").scrollIntoView({behavior:"smooth", block:"center"});
+  $("go").focus();
 }
 
 // The discovery→offer funnel (survey #4): one metric tile per stage. The count is the value;
@@ -3633,6 +5193,74 @@ async function delApp(id) {
   } catch (e) { $("track-msg").className = "msg err"; $("track-msg").textContent = String(e.message || e); }
 }
 
+// ---- Import applications from the linked inbox (decision 151) ----
+// Reads the inbox, turns "thank you for applying" emails into rows and rejection/interview
+// emails into status changes. Every run is undoable, and a run that finds forwarded job-alert
+// emails discovery isn't using offers the one click that switches them on (UI Principle #2).
+async function importInbox() {
+  const btn = $("track-import"), out = $("track-import-out");
+  out.classList.remove("hidden");
+  btnBusy(btn, "Reading inbox…");
+  const stop = busyInto(out, "Reading your inbox and matching emails to applications…", true);
+  try {
+    const d = await (await fetch("/track/import-inbox", {method:"POST",
+      headers:{"Content-Type":"application/json"}, body: JSON.stringify({})})).json();
+    stop();
+    renderImport(d);
+    await loadTrack();
+  } catch (e) {
+    stop();
+    out.innerHTML = "";
+    out.append(el("div", {class:"msg err", text:"Import failed: " + String(e.message || e)}));
+  } finally { btnDone(btn); }
+}
+
+function renderImport(d) {
+  const out = $("track-import-out");
+  out.innerHTML = "";
+  out.append(el("div", {class: d.ok ? "impmsg" : "msg err", text: d.message || ""}));
+  (d.errors || []).forEach(e => out.append(el("div", {class:"msg err", text: e})));
+  const acts = el("div", {class:"impacts"});
+  if (d.run_id && ((d.created || []).length || (d.updated || []).length)) {
+    acts.append(el("button", {class:"tbtn", type:"button",
+      text:"Undo this import (" + ((d.created||[]).length + (d.updated||[]).length) + ")",
+      title:"Delete the rows this import added and put the changed statuses back",
+      on:{click: async (ev) => {
+        const b = ev.currentTarget;
+        btnBusy(b, "Undoing…");
+        try {
+          const r = await (await fetch("/track/import-undo", {method:"POST",
+            headers:{"Content-Type":"application/json"},
+            body: JSON.stringify({run_id: d.run_id})})).json();
+          out.innerHTML = "";
+          out.append(el("div", {class:"impmsg", text:
+            "Undone — deleted " + r.deleted + " row(s), restored " + r.restored + " status(es)."}));
+          await loadTrack();
+        } catch (e) { btnDone(b); out.append(el("div", {class:"msg err", text:String(e.message||e)})); }
+      }}}));
+  }
+  const alerts = d.alerts || {};
+  const names = Object.keys(alerts);
+  if (names.length && !d.alerts_enabled) {
+    // Those emails are new openings, not applications — they belong to Discover, which is off.
+    acts.append(el("button", {class:"tbtn", type:"button",
+      text:"Use these job alerts in Discover",
+      title:"Turn on job-alert discovery for " + names.join(", "),
+      on:{click: async (ev) => {
+        const b = ev.currentTarget;
+        btnBusy(b, "Turning on…");
+        try {
+          await fetch("/track/enable-email-alerts", {method:"POST",
+            headers:{"Content-Type":"application/json"}, body: JSON.stringify({providers: names})});
+          b.replaceWith(el("span", {class:"impmsg", text:
+            "Job-alert discovery is on for " + names.join(", ") + " — run a search on Discover."}));
+        } catch (e) { btnDone(b); out.append(el("div", {class:"msg err", text:String(e.message||e)})); }
+      }}}));
+  }
+  if (acts.childNodes.length) out.append(acts);
+}
+
+$("track-import").addEventListener("click", importInbox);
 $("track-add").addEventListener("click", addApp);
 let trackSearchT = null;
 $("track-search").addEventListener("input", (e) => {
@@ -3699,6 +5327,69 @@ function fileB64(file) {
     r.onerror = rej;
     r.readAsDataURL(file);
   });
+}
+$("rf-import").addEventListener("click", async () => {
+  const f = $("rf-file").files[0], msg = $("rf-msg"), btn = $("rf-import");
+  if (!f) { msg.className = "msg err"; msg.textContent = "Choose your résumé file (PDF or .docx) first."; return; }
+  btnBusy(btn, "Parsing…"); msg.className = "msg busy";
+  const stop = busyInto(msg, "Reading your résumé and structuring it with Claude…", true);
+  try {
+    const d = await (await fetch("/resume/import-file", { method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ resume: currentResume(), filename: f.name, data_b64: await fileB64(f) }) })).json();
+    if (!d.ok) throw new Error(d.error || "parse failed");
+    const a = d.added || {}, bits = [];
+    for (const [k, lbl] of [["experience","experience"],["activities","activities"],["projects","projects"],
+                            ["education","education"],["skills","skills"],["certifications","certifications"]])
+      if (a[k]) bits.push(a[k] + " " + lbl);
+    if (d.summary_added) bits.push("summary");
+    if ((d.contact_filled||[]).length) bits.push("contact (" + d.contact_filled.join(", ") + ")");
+    await loadProfile();
+    msg.className = "msg ok";
+    msg.textContent = (d.created ? "Created your résumé from that file — added " : "Merged — added ")
+      + (bits.length ? bits.join(", ") + "." : "nothing new (everything was already in your résumé).")
+      + " Review the sections above and Save."
+      + (d.kept_document ? " Kept the PDF: jobs whose demanded skills it already covers get this"
+                         + " file as-is, instead of a tailored résumé." : "");
+  } catch (e) { msg.className = "msg err"; msg.textContent = String(e.message || e); }
+  finally { stop(); btnDone(btn); }
+});
+
+// ---- Kept résumé files (decision 152) ----
+// The PDFs the user uploaded, which postings can be sent verbatim. Listed so it is never a
+// surprise which file an employer receives, and removable in one click.
+function renderKeptResumes(docs) {
+  const box = $("rf-kept");
+  box.textContent = "";
+  if (!(docs || []).length) return;
+  box.appendChild(el("div", {class:"drawer-sec-label", style:"margin:12px 0 0",
+                            text:"Kept résumé files — sent as-is to closely matching jobs"}));
+  for (const d of docs) {
+    const btn = el("button", {type:"button", text:"Remove"});
+    btn.addEventListener("click", async () => {
+      btnBusy(btn, "Removing…");
+      try {
+        const r = await (await fetch("/resume/uploads/delete", { method:"POST",
+          headers:{"Content-Type":"application/json"}, body: JSON.stringify({ name: d.name }) })).json();
+        if (!r.ok) throw new Error(r.error || "remove failed");
+        renderKeptResumes(r.docs || []);
+      } catch (e) {
+        btnDone(btn);
+        const m = $("rf-msg"); m.className = "msg err"; m.textContent = String(e.message || e);
+      }
+    });
+    box.appendChild(el("div", {class:"kept-row"}, [
+      el("span", {}, [el("b", {text:d.filename}),
+                      el("span", {class:"kept-when",
+                                  text:d.uploaded_at ? " — uploaded " + d.uploaded_at.split("T")[0] : ""})]),
+      btn,
+    ]));
+  }
+}
+async function loadKeptResumes() {
+  try {
+    const d = await (await fetch("/resume/uploads")).json();
+    renderKeptResumes(d.docs || []);
+  } catch (e) { /* the list is informational; a fetch failure must not break the Profile page */ }
 }
 $("li-import").addEventListener("click", async () => {
   const f = $("li-file").files[0], msg = $("li-msg"), btn = $("li-import");
@@ -4023,6 +5714,12 @@ async function loadMailbox() {
       if ($("mb-email") && !$("mb-email").value) $("mb-email").value = s.email;
       if ($("mb-host")  && !$("mb-host").value)  $("mb-host").value  = s.host;
       if ($("mb-port")) $("mb-port").value = s.port;
+    } else if (s.problem) {
+      // Linked on disk but the keychain secret is gone — say which credential vanished and how to
+      // restore it, and keep Disconnect available to clear the stale record.
+      st.textContent = "⚠ " + s.problem;
+      st.style.color = "var(--bad)";
+      if (un) un.style.display = "";
     } else {
       st.textContent = "Not connected — add your Gmail address + app password below to auto-verify Workday accounts.";
       st.style.color = "";
@@ -4163,16 +5860,14 @@ function renderProfileForm() {
     row2(fld("MyGreenhouse email","greenhouse_email",P.greenhouse_email), passWrap),
     ghControls);
   put("s-logins", el("div", {class:"sec"}, [el("h3", {text:"Native autofill logins (optional)"}), creds]));
-
-  // Bot email for account-gated portals (Workday) — its own secure store (keychain), not the profile YAML.
-  put("s-botemail", mailboxPanel());
+  // The linked inbox (bot email for Workday verification / email-alert reading) now lives in Settings.
 
   // Section-jump nav (s-linkedin is the static import block below the form).
   const jump = [
     ["s-applicant","Applicant details"], ["s-experience","Experience"], ["s-activities","Activities"],
     ["s-projects","Projects"], ["s-education","Education"], ["s-skills","Skills"],
     ["s-resume-header","Résumé header"], ["s-screening","Screening answers"],
-    ["s-accounts","Autofill accounts"], ["s-logins","Logins"], ["s-botemail","Bot email"],
+    ["s-accounts","Autofill accounts"], ["s-logins","Logins"],
     ["s-linkedin","LinkedIn import"],
   ];
   const nav = el("div", {class:"pnav"}, jump.map(([id,label]) =>
@@ -4213,8 +5908,9 @@ async function loadProfile() {
     ]);
     if (rd.error) throw new Error(rd.error);
     if (pd.error) throw new Error(pd.error);
-    R = rd.resume; P = pd.profile; renderProfileForm(); loadMailbox();
+    R = rd.resume; P = pd.profile; renderProfileForm();
   } catch (e) { $("profile-form").innerHTML = ""; $("profile-form").appendChild(el("div", {class:"msg err", text:String(e.message || e)})); }
+  loadKeptResumes();
 }
 async function rankProjects() {
   const btn = $("rank-proj");
@@ -4272,8 +5968,11 @@ function boardRow(b) {
   row.append(sel, tok, del);
   return row;
 }
+let _discPreserve = {};   // filters fields with no form control — round-tripped so a save can't wipe them
 function renderDiscForm(f, levels) {
   const form = $("disc-form"); form.innerHTML = "";
+  // json_aggregators is enabled via the "New sources found" panel, not this form; preserve it on save.
+  _discPreserve = { json_aggregators: f.json_aggregators || [] };
 
   // Broad aggregators come first: they search across many companies and are the biggest lever
   // on how much discovery surfaces. The specific target-company list comes after them.
@@ -4327,6 +6026,18 @@ function renderDiscForm(f, levels) {
     numFld("Max results each contributes before filtering", "rb_max_results", rb.max_results==null?100:rb.max_results),
   ]));
 
+  const ea = f.email_alerts || {};
+  const eaProvs = ea.providers || [];
+  const provBox = (v,label) => { const i = mkChk(null, eaProvs.includes(v)); i.dataset.alertp = v; return el("label", {class:"chkrow"}, [i, " " + label]); };
+  form.appendChild(el("div", {class:"sec"}, [
+    el("h4", {text:"Forwarded job-alert emails"}),
+    el("div", {class:"editing", text:"Ingest job alerts from sites you already subscribe to, by forwarding their emails to your linked bot inbox (a Gmail filter → Forward). No second account, no scraping. Leads only: the apply links redirect out, so a lead becomes auto-applyable only if we can resolve it to a form we fill (Greenhouse/Lever/Ashby/SmartRecruiters/Recruitee/Workable/Workday). Link the bot inbox in the Profile tab first."}),
+    chkRow("Enable forwarded email alerts", "ea_enabled", ea.enabled),
+    el("label", {text:"Providers you're subscribed to (forward their alerts to the bot inbox)"}),
+    el("div", {class:"lvls"}, [provBox("lensa","Lensa"), provBox("aflac","Aflac"), provBox("linkedin","LinkedIn")]),
+    numFld("Newest alert emails to scan per provider", "ea_limit", ea.limit_per_provider==null?25:ea.limit_per_provider),
+  ]));
+
   // Specific target companies — each is one company's public ATS board, polled directly.
   const boards = el("div", {id:"disc-boards", class:"cards"}, (f.boards||[]).map(boardRow));
   const addBoard = el("button", {class:"addbtn", type:"button", text:"+ Add company",
@@ -4365,6 +6076,7 @@ const discChk = k => { const e = discEl(k); return e ? e.checked : false; };
 const discInt = (k, d) => { const v = parseInt(discVal(k), 10); return isNaN(v) ? d : v; };
 function collectDisc() {
   return {
+    ..._discPreserve,   // json_aggregators etc. — preserved so saving this form can't wipe them
     boards: [...document.querySelectorAll("#disc-boards .brd-row")]
       .map(r => ({ ats: r.querySelector(".bd-ats").value, token: r.querySelector(".bd-token").value.trim() }))
       .filter(b => b.token),
@@ -4394,6 +6106,11 @@ function collectDisc() {
       himalayas: discChk("rb_himalayas"),
       remoteok: discChk("rb_remoteok"),
       max_results: discInt("rb_max_results", 100),
+    },
+    email_alerts: {
+      enabled: discChk("ea_enabled"),
+      providers: [...document.querySelectorAll("#disc-form [data-alertp]")].filter(c => c.checked).map(c => c.dataset.alertp),
+      limit_per_provider: discInt("ea_limit", 25),
     },
   };
 }
@@ -4476,6 +6193,17 @@ async function loadSources(){
     const rbOn = [rb.himalayas && "Himalayas", rb.remoteok && "RemoteOK"].filter(Boolean);
     box.appendChild(srcRow("Remote aggregators (keyless)",
       rbOn.length ? ("on — " + rbOn.join(", ")) : "off"));
+    const ja = s.json_aggregators || [];
+    box.appendChild(srcRow("JSON-API aggregators",
+      ja.length ? ("on — " + ja.join(", ")) : "off — enable any found under “New sources found”"));
+    const ct = s.contrib_sources || [];
+    if (ct.length) box.appendChild(srcRow("Custom adapters", "on — " + ct.join(", ")));
+    const ea = s.email_alerts || {};
+    box.appendChild(srcRow("Forwarded job-alert emails",
+      !ea.enabled ? "off"
+        : !(ea.providers || []).length ? "on, but no providers selected — pick some in Discovery settings below"
+        : !ea.linked ? ("on (" + ea.providers.join(", ") + ") — but no bot inbox is linked; link it in the Profile tab so alerts can be read")
+        : ("on — " + ea.providers.join(", ") + " (leads; auto-appliable only when a link resolves to a fillable ATS)")));
     // Google Jobs is off by design (non-functional, decision 116) — only surface it if hand-enabled.
     if ((s.google || {}).enabled)
       box.appendChild(srcRow("Google Jobs",
@@ -4484,6 +6212,89 @@ async function loadSources(){
       "on — aggregator hits are resolved to their real ATS and upgraded to the full job description"));
     box.appendChild(el("div", {class:"editing", text:"Forms we can auto-fill: " + (s.fillable_ats || []).join(", ") + "."}));
   } catch(e){ box.innerHTML = ""; box.appendChild(el("div", {class:"msg err", text:String(e.message || e)})); }
+}
+
+// ---- New sources found (source-scout candidates, decision 134) ----
+// Lists validated, not-yet-configured boards the routine staged; one-click "Add" wires each into
+// discovery.yaml (same idempotent path as the CLI --accept). Panel stays hidden when none staged.
+async function loadCandidates(){
+  const panel = $("new-sources"), box = $("candidates-body");
+  try {
+    const r = await (await fetch("/candidates")).json();
+    if (r.error) throw new Error(r.error);
+    const cs = r.candidates || [], specs = r.specs || [], contrib = r.contrib || [];
+    if (!cs.length && !specs.length && !contrib.length) { panel.style.display = "none"; return; }  // nothing staged
+    panel.style.display = "";
+    box.innerHTML = "";
+    // one-click add row: `detail` text + an Add button that POSTs `path` with `body` and,
+    // on success, refreshes the boards form + sources overview. Each row's add is collected in
+    // `adders` so "Add all" can drive exactly the same per-row path (same endpoints, same
+    // per-row end-state) instead of a parallel bulk route that could drift from it.
+    const adders = [];
+    const addRow = (detail, path, body) => {
+      const row = el("div", {class:"fit-rec"});
+      row.appendChild(el("span", {text: detail}));
+      const b = el("button", {type:"button", text:"Add"});
+      // quiet: skip the per-add refresh; the "Add all" caller refreshes once at the end.
+      // Returns "" on success, else the error message (so the bulk run can report failures).
+      const add = async (quiet) => {
+        if (b.disabled) return "";              // already added
+        b.disabled = true; b.textContent = "Adding…";
+        try {
+          const res = await (await fetch(path, {method:"POST",
+            headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)})).json();
+          if (!res.ok) throw new Error(res.error || "Failed");
+          b.textContent = "Added ✓";            // definite end-state (UI Principle #5)
+          if (!quiet) { loadDisc(); loadSources(); }  // reflect it in the boards form + overview
+          return "";
+        } catch(e) { b.disabled = false; b.textContent = "Add"; return String(e.message || e); }
+      };
+      b.addEventListener("click", async () => { const err = await add(false); if (err) alert(err); });
+      adders.push(add);
+      row.appendChild(b);
+      box.appendChild(row);
+    };
+    const roles = n => n + " open role" + (n === 1 ? "" : "s");
+    cs.forEach(c => addRow(
+      c.ats + ":" + c.token + " — " + roles(c.n_postings) + (c.sample_title ? " (e.g. “" + c.sample_title + "”)" : ""),
+      "/candidates/accept", {ats: c.ats, token: c.token}));
+    specs.forEach(s => addRow(
+      s.name + " (aggregator) — " + roles(s.n_postings) + (s.sample_title ? " (e.g. “" + s.sample_title + "”)" : ""),
+      "/candidates/accept-spec", {name: s.name}));
+    contrib.forEach(c => addRow(
+      c.name + " (custom adapter)" + (c.description ? " — " + c.description : ""),
+      "/candidates/accept-contrib", {name: c.name}));
+    // "Add all" — wire every staged source into discovery.yaml in one click. Sequential (each
+    // add rewrites the same config file), with live "n of N" progress and a definite end state,
+    // reusing the shared waiting pattern (UI Principle #5). Only shown when it saves a click.
+    if (adders.length > 1) {
+      const bar = el("div", {class:"fit-rec"});
+      const note = el("span", {text: "Add all " + adders.length + " to discovery in one click."});
+      const all = el("button", {type:"button", text: "Add all (" + adders.length + ")"});
+      all.addEventListener("click", async () => {
+        all.disabled = true;
+        const errs = [];
+        for (let i = 0; i < adders.length; i++) {
+          all.textContent = "Adding " + (i + 1) + " of " + adders.length + "…";
+          const err = await adders[i](true);
+          if (err) errs.push(err);
+        }
+        loadDisc(); loadSources();             // one refresh for the whole batch
+        const ok = adders.length - errs.length;
+        all.textContent = errs.length ? "Added " + ok + " of " + adders.length : "Added all ✓";
+        if (errs.length) {
+          all.disabled = false;                 // the failed rows can be retried
+          note.textContent = errs.length + " could not be added: " + errs.join(" · ")
+            + " — press Add on those rows to retry.";
+          bar.classList.add("msg", "err");
+        } else {
+          note.textContent = "All " + ok + " added — the next discovery run searches them.";
+        }
+      });
+      bar.appendChild(note); bar.appendChild(all);
+      box.insertBefore(bar, box.firstChild);
+    }
+  } catch(e){ panel.style.display = ""; box.innerHTML = ""; box.appendChild(el("div", {class:"msg err", text:String(e.message || e)})); }
 }
 
 // ---- Discover: chart how fit improves run over run (decision 046) -----------
@@ -4626,21 +6437,29 @@ function escapeHtml(s){ const d=document.createElement("div"); d.textContent=s; 
   const SVG = 'viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"';
   const SUN = '<svg class="btn-ic" '+SVG+'><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>';
   const MOON = '<svg class="btn-ic" '+SVG+'><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>';
-  function apply(mode){
-    if (mode === "dark" || mode === "light") root.setAttribute("data-theme", mode);
+  let mode = "system"; try { mode = localStorage.getItem("ab-theme") || "system"; } catch(e){}
+  function apply(m){
+    mode = m;
+    if (m === "dark" || m === "light") root.setAttribute("data-theme", m);
     else root.removeAttribute("data-theme");
-    const dark = mode === "dark" || (mode !== "light" && sysDark());
+    const dark = m === "dark" || (m !== "light" && sysDark());
     if (btn) btn.innerHTML = dark ? SUN + "Light" : MOON + "Dark";
+    reflectTheme();
   }
-  let saved = null; try { saved = localStorage.getItem("ab-theme"); } catch(e){}
-  apply(saved || "system");
+  // Highlight the active choice in the Settings → Appearance segment (System / Light / Dark).
+  window.reflectTheme = function(){
+    document.querySelectorAll('#theme-seg button').forEach(b => b.classList.toggle("on", b.dataset.mode === mode));
+  };
+  window.setThemeMode = function(m){ try { localStorage.setItem("ab-theme", m); } catch(e){} apply(m); };
+  apply(mode);
+  // Footer button cycles light↔dark off the current effective theme; segment picks any of the three.
   if (btn) btn.addEventListener("click", () => {
     const dark = root.getAttribute("data-theme") === "dark"
       || (!root.getAttribute("data-theme") && sysDark());
-    const next = dark ? "light" : "dark";
-    try { localStorage.setItem("ab-theme", next); } catch(e){}
-    apply(next);
+    window.setThemeMode(dark ? "light" : "dark");
   });
+  document.querySelectorAll('#theme-seg button').forEach(b =>
+    b.addEventListener("click", () => window.setThemeMode(b.dataset.mode)));
 })();
 
 // ---- First-run tour — a spotlight walkthrough of what each section does ----------------------
@@ -4653,12 +6472,13 @@ function escapeHtml(s){ const d=document.createElement("div"); d.textContent=s; 
   const DONE_KEY = "ab-tour-done";
   const overlay = $("tour-overlay"), pop = $("tour-pop"), nav = document.querySelector("aside.nav");
   const STEPS = [
-    { view:null, title:"👋 Welcome to ApplicationBot", body:"It finds jobs, tailors your résumé, and fills out applications for you — everything runs as a safe dry-run until you arm it. Here's a 20-second tour of the four sections." },
-    { view:null, title:"🔑 How Claude tailors your résumé", body:"Primary: your Claude subscription via Claude Code (recommended — not metered; sign in inside Claude Code). Fallback: your own Anthropic API key (pay-per-token, separate from your subscription) — a third-party app can't use the subscription any other way. Neither? The free rules engine runs. Manage it anytime from the panel in the bottom-left." },
+    { view:null, title:"👋 Welcome to ApplicationBot", body:"It finds jobs, tailors your résumé, and fills out applications for you — everything runs as a safe dry-run until you arm it. Here's a 20-second tour of the five sections." },
+    { view:null, title:"🔑 How Claude tailors your résumé", body:"Primary: your Claude subscription via Claude Code (recommended — not metered; sign in inside Claude Code). Fallback: your own Anthropic API key (pay-per-token, separate from your subscription) — a third-party app can't use the subscription any other way. Neither? The free rules engine runs. Manage it anytime from the connection panel in the bottom-left, or in Settings." },
     { view:"profile", title:"👤 Profile", body:"Your details and résumé. Import your résumé and it fills these in automatically — the bot uses them to answer application questions truthfully." },
     { view:"discover", title:"🔍 Discover", body:"Choose what jobs to find, then let the bot search, rank every posting by how well it fits you, tailor your résumé, and fill the application — a dry-run you can watch." },
     { view:"review", title:"📝 Review", body:"See each tailored résumé and why it was written that way, and fine-tune it before it's used." },
     { view:"track", title:"📊 Track", body:"Every application the bot discovered, tailored, and filled — with status, notes, and how much Claude each one cost." },
+    { view:"settings", title:"⚙️ Settings", body:"Set-once configuration: your Claude connection, push notifications (desktop + phone), your linked inbox for account-gated portals, and light/dark theme." },
   ];
   let i = 0, startView = null, running = false;
   const spot = (v) => document.querySelectorAll(".tab").forEach(t => t.classList.toggle("tour-spot", !!v && t.dataset.view === v));

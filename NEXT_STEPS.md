@@ -152,12 +152,43 @@ still owed from the user's network.
     **do not** build evasion (Guideline #4). Consider **dropping SmartRecruiters from discovery** so
     the pipeline stops queueing postings it can never submit (~298 of the 074 unlock).
 
-### LinkedIn job alerts as a discovery source (decision 072) — BLOCKED ON USER
+### Lensa + Aflac + LinkedIn forwarded-email alerts (decisions 072 + 132) — BLOCKED ON USER
 
-Approach approved 2026-07-15; no code written yet. Ingest is by **email forwarding**, not by
-linking the personal Gmail: a filter on `jobalerts-noreply@linkedin.com` forwards to the
-already-linked bot inbox (the address linked in `profile/mailbox.yaml`). **No `mailbox.py` changes
-needed** — the second link slot originally scoped was dropped once forwarding was chosen.
+**The email-alert infrastructure now EXISTS (decision 132, 2026-07-23).** The generalized
+`discovery.EmailAlertSource` + `mailbox.fetch_alerts` build the email-forwarding pattern decision
+072 approved, for three built-in providers: `lensa`, `aflac`, `linkedin`. Enable in Discover
+settings (or `profile/discovery.yaml` `email_alerts:`), forward the provider's alert emails to the
+linked bot inbox, and each alert's job links become leads that ride the aggregator→ATS bridge.
+**Direct-search was rejected** for Lensa (bot-walled 402, redirect-only) and never wanted for Aflac
+(single-company SuccessFactors site, email-only) — see decision 132.
+
+**Status 2026-07-23 (probed the linked bot inbox):**
+- **LinkedIn — WORKING + validated on real markup.** 10 alert emails present → **79 distinct
+  `/comm/jobs/view/<id>` leads** parsed, deduped, correctly surfaced. LinkedIn leads are
+  **manual-apply / lead-only by design** (decision 133): `linkedin.com/jobs/view` is LinkedIn's own
+  login-walled, robots-disallowed page, not a redirect to an ATS, so we surface them for you to click
+  but never auto-drive them (Guideline #4). No further work needed for LinkedIn ingestion.
+- **Lensa / Aflac — 0 emails in the inbox; live apply UNconfirmed.** The forward isn't set up yet, so
+  the auto-apply path (browser follows the redirect to the real form) can't be confirmed on real data.
+
+- [ ] **USER — the one step no test covers (to confirm Lensa/Aflac apply end-to-end):** set up the
+      Gmail forward (Lensa: from `lensa.com`; Aflac: from `aflac` → Forward to
+      the linked bot inbox), forward a real alert, then run a discovery scan with
+      `email_alerts` enabled and dry-run apply to one lead. If **0 leads** appear, the provider wraps
+      its job links in a mailer/tracking domain that doesn't contain the brand domain — capture one
+      real forwarded email's `<a href>` and update that provider's `url_contains` in
+      `discovery._BUILTIN_ALERT_PROVIDERS` (a one-line change; this is exactly how LinkedIn's
+      `/comm/jobs/view` pattern was pinned). Until then Lensa/Aflac parsing is verified against a
+      plausible fixture, not real markup.
+- [ ] **(B) Company→ATS-board resolver (still does not exist)** — the bridge resolves a lead's
+      *redirect* to an ATS, but a Lensa/LinkedIn lead whose link stays on the aggregator's domain
+      (server-side 402/robots-blocked) can't be resolved that way and stays a tracked lead. Matching a
+      lead's company name to its public Greenhouse/Lever/Ashby board would re-enter it auto-applyable.
+      This is what makes these leads worth more than triage; reassess after seeing real lead volume.
+
+**Legacy note (decision 072, now superseded by 132 for ingestion):** ingest is by **email
+forwarding**, not by linking the personal Gmail: a filter on `jobalerts-noreply@linkedin.com`
+forwards to the already-linked bot inbox (the address linked in `profile/mailbox.yaml`).
 
 - [ ] **USER:** add the forwarding address in personal Gmail (Settings → Forwarding and POP/IMAP).
       Gmail emails a confirmation code **to the bot inbox** — an agent can read it out with
@@ -166,21 +197,11 @@ needed** — the second link slot originally scoped was dropped once forwarding 
       Click **Search** on the filter form first — 0 results means the alerts use a different sender
       and the filter should widen to `linkedin.com`. Tick *Also apply to matching conversations* to
       forward the existing backlog → gives the parser a real corpus immediately.
-- [ ] **(A)** `LinkedInAlertSource`: read the bot inbox, parse alert cards → `Posting(ats=
-      "linkedin_alert", extra={"snippet_only": True})`. Shape it on `AdzunaSource` (already
-      snippet-only + redirect-linked + bridged). **Build against the real forwarded markup — do not
-      guess the card structure.** Leads only: `auto_applyable=False` (the email links to
-      `linkedin.com/comm/jobs/view/<id>` → redirects to LinkedIn, not an ATS; scraping the job page
-      is robots-disallowed, Guideline #4).
-- [ ] **(B)** Company→ATS-board resolver (**does not exist today** — grepped). Match a lead's
-      company to its public Greenhouse/Lever/Ashby board → full JD + fillable apply URL → lead
-      re-enters the pipeline auto-applyable. This is what makes the source worth having; A alone
-      adds a human triage step and cuts against Guideline #0.
-- [ ] **Reassess before building B:** does A's lead quality actually beat Adzuna's recall on the
-      same filters? Adzuna already aggregates many boards and is already bridged. If not, stop at A
-      or drop the source (see decision 072's open question).
-
-Probe run 2026-07-15: bot inbox currently has **0** LinkedIn messages — the forward is required.
+- [x] **(A) The alert-parsing source** — **DONE (decision 132):** generalized `EmailAlertSource`
+      (not LinkedIn-specific), leads `ats="email_alert"`, snippet-only, bridged. The card-structure
+      parser keys on the destination domain (structure-agnostic), so the "don't guess the card
+      structure" rule is respected by construction; the remaining unknown is each provider's link
+      domain, tuned against a real email (the USER step above).
 
 ### Heaviest engine work (audit 2026-07-06) — build toward "fill AND submit any application, any site"
 
@@ -563,6 +584,48 @@ value ÷ effort:
       fillability predicate (`pipeline._is_fillable`, `discovery.py`). Adding a
       discovery-only source to that dict would silently assert an apply adapter exists.
 
+### FAANG+ / reputable-company boards staged (2026-07-28)
+
+- [x] **64 big-name boards live-validated → curated to 40 early-career-friendly, staged** in the
+      committed `data/source_candidates.json` (source-scout transport) — pending one-click **Accept**
+      in Settings; nothing is searched until accepted (decision 140). Two tiers: **25 apply-ready-now**
+      (≥1 early-career technical role live today; palantir, andurilindustries, snowflake, mistral.ai,
+      doordashusa, perplexity, cloudflare, verkada, notion, stripe, cohere, samsara, scaleai, openai,
+      ramp, asana, databricks, figma, gemini, lyft, roblox, sofi, twilio, BoschGroup, Ubisoft2) + **15
+      seasonal grad-watch** (0 open today but known new-grad/intern hirers; airbnb, datadog, reddit,
+      coinbase, robinhood, toast, pinterest, instacart, anthropic, brex, affirm, discord, duolingo,
+      vercel, gusto — provenance-tagged "seasonal grad watch"). The full 64-board validated set is in
+      scratchpad `finalize.py`. **Two watches are built:** (1) CLI — `runner --continuous` sends a
+      desktop/phone notification each cycle a role is ready to apply (decision 140); test it live with
+      `runner --continuous --headed --fresh --dry-run` (visible autofill, never submits). (2) Web —
+      a **"Keep watching"** toggle on the Discover auto-apply loop (decision 143) keeps re-checking the
+      boards every N min, autofills each new match, and holds it as a "Ready to apply" card you approve
+      per-application (never submits on its own). Accept the boards first, then run either.
+      For reference, all 64 returned ≥1 posting against the live ATS API:
+      ~46 Greenhouse (anduril `andurilindustries` 2132, databricks 811, stripe 533, doordash
+      `doordashusa`, datadog, anthropic, samsara, toast, verkada, cloudflare, brex, roblox, block,
+      scaleai, pinterest, reddit, airbnb, gitlab, twilio, figma, affirm, lyft, coinbase, flexport,
+      asana, ripple, wiz `wizinc`, robinhood, instacart, glean `gleanwork`, vercel, gusto, chime,
+      twitch, duolingo, sofi, mercury, discord, gemini, airtable, dropbox, webflow, nextdoor,
+      coursera), ~15 Ashby (openai, snowflake, elevenlabs, cohere, cursor, ramp, notion, plaid,
+      perplexity, kraken `kraken.com`, benchling, ironclad `ironcladhq`, linear, zapier, mistral
+      `mistral.ai`), 2 Lever (palantir, wealthfront), 2 SmartRecruiters (Bosch `BoschGroup`,
+      Ubisoft `Ubisoft2`), 1 Workable (huggingface, 7). Boards are senior/GTM-heavy vs the
+      early-career funnel — accept selectively.
+- [ ] **FAANG-proper is NOT wireable via `boards`** (custom portals / Workday-fetch-less):
+      Google, Meta, Apple, Amazon, Netflix, Microsoft, Nvidia, Tesla, Salesforce, Adobe, Oracle,
+      IBM. Would need new source adapters (Phase-2 PR, decision 136), not a `boards` entry.
+- [x] **Investigated the 5 Greenhouse 404s (Grammarly, Unity, Retool, Applied Intuition, Rippling)
+      — NOT an adapter gap; no public JSON board exists for them (2026-07-28).** Ruled out a
+      `job-boards.greenhouse.io` fallback: `boards-api.greenhouse.io/v1/boards/{token}` is
+      Greenhouse's only public JSON API and it already serves newer `job-boards`-hosted boards
+      (Glean's `gleanwork` validated at 103). For these five, every endpoint 404s — classic API,
+      `job-boards`/embed hosts, the opaque board token from the vanity URL, AND the live board pages
+      themselves (404, not 403 → "no such board", not blocked); no slug variant resolves either.
+      Their boards are gone/private (Grammarly folded into Superhuman). A fallback would fetch zero
+      boards, so it was deliberately NOT built (dead code; Guideline #2). Deel's Ashby board (`deel`)
+      likewise returns 0 (API disabled) but Mistral recovered via `ashby:mistral.ai` (169).
+
 ### Discovery source expansion — research 2026-07-22 (free sources only; decision 114)
 
 > Turnkey catalog from the 2026-07-22 landscape research (live-tested endpoints where marked
@@ -811,6 +874,195 @@ Posted to the agent bus 2026-07-06; independent of the engine work above.
 ---
 
 ## Recently added (this session, latest first)
+
+- 2026-07-29 — **Forwarded application emails become tracker rows (decision 151).** The Track stage
+  only knew about applications the bot itself made, so anything applied to by hand was invisible and
+  the funnel + `min_fit` calibration ran on a fraction of the real history. New
+  `applicationbot/inbox_import.py`: a **free gate** (`classify_message`) reads the true sender out of
+  a forwarded email's header block and admits a message only on a known ATS domain or application
+  wording — job-alert emails are routed out to discovery's `EmailAlertSource` (decision 132) and
+  never cost a token; survivors go to **haiku** in batches of 5 (`activity="inbox-import"`); each
+  extraction then **matches or inserts** — source URL first, else normalized company + role overlap.
+  Status moves forward only, so a late confirmation can't reset an interview; a rejection wins over
+  anything but an offer. Rows are written directly, flagged `method="email-import"` with the source
+  email in `notes`, and every run is undoable (`undo_run`) via a git-ignored Message-ID ledger that
+  also makes re-scans idempotent. `mailbox.fetch_messages` is the new reader that keeps headers
+  (`fetch_alerts` drops them and filters by sender — wrong for forwarded mail). Track tab gains
+  **Import from inbox** + Undo, and a one-click "Use these job alerts in Discover" when the run finds
+  alert emails discovery isn't using. **Verified on the real inbox** (52 messages/60 days): 0 tokens
+  spent by the gate, 21 LinkedIn + 18 Lensa alerts bucketed, 13 account notices skipped, no false
+  negatives; the Claude stage driven for real on four samples produced the right row for each
+  (confirmation → `applied` w/ portal + date + URL, rejection → `rejected`, recruiter → `interview`,
+  digest → not an application). 23 new tests.
+  - [ ] **USER:** forward one real application confirmation (and a rejection, if you have one) from
+        your personal address to the linked bot inbox, then click **Import from
+        inbox** on the Track tab. This is the one thing no test covers — a real ATS template.
+  - **Note for decision 132's flagged live step:** Lensa alerts ARE now arriving (18 in 60 days),
+    where the section below still records 0. LinkedIn: 21.
+
+- 2026-07-29 — **Never-reviewed applications come back in the search, the loop shows its search
+  breakdown, and scouted sources have one-click "Add all" (decision 149).** Three user asks in one
+  change. **(1)** A posting the loop prepared was suppressed twice — `skip_seen` (a tracker row
+  exists) and the seen-openings ledger (it was judged) — so applications prepared while the user was
+  away never resurfaced. New `applications.reviewed_at` (migrated in `_connect`, blank = never seen)
+  is stamped when the user opens an application's **Review** panel (`GET /track/review`) or clicks
+  Apply/Watch; `tracker.unreviewed_source_urls()` feeds `pipeline._revisit_canonical_urls`, which is
+  subtracted from BOTH filters. `applied` rows stay suppressed. Token guard: `discover_and_match`
+  gained `revisit=True`, and the loop passes `revisit=False` after its first pass plus skips
+  postings it already prepared this run, so a goal-mode hunt can't re-judge/re-prepare the same ones
+  every pass. The funnel reports `revisited` and the UI names it ("N brought back (prepared but never
+  reviewed)"). **(2)** `/loop/status` now carries `funnel`/`judged`/`scanned`/`matched`/`cleared`/
+  `min_fit` (shared `_judged_rows` with the test run) and the Discover tab renders them through the
+  SAME `renderScanFunnel`/`renderJudged` the dry run uses — re-rendered only when the stats change so
+  the 2s poll can't re-open a funnel the user collapsed; publishing is best-effort so a display
+  failure can't stop preparation. **(3)** "Add all (N)" heads the "New sources found" panel, driving
+  each row's existing per-row add sequentially with "n of N" progress, one refresh at the end, and a
+  failure summary that leaves failed rows retryable. **Verified by driving the real app** (Playwright
+  against the running server): "Add all (32)" renders atop the staged candidates; the loop breakdown
+  renders funnel + accepted/denied rows and stays collapsed across a re-poll. New
+  `tests/test_revisit_unreviewed.py` (4 tests); 543 pass (2 pre-existing `test_parking` `bot_wall`
+  failures from another agent's WIP remain).
+
+- 2026-07-29 — **Push notifications are now tracked in the Notifications tab (decision 145).** The
+  tab (decision 138) was a live snapshot recomputed from tracker state, so a push fired for an app
+  that was then submitted/cleared (or lost on a loop reset) left no trace — the user was "getting a
+  lot of push notifs not in the notifications tab." Fix: a durable `notifications` table in the
+  tracker DB (migrated in `_connect`) records every fired push; `web._record_and_push` logs then
+  pushes (gated by the event toggle, tagged with the tracker `app_id`), replacing the bare
+  `notifier.notify()` calls in the loop. `/inbox` gained `notifications` (+ per-row `actionable`)
+  and durably unions `ready` with the dry-run apps named in `approval_needed` log rows, so ready
+  action cards survive a server restart (the badge keeps its decision-138 meaning — live count of
+  ready+parked); new `/notifications/read` + `/notifications/dismiss`. UI: below the live action
+  cards, a "Recent notifications" feed showing EVERY push — urgency dot, title, relative time, body,
+  handled-status tag, per-item Dismiss + Clear all; actionable rows get an inline "Review & submit →" /
+  "Resolve →" that scrolls to that app's card (id `inbox-app-<id>`) and flashes it. Test notifications
+  aren't logged (channel probe, not an event). **Follow-up fixes from user testing:** the feed buttons
+  inherited the global `button{width:100%}` (crushed text to one word per line → added
+  `width:auto;margin:0`); reverted a wrong badge→unread switch back to the action count; unioned ready
+  from the log after ready cards weren't reviewable post-restart; then stopped filtering actionable
+  notifications OUT of the feed (they were "just missing" for the user) and gave them the inline jump.
+  **Verified live** (temp data dir + Playwright screenshot + jump-flash click): badge shows the action
+  count, Blocked + Ready cards render with working Review/Answer/Apply, every push shows in the feed with
+  its jump action, an applied posting shows as a plain record; served JS
+  `node --check` clean; 30 tests in `test_notifications.py`; full suite 524 passed (only the 2
+  pre-existing `test_parking` `bot_wall` failures from another agent's WIP remain). **Note for the
+  decision-138 owner:** `/inbox` now returns the log + a durable-ready union; badge meaning unchanged.
+- 2026-07-29 — **Surface résumé provenance in Track / notifications / review (decision 144).** A
+  submission now shows WHICH résumé it used — freshly tailored vs reused (from decision 142/069) —
+  everywhere it's presented, so a reused résumé is never a silent surprise. One human string
+  (`reuse.FRESH` / `exact_reuse_label` / `similar_reuse_label` naming the source + match % /
+  `stored_reuse_label`) is threaded from `run_testing_mode` → `meta["resume_source"]` →
+  `ApplyReport.resume_source` → a new `applications.resume_source` column (migrated; written by
+  `_record_run`, also appended to each run's history `detail`). Surfaces: the "Ready to apply"
+  notification body, the review panel (chip + sentence before the armed submit), and a green
+  "Tailored" / amber "Reused" chip (`resumeSrcChip`) on Track feed cards, the context drawer, and
+  the ready-card list. Tests: `test_reuse.py` +4 (19 total green); tracker/apply suites green with
+  the new column; served JS `node --check` clean.
+- 2026-07-28 — **Cross-posting résumé reuse to save tokens (decision 142).** When a new job demands
+  essentially the same candidate skills as one already tailored for, `run_testing_mode` now **reuses
+  that PDF verbatim and skips the Claude tailor call** instead of re-tailoring. "Close enough" =
+  identical base stamp (résumé + header links + tailoring-logic — `pipeline.tailor_base_stamp`) AND
+  demanded-skill **Jaccard ≥ 0.9** (`reuse.DEFAULT_THRESHOLD`, 0 disables) with a matching knockout
+  profile — a **token-free** metric reusing the `ats_requirements` extraction the loop already runs.
+  New pure module `reuse.py` (`JdSignature` + `similarity`), a `resume_store` `.sig` sidecar
+  (`{base_stamp, signature, label}`, cascade-deleted/pruned with its PDF), `pipeline.find_reusable`
+  (scans the sig corpus, **excludes the posting's own artifact** so decision-069's same-posting armed
+  re-tailor invariant stays intact). Applies on armed submits too (user's choice), for a *different*
+  posting only; `force_retailor` is the escape hatch; the reuse surfaces an honest note naming the
+  source + match %. Tests: `test_reuse.py` (8) + all `test_rescan_reuse` (7) still green.
+- 2026-07-28 — **Auto source discovery, escape hatch / Phase 3 (decision 139).** Bespoke `Source`
+  adapters for platforms a declarative spec can't express (HTML-only, odd auth, weird pagination)
+  now live as **drop-in plugin files** in the new `applicationbot/sources_contrib/` package —
+  `load_contrib_sources()` auto-discovers any module exposing `NAME` + `build(keywords) -> Source`
+  (skips `_`-prefixed/broken/incomplete ones). `filters.contrib_sources` (enable-by-name, off by
+  default) wired into `build_sources`; `source_scout.enable_contrib_source`; UI lists loaded-but-not-
+  enabled adapters in "New sources found" → one-click Add (`POST /candidates/accept-contrib`);
+  `/sources` shows enabled ones. A PR that adds a platform touches ONE new file, zero core code — the
+  only tier that goes through human PR review (never auto-merged). `_example.py.txt` is the contract +
+  reference; package ships no live adapters. Verified end-to-end against the real shipped loader
+  (dropped a real adapter file → discovered → built → fetched → listed in live GET /candidates → removed).
+  Routine doc gained a Phase 3 mode (`gh pr create`). **This closes the source-discovery ladder**
+  (companies → JSON aggregators → bespoke adapters); nothing on it is open.
+
+- 2026-07-28 — **Auto source discovery, Phase 2 (decision 136).** A new aggregator *platform* is now
+  declarative DATA, not code: `discovery.JsonApiSource` + `AggregatorSpec` (endpoint template, dotted
+  `list_path`/`field_map`, offset/page pagination) generalizes the Himalayas/RemoteOK shape; emits
+  `ats="jsonapi"` so ONE `_AGGREGATOR_ATS` entry rides every spec through the bridge + fillability.
+  Committed non-PII registry `data/aggregator_specs.json`; `filters.json_aggregators` (enable-by-name,
+  off by default) wired into `build_sources`. `source_scout.validate_spec`/`stage_spec`/
+  `enable_json_aggregator` + CLI `--add-spec`/`--keyword`/`--list-specs`. UI: the "New sources found"
+  panel now also lists staged specs → one-click **Add** (`POST /candidates/accept-spec`); `/sources`
+  shows enabled JSON aggregators. Fixed a latent bug: `collectDisc()` would wipe `json_aggregators`
+  on save (now round-tripped via `_discPreserve`). 18 tests + served-JS check; verified end-to-end
+  against the real **Remotive** keyless API (15 live postings staged + surfaced). Routine doc gained a
+  Phase 2 mode. **Escape hatch (still open):** a platform a spec can't express (HTML-only, odd auth)
+  needs a hand-written `Source` adapter via PR.
+
+- 2026-07-28 — **Push notifications for the auto-apply loop (decision 135).** The loop already
+  prepares each match then WAITS for the user's approval, and parks blocked applications — but those
+  signals were visible only while the page was open and watched (it polls `/loop/status`). Now the
+  two human-in-the-loop moments push wherever the user is. New `applicationbot/notifications.py`: a
+  pluggable `Channel` layer with `DesktopChannel` (macOS — covers BOTH the built app and localhost,
+  since the server runs on the user's Mac; **posts in-process via pyobjc `NSUserNotification` in the
+  packaged app so the notification shows the ApplicationBot icon** — `osascript` can't set an icon —
+  and falls back to `osascript` from source/localhost) and `NtfyChannel` (one `urllib` POST to
+  an ntfy.sh topic → phone push, no new dep, certifi-verified so macOS SSL doesn't silently break it),
+  fanned out by a `Notifier` with per-channel isolation. Fired from `web.py _loop_worker.prepare_one`:
+  `approval_needed` when an app becomes "ready" (deduped once per app), `intervention_needed` (urgent)
+  when one parks `blocked`; each deep-links `/#discover`. Config `profile/notifications.yaml`
+  (`examples/notifications.example.yaml`; defaults desktop-on/ntfy-off/both-events-on). UI: a "Notify
+  me…" panel in the Discover-tab loop card (desktop/ntfy/topic/event toggles + **Send test**), with
+  `GET /notifications`, `POST /notifications/update`, `POST /notifications/test`. **Verified live:**
+  test fired a real macOS notification AND a real ntfy push (`Sent via desktop, ntfy`); config
+  round-trips; served JS `node --check` clean. 18 tests. **Flagged live step:** confirm the
+  ApplicationBot icon renders on a real notification from the built `.app` (can't check from the dev
+  shell — not frozen, so it uses the osascript path). **Deferred:** Telegram/Pushover channels
+  (interface ready — one class + one `build_notifier` branch); Windows/Linux desktop (no-op off macOS);
+  browser-closed Web Push.
+- 2026-07-28 — **Auto source discovery, Phase 1 (decision 134).** New `applicationbot/source_scout.py`:
+  the deterministic half of a periodic Claude cloud routine that finds NEW companies on ATSs we
+  already support and stages them for one-click add. `extract_board(url)` (classify ATS + pull token
+  across every supported URL shape) → `validate_board` (live ATS-API probe; keeps only tokens that
+  return ≥1 posting, with the exact error otherwise) → dedup vs `filters.boards` → committed
+  **non-PII** candidates file `data/source_candidates.json` (the cloud→local transport) →
+  `merge_into_filters` (one-click accept → append to `discovery.yaml` boards, idempotent). CLI:
+  `--url`/`--from-discovery`/`--accept`/`--list`. **Scope guard:** allowlist == `discovery.ATS_SOURCES`,
+  so it proposes only companies on a board we already read AND can autofill — touches neither
+  `ATS_SOURCES` nor `_is_fillable` (the flagged overload). Routine spec (weekly, allowlist-only,
+  `/schedule` prompt): `docs/SOURCE_SCOUT_ROUTINE.md` — NOT auto-registered (billed recurring agent =
+  user's call). 20 tests pass; live probe smoke-verified (`greenhouse:gitlab` → 187 postings; dead
+  token → graceful 404). **Settings UI shipped (same session):** a "New sources found" panel in the
+  Discover tab — `GET /candidates` (validated + not-already-configured only) + one-click **Add** →
+  `POST /candidates/accept` → `merge_into_filters` → refreshes boards + sources overview; hidden when
+  empty. 3 route tests (`test_web_candidates.py`) + live GET verified. **Deferred:** Phase 2 (new
+  aggregator *platforms* → a reviewed PR with a hand-written adapter).
+- 2026-07-23 — **Redirects no longer count a posting out (decision 133).** Correcting decision 132:
+  an `email_alert` lead whose redirect can't be resolved server-side is now **deferred to apply-time
+  browser click-through** (tagged `browser_gated`, kept in the funnel) instead of stamped
+  `auto_applyable=False` and dropped pre-judge. New `discovery._BROWSER_GATED_FALLBACK = {"email_alert"}`;
+  the free server-side upgrade (Lensa reposts → Greenhouse/Lever) is preserved. Un-drops Aflac
+  (SuccessFactors `careers.aflac.com`, detected as `"other"`) + tracking-wrapped Lensa leads. Still
+  does NOT scrape Lensa's 402-walled listing endpoint (Guideline #4) — those postings come via email.
+  Validated against the real inbox: **79 LinkedIn leads** parse correctly. **Boundary discovered
+  there:** LinkedIn `/jobs/view` is login-walled + robots-disallowed (not a redirect to an ATS), so
+  `AlertProvider.auto_apply=False` for LinkedIn — its leads are manual-apply/lead-only, excluded from
+  the bridge (never auto-driven, Guideline #4); Lensa/Aflac stay auto-apply. Also tightened LinkedIn
+  `url_contains`→`/comm/jobs/view` + query-stripped dedup. 13 `test_email_alerts.py` pass.
+  **Candidate extension:** jooble is the same redirect-aggregator class; apply `_BROWSER_GATED_FALLBACK`
+  to it too if the user wants (left out for now — Guideline #7, don't silently change an existing source).
+
+- 2026-07-23 — **Lensa + Aflac support via forwarded-email alerts (decision 132).** Generalized the
+  approved-but-unbuilt LinkedIn email pattern (072) into `discovery.EmailAlertSource` +
+  `mailbox.fetch_alerts` (IMAP + Gmail-OAuth), with built-in providers `lensa`/`aflac`/`linkedin`.
+  Each forwarded alert's `<a>` job links become `ats="email_alert"` leads that ride the existing
+  aggregator→ATS bridge (a Lensa repost landing on Greenhouse/Lever auto-applyable for free; the rest
+  tracked leads). Parser is **structure-agnostic** — keys on the destination domain, not the email's
+  card layout. Config `EmailAlertsConfig` (off by default, provider-validated) + a Discover-tab toggle
+  / provider checkboxes / `/sources` row. **Aflac corrected to a single-company SuccessFactors site
+  (email-only, not an aggregator); Lensa direct-search rejected (HTTP 402 bot-wall, redirect-only
+  leads — Guideline #4/#0).** 10 new tests; suite 417 passed; served JS `node --check` clean.
+  **Flagged live step:** user forwards a real alert + confirms each provider's `url_contains` matches
+  the real (possibly tracking-wrapped) link markup — a one-line tune. See the BLOCKED-ON-USER item above.
 
 - 2026-07-22 — **Two-stage judging: Haiku pre-rank → Sonnet judge (decision 124).** New `prerank_n`
   knob — a cheap Haiku pass coarse-scores the top `prerank_n` survivors, and only the best `top_n`
@@ -2207,6 +2459,210 @@ Record each decision in [DECISIONS.md](DECISIONS.md) once the user chooses.
 ---
 
 ## Recently completed
+
+- 2026-07-29 — **Answers are editable in Review, and the edit is what gets submitted (decision 153).**
+  User: "lets include the ability to edit answers that the bot will submit when user is reviewing."
+  The last checkpoint before an irreversible submit was read-only. New `answer_overrides.py` stores
+  per-posting edits as `answers.json` in that posting's archive dir (decision 043); `AnswerResolver`
+  checks them at the top of `resolve()` (so they beat the profile, the answer bank, semantic
+  classification, and Claude drafting on every control type) and the native-first branch yields to
+  them too; `run_apply` loads them after deriving company/role, so re-apply, the loop's queued
+  submit, and the runner honour edits with no caller changes. Review renders every filled answer —
+  and every unanswered field — as an input, with "Save answers" (`POST /track/answers`); *Watch it
+  fill* / *Apply* / *Submit for real* auto-save unsaved edits and abort with an actionable error if
+  the save fails. A blank box hands the field back to the bot. `tests/test_answer_overrides.py` (7)
+  plus `tests/test_web_answer_edit.py` driving the real UI headless — all green.
+
+- 2026-07-29 — **Your uploaded résumé outranks any tailored one (decision 152).** User: "if a
+  application is close enough to an uploaded resume, we should use that one instead of reusing a
+  retailored." Uploaded résumés were parsed into the catalogue and the bytes discarded, so the
+  user's own real file could never be sent. New `resume_docs.py` keeps each uploaded **PDF** (plus
+  its extracted text) under `profile/uploads/`; `pipeline.find_uploaded_match` scores a posting's
+  demanded skills against it with `reuse.coverage` (asymmetric — share of demanded skills the
+  document covers, not Jaccard — at the same 0.9 bar, token-free); `run_testing_mode` checks it
+  **before** both reuse paths and sends the file as-is, clearing the tailoring sidecars on the
+  copied artifact. "Re-tailor" still forces a fresh pass. Provenance reads "Reused your uploaded
+  résumé <file> (N% of demanded skills covered)" everywhere decision 144 already shows it. Profile
+  tab lists kept files with one-click Remove (`GET /resume/uploads`, `POST /resume/uploads/delete`).
+  New `tests/test_uploaded_resume.py` (8, all green); verified against the running app end-to-end.
+
+- 2026-07-29 — **Agent-bus session ritual removed from `CLAUDE.md` (decision 150).** There is no
+  parallel Cursor agent, but `CLAUDE.md` told every session to run `agent_bus context/read`, claim
+  paths, and ack/release at the end — so agents kept narrating coordination that never happened
+  (decisions 144/145 both claim a handoff to "cursor" for solo work, a Guideline #11 violation).
+  That section is now an explicit prohibition: no bus commands, no claims/handoffs, no mentions of
+  another agent anywhere. `applicationbot/agent_bus.py`, `docs/AGENT_COLLAB.md`, `scripts/agent-bus`,
+  and `.cursor/hooks*` stay on disk as dormant tooling (user chose "instructions only"), usable if
+  parallel agents are ever wanted again. Docs-only — no runtime code or test touched.
+
+- 2026-07-29 — **A Review panel opened while the auto-apply loop runs stays open (decision 148).**
+  User: "I cant open an application review when loop is running." While the loop runs the UI polls
+  `/loop/status` every 2s, and `renderLoop` rebuilt the entire "Ready to apply" list
+  (`ready.innerHTML = ""`) each tick — destroying the expanded review panel and its in-flight
+  `/track/review` fetch about two seconds after the user opened it. Ready cards are now kept in a
+  `LOOP_CARDS` map keyed by application id and reused across polls; a card is rebuilt only when its
+  own facts change, so the open panel, its loaded contents, and the "Review ▴" state survive every
+  refresh. Backend unchanged — `/track/review` was always served concurrently. Verified by driving
+  the real UI headless (new `tests/test_web_loop_review.py`: open Review, wait out three polls,
+  assert still expanded and populated, no page errors); the same drive fails without the fix.
+
+- 2026-07-29 — **A linked inbox's app password is proven saved before the link is recorded, and a
+  link whose keychain secret vanished says so (decision 147).** User: "make sure that app passwords
+  for linked gmail accounts are saved." Verified the live link first — `profile/mailbox.yaml` +
+  the macOS keychain hold the app password, and `python -m applicationbot.mailbox test` logged into
+  Gmail over IMAP with it. Then closed two silent-failure paths: `save_link`/`save_gmail_link` now
+  **read the secret back** after writing it and raise an actionable error if it didn't stick (a
+  locked login keychain or a `keyring` fallback backend accepts the write and stores nothing), and
+  the link file is written only after that read-back passes — no link is recorded without its
+  password. New `mailbox.link_problem()` (surfaced as a `problem` field on `link_status`, in the
+  Settings inbox panel, and in CLI `mailbox status`) says *which* credential is missing and how to
+  restore it instead of the generic "Not connected". `POST /mailbox/link` and `connect_gmail` now
+  report a failed save as a failed link rather than a 500/traceback. 4 new mailbox tests; 97 green
+  across mailbox+web+alerts+notifications; driven live against the real keychain and Gmail.
+
+- 2026-07-29 — **Goal mode actually keeps looking; the seen-ledger no longer burns unjudged postings
+  (decision 146).** User: a loop set to stop at 5 ready applications "just stops and tells me that there
+  are no new matches." Three compounding causes, all fixed: (1) `autoloop.auto_apply_loop` returned
+  `caught_up` on the first empty batch *regardless of the goal* — now, with a goal unmet, it fires a
+  `hunting` event and idles a stop-responsive backoff (60s → 2m → 5m → 15m → 30m cap, injected as
+  `hunt_wait(n)`), then searches again, ending only on Stop or the goal. (2) `pipeline` recorded **every
+  keyword survivor** into the seen-openings ledger while the judge only scores `top_n` (user's is 40) —
+  so a pass that surfaced 200 postings judged 40 and hid all 200 forever (**99 of the user's 171 ledger
+  entries had never been judged**). The ledger is now applied **before** the judge on a live search
+  (`_drop_already_shown`, post-bridge) and only **judged** matches are recorded (`_record_shown`), so each
+  pass judges the next-best unscored slice — progressive deepening, zero re-judging. (3) Retries now run
+  `force_fresh=True`, and a cache-served first pass with nothing new escalates to a live search
+  immediately. Hunting status names progress + the reason + the next pass ("2 of 5 ready — pass 3 found no
+  new matches (judged 40, best fit 54 vs min_fit 60). Searching again in 5 min."). Maintain mode now hunts
+  below its goal instead of quitting. `scripts/prune_seen_ledger.py` (idempotent, `--apply`) repaired the
+  user's ledger 171 → 72, freeing 99 postings. Tests: 5 new in `test_autoloop.py`, 3 in
+  `test_autoloop_web.py` (incl. `force_fresh` per pass + the hunting message), 1 in
+  `test_discovery_seen.py` (four passes deepen through a 5-posting pool); full suite 534 passed.
+
+- 2026-07-28 — **Résumé-document upload on the Profile page (decision 141).** User reported there was
+  no button to upload a new/updated résumé — correct: the only import paths were manual field entry or a
+  LinkedIn `.zip`/`.csv` export. New `resume_import.py`: extracts text from **PDF** (bundled `pypdf`),
+  **DOCX** (stdlib `zipfile` — no `python-docx` dep), or **TXT**, has **Claude** structure it into the
+  `Resume` shape (subscription CLI, else keychain API key), and **merges** new entries into
+  `profile/resume.yaml` with the same dedup as the LinkedIn import — existing entries/contact/summary are
+  never overwritten; when no résumé exists yet the upload *creates* it. `POST /resume/import-file` +
+  an "Upload your résumé" section on the Profile page (above LinkedIn import); the onboarding nudge now
+  points here. Scanned/image-only PDFs raise an actionable error. 11 tests in `test_resume_import.py`
+  (real PDF/DOCX/TXT extraction, create/dedupe/merge/no-overwrite, no-Claude error); web.py `ast`-clean.
+- 2026-07-28 — **Notifications action-center tab + honest click-through (mobile informational, desktop opens the app)** (decision 138).
+  Fixed two reported bugs and added the requested tab. **Mobile:** ntfy no longer sends a `Click` to the Mac's localhost
+  (unreachable from the phone) — the phone push is informational and says to open ApplicationBot on the Mac (user chose to
+  keep the app localhost-only, not LAN-exposed). **Desktop:** `DesktopChannel` uses `terminal-notifier` (if installed) for a
+  clickable notification that opens the app on this Mac; else the native/osascript fallback (osascript can't deep-link — the
+  in-app tab is the fix). **New Notifications tab:** a live action center (nav **count badge** + `GET /inbox`) that reuses the
+  exact Discover cards for ready-to-submit + blocked items; acting hops to Discover so progress is never silent (Principle #5).
+  Added a real **hash router** (`/#notifications` now navigates; notification links updated from the never-wired `/#discover`).
+  **Verified by driving the app (Playwright, 2 real blocked postings): badge=2, deep-link works, cards render, 0 console errors.**
+  38 tests pass; `node --check` + `py_compile` clean. **Follow-up shipped (same session):** Settings → Notifications shows a
+  one-line "install `terminal-notifier`" tip (with a Copy button) — only when desktop click-through is unavailable
+  (`desktop_click_status()` via `GET /notifications`); hidden in the packaged app and once installed. Verified in the app.
+- 2026-07-28 — **Settings tab: set-once config gets a home; notifications + Claude connection + inbox + theme folded in** (decision 137).
+  Push notifications (decision 135) had shipped as a `<details>` panel inside the already-crowded Discover tab; user asked
+  whether it belonged in its own settings tab and what else to fold in. Added a 5th **Settings** nav tab holding four
+  cards — **Claude connection** (de-modaled; the footer chip now deep-links here), **Notifications** (moved, same `ntf-*`
+  IDs/endpoints), **Linked inbox** (`mailboxPanel` moved out of the Profile form into `#set-mailbox-mount`), and
+  **Appearance** (System/Light/Dark segment). Discovery filters + the auto-apply loop deliberately stay in Discover
+  (operational, not set-once). All element IDs preserved so handlers/endpoints were untouched (Guideline #7).
+  **Verified by driving the running app (Playwright): 0 console/page errors, live inbox status renders, theme + both
+  nav deep-links (footer chip, Discover "Set up notifications →") work, Profile still renders without the inbox panel.**
+  Served JS `node --check` + `py_compile` clean.
+- 2026-07-22 — **Workday create-account: robust custom-widget checkbox + report the disabled-button gate** (decision 131).
+  Next live run failed at "Create Account button wasn't found or couldn't be clicked" — the button was disabled (waiting
+  out the click) because the consent checkbox is a custom widget whose hidden `<input>` `.check()` silently failed. Made
+  `_check` click the visible wrapper as a fallback; added `_create_submit_button`/`_is_disabled`/`_create_disabled_reason`
+  so `create_account` polls ~2 s for the button to enable and, if still disabled, names the gate (consent checkbox, or a
+  stricter password/extra-field policy). 24/24 `test_workday.py` green. **Next live run:** if it still reports disabled
+  after the checkbox is handled, the gate is a Hartford-specific password policy or extra required field — the reason
+  string will say which.
+- 2026-07-22 — **Workday create-account: wait for the async form + name the exact failed step** (decision 130).
+  Live Hartford run failed at account creation with a bare *"account-creation form could not be completed"*. Same
+  timing-vs-instant-check bug as 129 plus a non-descriptive error (user asked for more descriptive messages). Added
+  `_reveal_create_form` (toggle by id or by "Create Account" name, then poll ~6 s for the create form) and changed
+  `create_account`'s return from `bool` → **reason string** (`""`=success, else names the failed step);
+  `ensure_account` now surfaces that reason + an actionable next step (re-run, or create manually at the tenant URL —
+  honestly *not* promising an auto-sign-in the credentials store can't back, since the CLI has no `set`). 23/23
+  `test_workday.py` green (2 new). **If it still fails on the next live run, the reason string will pinpoint the step**
+  (e.g. a two-step email→password layout would show "the password field wasn't found").
+- 2026-07-22 — **Workday auto-apply: wait for each async SPA transition in `start_application`** (decision 129).
+  Fixes the live error *"Workday: could not reach the application form from this page (the 'Apply' / 'Apply Manually'
+  step wasn't found)."* Root cause was timing, not selectors: the page navigates with `wait_until="domcontentloaded"`
+  (returns before Workday's React app mounts the Apply button), and the autofill popup mounts asynchronously after the
+  Apply click — but the old code did instant `.count()`/`.is_visible()` checks with a flat 600 ms wait, so an
+  unrendered-yet control read as "step not found." Added `_find_apply_control` (matches button/link/**menuitem**, anchored
+  case-insensitive, manual path preferred) + `_wait_for_apply_step` (polls ~9 s); `start_application` now waits for each
+  state to settle before clicking (`max_clicks` 3→4). Adapter-only, best-effort, never raises; `_APPLY_TEXTS`/flow
+  unchanged. **Needs a live Workday run to confirm** (dev never submits, Guideline #3). Possible follow-up: iframe-embedded
+  Workday would need a frame sweep (`page.get_by_role` is main-frame only).
+- 2026-07-22 — **Save any application's posting as a reusable fixture + a Track-tab "Retailor résumé →" button** (decision 128).
+  The Track drawer now has two buttons on every application: **"Save to fixtures"** (adds the posting to the Review-tab
+  fixture picker) and **"Retailor résumé →"** (offers to save it, then jumps to the Review tab with the posting pre-loaded
+  and the Tailor button focused — one click to re-tailor). Backend: user-saved fixtures live in a new git-ignored
+  `DATA_ROOT/profile/job_fixtures/` (writable in dev and the packaged app; never touches the read-only shipped
+  `fixtures/` bundle), written as `load_job_description`-compatible Markdown keyed on `company-title-<hash>` (idempotent
+  re-save). `list_fixtures()` merges saved (labeled "Company — Title · saved") + shipped; new `_fixture_path()` resolves a
+  token in the right root and is path-traversal-safe; `add_fixture_from_application()` pulls the JD from the app's archived
+  `posting.md` by id; wired at `POST /fixtures/add`. Verified end-to-end via real HTTP (save → list → `_fixture_path` →
+  `/tailor` rules engine), traversal rejected, empty-JD actionable error, JS `node --check`, 35 tests green.
+  Also unified the Track drawer's action buttons — Open posting / View résumé (links) and Re-run / Retailor / Save to
+  fixtures (buttons) now share one secondary-button style (they previously rendered as bare links vs solid-accent
+  buttons); verified in light + dark via headless screenshots.
+
+- 2026-07-22 — **Guarantee a full page: instruct the model to OVERSHOOT one page, then let the measured trimmer cut back to exactly one** (decision 127).
+  Follow-up to 126. The fill-first prompt helped but résumés still under-filled — the model estimates page geometry from
+  character counts and can't see the render, so the draft came in *under* a page and [`pdf.fit_to_pages`](applicationbot/pdf.py)
+  (which already renders → counts pages → pops one bullet ≈ one line at a time from the least-relevant entry until it hits
+  one page) never engaged. Reframed `LengthBudget.prompt()` ([length.py](applicationbot/length.py)) and the `SYSTEM_PROMPT`
+  directive ([backends.py](applicationbot/backends.py)) from "fill ~1 page" to "**slightly OVERFILL** — produce a bit more
+  than fits; the app trims the least-relevant lines back to exactly one page; overshooting guarantees a full page,
+  undershooting can't be fixed afterward; include the FULL allowance, and when in doubt include the extra entry/bullet."
+  Prompt-only; the caps, `enforce`, and `fit_to_pages` trimmer are unchanged (the model now aims above them, not below).
+  **Open / next lever if still under-full:** overshoot is still model-produced, so a thin candidate can't be forced full
+  (correct — no padding), and `_trim_once` drops a whole entry once all hit `_MIN_BULLETS=2` (coarse). If prompt-overshoot
+  isn't enough on the next live retailor, add a **measured grow pass** — deterministically re-add trimmed content (or one
+  bounded re-tailor) when the rendered PDF comes in under a page — rather than more prompt weight.
+
+- 2026-07-22 — **Tailored résumés fill the page — reframed the length rules from a ceiling into a fill target** (decision 126).
+  User observed tailored résumés under-using the vertical space (blank bottom half). The candidate pool was never the
+  limit (`catalogue.select_relevant` hands the model ~2× the budget), and `pdf.fit_to_pages` only ever *trims* over-full
+  pages — so the only lever that grows content is the prompt, and it was pointed the wrong way. Rewrote
+  `LengthBudget.prompt()` ([length.py](applicationbot/length.py)) to say the résumé should **FILL** ~N page(s), "at most"
+  → "up to", plus "DEFAULT TO USING those slots — full number of entries and bullets whenever you have genuinely relevant,
+  truthful material; go below a cap only when you truly lack content; never pad or repeat." Added a matching
+  "FILL THE PAGE VERTICALLY" directive to `SYSTEM_PROMPT` ([backends.py](applicationbot/backends.py)). Truthfulness
+  guardrails, the caps, and the `enforce`/`fit_to_pages` hard-cap are all unchanged — this only changes how aggressively
+  the model fills *up to* them. Applies to both Claude engines; rules engine unaffected. Verified the rendered prompt text.
+  **Open (needs a live tailor to confirm the effect):** run a real tailor and eyeball that pages now fill; if a stronger
+  push is needed, the next lever is a grow pass in `fit_to_pages` (re-add trimmed content when under a page) rather than
+  more prompt weight.
+
+- 2026-07-22 — **"Review before you sign off" preview panel on goal-loop Ready cards + "Watch it fill"** (decision 125).
+  Each Ready-to-apply card now has a **"Review ▾"** action that expands it in place into a preview of exactly
+  what will be submitted: posting details, a lazy **"View tailored résumé ↗"** button (`/track/resume`), the full
+  field-answer table, an unanswered-fields callout, a collapsible JD, and a per-application **"View filled form ↗"**
+  screenshot (`/track/screenshot`), with **Apply ▶ moved inside the reviewed panel**. Backed by a new read-only
+  `GET /track/review?id=` that joins the tracker row with the dry-run's archived `report.json`/`posting.md`
+  (decision 043) — mostly *exposure* of data the headless dry-run already wrote, not new capture. Two real changes:
+  (a) `run_apply` now writes the filled-form screenshot per-application to `profile/applications/<key>/filled.png`
+  (was one shared `apply_review.png`; CLI `--screenshot` still wins); (b) a **"Watch it fill"** button runs a visible
+  dry-run (`headed, pause, gate=None` — never submits) **routed through the loop's serialized queue** (new
+  `_LOOP_WATCHES`/`queue_watch` + two optional injected params on the pure `autoloop.auto_apply_loop`:
+  `take_watch_requests`/`watch_one`, inert by default so the 22 existing autoloop tests are unchanged); Stop sets
+  `_LOOP_WATCH_HOLD` so a watch never blocks shutdown. Apply remains the only real submit (decision 058). Verified:
+  both routes driven live against app #28, panel rendered in headless Chromium, watch wiring unit-checked without a
+  browser, 22/22 `test_autoloop*` green. **Now gates every real-submit button, not just the loop's:** the
+  parked/blocked "applications waiting on you" panel (`parkedCard`) — the other armed submit (`.pk-submit`
+  "Submit for real ▶", `/parked/reapply`) — got the same **Review ▾** toggle, with its dry-run re-fill +
+  armed submit moved inside the reviewed panel. `renderReview`/`toggleReview` take an optional
+  `signoff(r,title)→[button]` builder so each flow keeps its own endpoint/messaging (`loopSignoff` default,
+  `parkedSignoff` for parked). Both card types re-verified in headless Chromium, no JS errors. **Open:**
+  `filled.png` populates on the next live loop preparation/watch
+  (plumbing verified with a fixture PNG; a full external dry-run wasn't driven here — dev never submits, and an
+  external fill is heavy/flaky to drive locally).
 
 - 2026-07-22 — **Keyless remote aggregators: Himalayas + RemoteOK as opt-in sources** (decision 117).
   Public JSON APIs, no signup, no scraping, no JS. `HimalayasSource`/`RemoteOKSource` in
