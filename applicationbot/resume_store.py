@@ -116,6 +116,61 @@ def has_jd(pdf_path: str | Path) -> bool:
     return bool(pdf_path) and _jd_path(pdf_path).is_file()
 
 
+# --- reuse signature sidecar (decision 142) --------------------------------------------
+# A ``<pdf>.sig`` JSON sidecar holding the posting's demanded-skill fingerprint (``reuse.JdSignature``)
+# plus the JD-independent base stamp (résumé + links + tailoring-logic) that produced the PDF. The
+# cross-posting reuse scan (``pipeline.find_reusable``) reads these to find a prior PDF close enough
+# to a new posting to reuse verbatim — skipping a Claude tailor. Written on every tailor/reuse;
+# pruned/deleted with its PDF.
+
+def _sig_path(pdf_path: str | Path) -> Path:
+    return Path(str(pdf_path) + ".sig")
+
+
+def write_sig(pdf_path: str | Path, data: dict) -> None:
+    """Record the reuse signature dict beside ``pdf_path``. Best-effort (a missing sig only makes
+    this PDF unavailable as a reuse source, never a crash)."""
+    try:
+        _sig_path(pdf_path).write_text(json.dumps(data), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def read_sig(pdf_path: str | Path) -> dict | None:
+    """The reuse signature dict beside ``pdf_path``, or None if absent/unreadable."""
+    try:
+        return json.loads(_sig_path(pdf_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def all_sigs() -> list[tuple[Path, dict]]:
+    """Every stored ``(pdf_path, sig-dict)`` pair — the corpus the cross-posting reuse scan
+    searches. Sorted by path for deterministic tie-breaking; unreadable sidecars are skipped."""
+    if not TAILORED_DIR.exists():
+        return []
+    out: list[tuple[Path, dict]] = []
+    for sig in sorted(TAILORED_DIR.glob("*.pdf.sig")):
+        try:
+            out.append((sig.with_suffix(""), json.loads(sig.read_text(encoding="utf-8"))))
+        except (OSError, ValueError):
+            continue
+    return out
+
+
+def clear_tailor_sidecars(pdf_path: str | Path) -> None:
+    """Drop the ``.stamp`` and ``.sig`` beside ``pdf_path``. Used when a posting's slot is filled
+    with bytes that are NOT a tailor of the current inputs — the user's own uploaded résumé
+    (decision 152). Leaving a stale stamp there would make the next dry-run reuse those bytes as
+    "this posting's tailored résumé", and a stale sig would offer them to other postings as a
+    cross-posting reuse source under the wrong skill profile."""
+    try:
+        _stamp_path(pdf_path).unlink(missing_ok=True)
+        _sig_path(pdf_path).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def is_managed(path: str | Path) -> bool:
     """True iff ``path`` lives under ``TAILORED_DIR`` — the guard that keeps cascade
     delete from ever removing a user-supplied résumé outside this folder."""
@@ -134,6 +189,7 @@ def delete_if_managed(path: str | Path) -> bool:
         Path(path).unlink(missing_ok=True)
         _stamp_path(path).unlink(missing_ok=True)
         _jd_path(path).unlink(missing_ok=True)
+        _sig_path(path).unlink(missing_ok=True)
         return True
     except OSError:
         return False
@@ -161,6 +217,7 @@ def prune(*, max_bytes: int = MAX_BYTES, keep: Path | None = None) -> int:
             f.unlink()
             _stamp_path(f).unlink(missing_ok=True)
             _jd_path(f).unlink(missing_ok=True)
+            _sig_path(f).unlink(missing_ok=True)
             total -= size
             removed += 1
         except OSError:

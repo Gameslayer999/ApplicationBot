@@ -79,6 +79,7 @@ class _Stubs:
         self.tmp = tmp
         self.tailor_calls = 0
         self.applied_pdf = None
+        self.applied_meta = None  # meta dict passed to the stubbed run_apply (carries resume_source)
         self._orig = {}
 
     def __enter__(self):
@@ -95,15 +96,22 @@ class _Stubs:
 
         def fake_apply(url, resume_pdf, resolver, **kw):
             self.applied_pdf = resume_pdf
+            self.applied_meta = kw.get("meta")
             return NS(submitted=False, submit_state="dry-run", blockers=[], confirmation="")
+
+        from applicationbot import resume_docs
 
         self._orig = {
             "tailor": tailor.tailor_resume, "render": pdf_mod.render_pdf,
             "verify": ats_check.verify_pdf, "resolver": apply_mod.AnswerResolver,
             "apply": apply_mod.run_apply, "band": salary.advertised_band,
             "avail": backends.claude_code_available, "dir": resume_store.TAILORED_DIR,
-            "load_profile": pipeline.load_profile,
+            "load_profile": pipeline.load_profile, "uploads": resume_docs.UPLOADS_DIR,
         }
+        # Uploaded-résumé corpus (decision 152) → an empty temp dir, so a run never picks up the
+        # developer's own kept résumés and a test can seed one deliberately.
+        self.uploads = self.tmp / "uploads"
+        resume_docs.UPLOADS_DIR = self.uploads
         tailor.tailor_resume = fake_tailor
         pdf_mod.render_pdf = lambda *a, **k: b"%PDF-1.4 stub"
         ats_check.verify_pdf = lambda *a, **k: NS(notes=lambda: [])
@@ -117,7 +125,9 @@ class _Stubs:
         return self
 
     def __exit__(self, *a):
+        from applicationbot import resume_docs
         apply_mod, ats_check, backends, pdf_mod, salary, tailor = self._mods
+        resume_docs.UPLOADS_DIR = self._orig["uploads"]
         tailor.tailor_resume = self._orig["tailor"]
         pdf_mod.render_pdf = self._orig["render"]
         ats_check.verify_pdf = self._orig["verify"]
