@@ -42,7 +42,7 @@ STATUSES = ["discovered", "tailored", "dry-run", "blocked", "applied", "responde
 EDITABLE = [
     "company", "role", "location", "remote", "pay", "portal", "method",
     "source_url", "date_discovered", "date_dry_run", "date_applied", "status", "resume_path", "notes",
-    "fit_score", "follow_up_date", "blocked_kind", "blocked_detail",
+    "fit_score", "follow_up_date", "blocked_kind", "blocked_detail", "resume_source",
 ]
 
 _SCHEMA = """
@@ -61,11 +61,13 @@ CREATE TABLE IF NOT EXISTS applications (
     date_applied    TEXT NOT NULL DEFAULT '',       -- ISO date, blank until applied
     status          TEXT NOT NULL DEFAULT 'discovered',
     resume_path     TEXT NOT NULL DEFAULT '',       -- tailored résumé used (file path)
+    resume_source   TEXT NOT NULL DEFAULT '',       -- provenance of that résumé: freshly tailored vs reused (decision 144)
     notes           TEXT NOT NULL DEFAULT '',
     fit_score       TEXT NOT NULL DEFAULT '',       -- judge's 0-100 fit at apply time
     follow_up_date  TEXT NOT NULL DEFAULT '',       -- ISO date to chase a silent application
     blocked_kind    TEXT NOT NULL DEFAULT '',       -- parking.py kind if parked (needs_answer / login / …)
     blocked_detail  TEXT NOT NULL DEFAULT '',       -- specifics for the Resolve card (field names, error)
+    reviewed_at     TEXT NOT NULL DEFAULT '',       -- ISO datetime the user first opened this application's review (decision 149)
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL
 );
@@ -107,6 +109,28 @@ CREATE TABLE IF NOT EXISTS usage_events (
     ran_at                 TEXT NOT NULL               -- ISO datetime the call completed
 );
 CREATE INDEX IF NOT EXISTS idx_usage_posting ON usage_events(posting_key);
+
+-- Notification log (decision 145): one row per push the auto-apply loop fired — approval-needed
+-- (an application is ready to submit) or intervention-needed (one is blocked). The Notifications
+-- tab is a live snapshot of what needs the user NOW; this is the durable record of every push,
+-- so a notification survives the app being submitted/cleared or the loop resetting, and the user
+-- can still act on it (jump to it, dismiss it). `application_id` ties back to `applications.id`
+-- when known (NULL for app-less events); `channels` records which transports it went out on
+-- (desktop/ntfy) for display. `read`/`dismissed` are the user's per-item state.
+CREATE TABLE IF NOT EXISTS notifications (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    event           TEXT NOT NULL DEFAULT '',        -- approval_needed / intervention_needed
+    title           TEXT NOT NULL DEFAULT '',
+    body            TEXT NOT NULL DEFAULT '',
+    link            TEXT NOT NULL DEFAULT '',         -- deep-link path into the app (e.g. /#discover)
+    application_id  INTEGER,                          -- applications.id it concerns, or NULL
+    urgent          INTEGER NOT NULL DEFAULT 0,
+    channels        TEXT NOT NULL DEFAULT '',         -- transports it was pushed on, csv (desktop,ntfy)
+    read            INTEGER NOT NULL DEFAULT 0,
+    dismissed       INTEGER NOT NULL DEFAULT 0,
+    created_at      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_notif_created ON notifications(created_at);
 """
 
 # Columns a caller may set when recording a run. `id`/`ran_at` are managed here.
@@ -124,7 +148,8 @@ def _connect(path: str | Path = DEFAULT_DB) -> sqlite3.Connection:
     conn.executescript(_SCHEMA)
     # Migration for DBs created before decision 043 (CREATE IF NOT EXISTS won't add columns).
     cols = {r[1] for r in conn.execute("PRAGMA table_info(applications)")}
-    for missing in ("fit_score", "follow_up_date", "blocked_kind", "blocked_detail", "date_dry_run"):
+    for missing in ("fit_score", "follow_up_date", "blocked_kind", "blocked_detail", "date_dry_run",
+                    "resume_source", "reviewed_at"):
         if missing not in cols:
             conn.execute(f"ALTER TABLE applications ADD COLUMN {missing} TEXT NOT NULL DEFAULT ''")
             cols.add(missing)
@@ -390,6 +415,32 @@ def seen_source_urls(*, statuses: Optional[list[str]] = None, path: str | Path =
         return {r["source_url"] for r in cur.fetchall()}
 
 
+def mark_reviewed(app_id: int, *, path: str | Path = DEFAULT_DB) -> bool:
+    """Stamp the moment the user first LOOKED at this application (opened its review panel, or
+    clicked Apply/Watch on it). Returns True if this call was the one that stamped it; an
+    already-reviewed row keeps its original timestamp. Decision 149: an unstamped prepared
+    application is one the user never saw, so discovery deliberately re-surfaces it."""
+    with _connect(path) as conn:
+        cur = conn.execute(
+            "UPDATE applications SET reviewed_at=?, updated_at=? WHERE id=? AND reviewed_at=''",
+            (_now(), _now(), app_id),
+        )
+        return cur.rowcount > 0
+
+
+def unreviewed_source_urls(*, path: str | Path = DEFAULT_DB) -> set[str]:
+    """Source URLs of applications that were PREPARED but never reviewed — a dry-run row the
+    user has not opened. Discovery subtracts these from both its already-in-tracker skip and
+    its seen-openings ledger, so a posting prepared while you were away comes back in the next
+    search instead of being silently buried (decision 149)."""
+    with _connect(path) as conn:
+        cur = conn.execute(
+            "SELECT DISTINCT source_url FROM applications "
+            "WHERE source_url != '' AND status = 'dry-run' AND reviewed_at = ''"
+        )
+        return {r["source_url"] for r in cur.fetchall()}
+
+
 # Statuses at which a parked block is still worth surfacing to the user. Once a row reaches
 # `applied` (submitted) or a post-application outcome, its block is moot and it drops out.
 _PARKED_OPEN = {"discovered", "tailored", "dry-run", "blocked"}
@@ -401,6 +452,68 @@ def parked_applications(*, path: str | Path = DEFAULT_DB) -> list[dict[str, Any]
     `blocked_detail` describing what to fix before re-running Apply on the posting."""
     return [r for r in list_applications(path=path)
             if r.get("blocked_kind") and r["status"] in _PARKED_OPEN]
+
+
+def add_notification(
+    event: str, title: str, body: str, *, link: str = "",
+    application_id: Optional[int] = None, urgent: bool = False, channels: str = "",
+    path: str | Path = DEFAULT_DB,
+) -> int:
+    """Record one fired notification in the durable log; returns its new id (decision 145)."""
+    now = _now()
+    with _connect(path) as conn:
+        cur = conn.execute(
+            "INSERT INTO notifications (event, title, body, link, application_id, urgent, "
+            "channels, read, dismissed, created_at) VALUES (?,?,?,?,?,?,?,0,0,?)",
+            (event, title, body, link, application_id, 1 if urgent else 0, channels, now),
+        )
+        return int(cur.lastrowid)
+
+
+def list_notifications(
+    *, limit: int = 100, include_dismissed: bool = False, path: str | Path = DEFAULT_DB
+) -> list[dict[str, Any]]:
+    """Logged notifications, newest first. Dismissed ones are hidden unless asked for."""
+    clause = "" if include_dismissed else " WHERE dismissed = 0"
+    with _connect(path) as conn:
+        cur = conn.execute(
+            f"SELECT * FROM notifications{clause} ORDER BY id DESC LIMIT ?", (int(limit),))
+        return [dict(r) for r in cur.fetchall()]
+
+
+def unread_notification_count(*, path: str | Path = DEFAULT_DB) -> int:
+    """How many logged notifications the user hasn't seen yet (drives the nav badge)."""
+    with _connect(path) as conn:
+        return int(conn.execute(
+            "SELECT COUNT(*) FROM notifications WHERE read = 0 AND dismissed = 0").fetchone()[0])
+
+
+def mark_notifications_read(ids: Optional[list[int]] = None, *, path: str | Path = DEFAULT_DB) -> int:
+    """Mark the given notification ids read, or ALL of them when ids is None. Returns the count
+    updated."""
+    with _connect(path) as conn:
+        if ids is None:
+            cur = conn.execute("UPDATE notifications SET read = 1 WHERE read = 0")
+        elif not ids:
+            return 0
+        else:
+            q = ",".join("?" * len(ids))
+            cur = conn.execute(f"UPDATE notifications SET read = 1 WHERE id IN ({q})", ids)
+        return cur.rowcount
+
+
+def dismiss_notifications(ids: Optional[list[int]] = None, *, path: str | Path = DEFAULT_DB) -> int:
+    """Dismiss (hide) the given notification ids, or ALL of them when ids is None. Returns the
+    count updated. Dismissed rows stay in the DB (audit) but drop out of the tab."""
+    with _connect(path) as conn:
+        if ids is None:
+            cur = conn.execute("UPDATE notifications SET dismissed = 1 WHERE dismissed = 0")
+        elif not ids:
+            return 0
+        else:
+            q = ",".join("?" * len(ids))
+            cur = conn.execute(f"UPDATE notifications SET dismissed = 1 WHERE id IN ({q})", ids)
+        return cur.rowcount
 
 
 def list_applications(

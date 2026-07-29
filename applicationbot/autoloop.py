@@ -8,8 +8,11 @@ This one prepares each cleared match as a dry-run and then waits for a per-appli
 go-ahead from the user before the (armed, one-shot) submit.
 
 Token-frugal (an explicit user requirement — "we don't run through tokens"): every search
-asks discovery for ONLY-NEW postings, so a posting is never re-judged; when a search returns
-nothing new the world is exhausted and the loop stops rather than re-searching into the void.
+asks discovery for ONLY-NEW postings, so a posting is never re-judged. With no goal set, a
+search that returns nothing new means the world is exhausted and the loop stops rather than
+re-searching into the void. With a goal set, an empty search instead backs off and searches
+again (decision 146) — a target the user typed is a commitment, not a hint — and it is still
+token-frugal because each pass judges only postings no earlier pass has scored.
 
 A single browser drives everything on the web server (one worker slot), so this core
 SERIALIZES preparation and user-requested submits through one thread — no concurrency. It is
@@ -34,6 +37,11 @@ def auto_apply_loop(
     goal: Optional[int] = None,
     maintain: bool = False,
     wait: Optional[Callable[[], None]] = None,
+    take_watch_requests: Optional[Callable[[], list]] = None,
+    watch_one: Optional[Callable[[object], None]] = None,
+    watch: bool = False,
+    watch_wait: Optional[Callable[[], None]] = None,
+    hunt_wait: Optional[Callable[[int], None]] = None,
 ) -> str:
     """Run until the user stops it, the boards are exhausted, or (goal mode) a target number
     of applications are ready for the user to review and submit. Returns ``"stopped"``,
@@ -47,6 +55,10 @@ def auto_apply_loop(
       - ``take_submit_requests()`` → the app-ids the user has clicked "Apply" on since the
         last check (and clears that queue).
       - ``submit_one(app_id)`` → armed one-shot submit of that one prepared application.
+      - ``take_watch_requests()`` → the app-ids the user has clicked "Watch the autofill" on
+        since the last check (and clears that queue); optional, defaults to none.
+      - ``watch_one(app_id)`` → open a VISIBLE dry-run of that one prepared application so the
+        user can watch it fill; never submits. Optional, defaults to a no-op.
       - ``should_stop()`` → True once the user hit Stop.
 
     Goal mode (decision 121): when ``goal`` is set, ``ready_count()`` reports how many
@@ -59,12 +71,30 @@ def auto_apply_loop(
         top the pool back up. Ends only on stop or board exhaustion.
     With ``goal=None`` the goal checks are inert, so the pre-goal behaviour is unchanged.
 
-    Ordering each round: honor pending submits FIRST (the user is waiting on those), then —
-    unless the goal is already met — discover a fresh only-new batch and prepare each match,
-    re-checking for stop, for new submit requests, and for the goal between every application,
-    so an Apply click is never blocked by more than one in-flight preparation."""
+    Keep hunting toward an unmet goal (decision 146): a goal is a target, not a hint — a search
+    that comes back empty while the goal is still short must NOT end the run. The loop fires
+    ``hunting`` with the number of consecutive empty searches, idles via ``hunt_wait(n)`` (a
+    stop-responsive backoff the caller supplies, growing with ``n``), then searches again. It
+    ends only on stop or on reaching the goal. Without a goal, an empty batch still means
+    "boards exhausted" ⇒ ``"caught_up"``, unchanged.
+
+    Watch mode (``watch=True``): the loop does NOT end when the boards are exhausted. Instead of
+    returning ``"caught_up"`` on an empty batch, it fires ``caught_up`` (so the UI can say
+    "watching, will re-check"), idles via ``watch_wait`` (a long, stop-responsive sleep the caller
+    supplies — the between-poll interval), then re-searches. It keeps preparing each newly-posted
+    match and holding it for the user's review; it ends ONLY on stop. This is the "autofill every
+    new role but never submit until a human approves, forever" watch. ``watch=False`` is unchanged.
+
+    Ordering each round: honor pending submits and watch requests FIRST (the user is waiting on
+    those), then — unless the goal is already met — discover a fresh only-new batch and prepare
+    each match, re-checking for stop, for new submit/watch requests, and for the goal between
+    every application, so an Apply or Watch click is never blocked by more than one in-flight
+    preparation."""
     on_event = on_event or (lambda kind, payload=None: None)
     wait = wait or (lambda: None)
+    hunt_wait = hunt_wait or (lambda n: wait())
+    take_watch_requests = take_watch_requests or (lambda: [])
+    watch_one = watch_one or (lambda app_id: None)
 
     def _goal_met() -> bool:
         return goal is not None and ready_count is not None and ready_count() >= goal
@@ -80,8 +110,24 @@ def auto_apply_loop(
             on_event("submitted", app_id)
         return True
 
+    def _drain_watches() -> bool:
+        """Open a visible dry-run for each app the user asked to watch, in click order. Never
+        submits. Returns False if a stop landed mid-drain (so the caller breaks out)."""
+        for app_id in take_watch_requests():
+            if should_stop():
+                return False
+            on_event("watching", app_id)
+            watch_one(app_id)
+            on_event("watched", app_id)
+        return True
+
+    def _serve_requests() -> bool:
+        """Honor pending submits, then pending watches. False on a mid-drain stop."""
+        return _drain_submits() and _drain_watches()
+
+    dry_searches = 0  # consecutive searches that returned nothing (drives the hunt backoff)
     while not should_stop():
-        if not _drain_submits():
+        if not _serve_requests():
             break
         if _goal_met():
             on_event("goal_reached", ready_count() if ready_count else goal)
@@ -97,12 +143,28 @@ def auto_apply_loop(
             break
         if not batch:
             on_event("caught_up", None)
+            if watch:
+                # Watch mode: the boards are exhausted for now, but a new role could post any time.
+                # Idle the poll interval (stop-responsive), then loop back to re-search — never stop
+                # on our own. wait defaults to watch_wait; both are stop-responsive.
+                (watch_wait or wait)()
+                continue
+            if goal is not None:
+                # Goal set and still short (a met goal already returned/idled above): keep hunting.
+                # Back off (stop-responsive, growing with the dry-search count) and search again —
+                # the caller's discover_batch is expected to widen/refresh each pass so a retry can
+                # actually surface something the last pass didn't.
+                dry_searches += 1
+                on_event("hunting", dry_searches)
+                hunt_wait(dry_searches)
+                continue
             return "caught_up"
+        dry_searches = 0
         on_event("batch", batch)
         for match in batch:
             if should_stop():
                 break
-            if not _drain_submits():
+            if not _serve_requests():
                 break
             if _goal_met():
                 # Hit the goal mid-batch — stop preparing and re-evaluate at the top of the

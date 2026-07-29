@@ -99,6 +99,59 @@ def test_failure_is_isolated_but_claude_failure_stops():
     assert "Claude" in res.stopped_reason  # C never ran
 
 
+class _FakeNotifier:
+    def __init__(self):
+        self.sent = []
+
+    def notify(self, note):
+        self.sent.append(note)
+
+
+def test_notify_cycle_summarizes_ready_and_blocked():
+    from applicationbot import notifications as notif
+    from applicationbot.runner import Outcome, RunnerResult, _notify_cycle
+
+    n = _FakeNotifier()
+    res = RunnerResult(outcomes=[
+        Outcome("Stripe", "SWE New Grad", "u1", 82, "dry-run", "12 filled"),
+        Outcome("Ramp", "SWE Intern", "u2", 79, "dry-run", "10 filled"),
+        Outcome("Notion", "SWE", "u3", 80, "blocked", "needs answer"),
+        Outcome("Acme", "SWE", "u4", 85, "submitted", "confirmed"),  # not a 'ready' moment
+    ])
+    _notify_cycle(n, res)
+    events = [x.event for x in n.sent]
+    assert events.count(notif.APPROVAL_NEEDED) == 1  # ONE summary, not one per match
+    assert events.count(notif.INTERVENTION_NEEDED) == 1
+    approval = next(x for x in n.sent if x.event == notif.APPROVAL_NEEDED)
+    assert approval.title == "2 ready to apply"
+    assert "Stripe" in approval.body and "Ramp" in approval.body
+    interv = next(x for x in n.sent if x.event == notif.INTERVENTION_NEEDED)
+    assert interv.urgent and "Notion" in interv.body
+
+
+def test_notify_cycle_silent_when_nothing_ready():
+    from applicationbot.runner import Outcome, RunnerResult, _notify_cycle
+
+    n = _FakeNotifier()
+    _notify_cycle(n, RunnerResult(outcomes=[
+        Outcome("Acme", "SWE", "u", 90, "submitted", "ok"),
+        Outcome("B", "SWE", "u", 50, "failed", "boom"),
+    ]))
+    assert n.sent == []
+
+
+def test_notify_cycle_swallows_notifier_errors():
+    from applicationbot.runner import Outcome, RunnerResult, _notify_cycle
+
+    class Boom:
+        def notify(self, note):
+            raise RuntimeError("channel down")
+
+    # A broken notifier must never break the watch loop.
+    _notify_cycle(Boom(), RunnerResult(outcomes=[
+        Outcome("Stripe", "SWE", "u", 82, "dry-run", "filled")]))
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:

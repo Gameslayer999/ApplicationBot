@@ -65,6 +65,9 @@ class ApplyReport:
     pages: int = 1  # form pages walked (1 = single-page form)
     submit_probe: str = ""  # dry-run only: the submit control we WOULD click (live selector check)
     native_autofill: Optional[str] = None  # which native autofill ran (e.g. "greenhouse: MyGreenhouse")
+    # Provenance of the résumé this run used — freshly tailored vs reused (decision 144). Set from
+    # meta by run_apply so the review panel / notification can show it before it's persisted.
+    resume_source: str = ""
 
     def summary(self) -> str:
         native = sum(1 for f in self.filled if f.source == "native")
@@ -200,6 +203,23 @@ class AnswerResolver:
     picks_done: set = field(default_factory=set)     # dropdown labels the batch already adjudicated
     decided_options: dict = field(default_factory=dict)  # label -> batch-picked option text
     _commute_cache: dict = field(default_factory=dict)  # posting commutability judged once (Claude)
+    # Answers the user EDITED in the review panel for this exact posting (decision 153),
+    # {label: value}. Checked before every resolution rule — an edit is the user's own answer,
+    # so it outranks the profile, the answer bank, and any Claude draft.
+    overrides: dict = field(default_factory=dict)
+
+    def override_for(self, label: str) -> Optional[str]:
+        """The user's edited answer for `label`, or None. Labels are matched normalised, so an
+        ATS rendering the label slightly differently on a re-fill still gets the edit."""
+        if not self.overrides:
+            return None
+        n = _norm(label)
+        if not n:
+            return None
+        for k, v in self.overrides.items():
+            if _norm(k) == n:
+                return v.strip() or None
+        return None
 
     def learned_option_hints(self, value: Optional[str]) -> list[str]:
         """Dropdown options this value has matched before (learned across runs), so a repeat
@@ -470,6 +490,9 @@ class AnswerResolver:
         n = _norm(label)
         if not n:
             return None
+        edited = self.override_for(label)
+        if edited is not None:
+            return edited  # the user edited this answer in Review — it beats every rule below
         c = self.resume.contact
         p = self.profile
         first, last = self._name_parts()
@@ -1795,8 +1818,10 @@ def _fill_all_fields(page, resolver: AnswerResolver, report: "ApplyReport", done
         if not label or label in done:
             continue
         # Native-first: if the ATS's own autofill already populated this field, keep its value
-        # and record it — our resolver only fills what's still empty.
-        if only_empty:
+        # and record it — our resolver only fills what's still empty. An answer the user edited
+        # in Review (decision 153) is the exception: it must overwrite the native value, or the
+        # edit would silently do nothing on exactly the fields the ATS prefills.
+        if only_empty and resolver.override_for(label) is None:
             try:
                 current = loc.evaluate(_VALUE_JS)
             except Exception:
@@ -2604,11 +2629,31 @@ def _report_snapshot(report: ApplyReport) -> dict:
         "submitted": report.submitted, "submit_state": report.submit_state,
         "confirmation": report.confirmation, "blockers": report.blockers,
         "pages": report.pages,
-        "filled": [{"label": f.label, "value": f.value, "source": f.source}
+        # `control` tells the review panel what kind of field each answer came from, so an edit
+        # box can say whether the value has to match one of the form's options (decision 153).
+        "filled": [{"label": f.label, "value": f.value, "source": f.source, "control": f.control}
                    for f in report.filled],
         "skipped": report.skipped,
         "errors": report.errors,
     }
+
+
+def _load_overrides(resolver: AnswerResolver, meta: Optional[dict], company: str, role: str) -> None:
+    """Load the answers the user edited in this posting's review panel (decision 153) onto the
+    resolver, so this fill submits the edits instead of re-deriving the originals. Keyed exactly
+    like the archive dir the panel wrote them to. Best-effort — a missing/unreadable file just
+    means "no edits"."""
+    m = meta or {}
+    if not m.get("source_url"):
+        return  # no posting identity → no review panel could have saved edits for it
+    try:
+        from . import answer_overrides
+        resolver.overrides = answer_overrides.load(
+            m.get("company") or company, m.get("role") or role, m.get("source_url", ""))
+    except Exception:
+        return
+    if resolver.overrides:
+        print(f"Using {len(resolver.overrides)} answer(s) you edited in Review.")
 
 
 def _record_run(report: ApplyReport, resume_pdf: str, role: str, company: str,
@@ -2650,9 +2695,13 @@ def _record_run(report: ApplyReport, resume_pdf: str, role: str, company: str,
     drafted = sum(1 for f in report.filled if f.source == "generated")
     what = "Submitted" if report.submitted else "Dry-run"
     blocked = f" BLOCKED: {report.blockers[0]}" if report.blockers else ""
+    # Résumé provenance (decision 144): which résumé this run used — freshly tailored vs reused —
+    # appended so the run-history detail and the posting notes record it, not just the live panel.
+    resume_source = (m.get("resume_source") or report.resume_source or "").strip()
+    src_note = f" Résumé: {resume_source}." if resume_source else ""
     detail = (f"{what}: {len(report.filled)} field(s) filled "
               f"({native} native, {drafted} AI-drafted); {len(report.skipped)} need attention."
-              + blocked)
+              + blocked + src_note)
 
     existing = tracker.find_by_source_url(source_url)
     if existing:
@@ -2660,6 +2709,8 @@ def _record_run(report: ApplyReport, resume_pdf: str, role: str, company: str,
         # clobber user edits). A real submission DOES upgrade the status — that's runner-owned
         # truth, not a user edit (tracker stamps date_applied on the flip).
         changes: dict = {"resume_path": resume_pdf, "portal": report.ats, "method": method}
+        if resume_source:
+            changes["resume_source"] = resume_source  # runner-owned: this run's résumé provenance
         if m.get("fit_score") is not None:
             changes["fit_score"] = m["fit_score"]  # runner-owned: this run's judge verdict
         # Refresh the parked reason to this run's truth (a resolved re-run clears it); never
@@ -2689,7 +2740,7 @@ def _record_run(report: ApplyReport, resume_pdf: str, role: str, company: str,
             "fit_score": m.get("fit_score"),
             "blocked_kind": reason.kind if reason else "",
             "blocked_detail": reason.detail if reason else "",
-            "source_url": source_url, "resume_path": resume_pdf,
+            "source_url": source_url, "resume_path": resume_pdf, "resume_source": resume_source,
             "notes": f"[auto] {detail}",
         })
         outcome = "recorded"
@@ -2746,6 +2797,9 @@ def run_apply(
 
     ats = detect_ats(url)
     report = ApplyReport(url=url, ats=ats)
+    # Carry the résumé provenance (decision 144) onto the report so on_filled / the review panel /
+    # the loop notification can show whether this run's résumé was freshly tailored or reused.
+    report.resume_source = (meta or {}).get("resume_source", "")
     frame = None  # the form's frame — set once the form loads (None on Workday / an early-exit
     #               path); referenced by the review-pause manual-submit check below.
     done: set = set()  # labels already handled — dedupe across passes + required scan
@@ -2799,6 +2853,7 @@ def run_apply(
                     pass
                 if resolver.enable_generation and not resolver.company:
                     resolver.company = company or None
+                _load_overrides(resolver, meta, company, role)
                 from . import mailbox
                 from . import workday as _workday
                 form_loaded = _workday.apply_workday(
@@ -2818,6 +2873,7 @@ def run_apply(
                     pass
                 if resolver.enable_generation and not resolver.company:
                     resolver.company = company or None
+                _load_overrides(resolver, meta, company, role)
 
                 if debug:
                     _dump_fields(frame)
@@ -2873,9 +2929,25 @@ def run_apply(
                 except Exception:
                     pass
 
+            # Screenshot of the filled form. When we know which posting this is (meta from the
+            # discovered posting), write it into that posting's archive dir as filled.png — one
+            # stable per-application file the "Review before you apply" panel can show — instead
+            # of the shared default that every run overwrites. An explicit --screenshot (CLI)
+            # still wins; the default sentinel is what gets redirected.
+            shot_path = screenshot
+            m = meta or {}
+            if screenshot == "apply_review.png" and (m.get("company") or company) and m.get("source_url"):
+                try:
+                    from . import archive
+                    adir = archive.dir_for(m.get("company") or company, m.get("role") or role,
+                                           m.get("source_url", ""))
+                    adir.mkdir(parents=True, exist_ok=True)
+                    shot_path = str(adir / "filled.png")
+                except Exception:
+                    shot_path = screenshot
             try:
-                page.screenshot(path=screenshot, full_page=True)
-                report.screenshot = screenshot
+                page.screenshot(path=shot_path, full_page=True)
+                report.screenshot = shot_path
             except Exception as e:
                 report.errors.append(f"screenshot: {e}")
 

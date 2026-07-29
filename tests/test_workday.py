@@ -210,13 +210,69 @@ def test_create_account_reveals_form_fills_and_ticks_terms():
         b = pw.chromium.launch(headless=True)
         page = b.new_page()
         page.goto(ACCOUNT, wait_until="domcontentloaded")
-        ok = workday.create_account(page, "bot@example.com", "G3n!pass_word", report)
+        reason = workday.create_account(page, "bot@example.com", "G3n!pass_word", report)
         assert page.locator("#create [data-automation-id='email']").input_value() == "bot@example.com"
         assert page.locator("#create [data-automation-id='verifyPassword']").input_value() == "G3n!pass_word"
         assert page.locator("#create [data-automation-id='createAccountCheckbox'] input").is_checked()
         assert page.evaluate("() => window.__created") is True  # only true if fields + terms set
         b.close()
-    assert ok is True
+    assert reason == ""  # "" signals success; a non-empty reason names the failed step
+
+
+def test_create_account_reports_specific_reason_when_form_absent():
+    # A page with no create-account form and no toggle: create_account must NAME the failed step
+    # (Guideline #11 — descriptive errors), not just return a bare False.
+    from playwright.sync_api import sync_playwright
+
+    report = ApplyReport(url="x", ats="workday")
+    with sync_playwright() as pw:
+        b = pw.chromium.launch(headless=True)
+        page = b.new_page()
+        page.set_content("<html><body><h1>Some other page</h1></body></html>")
+        reason = workday.create_account(page, "bot@example.com", "G3n!pass_word", report)
+        b.close()
+    assert reason and "Create Account form never appeared" in reason
+
+
+def test_create_account_reports_disabled_button_with_gate():
+    # Create form is present but the submit button stays disabled and the consent checkbox is a
+    # custom widget with a hidden input that won't tick — create_account must name the gate, not
+    # time out on a dead click.
+    from playwright.sync_api import sync_playwright
+
+    html = (
+        "<html><body>"
+        "<input data-automation-id='email'>"
+        "<input data-automation-id='password' type='password'>"
+        "<input data-automation-id='verifyPassword' type='password'>"
+        "<div data-automation-id='createAccountCheckbox'>"
+        "<span>I agree to the Terms</span><input type='checkbox' style='display:none'></div>"
+        "<button data-automation-id='createAccountSubmitButton' disabled>Create Account</button>"
+        "</body></html>"
+    )
+    report = ApplyReport(url="x", ats="workday")
+    with sync_playwright() as pw:
+        b = pw.chromium.launch(headless=True)
+        page = b.new_page()
+        page.set_content(html)
+        reason = workday.create_account(page, "bot@example.com", "G3n!pass_word", report)
+        b.close()
+    assert reason and "disabled" in reason and "checkbox" in reason
+
+
+def test_ensure_account_surfaces_create_reason_and_tenant_url(monkeypatch):
+    # When create_account fails, ensure_account's error must include the specific reason AND the
+    # tenant URL the user can open to create the account manually.
+    kr, idx = _FakeKeyring(), _idx()
+    monkeypatch.setattr(workday, "create_account",
+                        lambda page, email, pw, report: "the password field wasn't found")
+    report = ApplyReport(url="x", ats="workday")
+    url = "https://thehartford.wd5.myworkdayjobs.com/job/1"
+    acct = workday.ensure_account(object(), url, _profile(email="me@x.com"), report,
+                                  backend=kr, index_path=idx)
+    assert acct is None
+    err = " ".join(report.errors)
+    assert "the password field wasn't found" in err and url in err
 
 
 def test_ensure_account_signs_in_when_stored(monkeypatch):
@@ -233,7 +289,7 @@ def test_ensure_account_signs_in_when_stored(monkeypatch):
 
 def test_ensure_account_creates_stores_and_flags_manual_verify(monkeypatch):
     kr, idx = _FakeKeyring(), _idx()
-    monkeypatch.setattr(workday, "create_account", lambda page, email, pw, report: True)
+    monkeypatch.setattr(workday, "create_account", lambda page, email, pw, report: "")
     report = ApplyReport(url="x", ats="workday")
     # no mailbox configured → account created + saved, but flagged for manual verification
     acct = workday.ensure_account(object(), "https://acme.wd1.myworkdayjobs.com/job/1",
@@ -250,7 +306,7 @@ def test_ensure_account_uses_bot_email_and_verifies(monkeypatch):
     from applicationbot.mailbox import MailboxConfig
 
     kr, idx = _FakeKeyring(), _idx()
-    monkeypatch.setattr(workday, "create_account", lambda page, email, pw, report: True)
+    monkeypatch.setattr(workday, "create_account", lambda page, email, pw, report: "")
     monkeypatch.setattr(mailbox, "wait_for_verification", lambda cfg, **kw: "550123")
     applied = {}
     monkeypatch.setattr(workday, "_apply_verification",

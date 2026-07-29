@@ -12,6 +12,10 @@ Run:
     python -m applicationbot.runner --max 5      # bound this run to 5 applications
     python -m applicationbot.runner --headed     # watch it work
     python -m applicationbot.runner --continuous # poll forever: cycle, wait --interval min, repeat
+
+In --continuous mode the runner is a **watch**: each cycle it re-checks your boards, and when a
+role clears the fit judge and is prepared (dry-run-filled), it pushes a desktop/phone notification
+(decision 135 channels) so you're told a role is ready to apply without watching the terminal.
 """
 
 from __future__ import annotations
@@ -200,6 +204,42 @@ def _report_parked(say=print) -> None:
         say(f"  … and {len(parked) - 10} more.")
 
 
+def _outcome_names(outcomes: list[Outcome], limit: int = 3) -> str:
+    """A compact 'Company — Role, …' label for a set of outcomes, capped with '+N more'."""
+    labels = [f"{o.company} — {o.role}".strip(" —") or o.url for o in outcomes]
+    head = ", ".join(labels[:limit])
+    return head + (f" +{len(labels) - limit} more" if len(labels) > limit else "")
+
+
+def _notify_cycle(notifier, result: RunnerResult) -> None:
+    """Push a continuous-watch cycle's user-facing moments to the desktop/phone channels
+    (decision 135): one 'ready to apply' notification for the matches prepared + dry-run-filled
+    this cycle, and one 'needs you' notification for any blocked. ONE summary per category so a
+    bursty first cycle can't spam. Best-effort — a broken notifier never stops the watch."""
+    from . import notifications as notif
+
+    ready = [o for o in result.outcomes if o.result == "dry-run"]
+    blocked = [o for o in result.outcomes if o.result == "blocked"]
+    try:
+        if ready:
+            notifier.notify(notif.Notification(
+                event=notif.APPROVAL_NEEDED,
+                title="Ready to apply" if len(ready) == 1 else f"{len(ready)} ready to apply",
+                body=_outcome_names(ready) + " — prepared and dry-run-filled. "
+                     "Open ApplicationBot to review and submit.",
+                link="/#discover"))
+        if blocked:
+            notifier.notify(notif.Notification(
+                event=notif.INTERVENTION_NEEDED,
+                title="Application blocked — needs you" if len(blocked) == 1
+                      else f"{len(blocked)} applications need you",
+                body=_outcome_names(blocked) + " — blocked pending your input. "
+                     "Open the Discover tab to resolve.",
+                link="/#discover", urgent=True))
+    except Exception:  # noqa: BLE001 — a notifier failure must never break the watch
+        pass
+
+
 def continuous_loop(run_cycle, gate: SafetyGate, *, interval_s: int,
                     say=None, _sleep=time.sleep) -> str:
     """Poll forever: run one cycle, wait `interval_s` (kill-file-abortable), repeat. `run_cycle()`
@@ -247,8 +287,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--fresh", action="store_true",
                         help="Ignore the cached discovery snapshot and re-search every board.")
     parser.add_argument("--continuous", action="store_true",
-                        help="Keep polling for new matching postings: run a cycle, wait "
-                        "--interval minutes, repeat. Stop with Ctrl-C or by creating profile/KILL.")
+                        help="Watch mode: keep polling for new matching postings — run a cycle, wait "
+                        "--interval minutes, repeat — and send a desktop/phone notification each "
+                        "cycle a role is ready to apply. Stop with Ctrl-C or by creating profile/KILL.")
     parser.add_argument("--interval", type=int, default=30,
                         help="Minutes to wait between cycles in --continuous mode (default 30). "
                         "Pair with --fresh to re-search boards every cycle; otherwise cycles "
@@ -275,6 +316,8 @@ def main(argv: Optional[list[str]] = None) -> int:
           f"{gate.max_submissions_per_run}/run). Create profile/KILL to halt."
           if gate.armed else "Dry-run — filling and recording, never submitting "
           "(arm in profile/safety.yaml).")
+
+    notifier = None  # built below only for --continuous (the watch use case)
 
     def apply_one(m: Match):
         return run_testing_mode(
@@ -323,11 +366,25 @@ def main(argv: Optional[list[str]] = None) -> int:
         print("\n" + result.summary())
         for o in result.outcomes:
             print(f"  - {o.result:11} {o.company} — {o.role} (fit {o.fit}) {o.detail}")
+        if notifier is not None:
+            _notify_cycle(notifier, result)
         _report_parked()
         return "stop" if "sign-in required" in result.stopped_reason.lower() else "ok"
 
     if not args.continuous:
         return 1 if run_cycle() == "empty" else 0
+
+    from . import notifications
+    notifier = notifications.build_notifier()
+    ncfg = notifications.load_config()
+    channels = [name for name, on in (("desktop", ncfg.desktop),
+                ("phone (ntfy)", ncfg.ntfy_enabled and ncfg.ntfy_topic)) if on]
+    if channels:
+        print(f"Watch notifications ON ({', '.join(channels)}) — you'll be alerted each cycle a "
+              "role is ready to apply. Turn off in Settings → Notifications.")
+    else:
+        print("Watch notifications are OFF (no channel enabled) — turn on desktop or phone (ntfy) "
+              "in Settings → Notifications to be alerted when a role is ready to apply.")
 
     print(f"Continuous mode — a cycle then a {args.interval} min wait, repeating. "
           f"Create {gate.kill_file} or press Ctrl-C to stop.")

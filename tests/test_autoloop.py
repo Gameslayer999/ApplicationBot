@@ -214,12 +214,15 @@ def test_goal_maintain_idles_then_refills_then_stops():
 
 
 def test_goal_maintain_refills_after_a_submit_drop():
-    # Reach goal=1, idle once, then a submit drops the count so the loop searches again.
+    # Reach goal=1, idle once, then a submit drops the count so the loop searches again. Since
+    # decision 146 the dry search that follows does NOT end the run (the goal is short again) —
+    # it hunts, so this ends on Stop rather than "caught_up".
     batch1, batch2 = [_Match("a")], [_Match("b")]
     log: list = []
     disc = {"i": 0}
     ready = {"n": 0}
     waited = {"n": 0}
+    stop = {"flag": False}
 
     def discover_batch():
         i = disc["i"]; disc["i"] += 1
@@ -238,7 +241,7 @@ def test_goal_maintain_refills_after_a_submit_drop():
         pass
 
     def should_stop():
-        return False
+        return stop["flag"]
 
     def ready_count():
         return ready["n"]
@@ -247,9 +250,128 @@ def test_goal_maintain_refills_after_a_submit_drop():
         waited["n"] += 1
         ready["n"] -= 1  # simulate the user applying to a ready one during the idle
 
+    def hunt_wait(n):
+        log.append(("hunt", n))
+        stop["flag"] = True  # user Stops rather than let it keep hunting
+
     reason = auto_apply_loop(discover_batch, prepare_one, take_submit_requests, submit_one,
                              should_stop, ready_count=ready_count, goal=1, maintain=True,
-                             wait=wait)
-    # a → goal met → idle drops count → b prepared → goal met → idle → boards exhausted.
-    assert reason == "caught_up"
+                             wait=wait, hunt_wait=hunt_wait)
+    # a → goal met → idle drops count → b prepared → goal met → idle → boards dry ⇒ hunt, not quit.
+    assert reason == "stopped"
     assert [n for k, n in log if k == "prepare"] == ["a", "b"]
+    assert ("hunt", 1) in log
+
+
+def test_watch_keeps_recycling_after_caught_up_until_stop():
+    # Watch mode (decision 143): batch 1 has a match, then the boards are dry forever. The loop
+    # must NOT return "caught_up" on the empty batch — it idles via watch_wait and re-searches,
+    # ending only on stop. Proves the "keep watching, autofill new roles, never stop" contract.
+    log: list = []
+    state = {"searches": 0, "waits": 0}
+
+    def discover_batch():
+        state["searches"] += 1
+        log.append(("search", state["searches"]))
+        return [_Match("A")] if state["searches"] == 1 else []
+
+    def prepare_one(m):
+        log.append(("prepare", m.name))
+
+    def watch_wait():
+        state["waits"] += 1
+        log.append(("wait", state["waits"]))
+
+    reason = auto_apply_loop(
+        discover_batch, prepare_one, lambda: [], lambda i: None,
+        should_stop=lambda: state["waits"] >= 3,  # stop after 3 idle cycles
+        watch=True, watch_wait=watch_wait)
+
+    assert reason == "stopped"                     # never returned "caught_up"
+    assert ("prepare", "A") in log                 # prepared the one real match
+    assert state["searches"] >= 3 and state["waits"] >= 1  # kept re-searching + idling
+
+
+def test_watch_false_still_stops_at_caught_up():
+    # Backward-compat: without watch=True, an empty batch still ends the loop immediately.
+    state = {"n": 0}
+
+    def discover_batch():
+        state["n"] += 1
+        return [_Match("A")] if state["n"] == 1 else []
+
+    reason = auto_apply_loop(discover_batch, lambda m: None, lambda: [], lambda i: None,
+                             should_stop=lambda: False)
+    assert reason == "caught_up"
+
+
+# ------------------------------------------------------- keep hunting toward a goal (decision 146)
+
+def _hunt_driver(batches, *, goal, stop_after_waits=None):
+    """Driver whose ready_count reflects real prepares (each prepare makes one app ready), with a
+    hunt_wait that logs the escalating dry-search counter and can trip a Stop."""
+    log: list = []
+    state = {"i": 0, "ready": 0, "waits": 0}
+
+    def discover_batch():
+        i = state["i"]; state["i"] += 1
+        b = batches[i] if i < len(batches) else []
+        log.append(("search", [m.name for m in b]))
+        return b
+
+    def prepare_one(m):
+        log.append(("prepare", m.name))
+        state["ready"] += 1
+
+    def hunt_wait(n):
+        state["waits"] += 1
+        log.append(("hunt", n))
+
+    def should_stop():
+        return stop_after_waits is not None and state["waits"] >= stop_after_waits
+
+    kwargs = dict(ready_count=lambda: state["ready"], goal=goal, hunt_wait=hunt_wait)
+    return log, (discover_batch, prepare_one, lambda: [], lambda i: None, should_stop), kwargs
+
+
+def test_goal_unmet_keeps_searching_instead_of_reporting_caught_up():
+    # The reported bug: goal=2, the first search finds one match and the next finds nothing.
+    # The loop must NOT stop at "no new matches" — it keeps hunting until the goal is met.
+    batches = [[_Match("a")], [], [], [_Match("b")]]
+    log, cbs, kwargs = _hunt_driver(batches, goal=2)
+    assert auto_apply_loop(*cbs, **kwargs) == "goal_reached"
+    assert [n for k, n in log if k == "prepare"] == ["a", "b"]
+    # Two dry searches in a row ⇒ the backoff counter escalates, and resets once a batch lands.
+    assert [n for k, n in log if k == "hunt"] == [1, 2]
+
+
+def test_goal_hunt_ends_on_stop_and_never_returns_caught_up():
+    # Boards dry forever with the goal short: the loop hunts until the user stops. It must never
+    # return "caught_up" — that message is what made the loop look broken.
+    log, cbs, kwargs = _hunt_driver([[]], goal=5, stop_after_waits=3)
+    assert auto_apply_loop(*cbs, **kwargs) == "stopped"
+    assert [n for k, n in log if k == "hunt"] == [1, 2, 3]
+
+
+def test_goal_hunt_defaults_to_wait_when_no_hunt_wait_supplied():
+    # hunt_wait is optional: it falls back to the maintain-mode wait() so the loop still idles.
+    state = {"i": 0, "waits": 0}
+
+    def discover_batch():
+        state["i"] += 1
+        return [_Match("a")] if state["i"] == 1 else []
+
+    def wait():
+        state["waits"] += 1
+
+    reason = auto_apply_loop(discover_batch, lambda m: None, lambda: [], lambda i: None,
+                             should_stop=lambda: state["waits"] >= 2,
+                             ready_count=lambda: 0, goal=3, wait=wait)
+    assert reason == "stopped" and state["waits"] == 2
+
+
+def test_no_goal_still_stops_at_caught_up():
+    # Backward-compat: hunting is goal-driven. With goal=None an empty batch ends the run.
+    log, cbs, kwargs = _hunt_driver([[_Match("a")], []], goal=None)
+    assert auto_apply_loop(*cbs, **kwargs) == "caught_up"
+    assert not [n for k, n in log if k == "hunt"]

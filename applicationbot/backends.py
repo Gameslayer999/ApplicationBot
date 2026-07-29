@@ -93,6 +93,12 @@ spills just a word or two onto a second line.
 one-line bullets FILL the line — get close to the one-line limit rather than leaving lots \
 of empty space — but never cross into the forbidden slightly-over range.
 - Keep every bullet within one entry the same length band (all one-line, or all 1.5+).
+- OVERSHOOT THE PAGE, never undershoot it. Give each included entry the full bullet count \
+the length instruction allows and include the full number of entries whenever you have \
+real, job-relevant content — aim to slightly OVERFLOW the page. The app measures the \
+rendered PDF and trims the least-relevant lines back to a single page, so extra strong \
+content is free but a half-empty page cannot be fixed after the fact. Reach that fill \
+with true, substantive bullets, never with filler or repetition.
 - Never pad with meaningless filler; if there isn't enough true content, make it a tight \
 single line. Truthfulness over length.
 

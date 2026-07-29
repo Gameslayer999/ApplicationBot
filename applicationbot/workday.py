@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -342,19 +343,78 @@ def _click(page, auto_id: str, *, timeout: int = 3000) -> bool:
 
 
 def _check(page, auto_id: str) -> bool:
-    """Tick a Workday checkbox at (or wrapped by) auto_id. Best-effort; returns True if checked."""
+    """Tick a Workday checkbox at (or wrapped by) auto_id. Best-effort; returns True if checked.
+    Workday usually hides the real <input type=checkbox> behind a custom styled control, so a
+    plain `.check()` on the hidden input fails — fall back to clicking the visible wrapper, then
+    confirm the input's checked state."""
     loc = page.locator(f"[data-automation-id='{auto_id}']:visible").first
     try:
         if loc.count() == 0:
             return False
-        tag = (loc.evaluate("el => el.tagName.toLowerCase()") or "")
-        cb = loc if tag == "input" else loc.locator("input[type=checkbox]").first
-        if cb.count() == 0:
-            return False
-        cb.check(timeout=3000)
-        return True
     except Exception:
         return False
+    tag = ""
+    try:
+        tag = (loc.evaluate("el => el.tagName.toLowerCase()") or "")
+    except Exception:
+        pass
+    inp = loc if tag == "input" else loc.locator("input[type=checkbox]").first
+    try:
+        if inp.count() and inp.is_checked():
+            return True
+    except Exception:
+        pass
+    try:  # native check first — works when the input itself is visible
+        if inp.count():
+            inp.check(timeout=1500)
+            return True
+    except Exception:
+        pass
+    try:  # hidden input behind a custom box: click the visible wrapper/label
+        loc.click(timeout=2000)
+        return inp.is_checked() if inp.count() else True
+    except Exception:
+        return False
+
+
+def _create_submit_button(page):
+    """The create-account submit control, preferring an inner <button> when the automation-id
+    sits on a wrapper. None if not present/visible."""
+    loc = page.locator(f"[data-automation-id='{_ACCT['create_btn']}']:visible").first
+    try:
+        if loc.count() == 0:
+            return None
+        if (loc.evaluate("el => el.tagName.toLowerCase()") or "") != "button":
+            inner = loc.locator("button").first
+            if inner.count():
+                return inner
+    except Exception:
+        pass
+    return loc
+
+
+def _is_disabled(loc) -> bool:
+    try:
+        return bool(loc.evaluate(
+            "el => el.disabled === true || el.getAttribute('aria-disabled') === 'true'"))
+    except Exception:
+        return False
+
+
+def _create_disabled_reason(page) -> str:
+    """Name the most likely reason Workday keeps the Create Account button disabled, so the error
+    is actionable rather than a generic 'couldn't be clicked'."""
+    cb = page.locator(f"[data-automation-id='{_ACCT['create_checkbox']}']:visible").first
+    try:
+        inp = cb.locator("input[type=checkbox]").first if cb.count() else None
+        if inp is not None and inp.count() and not inp.is_checked():
+            return ("the Create Account button stayed disabled because the terms/consent checkbox "
+                    "couldn't be ticked (this tenant uses a custom checkbox widget)")
+    except Exception:
+        pass
+    return ("the Create Account button stayed disabled after every field was filled — this tenant "
+            "likely enforces an extra requirement (a stricter password policy, an additional "
+            "required field, or a different consent control) beyond the standard Workday form")
 
 
 def sign_in(page, account, report) -> bool:
@@ -367,17 +427,79 @@ def sign_in(page, account, report) -> bool:
     return _click(page, _ACCT["sign_in_btn"])
 
 
-def create_account(page, email: str, password: str, report) -> bool:
+def _visible(page, auto_id: str) -> bool:
+    try:
+        return page.locator(f"[data-automation-id='{auto_id}']:visible").count() > 0
+    except Exception:
+        return False
+
+
+def _wait_visible(page, auto_id: str, *, timeout_ms: int = 6000, poll_ms: int = 250) -> bool:
+    """Poll until a [data-automation-id=auto_id] element is visible. Workday swaps the sign-in
+    form for the create-account form asynchronously, so a control checked once may not have
+    rendered yet."""
+    waited = 0
+    while True:
+        if _visible(page, auto_id):
+            return True
+        if waited >= timeout_ms:
+            return False
+        page.wait_for_timeout(poll_ms)
+        waited += poll_ms
+
+
+def _reveal_create_form(page) -> bool:
+    """Ensure Workday's create-account form is showing (the account screen often defaults to
+    Sign In with a 'Create Account' toggle). No-op if already on it. Returns True if the create
+    form's submit button is visible afterward."""
+    if _visible(page, _ACCT["create_btn"]):
+        return True
+    _click(page, _ACCT["create_toggle"])  # the tenant's create-account toggle, by automation id
+    if not _wait_visible(page, _ACCT["create_btn"], timeout_ms=2000):
+        # Fall back to clicking a control labelled "Create Account" (some tenants don't carry the id).
+        name = re.compile(r"^\s*Create Account\s*$", re.I)
+        for role in ("button", "link"):
+            try:
+                loc = page.get_by_role(role, name=name).first
+                if loc.count() and loc.is_visible():
+                    loc.click(timeout=3000)
+                    break
+            except Exception:
+                pass
+    return _wait_visible(page, _ACCT["create_btn"])
+
+
+def create_account(page, email: str, password: str, report) -> str:
     """Switch to Workday's create-account form (if a toggle is shown), fill email + password
     (+ verify-password and the terms checkbox when present), and click Create Account. Returns
-    True if the form was completed and submitted."""
-    _click(page, _ACCT["create_toggle"])  # no-op if the create form is already shown
-    if not (_fill_text(page, _ACCT["email"], email)
-            and _fill_text(page, _ACCT["password"], password)):
-        return False
-    _fill_text(page, _ACCT["verify_password"], password)  # absent on some tenants
-    _check(page, _ACCT["create_checkbox"])                # terms/consent, when present
-    return _click(page, _ACCT["create_btn"])
+    "" on success, else a specific one-phrase reason naming the exact step that failed (so the
+    caller's error tells the user what to fix, not just 'could not be completed')."""
+    if not _reveal_create_form(page):
+        return ("the Create Account form never appeared — the account screen may use a different "
+                "layout, or the 'Create Account' toggle wasn't found")
+    if not _fill_text(page, _ACCT["email"], email):
+        return "the email field wasn't found on the create-account form"
+    if not _fill_text(page, _ACCT["password"], password):
+        return "the password field wasn't found on the create-account form"
+    if _visible(page, _ACCT["verify_password"]) and not _fill_text(page, _ACCT["verify_password"], password):
+        return "the confirm-password field was present but couldn't be filled"
+    _check(page, _ACCT["create_checkbox"])  # terms/consent, when present — best-effort
+    btn = _create_submit_button(page)
+    if btn is None:
+        return "the Create Account button wasn't found on the create-account form"
+    # The button enables reactively once the fields + consent validate — give it a moment, then
+    # if it's still disabled report WHICH gate is unmet rather than timing out on a dead click.
+    waited = 0
+    while _is_disabled(btn) and waited < 2000:
+        page.wait_for_timeout(200)
+        waited += 200
+    if _is_disabled(btn):
+        return _create_disabled_reason(page)
+    try:
+        btn.click(timeout=3000)
+    except Exception as e:
+        return f"the Create Account button couldn't be clicked ({type(e).__name__} — it may be covered or re-disabled)"
+    return ""
 
 
 def _apply_verification(page, link_or_code: str, report) -> bool:
@@ -425,8 +547,14 @@ def ensure_account(page, tenant_url: str, profile, report, *, mailbox_config=Non
             "or an email in the Profile tab.")
         return None
     password = generate_password()
-    if not create_account(page, account_email, password, report):
-        report.errors.append(f"Workday account-creation form could not be completed for {tenant}.")
+    reason = create_account(page, account_email, password, report)
+    if reason:
+        report.errors.append(
+            f"Workday account creation failed for {tenant}: {reason}. Re-run once to retry — a "
+            f"slow-rendering form is waited out now, so a transient failure clears on retry. If it "
+            f"repeats on this same step, this tenant's account screen differs from the standard "
+            f"Workday layout; create the account manually at {tenant_url} (Apply → Apply Manually → "
+            f"Create Account with {account_email}) to unblock this application.")
         return None
 
     acct = credentials.Account(tenant=tenant, email=account_email, password=password)
@@ -467,27 +595,57 @@ def _on_account_or_form(page) -> bool:
     return False
 
 
-def start_application(page, report, *, max_clicks: int = 3) -> bool:
-    """Click Workday's 'Apply' → 'Apply Manually' to reach the account/wizard screen. No-op if
-    already there. Returns True if we end on an account/form screen. Best-effort — the exact
-    button labels are the live-tuning surface; never raises."""
-    for _ in range(max_clicks):
-        if _on_account_or_form(page):
-            return True
-        clicked = False
-        for text in _APPLY_TEXTS:
+def _find_apply_control(page):
+    """First visible Apply-step control on the page, or None. Matches _APPLY_TEXTS in order (so
+    the manual path is preferred over autofill) across button/link/menuitem roles, case-insensitive
+    — Workday's initial 'Apply' is a button, but the autofill popup renders 'Apply Manually' /
+    'Autofill with Resume' as menuitems/links, and casing varies by tenant."""
+    for text in _APPLY_TEXTS:
+        name = re.compile(rf"^{re.escape(text)}$", re.I)
+        for role in ("button", "link", "menuitem"):
             try:
-                btn = page.get_by_role("button", name=text, exact=True).first
-                if btn.count() == 0:
-                    btn = page.get_by_role("link", name=text, exact=True).first
-                if btn.count() and btn.is_visible():
-                    btn.click(timeout=3000)
-                    page.wait_for_timeout(600)
-                    clicked = True
-                    break
+                loc = page.get_by_role(role, name=name).first
+                if loc.count() and loc.is_visible():
+                    return loc
             except Exception:
                 pass
-        if not clicked:
+    return None
+
+
+def _wait_for_apply_step(page, *, timeout_ms: int = 9000, poll_ms: int = 300):
+    """Poll until we're on the account/form screen (return "form") or an Apply-step control is
+    visible (return the control), else None. Workday's React app mounts the Apply button after
+    navigation, and its autofill popup mounts after the Apply click — a single immediate check
+    races both, so we wait."""
+    waited = 0
+    while True:
+        if _on_account_or_form(page):
+            return "form"
+        ctrl = _find_apply_control(page)
+        if ctrl is not None:
+            return ctrl
+        if waited >= timeout_ms:
+            return None
+        page.wait_for_timeout(poll_ms)
+        waited += poll_ms
+
+
+def start_application(page, report, *, max_clicks: int = 4) -> bool:
+    """Click Workday's 'Apply' → 'Apply Manually' to reach the account/wizard screen. No-op if
+    already there. Returns True if we end on an account/form screen. Best-effort — the exact
+    button labels are the live-tuning surface; never raises.
+
+    Waits for each SPA transition (the initial Apply button and the autofill popup both mount
+    asynchronously) instead of checking once, so a slow render isn't misread as 'step not found'."""
+    for _ in range(max_clicks):
+        step = _wait_for_apply_step(page)
+        if step == "form":
+            return True
+        if step is None:
+            break
+        try:
+            step.click(timeout=3000)
+        except Exception:
             break
     return _on_account_or_form(page)
 
