@@ -129,6 +129,11 @@ Configure  →  Discover  →  Tailor  →  Apply  →  Track
    Claude about is asked *with* the surrounding text so the question is the one the form is really
    asking. The review panel prints what it read under each such answer ("on the form: Applicant
    certification · follows the field: Signature").
+   **Repeated fields are all filled.** A form that shows the same label twice — two education blocks,
+   a wizard asking again on a later page — used to get the first one filled and the rest silently
+   skipped. Each control is now identified in its own right (the second appears as `School #2` in
+   review, with its own answer and its own edit box) while still being answered as the question it
+   asks.
    **Answers that don't fit their question are called out.** A filled box can still be wrong: a form's
    bottom-of-page **Date** once got *"I'm available immediately…"* — the right answer to a different
    question. Every answer is checked against the shape its question asks for (a date field answered with

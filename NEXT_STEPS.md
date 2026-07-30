@@ -920,7 +920,7 @@ Posted to the agent bus 2026-07-06; independent of the engine work above.
 ## Recently added (this session, latest first)
 
 - 2026-07-30 — **ATS coverage shipped: Jobvite + BambooHR fill, iCIMS/Taleo/Avature refuse honestly
-  (decision 168).** A read-only probe of live postings reversed decision 167's build order — the two
+  (decision 168).** A read-only probe of live postings reversed decision 170's build order — the two
   "cheapest" portals are the ones that can finish today, and the 1,311-posting iCIMS prize is behind
   the account-gated work, not a form handler. New in the engine: honeypot detection (BambooHR ships
   a CSS-visible "Please leave this field blank" trap), button-facade selects (`[role=menuitem]`
@@ -932,7 +932,7 @@ Posted to the agent bus 2026-07-06; independent of the engine work above.
   than Greenhouse and the largest block we drop — queued unprobed under **Now**.
 
 - 2026-07-30 — **Simplify's autofill engine evaluated and rejected; its portal list adopted as our
-  ATS coverage target (decision 167).** User: *"look into if we can integrate simplify into our
+  ATS coverage target (decision 170).** User: *"look into if we can integrate simplify into our
   workflow since they already have a robust autofill workflow"*. No API (browser extension only),
   it never clicks Submit, it fills from its own cloud profile so our tailored PDF and answer bank
   can't reach it, we'd be arming an irreversible submit on a form a black box filled, and their
@@ -2566,6 +2566,21 @@ Record each decision in [DECISIONS.md](DECISIONS.md) once the user chooses.
 ---
 
 ## Recently completed
+
+- 2026-07-30 — **Fields are keyed by identity, not by label text (decision 169).** User: "look into
+  that architecture change: we might as well get it out of the way now." Measured first: no genuine
+  label collisions in 20 archived applications or on 3 live forms, and a DOM-identity key is **not**
+  viable — Ashby's radio group carries a per-render UUID (`96b38c4a-…` → `5fe56b1a-…`), so that key
+  would detach saved edits on every re-fill. Chose the occurrence-suffixed key instead: the n-th
+  control showing a label becomes `Date #2`. No schema change and no migration — a real re-fill of
+  the live Palantir posting produced 35 keys, all byte-identical to the previous archive.
+  The change splits the two jobs one string was doing: the **key** identifies the field (`done`, the
+  report, the per-posting edits, the surrounding-text map), the **question** (`_question(key)`) is
+  what every rule, the answer bank and every model call see. A field key can never enter the shared
+  answer bank. **Also fixed:** `done` was shared across all pages of a wizard, so a label appearing
+  on page 1 and page 3 was skipped on page 3 and left empty; each page now gets its own set, and the
+  review panel folds rows identical in label, value and control.
+  New `fixtures/apply_forms/repeated_labels.html` + `tests/test_field_keys.py`; suite **738 passed**.
 
 - 2026-07-30 — **Generic fields are answered from the text around them (decision 167).** User:
   "make sure that fields like those use the context around them to figure out what should be in
