@@ -1,0 +1,49 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Oracle Recruiting email-gate fixture</title></head>
+<body>
+<!-- Oracle Recruiting Cloud's first application step, modelled on the live DOM probed 2026-07-30
+     across three unrelated tenants (Oracle CX_45001, American Express CX_1, ADT CX_1 — decision
+     171). The component is literally named QUICK-EMAIL-VERIFICATION-FORM: you give an email, it
+     verifies it, and only then does the application itself open.
+
+     Two things here are exactly as the live page has them, and both broke the fill:
+
+     1. The honeypot is NAMED "honey-pot" (aria-label "honeypot") and carries aria-hidden ON THE
+        INPUT ITSELF. Decision 168's label rule misses it, and the aria-hidden skip that exists for
+        react-select mirrors swallowed it before any honeypot check could run — so it stayed empty
+        by luck, unnoted, on a control we would have filled had the tenant laid it out.
+     2. The terms checkbox is a 0x0 input behind a decorative <span>. A plain .check() times out,
+        which left a REQUIRED box unticked on every Oracle tenant. -->
+<div class="apply-flow-dialog__form">
+  <form>
+    <quick-email-verification-form>
+      <div class="input-row input-row--text">
+        <div class="input-row__control-container">
+          <label for="primary-email-0">Email Address</label>
+          <input id="primary-email-0" name="primary-email" type="email"
+                 aria-label="Email Address" required aria-required="true">
+        </div>
+      </div>
+      <div class="input-row input-row--text">
+        <div class="input-row__control-container">
+          <input id="honey-pot-1" name="honey-pot" type="text" aria-label="honeypot"
+                 aria-hidden="true">
+        </div>
+      </div>
+      <legal-disclaimer class="quick-apply-flow-verify-email">
+        <label class="input-row legal-disclaimer">
+          <input id="legal-disclaimer-checkbox" type="checkbox" required aria-required="true"
+                 style="width:0;height:0;position:absolute;opacity:0">
+          <span class="apply-flow-input-checkbox"
+                style="display:inline-block;width:16px;height:16px;border:1px solid #666"></span>
+          I agree with the terms and conditions
+        </label>
+      </legal-disclaimer>
+      <button type="button">Cancel</button>
+      <button type="submit">Next</button>
+    </quick-email-verification-form>
+  </form>
+</div>
+</body>
+</html>

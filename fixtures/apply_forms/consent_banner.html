@@ -1,0 +1,42 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Cookie-consent overlay fixture</title></head>
+<body>
+<!-- A consent overlay covering the form, plus the collapsed widgets that made an Oracle Recruiting
+     posting page look like it already held a form (decision 171). Two behaviours are pinned here:
+
+     1. `_count_fields` must count only controls a person can see. The three widgets below are
+        display:none; a page whose only "fields" are those has NOT rendered a form, and treating it
+        as one is what stopped the APPLY NOW click from ever firing.
+     2. The banner swallows pointer events while it is up, so the checkbox underneath cannot be
+        clicked. It offers both choices, so the least-consent one must win. -->
+<div id="cookie-banner"
+     style="position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:9999">
+  <div style="background:#fff;padding:20px">
+    <p>We use cookies.</p>
+    <button type="button" onclick="dismiss()">Accept All</button>
+    <button type="button" onclick="dismiss()">Reject All</button>
+    <button type="button">Manage Preferences</button>
+  </div>
+</div>
+
+<!-- Collapsed chat/copy-link widgets: real controls, but no person can see them. -->
+<textarea id="oda-chat-user-text-input" style="display:none"></textarea>
+<textarea id="oda-work-summary-text-area" style="display:none"></textarea>
+<input id="copy-link-abc" type="text" aria-label="Copy Link" style="display:none">
+
+<form>
+  <label for="email">Email Address</label>
+  <input id="email" name="email" type="email">
+  <label class="terms">
+    <input id="terms" type="checkbox" required style="width:0;height:0;position:absolute;opacity:0">
+    <span style="display:inline-block;width:16px;height:16px;border:1px solid #666"></span>
+    I agree with the terms and conditions
+  </label>
+</form>
+
+<script>
+function dismiss() { document.getElementById('cookie-banner').remove(); }
+</script>
+</body>
+</html>

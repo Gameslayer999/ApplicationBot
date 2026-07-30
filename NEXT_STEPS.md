@@ -264,14 +264,28 @@ real postings), one consolidated live dry-run per milestone.
       **refused at the wall with the portal named** instead of having their login form filled in
       as if it were an application. They unblock with the account-gated item above, not with a
       form handler.
-- [ ] **Oracle Recruiting Cloud (`*.fa.ocs.oraclecloud.com`) — 3,553 postings, the single
-      largest block we drop (found 2026-07-30 while measuring for decision 168).** More than
-      Greenhouse (3,026) and 2.7× iCIMS. It was not on Simplify's published list, so it was
-      never queued; the count comes from the two curated feeds. **Unprobed** — before any code,
-      run the same read-only probe used for decision 168 (`_open_application_form` against three
-      live postings) to find out whether the form is public or behind an account, because that
-      answer decides whether this is a fixture-and-handler job or part of the account-gated work.
-      If it is public it is the highest-value Apply-stage item on this list.
+- [ ] **Oracle Recruiting Cloud — reachable and filling; finish the address block (decision 171).**
+      3,553 postings, the largest block we drop. **Probed and answered: it is NOT account-gated**
+      ("You don't need to have an account") — it is email-VERIFIED, and a live walk on Linamar got
+      posting → APPLY NOW → email gate → 6-digit code read from the bot inbox → the real form,
+      **7 fields filled, 0 errors** (SUBMIT never clicked). Four shared-code defects were fixed to
+      get there (see decision 171). `oracle` is deliberately **still out of `FILLABLE_ATS`** —
+      pinned by a test — until the six remaining required fields close:
+      - [ ] **Profile data (3 of the 6, no code needed):** `street_address`, `postal_code` and
+            `desired_salary` are blank. The first two were added by decision 168 and nobody has
+            filled them yet; entering them on the Profile screen is the whole fix.
+      - [ ] **The dependent address chain (unverified).** Oracle's City/State offer **no options
+            at all** until Country and ZIP are set — the form says so itself ("you may need to edit
+            the value in their parent drop-down list"). Likely unblocked by the item above, but
+            that is an assumption: re-run the walk once the profile has an address and see whether
+            City/State resolve before writing any JET-combobox handler. Do not build the handler
+            first — it may not be needed.
+      - [ ] **Wire email verification into the engine.** `mailbox.wait_for_verification` already
+            works (it read Oracle's code in the probe) but `apply.py` never calls it. Note the
+            flow is not deterministic: an unknown email went straight to the form, and only a
+            later attempt was challenged — so the step must be *detected*, not assumed. Must wait
+            for a code NEWER than the last inbox message; a stale one is still sitting there.
+      - [ ] Only then add `oracle` to `FILLABLE_ATS` and flip the test that pins its absence.
 - [ ] **Eightfold (`*.eightfold.ai`) — 120 postings.** Same first step: probe before building.
 
 ### Adopted from the ai-job-search survey (2026-07-09) — user-approved queue
@@ -918,6 +932,18 @@ Posted to the agent bus 2026-07-06; independent of the engine work above.
 ---
 
 ## Recently added (this session, latest first)
+
+- 2026-07-30 — **Oracle Recruiting Cloud reached and filling (decision 171).** The largest block of
+  postings we drop (3,553) turned out **not** to be account-gated — it is email-verified, and a live
+  walk got all the way to the real application form with 7 fields filled and no errors (SUBMIT never
+  clicked). Getting there fixed four defects in **shared** code, none of them Oracle-specific: the
+  field count included controls nobody can see (so APPLY NOW was never clicked on 2 of 3 tenants);
+  a honeypot marked aria-hidden on itself slipped past decision 168's guards; a 0×0 terms checkbox
+  behind a `<span>` could only be ticked through its label — and the old JS fallback reported
+  success the site's own validation rejected, a **false positive the report believed**; and a cookie
+  overlay ate every click. `_check_radio` became `_force_check` and now serves checkboxes too.
+  `oracle` stays out of `FILLABLE_ATS` (pinned by a test) until the address block closes — 3 of the
+  6 remaining required fields are just empty profile data. 9 new tests, 2 new fixtures, suite 747.
 
 - 2026-07-30 — **ATS coverage shipped: Jobvite + BambooHR fill, iCIMS/Taleo/Avature refuse honestly
   (decision 168).** A read-only probe of live postings reversed decision 170's build order — the two

@@ -1107,6 +1107,8 @@ def detect_ats_from_url(url: str) -> str:
         return "taleo"
     if "avature.net" in u:
         return "avature"
+    if "oraclecloud.com" in u:
+        return "oracle"
     return "other"
 
 

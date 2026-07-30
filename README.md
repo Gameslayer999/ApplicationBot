@@ -98,7 +98,9 @@ Configure  →  Discover  →  Tailor  →  Apply  →  Track
    **iCIMS, Taleo, Avature** — are named as needing a sign-in and parked there rather than half-filled,
    and are kept out of the search so they don't spend judging on openings that can't be applied to.
    A **honeypot** field (a box the form expects to come back empty, used to catch bots) is left alone
-   and reported, never filled. Applications that get blocked (a question it can't answer, a login, a
+   and reported, never filled, and a **cookie-consent banner** covering the form is dismissed with the
+   narrowest choice it offers — refusing non-essential cookies wherever refusing is on the menu.
+   Applications that get blocked (a question it can't answer, a login, a
    CAPTCHA) are *parked* so you can resolve and resume them. Every submit is gated by the safety switch above.
    A site that **refuses automated traffic** (a bot wall, e.g. DataDome's "Access is temporarily restricted")
    is reported as exactly that — not as a missing form and not as a CAPTCHA you could solve — and parked as
@@ -322,7 +324,9 @@ Your résumé, contact details, credentials, and application history are sensiti
 
 Actively developed. All five stages have working implementations; a few live paths (some Workday tenants, the
 Adzuna apply click-through) are verified against fixtures and pending confirmation on a real residential network
-— see [NEXT_STEPS.md](NEXT_STEPS.md).
+— see [NEXT_STEPS.md](NEXT_STEPS.md). **Oracle Recruiting Cloud** (the largest single source of postings in the
+curated feeds) is reached and filling but not yet finished: its address block needs a street address and ZIP in
+your profile, so its postings are still held back from the search until that path is confirmed end-to-end.
 
 ## License
 

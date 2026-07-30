@@ -1511,6 +1511,11 @@ def detect_ats(url: str) -> str:
         return "taleo"
     if "avature" in u:
         return "avature"
+    # Oracle Recruiting Cloud ("Oracle Fusion" CX). Two host shapes in the wild —
+    # `<tenant>.fa.us2.oraclecloud.com` and `fa-<tenant>-saasfaprod1.fa.ocs.oraclecloud.com` —
+    # so the host suffix is the reliable tell, not the tenant (decision 171).
+    if "oraclecloud.com" in u:
+        return "oracle"
     return "generic"
 
 
@@ -1612,12 +1617,20 @@ _REVEAL_CONTROL = re.compile(r"\bapply\b|(?<!not )\binterested\b", re.I)
 
 
 def _count_fields(frame) -> int:
-    """Number of real (non-hidden) form controls in a frame."""
+    """Number of real form controls a PERSON can see in a frame — the signal `_open_application_form`
+    uses to decide "the form has rendered".
+
+    Laid-out, not CSS-pretty: a control counts when it has an offsetParent or any client rect, so a
+    react-select input at 1px/opacity:0 still counts (the fill drives those on purpose) while
+    `display:none` widgets do not. Counting hidden controls was wrong in a way that cost a whole
+    ATS: an Oracle Recruiting posting page carries a collapsed Oracle Digital Assistant chat box, a
+    hidden file input and a hidden copy-link box — 2-3 "fields" by the old count, so the poll
+    declared the form found, returned the posting page, and NEVER clicked APPLY NOW (decision 171)."""
     try:
         return frame.evaluate(
-            "() => document.querySelectorAll("
+            "() => [...document.querySelectorAll("
             "'input:not([type=hidden]):not([type=submit]):not([type=button]), textarea, select'"
-            ").length"
+            ")].filter(el => el.offsetParent || el.getClientRects().length).length"
         )
     except Exception:
         return 0
@@ -1647,9 +1660,9 @@ def _ats_from_frame(frame, fallback: str) -> str:
     greenhouse — the embed frame URL reveals it."""
     u = (getattr(frame, "url", "") or "").lower()
     for name in ("greenhouse", "lever", "ashby", "workday", "icims", "smartrecruiters",
-                 "jobvite", "bamboohr", "taleo", "avature"):
+                 "jobvite", "bamboohr", "taleo", "avature", "oraclecloud"):
         if name in u:
-            return "greenhouse" if name == "greenhouse" else name
+            return "oracle" if name == "oraclecloud" else name
     return fallback
 
 
@@ -1956,6 +1969,7 @@ def _open_application_form(page, ats: str, report: "ApplyReport", timeout_ms: in
             except Exception:
                 pass
             page.wait_for_timeout(600)
+            _dismiss_consent_banner(page, report)
             found = _ats_from_frame(frame, ats)
             # An account-gated portal answers Apply with a sign-in step whose 2-4 boxes look
             # exactly like a short form. Filling it would run the resolver over "User Name" /
@@ -1995,6 +2009,35 @@ def _open_application_form(page, ats: str, report: "ApplyReport", timeout_ms: in
         "form ApplicationBot doesn't support yet — so no fields were filled. Open the URL to check."
     )
     return False, page.main_frame, ats
+
+
+# Cookie-consent buttons, LEAST-consent first. A banner is an overlay: while it is up it swallows
+# pointer events, so a required checkbox underneath it cannot be clicked at all — that is what
+# stopped Oracle Recruiting's "I agree with the terms and conditions" (decision 171). We dismiss it
+# with the narrowest consent the banner offers and only fall back to accepting when refusing is not
+# on offer, because the alternative is leaving a form the user cannot submit.
+_CONSENT_REJECT = re.compile(
+    r"^\s*(reject all|reject|decline all|decline|only necessary|necessary only|"
+    r"strictly necessary|essential only|continue without)\b", re.I)
+_CONSENT_ACCEPT = re.compile(r"^\s*(accept all|accept cookies|accept|allow all|i agree|got it|ok)\s*$", re.I)
+
+
+def _dismiss_consent_banner(page, report: "ApplyReport") -> None:
+    """Close a cookie/consent overlay if one is up. No-op when there isn't one — which is every ATS
+    we already fill, so this cannot change their behaviour. Recorded in notes: it is a click we made
+    on the user's behalf, and a silent one would be the kind of thing they should not discover from
+    a cookie banner later."""
+    for pattern, kind in ((_CONSENT_REJECT, "refused"), (_CONSENT_ACCEPT, "accepted")):
+        try:
+            btn = page.get_by_role("button", name=pattern).first
+            if btn.count() and btn.is_visible():
+                btn.click(timeout=3000)
+                page.wait_for_timeout(400)
+                report.notes.append(f"Dismissed the cookie banner ({kind} non-essential cookies) "
+                                    "— it was covering the form.")
+                return
+        except Exception:
+            continue
 
 
 def _upload_resume(frame, resume_pdf: str, report: "ApplyReport") -> None:
@@ -2612,12 +2655,22 @@ def _scope_prefix(page) -> str:
 # real question ("Is there anything you'd like to leave blank?") never instructs like this.
 _HONEYPOT_LABEL = re.compile(r"leave (this )?(field |box )?blank|do not (fill|complete) this", re.I)
 
+# What a honeypot NAMES itself. Oracle Recruiting ships `id="honey-pot-1" name="honey-pot"
+# aria-label="honeypot"` — CSS-visible, no aria-hidden wrapper and a label that instructs nothing,
+# so neither signal above sees it (decision 171). Anchored on the whole word: no real field is
+# called this, and "money-pot"/"honeypots-of-the-world" style text can't reach it.
+_HONEYPOT_NAME = re.compile(r"\bhoney[-_ ]?pot\b", re.I)
+
 
 def _is_honeypot(kind: dict, label: str) -> bool:
-    """A bot trap rather than a field: either its wrapper is aria-hidden (so no person is meant to
-    see it, yet it is CSS-visible and enumerable) or its own label says to leave it empty. Both
-    signals were read off BambooHR's live form, which uses them together (decision 168)."""
-    return bool(kind.get("trapped")) or bool(_HONEYPOT_LABEL.search(label or ""))
+    """A bot trap rather than a field. Three independent tells, because the two live ATSs that ship
+    one share none of them: BambooHR wraps it in aria-hidden AND labels it "Please leave this field
+    blank" (decision 168); Oracle Recruiting just calls it "honey-pot" (decision 171). Filling any
+    of them is how a submission gets silently binned."""
+    return (bool(kind.get("trapped"))
+            or bool(_HONEYPOT_LABEL.search(label or ""))
+            or bool(_HONEYPOT_NAME.search(label or ""))
+            or bool(_HONEYPOT_NAME.search(kind.get("ident") or "")))
 
 
 # The visible control a form puts in front of a native <select> it keeps only to carry the value.
@@ -2749,6 +2802,7 @@ def _fill_all_fields(page, resolver: AnswerResolver, report: "ApplyReport", done
                 "role: (el.getAttribute('role')||'').toLowerCase(), "
                 "ariaHidden: (el.getAttribute('aria-hidden')||'').toLowerCase() === 'true', "
                 "trapped: !!(el.parentElement && el.parentElement.closest('[aria-hidden=\"true\"]')), "
+                "ident: [el.id, el.name, el.getAttribute('aria-label')].filter(Boolean).join(' '), "
                 "chrome: !!el.closest('nav,header,footer,[role=search],[role=navigation]')})"
             )
         except Exception:
@@ -2756,6 +2810,15 @@ def _fill_all_fields(page, resolver: AnswerResolver, report: "ApplyReport", done
         tag, typ, role = k["tag"], k["type"], k["role"]
         if typ in ("hidden", "submit", "button", "file", "checkbox", "radio", "search"):
             continue  # radios handled as groups below; search boxes aren't application fields
+        # Honeypot, decided from the control's OWN identity and checked FIRST — before both skips
+        # below. A trap is usually sized to nothing AND marked aria-hidden, so the two of them
+        # swallowed it silently: it came back empty by luck, and a tenant that rendered it
+        # laid-out would have had it filled. Its LABEL is checked again further down, for the
+        # traps whose only tell is what the label says (decision 171).
+        if _is_honeypot(k, ""):
+            report.notes.append(
+                f"Left the honeypot field {(k.get('ident') or '?').split()[0]!r} empty (bot trap).")
+            continue
         # react-select renders a second, aria-hidden requiredInput next to its real combobox
         # input, sharing the field's label. Its empty type reads as free text, so without this
         # skip it gets .fill()'d — writing nothing visible but claiming the label as "done",
@@ -2946,20 +3009,53 @@ def _fill_all_fields(page, resolver: AnswerResolver, report: "ApplyReport", done
         done.add(label)
 
 
-def _check_radio(loc) -> bool:
-    """Select a radio, resilient to an overlay that intercepts the real click — Lever embeds an
-    hCaptcha whose invisible enclave iframe sits over the form and swallows pointer events. Try a
-    normal check, then a forced check, then set `.checked` directly and fire input/change so any
-    listener notices. Returns True once the input reads as checked. NOT captcha circumvention: the
-    CAPTCHA widget is never touched and still gates submission (dry-run never submits anyway)."""
-    for attempt in (lambda: loc.check(timeout=4000),
-                    lambda: loc.check(force=True, timeout=2000)):
-        try:
-            attempt()
+def _force_check(loc) -> bool:
+    """Tick a radio OR a checkbox, resilient to the two things that stop a plain click: an overlay
+    that intercepts it (Lever embeds an hCaptcha whose invisible enclave iframe sits over the form)
+    and a control styled to 0x0 behind a decorative element (Oracle Recruiting's terms checkbox is
+    a 0x0 input under a <span> — a plain .check() just times out, which left the required box
+    unticked, decision 171). Try a normal check, then a forced check, then set `.checked` directly
+    and fire input/change so any listener notices. Returns True once the input reads as checked.
+    NOT captcha circumvention: the CAPTCHA widget is never touched and still gates submission
+    (dry-run never submits anyway)."""
+    try:
+        loc.check(timeout=4000)
+        if loc.is_checked():
+            return True
+    except Exception:
+        pass
+    # Through the LABEL, which is how a person ticks a control styled to 0x0: the browser forwards
+    # the click to the input and the site's own component sees a real click. This is the step that
+    # matters — Oracle Recruiting's terms box accepts nothing else, and the JS fallback below only
+    # LOOKS like it worked (the input reads checked; the form still refuses with "You need to agree
+    # to the terms and conditions"). Clicked near the top-left corner, where the decorative
+    # checkbox sits, so a "terms and conditions" LINK in the middle of the label is never hit.
+    try:
+        lab = loc.locator("xpath=ancestor::label[1]")
+        if lab.count():
+            target = lab.first
+            for sel in ("[class*=checkbox]", "span, i, svg"):
+                cand = lab.first.locator(sel).first
+                if cand.count():
+                    target = cand
+                    break
+            target.click(timeout=3000, position={"x": 4, "y": 4})
             if loc.is_checked():
                 return True
-        except Exception:
-            pass
+    except Exception:
+        pass
+    try:
+        loc.scroll_into_view_if_needed(timeout=2000)  # a 0x0 box is "outside the viewport" without this
+    except Exception:
+        pass
+    try:
+        loc.check(force=True, timeout=2000)
+        if loc.is_checked():
+            return True
+    except Exception:
+        pass
+    # Last resort, for an overlay that eats every real click (Lever's hCaptcha enclave). Kept last
+    # BECAUSE it can report success a framework doesn't agree with — see the label note above.
     try:
         loc.evaluate("el => { el.checked = true; "
                      "el.dispatchEvent(new Event('input', {bubbles: true})); "
@@ -3022,7 +3118,7 @@ def _fill_radio_groups(page, resolver: AnswerResolver, report: "ApplyReport", do
         for pos, opt_label in enumerate(opt_labels):
             opt, i = opt_label.lower(), idxs[pos]
             if opt and (opt == v or v in opt):
-                if _check_radio(radios.nth(i)):
+                if _force_check(radios.nth(i)):
                     report.filled.append(FilledField(q, value, "radio"))
                     _record_capture(report, q, "radio", opt_labels)
                     picked = True
@@ -3121,7 +3217,7 @@ def _fill_checkboxes(page, resolver: AnswerResolver, report: "ApplyReport", done
             if opt and any(_matches(opt, c) for c in candidates):
                 if not info[i]["checked"]:
                     try:
-                        boxes.nth(i).check(timeout=4000)
+                        _force_check(boxes.nth(i))
                     except Exception as e:
                         report.errors.append(f"{q}: {type(e).__name__}: {e}")
                         continue
@@ -3145,7 +3241,7 @@ def _fill_checkboxes(page, resolver: AnswerResolver, report: "ApplyReport", done
         if _is_optional_optin(nlbl) or not _is_agreement(nlbl):
             continue  # optional opt-in, or a checkbox we can't confidently classify — leave it
         try:
-            boxes.nth(i).check(timeout=4000)
+            _force_check(boxes.nth(i))
             report.filled.append(FilledField(lbl, "checked", "checkbox"))
             done.add(lbl)
         except Exception as e:
