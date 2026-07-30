@@ -1,0 +1,101 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>BambooHR-shaped apply form fixture</title></head>
+<body>
+<!-- Modelled on the live BambooHR form probed 2026-07-30 (alkira.bamboohr.com/careers/232/,
+     decision 168). Two things here are NOT generic form markup and are the point of the fixture:
+
+     1. The honeypot. A real, CSS-visible, labelled text box whose only "hidden" marker is
+        aria-hidden on its wrapper. BambooHR ships it verbatim as "Please leave this field blank".
+     2. The Fabric Select facade. The native <select> is aria-hidden + readonly + height:0 and
+        carries NO options; the user drives a <button aria-haspopup> that opens
+        [role=menu] > [role=menuitem]. A fill that only looks at <select>/<option> leaves the
+        REQUIRED State empty while the page still looks answered. -->
+<form>
+  <label for="firstName">First Name&thinsp;*</label>
+  <input id="firstName" name="firstName" type="text">
+
+  <label for="lastName">Last Name&thinsp;*</label>
+  <input id="lastName" name="lastName" type="text">
+
+  <label for="email">Email&thinsp;*</label>
+  <input id="email" name="email" type="text">
+
+  <label for="phone">Phone&thinsp;*</label>
+  <input id="phone" name="phone" type="text">
+
+  <div class="fabric-root" aria-hidden="true">
+    <label for="nickname_hpcsaf">Please leave this field blank</label>
+    <input name="nickname_hpcsaf" id="nickname_hpcsaf" type="text"
+           autocomplete="newAppNicknameInput_hpcsaf" data-1p-ignore="true" data-lpignore="true">
+  </div>
+
+  <div class="fab-Select" data-fabric-component="Select">
+    <label for="fab-select323">State&thinsp;*</label>
+    <button data-menu-id="fab-menu46" aria-expanded="false" aria-haspopup="true"
+            aria-label="State –Select–" type="button" class="fab-SelectToggle"
+            onclick="openMenu('fab-menu46', this)">–Select–</button>
+    <select data-has-default-value="" aria-hidden="true" class="chzn-ignore" id="fab-select323"
+            name="state.value" readonly="" required="" tabindex="-1"
+            style="height:0;opacity:0;overflow:hidden;position:absolute"></select>
+    <div id="fab-menu46" role="menu" tabindex="-1" class="fab-MenuList" hidden>
+      <div class="fab-MenuOption" role="menuitem" tabindex="-1">Alabama</div>
+      <div class="fab-MenuOption" role="menuitem" tabindex="-1">California</div>
+      <div class="fab-MenuOption" role="menuitem" tabindex="-1">New Jersey</div>
+      <div class="fab-MenuOption" role="menuitem" tabindex="-1">New York</div>
+      <div class="fab-MenuOption" role="menuitem" tabindex="-1">Texas</div>
+    </div>
+  </div>
+
+  <div class="fab-Select" data-fabric-component="Select">
+    <label for="fab-select325">Country&thinsp;*</label>
+    <button data-menu-id="fab-menu28" aria-expanded="false" aria-haspopup="true"
+            aria-label="Country United States" type="button" class="fab-SelectToggle"
+            onclick="openMenu('fab-menu28', this)">United States</button>
+    <select aria-hidden="true" class="chzn-ignore" id="fab-select325" name="countryId.value"
+            readonly="" required="" tabindex="-1"
+            style="height:0;opacity:0;overflow:hidden;position:absolute">
+      <option value="US" selected>United States</option>
+    </select>
+    <div id="fab-menu28" role="menu" tabindex="-1" class="fab-MenuList" hidden>
+      <div class="fab-MenuOption" role="menuitem" tabindex="-1">Canada</div>
+      <div class="fab-MenuOption" role="menuitem" tabindex="-1">United States</div>
+    </div>
+  </div>
+
+  <label for="desiredPay">Desired Pay</label>
+  <input id="desiredPay" name="desiredPay" type="text">
+
+  <label for="linkedinUrl">LinkedIn URL</label>
+  <input id="linkedinUrl" name="linkedinUrl" type="text">
+
+  <button type="submit">Submit Application</button>
+</form>
+
+<script>
+// The facade: clicking the toggle shows the menu; clicking an item writes the value into the
+// hidden <select> (which is how the value actually reaches the server) and updates the toggle.
+function openMenu(id, btn) {
+  var menu = document.getElementById(id);
+  menu.hidden = !menu.hidden;
+  btn.setAttribute('aria-expanded', String(!menu.hidden));
+}
+document.querySelectorAll('[role=menuitem]').forEach(function (item) {
+  item.addEventListener('click', function () {
+    var menu = item.closest('[role=menu]');
+    var wrap = menu.closest('.fab-Select');
+    var sel = wrap.querySelector('select');
+    var btn = wrap.querySelector('button');
+    var text = item.textContent.trim();
+    if (![].some.call(sel.options, function (o) { return o.text === text; })) {
+      sel.add(new Option(text, text));
+    }
+    sel.value = text;
+    btn.textContent = text;
+    btn.setAttribute('aria-label', (btn.getAttribute('aria-label') || '').split(' ')[0] + ' ' + text);
+    menu.hidden = true;
+  });
+});
+</script>
+</body>
+</html>

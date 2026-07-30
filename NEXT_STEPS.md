@@ -254,6 +254,25 @@ real postings), one consolidated live dry-run per milestone.
       creation + login + credential store (keyring, not plaintext YAML) +
       email-verification handling + the multi-page wizard. Largest single item
       (multi-week); starts once the submit path + runner are solid on the open ATSs.
+- [x] **ATS coverage gap vs Simplify's published portal list** — done (2026-07-30, decision 168).
+      A read-only probe of live postings split the five: **Jobvite (104 postings) and BambooHR
+      (22)** serve the form to anyone and now fill end-to-end (verified on the real forms: 9 and
+      10 fields), including BambooHR's honeypot and its button-facade selects and the split
+      Address/City/State/ZIP block both require (two new profile fields, `street_address` +
+      `postal_code`). **iCIMS (1,311), Taleo (152) and Avature (26)** answer Apply with an
+      account wall on every tenant sampled — they are detected, gated out of the search, and
+      **refused at the wall with the portal named** instead of having their login form filled in
+      as if it were an application. They unblock with the account-gated item above, not with a
+      form handler.
+- [ ] **Oracle Recruiting Cloud (`*.fa.ocs.oraclecloud.com`) — 3,553 postings, the single
+      largest block we drop (found 2026-07-30 while measuring for decision 168).** More than
+      Greenhouse (3,026) and 2.7× iCIMS. It was not on Simplify's published list, so it was
+      never queued; the count comes from the two curated feeds. **Unprobed** — before any code,
+      run the same read-only probe used for decision 168 (`_open_application_form` against three
+      live postings) to find out whether the form is public or behind an account, because that
+      answer decides whether this is a fixture-and-handler job or part of the account-gated work.
+      If it is public it is the highest-value Apply-stage item on this list.
+- [ ] **Eightfold (`*.eightfold.ai`) — 120 postings.** Same first step: probe before building.
 
 ### Adopted from the ai-job-search survey (2026-07-09) — user-approved queue
 
@@ -899,6 +918,69 @@ Posted to the agent bus 2026-07-06; independent of the engine work above.
 ---
 
 ## Recently added (this session, latest first)
+
+- 2026-07-30 — **ATS coverage shipped: Jobvite + BambooHR fill, iCIMS/Taleo/Avature refuse honestly
+  (decision 168).** A read-only probe of live postings reversed decision 167's build order — the two
+  "cheapest" portals are the ones that can finish today, and the 1,311-posting iCIMS prize is behind
+  the account-gated work, not a form handler. New in the engine: honeypot detection (BambooHR ships
+  a CSS-visible "Please leave this field blank" trap), button-facade selects (`[role=menuitem]`
+  pickers over a hidden `<select>`), the account-wall refusal (scoped to the three gated portals so
+  Workday's own account flow is untouched), and the split Address/City/State/ZIP block with two new
+  profile fields. One deliberate behaviour change: a `City` box now gets `"Austin"`, not
+  `"Austin, TX"` — resolver corpus updated in the same commit. 19 new tests, 3 new fixtures,
+  suite 738 green. **Measured while counting: Oracle Recruiting Cloud is 3,553 postings** — bigger
+  than Greenhouse and the largest block we drop — queued unprobed under **Now**.
+
+- 2026-07-30 — **Simplify's autofill engine evaluated and rejected; its portal list adopted as our
+  ATS coverage target (decision 167).** User: *"look into if we can integrate simplify into our
+  workflow since they already have a robust autofill workflow"*. No API (browser extension only),
+  it never clicks Submit, it fills from its own cloud profile so our tailored PDF and answer bank
+  can't reach it, we'd be arming an irreversible submit on a form a black box filled, and their
+  Terms bar bot accounts and automated extraction. Decision 024 had already rejected it on the
+  tracker side for the same reason. The Simplify surface we *do* use — their public
+  `listings.json` feeds via `CuratedListSource` (decisions 031/073) — is unchanged. Docs only,
+  no code; the coverage gap (iCIMS, Taleo, Avature, BambooHR, Jobvite) is queued under **Now**.
+
+- 2026-07-30 — **Dropdown questions are captured and reviewed as dropdowns (decision 165).** User
+  report: *a field that is a dropdown in the real application shows up as a text box in the review.*
+  Reproduced from the user's own Palantir archive — four answered `select` fields in `filled`, none
+  in `captured`. Two bugs: **(1)** `_record_capture` only ran for fields we could NOT answer, so an
+  answered `<select>`/radio group/static combobox recorded no options for the panel to rebuild from;
+  now a native `<select>` records `_selectable_options` however the fill turns out (its `<option>`s
+  ARE the choice set; the "Select …" placeholder is excluded), an answered radio group records the
+  option labels it already reads, and the required-dropdown model-pick records the list it chose
+  from. A combobox records only the list shown **on open** and only when the answer matched there
+  (new `AnswerResolver.seen_options`) — a searchable picker's open list is an alphabetical prefix,
+  not its choices (decision 080), so a school typeahead correctly stays a text box. **(2)**
+  `answerRow` rendered everything but check-all-that-apply groups as free text; new `isSingleChoice`
+  + `singleChoiceInput` render the form's own list as a `<select>` mirrored into a hidden input, so
+  the save path is unchanged. Because a captured list can be short of the form's real one (caps at
+  40/60 options, and postings change), every dropdown ends with **"Type a different value…"** and a
+  one-click way back — a closed list must never make a field un-editable. Archives written before
+  this stay text boxes until **Rescan questions** (decision 164) refreshes them.
+  New `tests/test_review_dropdowns.py` (3, incl. a live fill of `lever_custom_cards.html`).
+
+- 2026-07-30 — **Reviewed questions say Required or Optional, and the panel can rescan the posting
+  (decision 164).** The review panel listed every answer identically, so nothing told the user which
+  blank box blocks a submit and which is a voluntary field. `apply.py` gains `_REQUIRED_MAP_JS` +
+  `_record_required` — **one JS sweep per form page** returning `{question: isRequired}` for every
+  visible control, reusing the existing `_LABEL_JS`/`_GROUP_QUESTION_JS`/`_IS_REQUIRED_JS` so its keys
+  match the question strings the fill reports answers under (a radio group is keyed by its card
+  question, not by "Yes"/"No"). It merges across wizard pages, rides along in
+  `_report_snapshot["required"]`, and `_review_data` joins it onto every filled and unanswered row.
+  The panel badges each row **Required**/**Optional**, prints "N required · M optional" above the
+  list, and says how many unanswered rows are required *and therefore blocking a real submit*. A
+  question the sweep never saw gets **no badge** — never a guessed "optional". Reports written before
+  this (and Workday runs, which fill through their own driver) have no map: the panel says so and
+  points at the new **Rescan questions** button — a headless dry-run re-fill (`gate=None`, no window)
+  that rewrites the posting's `report.json` and re-renders the panel with the current questions,
+  control types, required marks and answers. Unsaved edits are flushed first and saved edits are
+  reapplied by the fill, so a rescan never reverts the user's answers. It queues onto the loop thread
+  while the loop runs (new `take_rescan_requests`/`rescan_one` hooks in `autoloop`, mirroring
+  watches), and the panel detects completion by the archived report's timestamp changing — the same
+  signal for the direct and the queued run. **Also fixed:** `start_reapply` referenced an undefined
+  `mode`, so every re-apply/watch with the loop idle raised `NameError` before starting.
+  New `tests/test_required_marks.py` (5) + 2 autoloop tests; suite **664 passed**.
 
 - 2026-07-29 — **Forwarded application emails become tracker rows (decision 151).** The Track stage
   only knew about applications the bot itself made, so anything applied to by hand was invisible and
@@ -2484,6 +2566,124 @@ Record each decision in [DECISIONS.md](DECISIONS.md) once the user chooses.
 ---
 
 ## Recently completed
+
+- 2026-07-30 — **Generic fields are answered from the text around them (decision 167).** User:
+  "make sure that fields like those use the context around them to figure out what should be in
+  them." Every answer used to come from one string, the field's label — which works for a real
+  question and fails for `Date`, `Name`, `Other`, `If yes, please explain`. New `_CONTEXT_JS`
+  reads a field's neighbourhood off the page (its help text, the heading/legend of the blocks it
+  sits in, the text just above it, and the label of the field it follows), capped at 300 chars and
+  fetched **only** for a generic label or a field nothing structured could answer. It feeds three
+  places: the signature-date rule (today, *unless* the surroundings say the box is the applicant's
+  own — birth, graduation, employment, school — in which case it is left for them); every model
+  call (`classify_question(s)`, `match_banked_question(s)`, `generate_answer`,
+  `choose_required_option`) as explicit "which question is this?" grounding; and the review panel,
+  which prints it under the label ("on the form: Applicant certification · follows the field:
+  Signature"). `answer_bank.is_context_dependent` now blocks a generic label from ever entering the
+  shared answer bank — the loop that made decision 166's bug recur across postings.
+  Verified on the live Palantir posting: it reads "SELF-IDENTIFICATION OF VETERAN STATUS … ·
+  follows the field: Name" around that form's `Date` (today — correct there), plus real context on
+  four questions it couldn't answer. New `fixtures/apply_forms/context_dates.html`; suite
+  **711 passed**.
+
+- 2026-07-30 — **Wrong-context answers: fixed at the source, and made visible in review
+  (decision 166).** User: "many fields filled out technically correctly but not the right context:
+  date on the bottom (meant to take in the day you apply, had a string instead saying when i am
+  free)." Reproduced from the user's own archive — three Palantir dry-runs filled the signature-line
+  **Date** box with `"Yes"` / *"I'm available immediately, with confirmed graduation in May 2027."*
+  **Cause:** `banked_qa` matched a label against a banked question by containment with the length
+  guard on one side only, so the 4-character label `"date"` matched *any* banked question containing
+  the word — *"…earliest start date?"* and a *"…receive up**date**s…"* opt-in — and the wrong answer
+  was then re-learned into the bank. **Fixed:** containment needs both sides > 15 chars; a new
+  `_is_todays_date_q` rule answers a form's own signature date with today (whole-label match, so
+  birth/graduation/start dates are untouched, and it runs before the bank); `<input type=date>` is
+  now filled (`YYYY-MM-DD` only). `scripts/prune_answer_bank.py` now also drops a **generated** bank
+  answer a structured rule has since taken over — one `--apply` run cleared the poisoned entry.
+  **Review panel:** `_answer_flag` checks each answer's shape against its question and the panel
+  turns mismatched rows amber with **Check this** and the reason above the edit box; model-produced
+  answers carry an **AI-drafted** / **AI-picked** chip. Run against the four archived Palantir
+  applications it caught all three bad dates plus a *"which role … and why?"* answered `"Yes"`; a
+  live headless re-fill of the real Palantir form then put `2026-07-30` in the Date box.
+  New `tests/test_wrong_context_answers.py` (35 cases) + `fixtures/apply_forms/signature_date.html`;
+  suite **700 passed**.
+
+- 2026-07-30 — **The Review & tailor tab is gone; tailoring is now a dry-run choice on Discover
+  (decision 163).** User: "we can get rid of the review tab altogether: make it a dry run option (you
+  can choose to dry run the application or just the tailoring step)." The dry-run panel gained two
+  segmented controls — **Job** (best match it finds · a posting I paste) × **How far to go** (tailor +
+  fill the form · tailor the résumé only) — and one button that relabels itself for each state.
+  *Paste × fill* is impossible (a pasted posting has no application URL), so that option is disabled
+  with the reason on the control instead of failing at run time. Review owned three live things, all
+  rehomed rather than dropped: the `#resume` selector every screen reads now sits at the top of
+  **Profile** as **"Profile you're working on"** (the label names what it governs — what the sections
+  edit, what imports merge into, and what every application is tailored from — with a hint that
+  applicant details are one shared file and don't switch with it); the fixture picker, paste box, and engine/quality/length knobs moved into the dry-run
+  panel behind the paste option; Track's **Retailor** now lands on Discover with the posting loaded.
+  Server: `_test_worker(force_fresh, mode)` takes `mode="tailor"` and stops after
+  `pipeline.tailor_and_render` (no browser, no fill, no tracker row — nothing was applied to), the PDF
+  still landing on the posting's reusable path so a later apply run doesn't re-tailor;
+  `tailor_and_render` gained an additive `on_result` callback so the UI can show the tailored résumé
+  and its **drift warnings**; new `/test-run/resume` streams that PDF; the polled state echoes `mode`
+  so a tailor-only run shows four steps, not six. Verified against the live app in headless Chromium:
+  a real paste-path tailor and a real discovered tailor-only run (Vestmark — Associate Java Software
+  Engineer) both rendered the résumé, notes and drift panel, and served the PDF; no JS errors.
+
+- 2026-07-30 — **The app opens on Discover instead of Review & tailor (decision 162).** User: "lets also
+  make the discover page the main page instead of the review and tailor." Review was the landing view
+  only because it was built first; it is stage 3 of five and shows an empty form until a posting exists.
+  Discover is now first in the nav rail, `active` in the served HTML, and `#view-discover` ships
+  unhidden (`#view-review` hidden), so the right page paints on the first frame. The tab-click body
+  became **`showView(v, {nudge})`** — nav clicks, the `#hash` deep-link router, the tour, and the
+  landing call all route through it, so a view can't be shown without its loaders; landing on Discover
+  fires all seven (`pollLoop`, `loadParked`, `loadSources`, `loadFitInsights`, `loadCandidates`,
+  `loadDisc`, `pollTest`). `applyHash()` now reports whether the hash matched, so `/#notifications`
+  push links still win over the default. The landing call passes `nudge:false`: `/setup/status` hasn't
+  answered at load, so an already-configured user would otherwise get the "choose what jobs to find"
+  nudge on every launch. Verified by driving the real UI in headless Chromium — lands on *Discover &
+  apply*, only `view-discover` visible, all seven endpoints hit, no JS errors, deep link and the Review
+  tab both still work.
+
+- 2026-07-30 — **Résumé import is now the first thing on the Profile screen; LinkedIn import is a
+  small button inside it (decision 161).** User: "lets move the resume import to the top of the
+  profile screen as well as linkedin import. Linkedin import can be a small button in the resume
+  inport section since it probably wont be as used." Both import boxes previously sat below the
+  entire profile form, so the action that fills the form in was the last thing a new user reached.
+  `#s-upload` ("Start here — upload your résumé") now renders above `#profile-form`; `#s-linkedin`
+  is nested inside it as a collapsed panel behind a small `#li-toggle` button. Layout only — no
+  import handler or endpoint changed. Directional copy ("sections above" → "below") and the
+  section-jump nav (`LinkedIn import` → a leading `Import résumé`) updated to match. Verified in
+  headless Chromium against the running app: correct DOM order, panel toggles and relabels, no
+  console errors.
+
+- 2026-07-30 — **Uploading a second résumé no longer duplicates roles the profile already has
+  (decision 160).** User: "when parsing a resume and adding onto an already existing profile, we
+  should take into account what already exists (ex: don't make another duplicate intern role if one
+  already exists)." `resume_import.import_resume()` deduped on exact `(organization, role)` strings,
+  which two résumé versions of one job almost never share. Reproduced on the user's own data:
+  re-importing `profile/Gabriel Chan - SoftEngResume10:29:25.pdf` onto a copy of `profile/resume.yaml`
+  appended *Jaguar Technologies — Junior Software Engineer* beside the existing *Jaguar Technologies —
+  Software Engineer Intern*, same May 2024–Apr 2025 span. Matching is now token-based (punctuation
+  dropped, `M.I.T.`→`mit`, `Inc`/`LLC`/`Corp` stripped, `engineering`/`developer`/`swe`→`engineer`,
+  `internship`→`intern`), accepting equality, containment (`Intern` ⊂ `Software Engineer Intern`), or
+  ≥0.87 similarity; an entry is a duplicate when the **employer** matches and (the **title** matches or
+  the **month-precise span** is identical) and the years do not conflict — so a 2023 internship and a
+  2024 return offer stay separate. `experience` and `activities` are searched together (the same
+  internship lands in either). Matched entries get their **blank** fields filled from the upload
+  (nothing non-blank is overwritten), and the Profile page now lists what it matched instead of adding
+  and what it filled in — a fuzzy match the user can't see reads as "it ignored my résumé". Skills stay
+  exact-with-punctuation-stripped (`Node.js` = `NodeJS`); fuzzy there would eat `React Native`.
+  Verified end-to-end: re-importing the real PDF onto a copy of the real profile now adds nothing and
+  leaves the file byte-identical. Six new tests in `tests/test_resume_import.py`.
+  **The LinkedIn import now shares that matcher** (same session, same decision): it had the identical
+  exact-string dedup and is the worst case for it — LinkedIn stores the legal company name a résumé
+  shortens (`Jaguar Technologies Inc.`, `Kumon North America`), its own job titles, and ISO dates
+  (`_month_year` learned that form). The rules were made `resume_import`'s public API — `find_role`,
+  `find_education`, `same_tokens`, `same_period`, `fill_blanks`, `skill_key` — and `linkedin.py`
+  imports them, so the two paths cannot drift; it returns the same `skipped`/`enriched` lists and the
+  Profile page reports them the same way. New `tests/test_linkedin_import.py` (5 tests) builds the
+  export CSVs by hand, so the whole path runs for real with no network. Verified on real data: a PDF
+  re-import followed by a LinkedIn export naming those same roles LinkedIn's way adds nothing on
+  either path and leaves the file byte-identical.
 
 - 2026-07-30 — **A test was destroying the real apply profile; config files can no longer be written
   over as résumés, and "which/why" questions can no longer be answered "Yes" (decision 159).**

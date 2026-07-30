@@ -1097,6 +1097,16 @@ def detect_ats_from_url(url: str) -> str:
         return "workable"
     if "myworkdayjobs.com" in u or "workday" in u:
         return "workday"
+    if "jobvite.com" in u:
+        return "jobvite"
+    if "bamboohr.com" in u:
+        return "bamboohr"
+    if "icims.com" in u:
+        return "icims"
+    if "taleo.net" in u:
+        return "taleo"
+    if "avature.net" in u:
+        return "avature"
     return "other"
 
 
@@ -1513,6 +1523,20 @@ ATS_SOURCES = {
     "recruitee": RecruiteeSource,
     "workable": WorkableSource,
 }
+
+# ATSs the APPLY stage can drive but that publish no board API we discover FROM — they arrive via
+# the curated feeds and the aggregator bridges. `workday` is decision 059's deterministic adapter;
+# `jobvite` and `bamboohr` were verified against live postings on 2026-07-30 (decision 168):
+# Jobvite's Apply lands on a public `<posting>/apply` form, BambooHR renders the form on the
+# posting page itself. Kept separate from ATS_SOURCES so "can we discover it" stays distinct
+# from "can we fill it".
+FILLABLE_ATS = set(ATS_SOURCES) | {"workday", "jobvite", "bamboohr"}
+
+# Reached the same way, but every sampled posting answered Apply with a sign-in or
+# create-an-account step, so the Apply stage cannot finish one yet (decision 168). Listed
+# explicitly — rather than just left out — so the gate's reason is readable and the set is one
+# edit away from flipping once the account-gated portal work lands.
+ACCOUNT_GATED_ATS = {"icims", "taleo", "avature"}
 
 
 def build_source(ats: str, token: str) -> Source:

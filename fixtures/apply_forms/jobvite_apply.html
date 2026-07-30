@@ -1,0 +1,48 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Jobvite-shaped apply form fixture</title></head>
+<body>
+<!-- Modelled on the live Jobvite form probed 2026-07-30
+     (jobs.jobvite.com/visionist/job/oEBdAfwM → .../apply, decision 168). Nothing here needs a
+     Jobvite-specific handler — the point of the fixture is to PIN that: opaque generated ids
+     (jv-field-*), the label carrying the required marker as a trailing "*", a native <select>
+     with a "Select an option..." placeholder, and a "Next" wizard button. If a change ever
+     breaks Jobvite, it broke the generic engine. -->
+<form>
+  <label for="jv-field-yD5jZfwK">First Name*</label>
+  <input id="jv-field-yD5jZfwK" name="firstName" type="text" required aria-required="true">
+
+  <label for="jv-field-yF5jZfwM">Last Name*</label>
+  <input id="jv-field-yF5jZfwM" name="lastName" type="text" required aria-required="true">
+
+  <label for="jv-field-yE5jZfwL">Email Address*</label>
+  <input id="jv-field-yE5jZfwL" name="email" type="text" required aria-required="true">
+
+  <label for="jv-field-yH5jZfwO">Phone*</label>
+  <input id="jv-field-yH5jZfwO" name="phone" type="tel" required aria-required="true">
+
+  <label for="jv-field-yI5jZfwP">Address*</label>
+  <input id="jv-field-yI5jZfwP" name="address" type="text" required aria-required="true">
+
+  <label for="jv-field-yJ5jZfwQ">City*</label>
+  <input id="jv-field-yJ5jZfwQ" name="city" type="text" required aria-required="true">
+
+  <label for="jv-field-yK5jZfwR">State*</label>
+  <select id="jv-field-yK5jZfwR" name="state" required aria-required="true">
+    <option value="">Select an option...</option>
+    <option value="NA">Not Applicable</option>
+    <option value="CA">California</option>
+    <option value="NJ">New Jersey</option>
+    <option value="NY">New York</option>
+  </select>
+
+  <label for="jv-field-yL5jZfwS">Zip*</label>
+  <input id="jv-field-yL5jZfwS" name="zip" type="text" required aria-required="true">
+
+  <label for="jv-field-ydonZfwH">Years of related experience</label>
+  <input id="jv-field-ydonZfwH" name="years" type="text">
+
+  <button type="button">Next</button>
+</form>
+</body>
+</html>

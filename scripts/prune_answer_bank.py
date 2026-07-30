@@ -37,6 +37,15 @@ def main(argv: list[str]) -> int:
                 and any(t in qn for t in answer_bank._NUMERIC_FACT):
             notes.append(f"DROP  (drafted numeric fact) {qa.question[:60]!r} = {qa.answer!r}")
             continue
+        # A GENERATED plain answer for a question a structured rule now answers is dead weight at
+        # best (the bank is consulted last, so it can never win) and a live hazard at worst: it is
+        # still a fuzzy-match target for other labels. These are exactly the entries a wrong
+        # semantic match wrote — e.g. a bare "Date" banked as "I'm available immediately…"
+        # (decision 166). User-entered answers are never dropped.
+        if qa.generated and not qa.maps_to and resolver.resolve(qa.question) is not None:
+            notes.append(f"DROP  (a profile rule now answers it) {qa.question[:60]!r} "
+                         f"= {(qa.answer or '')[:60]!r}")
+            continue
         if qa.maps_to:
             invalid = (
                 not answer_bank.valid_mapping(qa.question, qa.maps_to)  # same gate as write time

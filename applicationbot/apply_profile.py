@@ -57,6 +57,12 @@ class ApplicationProfile(BaseModel):
     email: str = ""
     phone: str = ""
     location: str = ""
+    # The two address-block parts `location` ("Edison, NJ") cannot supply. Portals that split the
+    # address into Address / City / State / ZIP mark all four REQUIRED — both Jobvite and BambooHR
+    # do — so without these the fill stalls on a field no rule can derive (decision 168). City and
+    # state ARE derived from `location`; only these two are genuinely new user data.
+    street_address: str = ""
+    postal_code: str = ""
     country: str = "United States"
     linkedin_url: str = ""
     github_url: str = ""
@@ -291,7 +297,10 @@ def remember_answers(new: list[QA], path: str | Path = DEFAULT_PATH) -> int:
         # Keep entries that carry either a written answer OR a structured mapping (maps_to);
         # a mapped entry answers live from the profile, so its `answer` is intentionally blank.
         has_content = bool((qa.answer or "").strip()) or bool(maps_to)
-        if not key or len(key) < 4 or not has_content or key in have:
+        # A context-dependent label ("Date", "Other", "If yes…") is a word, not a question:
+        # banked, it would answer a DIFFERENT field on the next form (decision 167).
+        if not key or len(key) < 4 or not has_content or key in have \
+                or answer_bank.is_context_dependent(qa.question):
             continue
         profile.custom_answers.append(qa)
         have.add(key)

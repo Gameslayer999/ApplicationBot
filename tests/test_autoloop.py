@@ -375,3 +375,35 @@ def test_no_goal_still_stops_at_caught_up():
     log, cbs, kwargs = _hunt_driver([[_Match("a")], []], goal=None)
     assert auto_apply_loop(*cbs, **kwargs) == "caught_up"
     assert not [n for k, n in log if k == "hunt"]
+
+
+def test_rescan_requests_are_served_before_preparing():
+    """A "Rescan questions" click (decision 164) is a browser job like a watch: the loop thread
+    owns the browser, so the click is queued and drained BEFORE the next preparation — never left
+    waiting behind a whole batch."""
+    log: list = []
+    state = {"i": 0, "took": 0}
+
+    def discover_batch():
+        state["i"] += 1
+        return [_Match("a"), _Match("b")] if state["i"] == 1 else []
+
+    def take_rescans():
+        state["took"] += 1
+        return [7] if state["took"] == 1 else []   # queued before the first preparation
+
+    reason = auto_apply_loop(
+        discover_batch, lambda m: log.append(("prepare", m.name)),
+        lambda: [], lambda i: None, lambda: False,
+        take_rescan_requests=take_rescans,
+        rescan_one=lambda app_id: log.append(("rescan", app_id)))
+
+    assert reason == "caught_up"
+    assert log == [("rescan", 7), ("prepare", "a"), ("prepare", "b")]
+
+
+def test_rescan_hooks_are_optional():
+    # Callers that don't offer rescanning (the CLI runner) behave exactly as before.
+    log, *cbs = _driver([[_Match("a")], []])
+    assert auto_apply_loop(*cbs) == "caught_up"
+    assert log == [("search", 1), ("prepare", "a"), ("search", 0)]

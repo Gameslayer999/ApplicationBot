@@ -20,6 +20,7 @@ import difflib
 import json
 import re
 from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
 from typing import Optional
 
@@ -51,6 +52,14 @@ class ApplyReport:
     skipped: list[str] = field(default_factory=list)  # fields we couldn't answer
     captured: dict = field(default_factory=dict)  # question -> {kind, options}, so the UI can
     #                                               recreate an unanswered field as its real control
+    # question -> the form text AROUND that field (decision 167), recorded for labels too generic
+    # to answer on their own. It is what the fill answered them FROM, so the review panel shows it
+    # and the user can see which "Date" a "Date" box is.
+    context: dict = field(default_factory=dict)
+    # question -> True/False: does the form mark this field REQUIRED? Swept per form page, so the
+    # review panel can say what must be answered before a submit will go through (decision 164).
+    # A question absent from this map is one the sweep never saw (unknown), not "optional".
+    required: dict = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
     screenshot: Optional[str] = None
     submitted: bool = False
@@ -118,6 +127,64 @@ def _norm(s: str) -> str:
 
 def _has(n: str, *terms: str) -> bool:
     return any(t in n for t in terms)
+
+
+# A field KEY is the question the form shows, plus " #n" when the same label appears on more than
+# one control ("Date #2"). The key identifies the FIELD — it keys `done`, the report, and the
+# user's per-posting edits. The QUESTION is the key without that disambiguator, and it is what
+# every answering rule, the answer bank and every model call see: a second "Date" box is still a
+# date question (decision 169).
+_OCCURRENCE_SUFFIX = re.compile(r"\s+#\d+$")
+
+
+def _question(label: str) -> str:
+    """The question a field key names — the key minus its " #n" occurrence disambiguator."""
+    return _OCCURRENCE_SUFFIX.sub("", label or "")
+
+
+# The form's own date-of-signature field, in the phrasings ATSs use for it. Matched WHOLE, never
+# as a substring: "date" is a word that appears in half the questions on a form, and a date ABOUT
+# the applicant ("date of birth", "graduation date", "date available to start") is theirs to
+# state, not today's. Requiring the label to BE one of these phrasings excludes all of those.
+_TODAYS_DATE_Q = re.compile(
+    r"((todays?|current|signature|applicants?)\s*)?date"
+    r"(\s*(signed|of signature|of application|of this application|completed|filled out|submitted))?"
+)
+
+
+def _is_todays_date_q(n: str) -> bool:
+    """True if the normalised label `n` is a form's signature/date-of-application field — the day
+    the applicant fills the form in."""
+    return bool(n) and bool(_TODAYS_DATE_Q.fullmatch(n))
+
+
+# A generic label can't be answered from its own words: it names a format ("Date", "Year"), a
+# follow-up ("If yes", "Please specify") or a catch-all ("Other", "Details"). These are the boxes
+# that get filled "technically correctly" with the answer to a different question, so the fill
+# reads the text around them before answering. Matched on the WHOLE normalised label — "Date" is
+# generic, "Date of birth" says what it wants.
+_GENERIC_LABELS = frozenset({
+    "date", "year", "month", "day", "name", "number", "amount", "other", "details", "detail",
+    "comments", "comment", "notes", "note", "explain", "explanation", "specify", "signature",
+    "initials", "title", "from", "to", "value", "answer", "response", "position", "location",
+})
+_GENERIC_PREFIXES = ("if yes", "if no", "if so", "if other", "if applicable", "if selected",
+                     "please specify", "please explain", "please describe", "other please")
+
+
+def _is_generic_label(label: str) -> bool:
+    """True if `label`'s meaning lives in the form around it rather than in the label itself."""
+    n = _norm(label)
+    return bool(n) and (n in _GENERIC_LABELS or n.startswith(_GENERIC_PREFIXES))
+
+
+# Words that make a "Date" box the APPLICANT's date (their history, availability, documents)
+# rather than the day they sign the form. Read from the SURROUNDING text, not the label — the
+# label in this case is just "Date".
+_DATE_ABOUT_APPLICANT = ("birth", "graduat", "start date", "available", "availability", "notice",
+                         "hired", "employment", "employer", "expire", "expiration", "issued",
+                         "attended", "degree", "school", "university", "interview", "deadline",
+                         "last day", "resign", "previous", "prior")
 
 
 def _yn(b: Optional[bool]) -> Optional[str]:
@@ -223,11 +290,36 @@ class AnswerResolver:
     semantic_done: set = field(default_factory=set)  # labels the batch already adjudicated
     picks_done: set = field(default_factory=set)     # dropdown labels the batch already adjudicated
     decided_options: dict = field(default_factory=dict)  # label -> batch-picked option text
+    # label -> the option texts a combobox showed ON OPEN, recorded only when the answer matched
+    # one of them. That makes the list the field's real choice set (a searchable picker's open
+    # list is an alphabetical prefix and never matches, so it is never recorded) — which is what
+    # lets the review panel edit an answered dropdown as a dropdown (decision 165).
+    seen_options: dict = field(default_factory=dict)
     _commute_cache: dict = field(default_factory=dict)  # posting commutability judged once (Claude)
     # Answers the user EDITED in the review panel for this exact posting (decision 153),
     # {label: value}. Checked before every resolution rule — an edit is the user's own answer,
     # so it outranks the profile, the answer bank, and any Claude draft.
     overrides: dict = field(default_factory=dict)
+    # label -> the text AROUND that field on the form (section heading, the sentence before it,
+    # the field it follows), recorded by the fill for labels too generic to answer on their own
+    # (decision 167). Read by the date rule and passed to every model call as grounding. Empty
+    # off-page (the review panel's preview resolver has no browser), which is the old behaviour.
+    context: dict = field(default_factory=dict)
+
+    def note_context(self, label: str, text: str) -> None:
+        """Record the form text surrounding `label` as read off the live page. Keyed normalised
+        (like every other label lookup, so a re-render of the same label still finds it), and an
+        empty read is recorded too — that means "already looked", so no field is read twice."""
+        if label:
+            self.context.setdefault(_norm(label), text or "")
+
+    def context_for(self, label: str) -> str:
+        """The recorded text around `label`'s field, or "" if there is none."""
+        return self.context.get(_norm(label), "")
+
+    def context_read(self, label: str) -> bool:
+        """True if this field's surroundings have already been read (possibly to nothing)."""
+        return _norm(label) in self.context
 
     def override_for(self, label: str) -> Optional[str]:
         """The user's edited answer for `label`, or None. Labels are matched normalised, so an
@@ -370,6 +462,22 @@ class AnswerResolver:
             if full in low:
                 return full.title()
         return None
+
+    def _city_only(self) -> Optional[str]:
+        """Just the city from the applicant's location: "Edison, NJ" → "Edison". What an
+        address-block City box wants — the whole "Edison, NJ" string is a wrong answer there."""
+        loc = (self.profile.location or self.resume.contact.location or "").strip()
+        if not loc:
+            return None
+        head = loc.split(",")[0].strip()
+        # A location with no comma may already BE a bare city ("Boston") or a city+state that only
+        # a state name can split ("Edison New Jersey"); strip a trailing state either way.
+        if "," not in loc:
+            for full in _US_STATES.values():
+                if head.lower().endswith(" " + full):
+                    head = head[: -len(full) - 1].strip()
+                    break
+        return head or None
 
     def _office_prefs(self) -> list[str]:
         """Ranked office-location candidates for a "preferred office location" dropdown: the explicit
@@ -535,9 +643,21 @@ class AnswerResolver:
             return "She/Her"
         return None
 
+    def _signature_date(self, label: str) -> Optional[str]:
+        """A form's bare "Date" box: today, the day the application is filled in — UNLESS the text
+        around it says the form is asking for a date about the APPLICANT (a birth date, an
+        employment or education span, a document's expiry). That one is theirs to state, so we
+        leave it unanswered for them rather than stamping today on it (decision 167)."""
+        ctx = _norm(self.context_for(label))
+        if ctx and _has(ctx, *_DATE_ABOUT_APPLICANT):
+            return None
+        return date.today().isoformat()
+
     def resolve(self, label: str) -> Optional[str]:
-        """Return the answer for a field labelled `label`, or None if we can't answer it."""
-        n = _norm(label)
+        """Return the answer for the field keyed `label`, or None if we can't answer it. `label` is
+        a field KEY, so the rules below read the question out of it (`_question`) while the
+        per-field lookups — the user's edit, this field's surrounding text — use the key."""
+        n = _norm(_question(label))
         if not n:
             return None
         edited = self.override_for(label)
@@ -662,11 +782,32 @@ class AnswerResolver:
         # "country where you reside" question resolves to the country, not the city.
         if _has(n, "country"):
             return p.country or None
+        # The ADDRESS BLOCK — Address / City / State / ZIP as four separate required boxes, which
+        # is how Jobvite and BambooHR ask for it (decision 168). Each part answers with that part
+        # alone; the whole-location rule below still serves "Where are you based?".
+        # "Email address" can never reach here — the email rule above already returned.
+        if re.search(r"\b(street|address|address line 1|address 1)\b", n) \
+                and not _has(n, "url", "web", "linkedin", "ip "):
+            return p.street_address or None
+        if re.search(r"\b(zip|zipcode|postal)\b", n) or _has(n, "postal code", "post code"):
+            return p.postal_code or None
+        # A bare "State" / "Province" box (no verb, no qualifier) is the address-block field. The
+        # "which state do you live in?" phrasing is handled by its own rule further down; this one
+        # exists because both portals label it just "State*", which that rule deliberately won't
+        # match (so "please state your salary" can't trigger it).
+        if n in ("state", "province", "state province", "state region", "region",
+                 "state or province", "province state"):
+            return self._state_from_location()
         # NOTE: match "city" only as a whole word — as a bare substring it hits "ethni-CITY"
         # (and "simpli-city"), which wrongly answered "Race/Ethnicity" with the applicant's city.
         # NB: exclude "office" — "preferred office location" asks which COMPANY office you'd work
         # from (from the job's office list), not where you live; answering it with the home city is
         # wrong, so leave it for the user.
+        # A CITY box wants the city alone. Checked before the whole-location rule, and only when
+        # the label doesn't also ask for the location, so "Location (City)" keeps returning
+        # "Edison, NJ" while a split address block's "City*" gets "Edison" (decision 168).
+        if re.search(r"\b(city|town)\b", n) and not _has(n, "location", "office"):
+            return self._city_only() or p.location or c.location or None
         if (_has(n, "location", "current location", "where are you based", "reside", "residence",
                  "where do you live", "where you live", "based out of")
                 or re.search(r"\b(city|live)\b", n)) and not _has(n, "office"):
@@ -685,6 +826,14 @@ class AnswerResolver:
                 "earliest", "start working", "want to start", "like to start", "when would you start",
                 "when could you start", "availability to start", "available start"):
             return p.earliest_start_date or None
+        # The form's own signature date — "Date", "Today's date", "Date signed" — means the day
+        # this application is filled out, NOT a date about the applicant. Checked AFTER the
+        # start-date rule (so "date available to start" still answers availability) and BEFORE
+        # the answer bank, which is what was answering it wrongly: a live Palantir dry-run put
+        # "I'm available immediately, with confirmed graduation in May 2027." into a bare "Date"
+        # field, and another put "Yes" there (decision 166).
+        if _is_todays_date_q(n):
+            return self._signature_date(label)
         if _has(n, "years of experience", "years experience"):
             return p.years_experience or None
         # Spoken/written languages (decision 158). Guarded against PROGRAMMING-language questions,
@@ -790,12 +939,16 @@ class AnswerResolver:
         uses), or None. Exposed so callers can tell a BANK-answered field from a field the
         structured profile rules answer — the bank is consulted last, so teaching it a label the
         rules already answer would have no effect (web._learn_reviewed_answers, decision 155)."""
-        n = _norm(label)
+        n = _norm(_question(label))
         if not n:
             return None
         for qa in self.profile.custom_answers:
             qn = _norm(qa.question)
-            if qn and (qn == n or (len(qn) > 15 and (qn in n or n in qn))):
+            # Substring containment needs BOTH sides long: with the length guard on the banked
+            # question only, a SHORT label was matched by any long banked question that happened
+            # to contain it — a bare "Date" field took the answer to "…earliest start date?" and,
+            # on another posting, to a "…receive updates…" opt-in ("Yes"). Decision 166.
+            if qn and (qn == n or (len(qn) > 15 and len(n) > 15 and (qn in n or n in qn))):
                 return qa
         return None
 
@@ -838,11 +991,13 @@ class AnswerResolver:
             return None
         if label in self.semantic_done:
             return None  # the batch already adjudicated this label — never re-ask per-field
-        key = answer_bank.classify_question(label, model=self.model)
+        key = answer_bank.classify_question(_question(label), context=self.context_for(label),
+                                            model=self.model)
         if key:
             ans = self.answer_for_type(key)
             if ans is not None:
-                self.learned.append(QA(question=label, answer="", maps_to=key, generated=True))
+                self.learned.append(
+                    QA(question=_question(label), answer="", maps_to=key, generated=True))
                 return ans
         # Not a structured type (or its profile field is unset) — the question may still be a
         # REPHRASING of a custom question already answered in the bank.
@@ -862,11 +1017,12 @@ class AnswerResolver:
         if not cands:
             return None
         idx = answer_bank.match_banked_question(
-            label, [(qa.question, ans) for qa, ans in cands], model=self.model)
+            _question(label), [(qa.question, ans) for qa, ans in cands],
+            context=self.context_for(label), model=self.model)
         if idx is None:
             return None
         qa, ans = cands[idx]
-        self.learned.append(QA(question=label, answer="" if qa.maps_to else qa.answer,
+        self.learned.append(QA(question=_question(label), answer="" if qa.maps_to else qa.answer,
                                maps_to=qa.maps_to, generated=True))
         return ans
 
@@ -875,7 +1031,7 @@ class AnswerResolver:
         won't match one directly. "How did you hear about this job?" is often a dropdown whose
         options vary by company — since we discover roles via online search, prefer
         online/job-board/company-site options, then a generic bucket."""
-        n = _norm(label)
+        n = _norm(_question(label))
         # Preferred work-arrangement select (Remote / Hybrid / On-site): map our target arrangement
         # onto whatever wording the form uses. Before the office-location hints since an arrangement
         # question ("Preferred work location: Remote/Hybrid/On-site") also mentions "location".
@@ -1014,18 +1170,21 @@ class AnswerResolver:
         # Draft when the question invites prose, OR it's a required field that must be filled to
         # submit — the latter is why an oddly-phrased required question ("Why WHOOP?" as a short
         # input) still gets an answer instead of blocking the submit.
-        if not (answer_bank.is_open_ended(label, is_textarea)
-                or (required and answer_bank.is_draftable_required(label))):
+        # The drafting decisions and the draft itself are about the QUESTION, not the field key.
+        question = _question(label)
+        if not (answer_bank.is_open_ended(question, is_textarea)
+                or (required and answer_bank.is_draftable_required(question))):
             return None, ""
-        company_specific = answer_bank.is_company_specific(label)
+        company_specific = answer_bank.is_company_specific(question)
         if company_specific and not (self.company or self.jd):
             return None, ""  # needs company context we don't have — leave it to the user
         ans = answer_bank.generate_answer(
-            label, self.resume, company=self.company, jd=self.jd, model=self.model)
+            question, self.resume, company=self.company, jd=self.jd,
+            context=self.context_for(label), model=self.model)
         if not ans:
             return None, ""
         if not company_specific:  # cache reusable answers only
-            self.learned.append(QA(question=label, answer=ans, generated=True))
+            self.learned.append(QA(question=question, answer=ans, generated=True))
         return ans, "generated"
 
     def choose_option(self, label: str, options: list[str]) -> Optional[str]:
@@ -1037,7 +1196,8 @@ class AnswerResolver:
         if not self.enable_generation:
             return None
         return answer_bank.choose_required_option(
-            label, options, self.resume, company=self.company, jd=self.jd, model=self.model)
+            _question(label), options, self.resume, company=self.company, jd=self.jd,
+            context=self.context_for(label), model=self.model)
 
 
 # --------------------------------------------------------------- Greenhouse (Playwright)
@@ -1086,6 +1246,110 @@ _LABEL_JS = r"""(el) => {
   }
   return clean(el.getAttribute('placeholder') || el.getAttribute('name') || '');
 }"""
+
+# JS: a control's FIELD KEY — its label, plus " #n" when it is the n-th (n>1) control on the page
+# deriving that same label (decision 169). Without this, a form with two boxes labelled "Date" was
+# keyed by label alone: the second was silently skipped as already-done, and the review panel, the
+# required marks and the user's saved edits had no way to tell the two apart.
+#
+# Counted over the same candidate set the fill loop enumerates and with the same filters, so
+# `_REQUIRED_MAP_JS` (which embeds this) and the fill agree on every key. Radio/checkbox OPTIONS
+# are excluded on purpose — they legitimately share their group's question.
+_KEY_FN_JS = r"""(el, labelOf) => {
+  // Deriving a label walks the DOM, and this counts labels across the whole page for every field
+  // — so memoise it on the element. A plain JS property (not an attribute) is invisible to the
+  // page and to the served HTML, and it survives between evaluates on the same document.
+  const labelCached = e => (e.__abLabel !== undefined ? e.__abLabel : (e.__abLabel = labelOf(e) || ''));
+  const candidate = e => {
+    const t = (e.getAttribute('type') || '').toLowerCase();
+    if (['hidden', 'submit', 'button', 'file', 'checkbox', 'radio', 'search'].includes(t)) return false;
+    if ((e.getAttribute('aria-hidden') || '').toLowerCase() === 'true') return false;
+    if (e.closest('nav,header,footer,[role=search],[role=navigation]')) return false;
+    const r = e.getBoundingClientRect();
+    return (r.width > 0 && r.height > 0) || (e.getAttribute('role') || '').toLowerCase() === 'combobox';
+  };
+  const base = labelCached(el);
+  // Not one of the counted controls (an invisible facade <select>, a div[role=combobox]) — those
+  // are keyed by their plain label by the passes that own them.
+  if (!base || !candidate(el)) return base;
+  let n = 0;
+  for (const e of document.querySelectorAll('input, textarea, select')) {
+    if (candidate(e) && labelCached(e) === base) n++;
+    if (e === el) break;
+  }
+  return n > 1 ? base + ' #' + n : base;
+}"""
+
+_FIELD_KEY_JS = ("(el) => { const labelOf = " + _LABEL_JS + "; const keyOf = " + _KEY_FN_JS
+                 + "; return keyOf(el, labelOf); }")
+
+
+# JS: the text AROUND a control — what a person reads to know what a bare "Date" or "Other" box
+# is for. Collected nearest-first: the field's own help text, the heading/legend of the block it
+# sits in, the sentence immediately before it, and the label of the field it follows (a "Date"
+# after "Signature" is a signature date). Every fragment is capped and the whole string is short:
+# this is a disambiguating hint, not a copy of the page.
+_CONTEXT_JS = (
+    "(el) => { const labelOf = " + _LABEL_JS + ";"
+    r"""
+  const clean = s => (s || '').replace(/\s+/g, ' ').replace(/[*✱★]/g, '').trim();
+  const self = clean(labelOf(el));
+  const out = [];
+  const push = t => {
+    t = clean(t);
+    // The field's own <label> is a previous sibling of its input, so it would otherwise lead
+    // every context string with the label we already have.
+    if (t && t !== self && t.length <= 180 && !out.some(o => o.indexOf(t) >= 0)) out.push(t);
+  };
+  const HEAD = 'h1,h2,h3,h4,h5,h6,legend,[role=heading]';
+  const describedby = el.getAttribute('aria-describedby');
+  if (describedby) describedby.split(/\s+/).forEach(id => {
+    const n = document.getElementById(id); if (n) push(n.innerText);
+  });
+  let node = el;
+  for (let hops = 0; hops < 6 && node.parentElement && out.length < 4; hops++) {
+    node = node.parentElement;
+    if (node.tagName === 'FORM' || node.tagName === 'BODY') break;
+    const own = node.querySelector(':scope > ' + HEAD.split(',').join(', :scope > '));
+    if (own) push(own.innerText);
+    let sib = node.previousElementSibling, seen = 0;
+    while (sib && seen < 5 && out.length < 4) {
+      // A heading always counts; other blocks only when they hold no form control of their own
+      // (a sibling FIELD's text describes that field, not this one).
+      if (sib.matches(HEAD)) push(sib.innerText);
+      else if (!sib.querySelector('input, select, textarea')) push(sib.innerText);
+      sib = sib.previousElementSibling; seen++;
+    }
+  }
+  const all = Array.from(document.querySelectorAll('input, select, textarea')).filter(
+    x => !['hidden', 'submit', 'button', 'file'].includes((x.getAttribute('type') || '').toLowerCase()));
+  const i = all.indexOf(el);
+  if (i > 0) {
+    const prev = clean(labelOf(all[i - 1]));
+    if (prev && prev !== self) push('follows the field: ' + prev);
+  }
+  return out.join(' · ').slice(0, 300);
+}"""
+)
+
+
+def _field_context(loc) -> str:
+    """The text around a control, for labels too generic to answer on their own. Best-effort:
+    "" on any failure — context only ever ADDS information to a resolution."""
+    try:
+        return (loc.evaluate(_CONTEXT_JS) or "").strip()
+    except Exception:
+        return ""
+
+
+def _note_context(loc, resolver: "AnswerResolver", report: "ApplyReport", label: str) -> None:
+    """Read a field's surroundings once and record them on the resolver (which answers with them)
+    and on the report (so the review panel can show what the answer was read from)."""
+    ctx = _field_context(loc)
+    resolver.note_context(label, ctx)
+    if ctx:
+        report.context[label] = ctx
+
 
 # JS: for a radio, the group's QUESTION (its own label is just the option, e.g. "Yes").
 _GROUP_QUESTION_JS = r"""(el) => {
@@ -1152,6 +1416,46 @@ def _is_required(loc) -> bool:
         return False
 
 
+# JS: one sweep of a form page returning {question: isRequired} for EVERY visible control —
+# the same label derivation the fill uses (a radio/checkbox is keyed by its GROUP question, since
+# its own label is only the option text), and the same required test as `_IS_REQUIRED_JS`. One
+# evaluate per page instead of a flag threaded through every fill path.
+_REQUIRED_MAP_JS = (
+    "(scope) => { const labelOf = " + _LABEL_JS + "; const groupQ = " + _GROUP_QUESTION_JS
+    + "; const isReq = " + _IS_REQUIRED_JS + "; const keyOf = " + _KEY_FN_JS + ";"
+    " const out = {};"
+    " document.querySelectorAll(scope+'input, '+scope+'textarea, '+scope+'select, '+scope+'[role=combobox]')"
+    "  .forEach(el => {"
+    "    const t = (el.getAttribute('type')||'').toLowerCase();"
+    "    const role = (el.getAttribute('role')||'').toLowerCase();"
+    "    if (t === 'hidden' || t === 'submit' || t === 'button' || t === 'search') return;"
+    "    if ((el.getAttribute('aria-hidden')||'').toLowerCase() === 'true') return;"
+    "    if (el.closest('nav,header,footer,[role=search],[role=navigation]')) return;"
+    "    const r = el.getBoundingClientRect();"
+    "    if (!(r.width && r.height) && role !== 'combobox') return;"
+    "    const grouped = (t === 'radio' || t === 'checkbox');"
+    "    const label = (grouped ? (groupQ(el) || labelOf(el)) : keyOf(el, labelOf)) || '';"
+    "    if (!label) return;"
+    "    out[label] = !!out[label] || !!isReq(el);"
+    "  });"
+    " return out; }"
+)
+
+
+def _record_required(frame, report: "ApplyReport") -> None:
+    """Record which of this page's questions the form marks REQUIRED — and which it explicitly
+    doesn't — so the review panel can tell the user what must be answered before a submit will go
+    through (decision 164). Merged across a wizard's pages; a later page never unmarks an earlier
+    one. Best-effort: a page we can't sweep just leaves the questions unmarked."""
+    try:
+        found = frame.evaluate(_REQUIRED_MAP_JS, _scope_prefix(frame))
+    except Exception:
+        return
+    for label, required in (found or {}).items():
+        if label:
+            report.required[label] = bool(report.required.get(label)) or bool(required)
+
+
 _TEXTLIKE = {"", "text", "email", "tel", "url", "number", "search"}
 
 # JS: inventory every form control with its derived label + kind + visibility (diagnostics).
@@ -1199,6 +1503,14 @@ def detect_ats(url: str) -> str:
         return "icims"
     if "smartrecruiters" in u:
         return "smartrecruiters"
+    if "jobvite" in u:
+        return "jobvite"
+    if "bamboohr" in u:
+        return "bamboohr"
+    if "taleo" in u:
+        return "taleo"
+    if "avature" in u:
+        return "avature"
     return "generic"
 
 
@@ -1334,7 +1646,8 @@ def _ats_from_frame(frame, fallback: str) -> str:
     company domain (stripe.com) is detected as 'generic' from the outer URL but is really
     greenhouse — the embed frame URL reveals it."""
     u = (getattr(frame, "url", "") or "").lower()
-    for name in ("greenhouse", "lever", "ashby", "workday", "icims", "smartrecruiters"):
+    for name in ("greenhouse", "lever", "ashby", "workday", "icims", "smartrecruiters",
+                 "jobvite", "bamboohr", "taleo", "avature"):
         if name in u:
             return "greenhouse" if name == "greenhouse" else name
     return fallback
@@ -1350,6 +1663,40 @@ def _is_adzuna_access_wall(page) -> bool:
         return "access denied" in (page.title() or "").lower()
     except Exception:
         return False
+
+
+# --------------------------------------------------------- account-gated portals (decision 168)
+
+# Portals that put the application itself behind an ACCOUNT. Probing live postings from the
+# curated feeds on 2026-07-30, the Apply control on every one of these answered with a sign-in or
+# create-an-account step, never a form: iCIMS → `<posting>/login` (email + hCaptcha), Taleo →
+# `careersection/iam/accessmanagement/login.jsf`, Avature → `careers/ApplicationMethods` (user +
+# password). Until the account-gated portal work lands they are gated out of the pipeline
+# (`discovery.FILLABLE_ATS`); this constant is what makes the refusal name the right portal.
+ACCOUNT_GATED_ATS = ("icims", "taleo", "avature")
+
+# A URL that IS the sign-in step. Anchored at the end of the path so a posting whose slug merely
+# contains the word (".../senior-login-systems-engineer/job") can never match.
+_LOGIN_URL = re.compile(r"(/login(\.jsf|\.html)?|/accessmanagement/login|/sign[_-]?in)/?$", re.I)
+
+
+def _account_wall_evidence(page, frame) -> str:
+    """What proves the "form" we just reached is really an account wall — a visible password box,
+    or a URL that is the sign-in step. Returns the evidence, or "" when this is a real form.
+
+    Deliberately consulted ONLY for `ACCOUNT_GATED_ATS` (Guideline #7): Workday's own flow creates
+    an account mid-application and its deterministic adapter (decision 059) handles the password
+    page on purpose, so a global refusal would break a portal that already works."""
+    try:
+        if frame.locator("input[type=password]").first.is_visible():
+            return "a password field"
+    except Exception:
+        pass
+    for u in ((getattr(frame, "url", "") or ""), (getattr(page, "url", "") or "")):
+        path = u.split("?")[0].split("#")[0]
+        if _LOGIN_URL.search(path):
+            return f"a sign-in page ({path})"
+    return ""
 
 
 # --------------------------------------------------------------- bot walls (decision 076)
@@ -1609,7 +1956,22 @@ def _open_application_form(page, ats: str, report: "ApplyReport", timeout_ms: in
             except Exception:
                 pass
             page.wait_for_timeout(600)
-            return True, frame, _ats_from_frame(frame, ats)
+            found = _ats_from_frame(frame, ats)
+            # An account-gated portal answers Apply with a sign-in step whose 2-4 boxes look
+            # exactly like a short form. Filling it would run the resolver over "User Name" /
+            # "Password" and bank them as screening questions; refusing here parks the posting as
+            # `login` instead, which deep-links the user to the credential store (decision 168).
+            if found in ACCOUNT_GATED_ATS:
+                proof = _account_wall_evidence(page, frame)
+                if proof:
+                    report.errors.append(
+                        f"{found} requires an account before it will show the application: the "
+                        f"Apply control led to {proof} at {page.url}. No fields were filled. "
+                        f"Store this portal's sign-in under Credentials and re-run, or apply "
+                        f"manually — ApplicationBot cannot create the account for you yet."
+                    )
+                    return False, frame, found
+            return True, frame, found
         if not revealed:
             for role in ("link", "button"):
                 try:
@@ -1838,6 +2200,15 @@ def _open_options(page):
         opts.first.wait_for(state="visible", timeout=1500)
         return opts
     except Exception:
+        pass
+    # Button-facade pickers render their choices as a MENU, not a listbox (BambooHR's Fabric
+    # Select: <button aria-haspopup> → [role=menu] > [role=menuitem]). Last, so a page with both
+    # still prefers the listbox its combobox actually owns.
+    opts = page.locator('[role="menuitem"]:visible')
+    try:
+        opts.first.wait_for(state="visible", timeout=1500)
+        return opts
+    except Exception:
         return None
 
 
@@ -1879,6 +2250,24 @@ def _best_by_tokens(texts: list[str], want: str) -> tuple[int, int]:
     return best_i, best_score
 
 
+def _best_option_index(texts: list[str], target: str) -> Optional[int]:
+    """Index of the option that best answers `target`, or None when none of them does. The three
+    tiers, in order: a direct fuzzy match; the same name spelled differently (decision 154); the
+    best token overlap ("Edison, NJ" → "New Jersey").
+
+    Returning None is a real answer: do NOT blind-pick the first option — that committed a wrong
+    value on a live run (answering "country: United States" with "Australia"). An unselected
+    field surfaces for review; a confidently wrong one is submitted."""
+    for i, t in enumerate(texts):
+        if _matches(t, target):
+            return i
+    fi = _fuzzy_option_index(texts, target)
+    if fi is not None:
+        return fi
+    bi, score = _best_by_tokens(texts, target)
+    return bi if (bi >= 0 and score > 0) else None
+
+
 def _pick_from_open(page, want: str, want_full: Optional[str] = None) -> Optional[str]:
     """Given an already-open combobox menu, click the best-matching visible option."""
     opts = _open_options(page)
@@ -1886,23 +2275,11 @@ def _pick_from_open(page, want: str, want_full: Optional[str] = None) -> Optiona
         return None
     count = min(opts.count(), 30)
     texts = [(opts.nth(i).inner_text() or "").strip() for i in range(count)]
-    target = want_full or want
-    for i, t in enumerate(texts):  # 1) direct fuzzy match
-        if _matches(t, target):
-            opts.nth(i).click(timeout=4000)
-            return t
-    fi = _fuzzy_option_index(texts, target)  # 2) same name, different spelling (decision 154)
-    if fi is not None:
-        opts.nth(fi).click(timeout=4000)
-        return texts[fi]
-    bi, score = _best_by_tokens(texts, target)  # 3) best token overlap (Edison, NJ → New Jersey)
-    if bi >= 0 and score > 0:
-        opts.nth(bi).click(timeout=4000)
-        return texts[bi]
-    # No option fuzzy-matches or shares a token with what we wanted. Do NOT blind-pick the first
-    # option — that committed a wrong value (e.g. answering "country: United States" with
-    # "Australia"). Leave it unselected so it surfaces for review instead of a confident-wrong fill.
-    return None
+    i = _best_option_index(texts, want_full or want)
+    if i is None:
+        return None
+    opts.nth(i).click(timeout=4000)
+    return texts[i]
 
 
 def _combo_try(page, loc, text: str) -> Optional[str]:
@@ -2109,6 +2486,8 @@ def _fill_combobox(page, loc, value: Optional[str], hints: Optional[list[str]] =
                     opts.nth(i).click(timeout=4000)
                     if tier == "claude":
                         resolver.learn_option(value, t)  # a committed batch pick is learned too
+                    if resolver is not None:
+                        resolver.seen_options[label] = list(texts)  # the field's real choice set
                     return t, tier
         # Same institution, different spelling — deterministic, so it runs before any model call
         # (and before the round-1 defer): a list that shows "Penn State University-University
@@ -2118,6 +2497,7 @@ def _fill_combobox(page, loc, value: Optional[str], hints: Optional[list[str]] =
             opts.nth(fi).click(timeout=4000)
             if resolver is not None:
                 resolver.learn_option(value, texts[fi])
+                resolver.seen_options[label] = list(texts)
             return texts[fi], "fuzzy"
         try:
             loc.press("Escape")  # close before any Claude call / Phase 2 typing
@@ -2228,6 +2608,130 @@ def _scope_prefix(page) -> str:
         return ""
 
 
+# What a honeypot field TELLS the human it is. Matched whole-phrase and deliberately narrow — a
+# real question ("Is there anything you'd like to leave blank?") never instructs like this.
+_HONEYPOT_LABEL = re.compile(r"leave (this )?(field |box )?blank|do not (fill|complete) this", re.I)
+
+
+def _is_honeypot(kind: dict, label: str) -> bool:
+    """A bot trap rather than a field: either its wrapper is aria-hidden (so no person is meant to
+    see it, yet it is CSS-visible and enumerable) or its own label says to leave it empty. Both
+    signals were read off BambooHR's live form, which uses them together (decision 168)."""
+    return bool(kind.get("trapped")) or bool(_HONEYPOT_LABEL.search(label or ""))
+
+
+# The visible control a form puts in front of a native <select> it keeps only to carry the value.
+# BambooHR's Fabric Select is the case this was built for: the real <select> is aria-hidden,
+# readonly, height 0 and carries NO options, while the user drives
+# <button aria-haspopup="true" aria-label="State –Select–"> → [role=menu] > [role=menuitem].
+# The NEAREST ancestor that wraps a popup button, then that button. `ancestor::` is a reverse
+# axis, so `[1]` is the closest one — anchoring on the whole <form> instead would hand every
+# facade select on the page the FIRST toggle in document order (Country would be set to a state).
+_FACADE_BTN = ('xpath=ancestor::*[.//button[@aria-haspopup="true"]][1]'
+               '//button[@aria-haspopup="true"]')
+
+
+def _facade_button(loc):
+    """The visible toggle standing in for a hidden <select>, or None if it has none (an ordinary
+    hidden select — e.g. a react-select mirror — must stay untouched)."""
+    try:
+        btn = loc.locator(_FACADE_BTN)
+        if btn.count() and btn.first.is_visible():
+            return btn.first
+    except Exception:
+        pass
+    return None
+
+
+def _fill_facade_selects(page, resolver: AnswerResolver, report: "ApplyReport", done: set) -> None:
+    """Fill every button-facade dropdown on the page. A separate pass (like radio groups and
+    checkboxes) rather than a branch inside `_fill_all_fields`, because the control the user drives
+    is a <button> that loop never enumerates and the value lands by clicking a menu item, not by
+    select_option. Without this, BambooHR's REQUIRED State and Country stay empty and block the
+    submit while looking answered — the hidden <select> is skipped as aria-hidden."""
+    try:
+        sels = page.locator("select")
+        count = sels.count()
+    except Exception:
+        return
+    for i in range(count):
+        loc = sels.nth(i)
+        try:
+            # aria-hidden is the marker a facade select actually carries (BambooHR sets it, and
+            # it is the same signal `_fill_all_fields` skips on). A CSS check is not enough: the
+            # real one is height:0/opacity:0, which Playwright still reports as visible.
+            hidden = loc.evaluate(
+                "el => (el.getAttribute('aria-hidden')||'').toLowerCase() === 'true'"
+                " || el.hasAttribute('readonly') || el.tabIndex < 0")
+            if not hidden:
+                continue  # an ordinary <select> — _fill_all_fields owns it
+            btn = _facade_button(loc)
+            if btn is None:
+                continue
+            label = loc.evaluate(_LABEL_JS)
+        except Exception:
+            continue
+        if not label or label in done:
+            continue
+        try:
+            # The DISPLAYED value, not the posted one — a facade posts a code ("US") while the
+            # toggle shows "United States", and the report is read by a person.
+            current = loc.evaluate(
+                "el => { const o = el.selectedOptions && el.selectedOptions[0];"
+                " return o ? (o.textContent||'').trim() : (el.value||'').trim(); }")
+        except Exception:
+            current = ""
+        if current and resolver.override_for(label) is None:
+            # The form pre-selected it (BambooHR defaults Country) — same native-first rule as
+            # every other field: keep what the ATS chose and record where it came from.
+            report.filled.append(FilledField(label, current, "dropdown", source="native"))
+            done.add(label)
+            continue
+        value = resolver.resolve(label) or resolver.resolve_semantic(label)
+        hints = resolver.option_hints(label)
+        try:
+            btn.click(timeout=4000)
+            page.wait_for_timeout(300)
+            opts = _open_options(page)
+            # Read the WHOLE list, not `_pick_from_open`'s 30 (a US state menu runs to ~57 with
+            # the territories, and a live BambooHR fill missed "New Jersey" at #33 because of it)
+            # and not `_open_options_and_texts`' 60 (a country menu is ~200).
+            n = min(opts.count(), 250) if opts is not None else 0
+            texts = [(opts.nth(i).inner_text() or "").strip() for i in range(n)]
+        except Exception as e:
+            report.errors.append(f"{label}: could not open its dropdown: {type(e).__name__}: {e}")
+            continue
+        if not texts:
+            report.errors.append(f"{label}: its dropdown opened but listed no options.")
+            continue
+        if value is None and _is_required(loc):
+            # Same rule as a required native select: let the weak model pick from the OFFERED
+            # options rather than leave a required field blocking the submit.
+            value = resolver.choose_option(label, [t for t in texts if t])
+            if value:
+                resolver.decided_options[label] = value
+        chosen = None
+        for want in ([value] if value else []) + (hints or []):
+            i = _best_option_index(texts, want)
+            if i is not None:
+                opts.nth(i).click(timeout=4000)
+                chosen = texts[i]
+                break
+        if chosen:
+            report.filled.append(FilledField(
+                label, chosen, "dropdown",
+                source="option:claude" if label in resolver.decided_options else "resolver"))
+            done.add(label)
+            _record_capture(report, label, "dropdown", texts)
+            continue
+        try:
+            page.keyboard.press("Escape")  # leave the menu closed or the next field can't be clicked
+        except Exception:
+            pass
+        report.skipped.append(label)
+        _record_capture(report, label, "dropdown", texts)
+
+
 def _fill_all_fields(page, resolver: AnswerResolver, report: "ApplyReport", done: set,
                      only_empty: bool = True) -> None:
     sp = _scope_prefix(page)
@@ -2244,6 +2748,7 @@ def _fill_all_fields(page, resolver: AnswerResolver, report: "ApplyReport", done
                 "type: (el.getAttribute('type')||'').toLowerCase(), "
                 "role: (el.getAttribute('role')||'').toLowerCase(), "
                 "ariaHidden: (el.getAttribute('aria-hidden')||'').toLowerCase() === 'true', "
+                "trapped: !!(el.parentElement && el.parentElement.closest('[aria-hidden=\"true\"]')), "
                 "chrome: !!el.closest('nav,header,footer,[role=search],[role=navigation]')})"
             )
         except Exception:
@@ -2269,10 +2774,20 @@ def _fill_all_fields(page, resolver: AnswerResolver, report: "ApplyReport", done
         if not vis and role != "combobox":
             continue
         try:
-            label = loc.evaluate(_LABEL_JS)
+            # The KEY, not the bare label: a second control with the same label gets " #2", so it
+            # is filled in its own right instead of skipped as already-done (decision 169).
+            label = loc.evaluate(_FIELD_KEY_JS)
         except Exception:
             label = ""
         if not label or label in done:
+            continue
+        if _is_honeypot(k, label):
+            # A bot trap: a real, CSS-visible, labelled text box the form expects to come back
+            # EMPTY, hidden from people only by aria-hidden on its wrapper (BambooHR ships one as
+            # "Please leave this field blank"). Filling it is how a submission gets silently
+            # dropped, so it is skipped and NOTED — never captured as a question for the user.
+            report.notes.append(f"Left the honeypot field {label!r} empty (bot trap).")
+            done.add(label)
             continue
         # Native-first: if the ATS's own autofill already populated this field, keep its value
         # and record it — our resolver only fills what's still empty. An answer the user edited
@@ -2288,7 +2803,15 @@ def _fill_all_fields(page, resolver: AnswerResolver, report: "ApplyReport", done
                     label, current, "combobox" if role == "combobox" else "text", source="native"))
                 done.add(label)
                 continue
+        # A generic label ("Date", "Other", "If yes…") doesn't say what the form wants — read the
+        # text around it FIRST, since the rules themselves consult it (decision 167).
+        if _is_generic_label(label) and not resolver.context_read(label):
+            _note_context(loc, resolver, report, label)
         value = resolver.resolve(label)
+        if value is None and not resolver.context_read(label):
+            # Nothing structured answered it, so this field is headed for the classifier, the
+            # bank matcher, a draft, or the user — all of which do better with the neighbourhood.
+            _note_context(loc, resolver, report, label)
         hints = resolver.option_hints(label)
         is_free = (tag == "textarea" or typ in _TEXTLIKE) and role != "combobox"
         # For structured (non-open-ended) fields the keyword rules missed, ask Claude to
@@ -2328,9 +2851,16 @@ def _fill_all_fields(page, resolver: AnswerResolver, report: "ApplyReport", done
                         report.errors.append(f"{label}: {type(e).__name__}: {e}")
                     if text:
                         report.filled.append(FilledField(label, text, kind, source="option:claude"))
+                        # Record the list it chose from, so the review panel edits this answer as
+                        # the dropdown it is — the user is the one most likely to correct a
+                        # model-picked option (decision 165).
+                        _record_capture(report, label, kind, pickable)
                         done.add(label)
                         continue
-            _record_capture(report, label, kind, options)
+            # A native <select>'s REAL choices, so neither the review panel nor the profile's
+            # answer editor offers its "Select …" placeholder as an answer (decision 165).
+            _record_capture(report, label, kind,
+                            _selectable_options(loc, options) if tag == "select" else options)
             report.skipped.append(f"{label} — no saved answer")
             done.add(label)
             continue
@@ -2341,6 +2871,15 @@ def _fill_all_fields(page, resolver: AnswerResolver, report: "ApplyReport", done
                 got = _fill_combobox(page, loc, value, hints, resolver=resolver, label=label)
                 if got:
                     text, tier = got
+                    # An ANSWERED dropdown must record its options too (decision 165) — the review
+                    # panel recreates the field from `captured`, so without this the user edits a
+                    # dropdown as a free-text box and can type a value no option matches. Only the
+                    # list the combobox showed on open, and only when the answer matched THERE: a
+                    # searchable picker's open list is an alphabetical prefix, not its choices
+                    # (decision 080), so a typed-filter match records nothing.
+                    seen = resolver.seen_options.get(label)
+                    if seen:
+                        _record_capture(report, label, "dropdown", seen)
                     # source records HOW the option matched (option:literal | option:learned |
                     # option:hint | option:fuzzy | option:claude | option:substring | option:other)
                     # — the determinism audit trail: anything but option:claude was resolved
@@ -2353,6 +2892,10 @@ def _fill_all_fields(page, resolver: AnswerResolver, report: "ApplyReport", done
                 else:
                     report.skipped.append(f"{label} — no dropdown option matched {value!r}")
             elif tag == "select":
+                # A native <select>'s options ARE its complete choice set and cost one evaluate to
+                # read (no menu to open), so record them however the fill turns out (decision 165)
+                # — the review panel then edits this answer as the dropdown the form shows.
+                _record_capture(report, label, "select", _selectable_options(loc, []))
                 try:
                     report.filled.append(FilledField(label, _fill_select(loc, value, hints), "select"))
                 except Exception:
@@ -2386,6 +2929,16 @@ def _fill_all_fields(page, resolver: AnswerResolver, report: "ApplyReport", done
                 else:
                     loc.fill(ans, timeout=5000)
                     report.filled.append(FilledField(label, ans, "text", source=source))
+            elif typ == "date":
+                # A native date picker takes YYYY-MM-DD only, so it is filled from the resolver's
+                # structured answer and never from a drafted sentence (which the control would
+                # reject). Anything else is captured for the user rather than mangled.
+                if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value or ""):
+                    loc.fill(value, timeout=5000)
+                    report.filled.append(FilledField(label, value, "date", source="resolver"))
+                else:
+                    _record_capture(report, label, "date")
+                    report.skipped.append(f"{label} — needs a date (YYYY-MM-DD), not {value!r}")
             else:
                 report.skipped.append(f"{label} — unsupported field type ({tag}/{typ})")
         except Exception as e:
@@ -2457,14 +3010,21 @@ def _fill_radio_groups(page, resolver: AnswerResolver, report: "ApplyReport", do
             continue
         v = value.strip().lower()
         picked = False
+        # The group's options, read once: they're both what we match the answer against and — for
+        # an ANSWERED group — what lets the review panel edit it as a picker, not a text box
+        # (decision 165).
+        opt_labels: list[str] = []
         for i in idxs:
             try:
-                opt = (radios.nth(i).evaluate(_LABEL_JS) or "").strip().lower()
+                opt_labels.append((radios.nth(i).evaluate(_LABEL_JS) or "").strip())
             except Exception:
-                opt = ""
+                opt_labels.append("")
+        for pos, opt_label in enumerate(opt_labels):
+            opt, i = opt_label.lower(), idxs[pos]
             if opt and (opt == v or v in opt):
                 if _check_radio(radios.nth(i)):
                     report.filled.append(FilledField(q, value, "radio"))
+                    _record_capture(report, q, "radio", opt_labels)
                     picked = True
                 else:
                     report.errors.append(f"{q}: could not check option {opt!r} "
@@ -2693,13 +3253,18 @@ def _resolve_pending(resolver: AnswerResolver, pending: PendingDecisions) -> Non
     Every deferred label is marked adjudicated regardless of outcome, so round 2 captures the
     leftovers for the user instead of falling back to per-field Claude calls."""
     labels = list(pending.questions)
-    types = answer_bank.classify_questions(labels, model=resolver.model) if labels else {}
+    # Batched over QUESTIONS (two fields keyed "Date" and "Date #2" ask the same thing, so they
+    # cost one classification between them), mapped back onto each field key.
+    questions = [_question(label) for label in labels]
+    contexts = {_question(label): resolver.context_for(label) for label in labels}
+    types = (answer_bank.classify_questions(questions, contexts=contexts, model=resolver.model)
+             if questions else {})
     unresolved = []
     for label in labels:
-        key = types.get(label)
+        key = types.get(_question(label))
         ans = resolver.answer_for_type(key) if key else None
         if key and ans is not None:
-            qa = QA(question=label, answer="", maps_to=key, generated=True)
+            qa = QA(question=_question(label), answer="", maps_to=key, generated=True)
             resolver.learned.append(qa)
             resolver.profile.custom_answers.append(qa)
         else:
@@ -2713,13 +3278,14 @@ def _resolve_pending(resolver: AnswerResolver, pending: PendingDecisions) -> Non
                 cands.append((qa, ans))
         if cands:
             matches = answer_bank.match_banked_questions(
-                unresolved, [(qa.question, ans) for qa, ans in cands], model=resolver.model)
+                [_question(l) for l in unresolved], [(qa.question, ans) for qa, ans in cands],
+                contexts=contexts, model=resolver.model)
             for label in unresolved:
-                idx = matches.get(label)
+                idx = matches.get(_question(label))
                 if idx is None:
                     continue
                 qa, _ = cands[idx]
-                alias = QA(question=label, answer="" if qa.maps_to else qa.answer,
+                alias = QA(question=_question(label), answer="" if qa.maps_to else qa.answer,
                            maps_to=qa.maps_to, generated=True)
                 resolver.learned.append(alias)
                 resolver.profile.custom_answers.append(alias)
@@ -2755,6 +3321,7 @@ def _fill_page(frame, resolver: AnswerResolver, report: "ApplyReport", done: set
     resolver.pending = PendingDecisions() if resolver.enable_generation else None
     try:
         _fill_all_fields(frame, resolver, report, done, only_empty=True)
+        _fill_facade_selects(frame, resolver, report, done)
         _fill_radio_groups(frame, resolver, report, done)
         _fill_checkboxes(frame, resolver, report, done)
     finally:
@@ -2762,6 +3329,7 @@ def _fill_page(frame, resolver: AnswerResolver, report: "ApplyReport", done: set
     if pending:
         _resolve_pending(resolver, pending)
         _fill_all_fields(frame, resolver, report, done, only_empty=True)
+        _fill_facade_selects(frame, resolver, report, done)
         _fill_radio_groups(frame, resolver, report, done)
         _fill_checkboxes(frame, resolver, report, done)
 
@@ -2780,8 +3348,17 @@ def _fill_all_pages(page, frame, resolver: AnswerResolver, report: "ApplyReport"
                     _upload_resume(frame, resume_pdf, report)
             except Exception:
                 pass
-        _fill_page(frame, resolver, report, done)
-        _flag_missing_required(frame, report, done)
+        # A wizard page gets a FRESH done-set (decision 169): it is a different set of
+        # controls, and carrying the previous page's keys made a label that appears on two
+        # pages fill on the first and stay empty on the second — silently, since the field
+        # read as already-handled. Within one page, `done` still dedupes the two rounds.
+        page_done: set = set()
+        _fill_page(frame, resolver, report, page_done)
+        done.update(page_done)
+        # Which of this page's questions are required vs optional — swept before we advance,
+        # while its fields are still in the DOM (decision 164).
+        _record_required(frame, report)
+        _flag_missing_required(frame, report, page_done)
 
         nxt = _find_next_button(frame)
         advanced = False
@@ -3106,9 +3683,14 @@ def _report_snapshot(report: ApplyReport) -> dict:
         # box can say whether the value has to match one of the form's options (decision 153).
         "filled": [{"label": f.label, "value": f.value, "source": f.source, "control": f.control}
                    for f in report.filled],
+        # question -> the form text around it, for the generic labels that were answered from it.
+        "context": report.context,
         # question -> {kind, options}: the real control each answer came from, so the review
         # panel offers a check-all-that-apply group as checkboxes instead of a text box.
         "captured": report.captured,
+        # question -> is it REQUIRED? So the review panel marks what must be answered to submit
+        # and what is optional (decision 164). Absent question = the form didn't say.
+        "required": report.required,
         "skipped": report.skipped,
         "errors": report.errors,
     }

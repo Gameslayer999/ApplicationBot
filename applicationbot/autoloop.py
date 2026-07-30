@@ -39,6 +39,8 @@ def auto_apply_loop(
     wait: Optional[Callable[[], None]] = None,
     take_watch_requests: Optional[Callable[[], list]] = None,
     watch_one: Optional[Callable[[object], None]] = None,
+    take_rescan_requests: Optional[Callable[[], list]] = None,
+    rescan_one: Optional[Callable[[object], None]] = None,
     watch: bool = False,
     watch_wait: Optional[Callable[[], None]] = None,
     hunt_wait: Optional[Callable[[int], None]] = None,
@@ -59,6 +61,10 @@ def auto_apply_loop(
         since the last check (and clears that queue); optional, defaults to none.
       - ``watch_one(app_id)`` → open a VISIBLE dry-run of that one prepared application so the
         user can watch it fill; never submits. Optional, defaults to a no-op.
+      - ``take_rescan_requests()`` → the app-ids the user has clicked "Rescan questions" on
+        since the last check (and clears that queue); optional, defaults to none.
+      - ``rescan_one(app_id)`` → HEADLESS dry-run re-fill of that one application, refreshing
+        what its review panel knows about the form; never submits. Optional, no-op by default.
       - ``should_stop()`` → True once the user hit Stop.
 
     Goal mode (decision 121): when ``goal`` is set, ``ready_count()`` reports how many
@@ -85,16 +91,18 @@ def auto_apply_loop(
     match and holding it for the user's review; it ends ONLY on stop. This is the "autofill every
     new role but never submit until a human approves, forever" watch. ``watch=False`` is unchanged.
 
-    Ordering each round: honor pending submits and watch requests FIRST (the user is waiting on
-    those), then — unless the goal is already met — discover a fresh only-new batch and prepare
-    each match, re-checking for stop, for new submit/watch requests, and for the goal between
-    every application, so an Apply or Watch click is never blocked by more than one in-flight
-    preparation."""
+    Ordering each round: honor pending submits, watch and rescan requests FIRST (the user is
+    waiting on those), then — unless the goal is already met — discover a fresh only-new batch and
+    prepare each match, re-checking for stop, for new user requests, and for the goal between
+    every application, so an Apply, Watch or Rescan click is never blocked by more than one
+    in-flight preparation."""
     on_event = on_event or (lambda kind, payload=None: None)
     wait = wait or (lambda: None)
     hunt_wait = hunt_wait or (lambda n: wait())
     take_watch_requests = take_watch_requests or (lambda: [])
     watch_one = watch_one or (lambda app_id: None)
+    take_rescan_requests = take_rescan_requests or (lambda: [])
+    rescan_one = rescan_one or (lambda app_id: None)
 
     def _goal_met() -> bool:
         return goal is not None and ready_count is not None and ready_count() >= goal
@@ -121,9 +129,20 @@ def auto_apply_loop(
             on_event("watched", app_id)
         return True
 
+    def _drain_rescans() -> bool:
+        """Re-read the form of each app the user asked to rescan, in click order. Headless and
+        never submits. Returns False if a stop landed mid-drain (so the caller breaks out)."""
+        for app_id in take_rescan_requests():
+            if should_stop():
+                return False
+            on_event("rescanning", app_id)
+            rescan_one(app_id)
+            on_event("rescanned", app_id)
+        return True
+
     def _serve_requests() -> bool:
-        """Honor pending submits, then pending watches. False on a mid-drain stop."""
-        return _drain_submits() and _drain_watches()
+        """Honor pending submits, then watches, then rescans. False on a mid-drain stop."""
+        return _drain_submits() and _drain_watches() and _drain_rescans()
 
     dry_searches = 0  # consecutive searches that returned nothing (drives the hunt backoff)
     while not should_stop():

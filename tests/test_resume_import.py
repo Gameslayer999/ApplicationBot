@@ -161,6 +161,121 @@ def test_existing_fields_never_overwritten(monkeypatch, target):
     assert r.summary == "Engineer."
 
 
+# ------------------------------------------------- dedupe against what the profile already has
+
+def _seed(monkeypatch, target, **kw):
+    """Create the résumé from one parse, then return a function that merges a second parse in."""
+    monkeypatch.setattr(ri, "extract_text", lambda *a: "text")
+    monkeypatch.setattr(ri, "_parse_with_claude", lambda *a: _parsed(**kw))
+    ri.import_resume(target, "resume.pdf", b"%PDF-x")
+
+    def again(**kw2):
+        second = dict(projects=[], education=[], certifications=[], skills=[], summary=None)
+        second.update(kw2)
+        monkeypatch.setattr(ri, "_parse_with_claude", lambda *a: _parsed(**second))
+        return ri.import_resume(target, "resume2.pdf", b"%PDF-x")
+
+    return again
+
+
+@pytest.mark.parametrize("org,role", [
+    ("Acme Corp.", "Software Engineer Intern"),   # suffix + longer title
+    ("ACME, Inc.", "SWE Intern"),                 # abbreviation
+    ("Acme", "Software Engineering Intern"),      # engineer/engineering
+    ("Acme", "Intern"),                           # the résumé's shorter wording
+])
+def test_same_role_spelled_differently_is_not_duplicated(monkeypatch, target, org, role):
+    again = _seed(monkeypatch, target, experience=[
+        Experience(organization="Acme", role="Software Engineer Intern", start="May 2024",
+                   end="Aug 2024", bullets=["Built REST services"])])
+
+    result = again(experience=[Experience(organization=org, role=role, start="May 2024",
+                                          end="Aug 2024", bullets=["Built REST services"])])
+
+    assert result["added"]["experience"] == 0
+    assert result["skipped"] + result["enriched"] == ["Acme — Software Engineer Intern"]
+    assert len(load_resume(target).experience) == 1
+
+
+def test_same_job_retitled_between_resume_versions_is_not_duplicated(monkeypatch, target):
+    # Different title wording, but identical employer and month-precise span = one job.
+    again = _seed(monkeypatch, target, experience=[
+        Experience(organization="Jaguar Technologies", role="Software Engineer Intern",
+                   start="May 2024", end="Apr 2025")])
+
+    result = again(experience=[Experience(organization="Jaguar Technologies",
+                                          role="Junior Software Engineer",
+                                          start="May 2024", end="Apr 2025")])
+
+    assert result["added"]["experience"] == 0
+    assert len(load_resume(target).experience) == 1
+
+
+def test_different_role_and_span_at_same_employer_is_kept(monkeypatch, target):
+    # Same employer, overlapping year, but neither the title nor the span matches.
+    again = _seed(monkeypatch, target, experience=[
+        Experience(organization="Penn State", role="Research Assistant",
+                   start="Sep 2024", end="May 2025")])
+
+    result = again(experience=[Experience(organization="Penn State", role="Teaching Assistant",
+                                          start="Sep 2024", end="Dec 2024")])
+
+    assert result["added"]["experience"] == 1
+    assert len(load_resume(target).experience) == 2
+
+
+def test_second_stint_at_same_employer_is_kept(monkeypatch, target):
+    # Same org and title, different years = a real second entry, not a re-spelling.
+    again = _seed(monkeypatch, target, experience=[
+        Experience(organization="Acme", role="Software Engineer Intern", start="May 2023", end="Aug 2023")])
+
+    result = again(experience=[Experience(organization="Acme", role="Software Engineer Intern",
+                                          start="May 2024", end="Aug 2024")])
+
+    assert result["added"]["experience"] == 1
+    assert [e.start for e in load_resume(target).experience] == ["May 2023", "May 2024"]
+
+
+def test_role_already_under_activities_is_not_re_added_to_experience(monkeypatch, target):
+    again = _seed(monkeypatch, target, experience=[], activities=[
+        Experience(organization="Robotics Club", role="Team Lead", start="2023", end="2024")])
+
+    result = again(experience=[Experience(organization="Robotics Club", role="Team Lead",
+                                          start="2023", end="2024")])
+
+    assert result["added"]["experience"] == 0
+    r = load_resume(target)
+    assert r.experience == [] and len(r.activities) == 1
+
+
+def test_matching_entry_gains_only_its_blank_fields(monkeypatch, target):
+    again = _seed(monkeypatch, target, experience=[
+        Experience(organization="Acme", role="Engineer", start="", end="Present",
+                   bullets=["Built REST services"])])
+
+    result = again(experience=[Experience(organization="Acme", role="Engineer", start="Jan 2023",
+                                          end="Dec 2024", location="Austin, TX")])
+
+    assert result["added"]["experience"] == 0 and result["enriched"] == ["Acme — Engineer"]
+    e = load_resume(target).experience[0]
+    assert (e.start, e.location) == ("Jan 2023", "Austin, TX")
+    assert e.end == "Present" and e.bullets == ["Built REST services"]  # non-blank fields untouched
+
+
+def test_education_and_skill_variants_are_not_duplicated(monkeypatch, target):
+    again = _seed(monkeypatch, target,
+                  education=[Education(school="MIT", degree="BS Computer Science", graduation="2023")],
+                  skills=[SkillCategory(category="Languages", items=["Node.js"])])
+
+    result = again(education=[Education(school="M.I.T.", degree="B.S. Computer Science", graduation="2023")],
+                   skills=[SkillCategory(category="Languages", items=["NodeJS", "Rust"])])
+
+    assert result["added"]["education"] == 0 and result["added"]["skills"] == 1
+    r = load_resume(target)
+    assert len(r.education) == 1
+    assert next(c for c in r.skills if c.category == "Languages").items == ["Node.js", "Rust"]
+
+
 def test_parse_requires_claude(monkeypatch, target):
     monkeypatch.setattr(ri, "extract_text", lambda *a: "text")
     monkeypatch.setattr(ri.backends, "claude_code_available", lambda: False)

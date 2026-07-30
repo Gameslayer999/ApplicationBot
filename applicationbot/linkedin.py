@@ -3,8 +3,9 @@
 LinkedIn cannot be live-linked to pull a full profile (their API restricts it to approved
 partners, and scraping violates their ToS + Agent Guideline #4). The compliant path is
 LinkedIn's own "Get a copy of your data" export — a ZIP of CSVs. This module parses the
-relevant CSVs (Positions, Education, Skills) and MERGES new entries into the catalogue,
-deduping against what's already there (never overwrites existing entries or contact info).
+relevant CSVs (Positions, Education, Skills) and MERGES new entries into the catalogue, deduping
+against what's already there with the shared entry matcher in `resume_import` (never overwrites
+existing entries or contact info, and never re-adds a role under LinkedIn's wording of it).
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ import csv
 import io
 import zipfile
 
+from . import resume_import
 from .catalogue import save_resume
 from .models import Education, Experience, SkillCategory
 from .resume import load_resume
@@ -62,63 +64,67 @@ def _bullets(desc: str | None) -> list[str]:
 
 
 def import_into(path, filename: str, data: bytes) -> dict:
-    """Parse a LinkedIn export and merge new experience/education/skills into `path`."""
+    """Parse a LinkedIn export and merge new experience/education/skills into `path`.
+
+    Dedup uses the same entry matcher as the résumé-document import, so the two paths agree on what
+    counts as the same entry: LinkedIn writes the legal company name a résumé shortens ("Acme Corp.
+    Inc." vs "Acme") and its own job titles, which exact string matching re-added as duplicates."""
     csvs = _csvs_from_upload(filename, data)
     resume = load_resume(path)
     added = {"experience": 0, "education": 0, "skills": 0}
+    skipped: list[str] = []   # entries the résumé already had, named so the user can see what we dropped
+    enriched: list[str] = []  # existing entries whose blank fields this import filled in
 
     # Positions -> experience
-    have_roles = {
-        (e.organization.strip().lower(), e.role.strip().lower()) for e in resume.experience
-    }
     for row in csvs.get("positions.csv", []):
         org = _get(row, "Company Name", "Company")
         role = _get(row, "Title", "Position Title")
-        if not org or not role or (org.lower(), role.lower()) in have_roles:
+        if not org or not role:
             continue
-        have_roles.add((org.lower(), role.lower()))
-        resume.experience.append(
-            Experience(
-                organization=org,
-                role=role,
-                location=_get(row, "Location"),
-                start=_get(row, "Started On", "Start Date") or "",
-                end=_get(row, "Finished On", "End Date") or "Present",
-                bullets=_bullets(_get(row, "Description")),
-            )
+        entry = Experience(
+            organization=org,
+            role=role,
+            location=_get(row, "Location"),
+            start=_get(row, "Started On", "Start Date") or "",
+            end=_get(row, "Finished On", "End Date") or "Present",
+            bullets=_bullets(_get(row, "Description")),
         )
+        match = resume_import.find_role(resume, entry)
+        if match is not None:
+            label = f"{match.organization} — {match.role}"
+            filled = resume_import.fill_blanks(match, entry, ("location", "start", "end"))
+            (enriched if filled else skipped).append(label)
+            continue
+        resume.experience.append(entry)
         added["experience"] += 1
 
     # Education
-    have_edu = {
-        (e.school.strip().lower(), (e.degree or "").strip().lower()) for e in resume.education
-    }
     for row in csvs.get("education.csv", []):
         school = _get(row, "School Name", "School")
         if not school:
             continue
-        degree = _get(row, "Degree Name", "Degree") or ""
-        if (school.lower(), degree.lower()) in have_edu:
-            continue
-        have_edu.add((school.lower(), degree.lower()))
-        details = [d for d in (_get(row, "Notes"), _get(row, "Activities")) if d]
-        resume.education.append(
-            Education(
-                school=school,
-                degree=degree,
-                graduation=_get(row, "End Date", "Finished On"),
-                details=details,
-            )
+        entry = Education(
+            school=school,
+            degree=_get(row, "Degree Name", "Degree") or "",
+            graduation=_get(row, "End Date", "Finished On"),
+            details=[d for d in (_get(row, "Notes"), _get(row, "Activities")) if d],
         )
+        match = resume_import.find_education(resume, entry)
+        if match is not None:
+            label = f"{match.school} — {match.degree}" if match.degree.strip() else match.school
+            filled = resume_import.fill_blanks(match, entry, ("degree", "graduation"))
+            (enriched if filled else skipped).append(label)
+            continue
+        resume.education.append(entry)
         added["education"] += 1
 
     # Skills -> a "LinkedIn Skills" category (deduped against all existing skills)
-    existing = {i.strip().lower() for c in resume.skills for i in c.items}
+    existing = {resume_import.skill_key(i) for c in resume.skills for i in c.items}
     new_skills: list[str] = []
     for row in csvs.get("skills.csv", []):
         name = _get(row, "Name", "Skill")
-        if name and name.lower() not in existing:
-            existing.add(name.lower())
+        if name and resume_import.skill_key(name) not in existing:
+            existing.add(resume_import.skill_key(name))
             new_skills.append(name)
     if new_skills:
         cat = next((c for c in resume.skills if c.category.lower() == "linkedin skills"), None)
@@ -129,4 +135,5 @@ def import_into(path, filename: str, data: bytes) -> dict:
         added["skills"] = len(new_skills)
 
     save_resume(path, resume)
-    return {"added": added, "found_files": sorted(csvs.keys())}
+    return {"added": added, "found_files": sorted(csvs.keys()),
+            "skipped": skipped, "enriched": enriched}

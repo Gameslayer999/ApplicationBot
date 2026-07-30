@@ -89,8 +89,12 @@ cases:
   expect: Texas
 - label: Current location
   expect: Austin, TX
+# Flipped from "Austin, TX" to "Austin" by decision 168. This label sits in a SPLIT address
+# block — the two entries above it are the separate State/Province and Current location fields —
+# so the whole "City, ST" string was never right here; it is what Jobvite's and BambooHR's
+# required City boxes would have been filled with. "Current location" (above) still gets the pair.
 - label: City
-  expect: Austin, TX
+  expect: Austin
 - label: Country
   expect: United States
   hints:

@@ -19,6 +19,7 @@ import argparse
 import base64
 import json
 import os
+import re
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -84,7 +85,7 @@ def _test_reset() -> dict:
         "message": "Starting…", "elapsed_note": "",
         "scanned": 0, "matched": 0, "judged": 0, "judged_total": 0, "funnel": {},
         "from_cache": False, "cache_age_min": None, "can_research": False,
-        "chosen": None, "report": None, "errors": [],
+        "chosen": None, "report": None, "tailored": None, "mode": "apply", "errors": [],
     }
 
 
@@ -108,9 +109,11 @@ def _judged_rows(matches, min_fit: int) -> list[dict]:
     } for m in matches if m.fit_score is not None]
 
 
-def _test_worker(force_fresh: bool = False) -> None:
-    """Run the full testing-mode pipeline in the background, updating _TEST_STATE.
-    `force_fresh` bypasses the discovery snapshot cache and re-searches every board."""
+def _test_worker(force_fresh: bool = False, mode: str = "apply") -> None:
+    """Run the testing-mode pipeline in the background, updating _TEST_STATE.
+    `force_fresh` bypasses the discovery snapshot cache and re-searches every board.
+    `mode="tailor"` stops after the résumé is tailored and exported (no browser, no form fill) —
+    the "just the tailoring step" dry run (decision 163); `mode="apply"` runs the whole thing."""
     from . import backends, pipeline
     from .filters import load_filters
 
@@ -187,6 +190,31 @@ def _test_worker(force_fresh: bool = False) -> None:
         def status_cb(step, message):
             _set(step=step, message=message.lstrip("▶ ").strip())
 
+        if mode == "tailor":
+            # Tailor-only: tailor + export the PDF for the best match and stop. No browser opens
+            # and nothing is filled, so there is no application to record — this is the "show me
+            # the résumé this job would get" pass. The PDF is still written to the posting's
+            # reusable path with its stamp, so a later apply run can reuse it.
+            prof = profile or apply_profile.ApplicationProfile()
+            held: dict = {}
+            pdf = pipeline.tailor_and_render(
+                resume, prof, p.to_job_description(), p.company, p.title, p.url,
+                backend="auto", status_cb=status_cb,
+                on_result=lambda r: held.update(result=r))
+            r = held.get("result")
+            _set(phase="done", step="done",
+                 message=f"Tailored your résumé for {p.company} — {p.title}. Nothing was filled "
+                         "or submitted.",
+                 tailored={
+                     "pdf": str(pdf), "company": p.company, "title": p.title, "url": p.url,
+                     "html": render_html(apply_profile.resume_with_profile_links(resume, prof),
+                                         r.tailored) if r else "",
+                     "notes": (r.tailored.relevance_notes if r else []),
+                     "warnings": (r.warnings if r else []),
+                     "backend": (r.backend if r else ""),
+                 })
+            return
+
         def on_filled(report):
             _set(phase="filled", step="review",
                  message="Filled — review the browser window. Nothing was submitted.",
@@ -209,7 +237,7 @@ def _test_worker(force_fresh: bool = False) -> None:
         _set(phase="error", errors=[f"{type(e).__name__}: {e}"])
 
 
-def start_test_run(force_fresh: bool = False) -> dict:
+def start_test_run(force_fresh: bool = False, mode: str = "apply") -> dict:
     if _loop_running():
         return {"ok": False, "error": "The auto-apply loop is running (it owns the browser). "
                 "Stop the loop first, or use its Apply buttons."}
@@ -218,7 +246,9 @@ def start_test_run(force_fresh: bool = False) -> dict:
             return {"ok": False, "error": "A test run is already in progress."}
         _TEST_STATE.clear()
         _TEST_STATE.update(_test_reset())
-    threading.Thread(target=_test_worker, kwargs={"force_fresh": force_fresh}, daemon=True).start()
+        _TEST_STATE["mode"] = mode
+    threading.Thread(target=_test_worker,
+                     kwargs={"force_fresh": force_fresh, "mode": mode}, daemon=True).start()
     return {"ok": True}
 
 
@@ -351,6 +381,78 @@ def start_reapply(app_id: int, *, arm: bool = False, retailor: bool = False) -> 
     return {"ok": True}
 
 
+def _rescan_worker(app_id: int) -> None:
+    """Re-read one posting's application form and refresh what the review panel shows about it
+    (decision 164): every question, its control type and options, whether the form marks it
+    REQUIRED, and the answer the bot now produces for it.
+
+    A HEADLESS dry-run re-fill — no browser window, no pause, and `gate=None`, so it can never
+    submit. It is the same fill the loop's prepare step runs, so it rewrites this posting's
+    `report.json` archive (the panel's only source) with current data. Answers the user edited in
+    the panel are loaded by `run_apply` itself, so a rescan keeps their edits instead of reverting
+    to the bot's originals. Postings change their forms, and reports written before a feature
+    landed lack its data — this is how the user refreshes both without opening a browser."""
+    from . import backends, reuse
+    from .apply import AnswerResolver, run_apply
+
+    try:
+        app = tracker.get_application(app_id)
+        if not app:
+            _set(phase="error", errors=["That application is no longer in the tracker."])
+            return
+        url = (app.get("source_url") or "").strip()
+        pdf = (app.get("resume_path") or "").strip()
+        company, role = app.get("company", ""), app.get("role", "")
+        who = f"{company} — {role}".strip(" —")
+        if not url:
+            _set(phase="error", errors=[
+                "This application has no source URL, so its form can't be re-read. Run a fresh "
+                "dry-run for the posting from Discover instead."])
+            return
+        if not pdf or not Path(pdf).is_file():
+            _set(phase="error", errors=[
+                f"The tailored résumé PDF for {who} is gone, and the form can't be filled without "
+                "it. Run a fresh dry-run for this posting from Discover instead."])
+            return
+        _set(step="apply", message=f"Re-reading the application form for {who}…",
+             chosen={"company": company, "title": role, "url": url})
+        resolver = AnswerResolver(
+            resume=load_resume("profile/resume.yaml"),
+            profile=apply_profile.load_profile(),
+            enable_generation=backends.claude_code_available(),
+        )
+        report = run_apply(
+            url, pdf, resolver, headed=False, pause=False,
+            meta={"company": company, "role": role, "source_url": url,
+                  "fit_score": app.get("fit_score") or None,
+                  # A rescan never re-tailors — it reuses the stored PDF (decision 144).
+                  "resume_source": app.get("resume_source", "") or reuse.stored_reuse_label()},
+            gate=None,
+        )
+        needed = len([s for s in report.skipped if not str(s).startswith("[")])
+        _set(phase="done", step="done",
+             message=(f"Rescanned {who}: {len(report.filled)} answer(s) ready, "
+                      f"{needed} still need attention. Nothing was submitted."),
+             report={"summary": report.summary(), "submitted": report.submitted,
+                     "url": report.url, "screenshot": report.screenshot})
+    except Exception as e:
+        _set(phase="error", errors=[f"{type(e).__name__}: {e}"])
+
+
+def start_rescan(app_id: int) -> dict:
+    """Run the headless rescan now (the loop is idle, so this thread owns the browser slot)."""
+    if _loop_running():
+        return {"ok": False, "error": "The auto-apply loop is running (it owns the browser). "
+                "Stop the loop first, then rescan."}
+    with _TEST_LOCK:
+        if _TEST_STATE.get("phase") == "running":
+            return {"ok": False, "error": "A run is already in progress — let it finish first."}
+        _TEST_STATE.clear()
+        _TEST_STATE.update(_test_reset())
+    threading.Thread(target=_rescan_worker, kwargs={"app_id": app_id}, daemon=True).start()
+    return {"ok": True}
+
+
 # --------------------------------------------------------------------------- auto-apply loop
 # The "prepare-then-prompt" mode (decision 069): discover as many matches as possible, prepare
 # each cleared one (tailor → PDF → headless dry-run fill) into a "Ready to apply" queue, and let
@@ -370,6 +472,7 @@ _LOOP_STATE: dict = {"running": False, "phase": "idle", "message": "", "prepared
 _LOOP_STOP = threading.Event()
 _LOOP_SUBMITS: list[int] = []  # app-ids the user clicked "Apply" on, awaiting the loop thread
 _LOOP_WATCHES: list[int] = []  # app-ids the user clicked "Watch the autofill" on, awaiting the thread
+_LOOP_RESCANS: list[int] = []  # app-ids the user clicked "Rescan questions" on, awaiting the thread
 _LOOP_WATCH_HOLD = threading.Event()  # set to release an in-progress watch (window close or Stop)
 
 # Goal mode keeps hunting when a pass finds nothing new (decision 146). How long it idles before
@@ -573,6 +676,51 @@ def _loop_take_watches() -> list[int]:
     with _LOOP_LOCK:
         ids = list(_LOOP_WATCHES)
         _LOOP_WATCHES.clear()
+    return ids
+
+
+def _loop_rescan(app_id: int) -> None:
+    """Re-read one prepared application's form on the loop thread (decision 164) — the same
+    headless dry-run `_rescan_worker` runs, routed here because the loop owns the browser while
+    it's running. Never submits; no window opens."""
+    from . import backends, reuse
+    from .apply import AnswerResolver, run_apply
+
+    app = tracker.get_application(app_id)
+    if not app:
+        _loop_set(message="That application is no longer in the tracker.")
+        return
+    url = (app.get("source_url") or "").strip()
+    pdf = (app.get("resume_path") or "").strip()
+    company, role = app.get("company", ""), app.get("role", "")
+    who = f"{company} — {role}".strip(" —")
+    if not url or not pdf or not Path(pdf).is_file():
+        _loop_set(message=f"Can't rescan {who}: its URL or tailored PDF is missing.")
+        return
+    _loop_set(phase="rescanning",
+              current={"company": company, "role": role, "fit": app.get("fit_score")},
+              message=f"Re-reading the application form for {who} — no browser opens and "
+                      "nothing is submitted.")
+    resolver = AnswerResolver(
+        resume=load_resume("profile/resume.yaml"),
+        profile=apply_profile.load_profile(),
+        enable_generation=backends.claude_code_available(),
+    )
+    report = run_apply(
+        url, pdf, resolver, headed=False, pause=False,
+        meta={"company": company, "role": role, "source_url": url,
+              "fit_score": app.get("fit_score") or None,
+              "resume_source": app.get("resume_source", "") or reuse.stored_reuse_label()},
+        gate=None)
+    needed = len([s for s in report.skipped if not str(s).startswith("[")])
+    _loop_set(message=f"Rescanned {who}: {len(report.filled)} answer(s) ready, {needed} still "
+                      "need attention. Back to preparing.")
+
+
+def _loop_take_rescans() -> list[int]:
+    with _LOOP_LOCK:
+        ids = list(_LOOP_RESCANS)
+        _LOOP_RESCANS.clear()
     return ids
 
 
@@ -812,6 +960,9 @@ def _loop_worker(rescan: bool = False, force_retailor: bool = False,
             # A stop-responsive idle for maintain mode: waits up to 2s, returns at once on Stop.
             wait=lambda: _LOOP_STOP.wait(2.0),
             take_watch_requests=_loop_take_watches, watch_one=_loop_watch,
+            # "Rescan questions" clicks (decision 164) — headless re-reads of one posting's form,
+            # served on this thread for the same reason watches are: it owns the browser.
+            take_rescan_requests=_loop_take_rescans, rescan_one=_loop_rescan,
             # Watch mode: keep re-checking the boards on an interval instead of stopping when
             # caught up. The wait is stop-responsive (_LOOP_STOP.wait returns at once on Stop).
             watch=watch, watch_wait=lambda: _LOOP_STOP.wait(max(1, watch_interval_min) * 60),
@@ -863,6 +1014,7 @@ def start_loop(rescan: bool = False, force_retailor: bool = False,
         _LOOP_STOP.clear()
         _LOOP_SUBMITS.clear()
         _LOOP_WATCHES.clear()
+        _LOOP_RESCANS.clear()
         _LOOP_WATCH_HOLD.clear()
         _LOOP_STATE.clear()
         _LOOP_STATE.update(_loop_reset())
@@ -922,6 +1074,21 @@ def queue_watch(app_id: int) -> dict:
     return start_reapply(app_id, arm=False)
 
 
+def queue_rescan(app_id: int) -> dict:
+    """Re-read one posting's application form — a HEADLESS dry-run that never submits and opens
+    no window (decision 164). While the loop runs, enqueue it for the loop thread (which owns the
+    browser); otherwise run it here. Either way the panel sees it finish by the archived report's
+    timestamp changing."""
+    _mark_reviewed(app_id)
+    with _LOOP_LOCK:
+        running = bool(_LOOP_STATE.get("running"))
+        if running and app_id not in _LOOP_RESCANS:
+            _LOOP_RESCANS.append(app_id)
+    if running:
+        return {"ok": True, "queued": True}
+    return start_rescan(app_id)
+
+
 def _merge_checkbox_groups(filled: list[dict]) -> list[dict]:
     """Fold a check-all-that-apply group's per-option rows into ONE answer row.
 
@@ -944,7 +1111,87 @@ def _merge_checkbox_groups(filled: list[dict]) -> list[dict]:
         if v and v not in parts:
             parts.append(v)
         row["value"] = "; ".join(parts)
-    return out
+    # A wizard can put the SAME question on two pages, and each page now fills it (decision 169).
+    # Identical rows are one answer as far as the user is concerned — showing it twice would give
+    # them two edit boxes writing to one key. Fields that genuinely differ carry a " #n" key and
+    # so are never folded here.
+    seen: set = set()
+    deduped: list[dict] = []
+    for f in out:
+        sig = (f.get("label", ""), f.get("value", ""), f.get("control", ""))
+        if sig in seen:
+            continue
+        seen.add(sig)
+        deduped.append(f)
+    return deduped
+
+
+# --- Answer-shape checks (decision 166) -------------------------------------------------------
+#
+# The failure these catch is NOT a blank field — it's an answer that is well-formed and plausible
+# but belongs to a different question, which reads as "filled correctly" in a screenshot and in
+# the review table. A bare "Date" field answered "I'm available immediately…" is the case that
+# prompted this. Each rule fires only when the question's expected shape is unambiguous, so a
+# flag always means "look at this", never "the bot was unsure" (that's the unanswered table).
+_DATE_SHAPE = re.compile(
+    r"\d{4}-\d{1,2}-\d{1,2}|\d{1,2}[/.\-]\d{1,2}[/.\-]\d{2,4}"
+    r"|(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s*\d", re.I)
+_YES_NO_A = re.compile(r"^(yes|no|y|n|true|false|n/?a)\b", re.I)
+_YES_NO_Q = re.compile(
+    r"^(are|do|does|did|have|has|had|is|was|were|will|would|can|could|may|must|should)\b")
+# A question that opens like a Yes/No but genuinely wants prose or a value.
+_WANTS_PROSE = ("why", "explain", "describe", "tell us", "tell me", "how many", "how much",
+                "which", "what", "who", "where", "when", "list", "if so", "if yes", "share",
+                "example", "highlight", "elaborate", "walk us", "anything else", "provide")
+# Free-text controls only: an answer picked from the form's OWN option list can't be off-shape.
+_FREE_CONTROLS = ("", "text", "textarea", "date")
+
+
+def _answer_flag(label: str, value: str, control: str = "") -> str:
+    """Why `value` looks wrong FOR `label`, phrased as what to check, or "" when it looks right."""
+    from .apply import _is_todays_date_q, _norm  # lazy: keeps the web import light
+
+    n, v = _norm(label), (value or "").strip()
+    if not n or not v or control == "file":
+        return ""
+    digits = sum(c.isdigit() for c in v)
+    # Date fields. Only SHORT, date-owning labels ("Date", "Date of birth", "Graduation date") —
+    # a long question that merely mentions dates may legitimately be answered in prose. Start-date
+    # and availability questions are excluded for the same reason ("Immediately" is a real answer).
+    is_date_q = _is_todays_date_q(n) or (
+        len(n) <= 40 and re.search(r"\bdates?\b", n)
+        and not any(t in n for t in ("start", "available", "availability", "notice")))
+    # A date answer is a date and little else: the sentence that stole this field ("I'm available
+    # immediately, with confirmed graduation in May 2027.") does contain a month and a year, so
+    # containing a date isn't enough — it has to be one.
+    if is_date_q and (len(v) > 30 or not _DATE_SHAPE.search(v)):
+        return ("This field asks for a date and the answer isn't one — a form's bare “Date” is "
+                "the day you apply.")
+    # "gpa" as a whole word only — as a substring it hits a URL in the question text
+    # ("blo(g.pa)lantir.com" normalises to "blogpalantircom").
+    if (any(t in n for t in ("how many", "number of", "years of experience"))
+            or re.search(r"\bgpa\b", n)) and not digits:
+        return "This field asks for a number and the answer doesn't contain one."
+    if "email" in n and "@" not in v:
+        return "This field asks for an email address and the answer isn't one."
+    if any(t in n for t in ("phone", "mobile number", "cell")) and digits < 7:
+        return "This field asks for a phone number and the answer doesn't look like one."
+    if any(t in n for t in ("linkedin", "github", "website", "portfolio", "url")) \
+            and not re.search(r"https?://|www\.|\.[a-z]{2,}/", v, re.I):
+        return "This field asks for a link and the answer isn't a URL."
+    # A Yes/No question answered with a sentence — the shape of an answer written for a different
+    # question. Free-text controls only, and only when the question doesn't invite prose.
+    if control in _FREE_CONTROLS and _YES_NO_Q.match(n) and len(v) > 25 \
+            and not _YES_NO_A.match(v) and not any(t in n for t in _WANTS_PROSE):
+        return "This reads as a Yes/No question but the answer is a sentence."
+    # The inverse: a question asking WHICH or WHY, answered with a bare "Yes" — the shape a
+    # yes/no profile field produces when it is asked a question it doesn't answer. A live
+    # Palantir fill answered "Which of these roles resonates the most … and why?" with "Yes".
+    if control in _FREE_CONTROLS and _YES_NO_A.fullmatch(v) and not _YES_NO_Q.match(n) \
+            and any(t in n for t in ("which", "why", "how many", "how much", "describe",
+                                     "explain", "tell us", "tell me")):
+        return f"This question asks for a choice or an explanation — the answer is just “{v}”."
+    return ""
 
 
 def _review_data(app_id: int) -> dict | None:
@@ -962,6 +1209,8 @@ def _review_data(app_id: int) -> dict | None:
     filled: list[dict] = []
     skipped: list[str] = []
     captured: dict = {}
+    required: dict = {}
+    context: dict = {}
     when = ""
     rj = adir / "report.json"
     if rj.is_file():
@@ -969,6 +1218,8 @@ def _review_data(app_id: int) -> dict | None:
             data = json.loads(rj.read_text(encoding="utf-8"))
             filled = data.get("filled", []) or []
             captured = data.get("captured", {}) or {}
+            required = data.get("required", {}) or {}
+            context = data.get("context", {}) or {}
             # A check-all-that-apply group is reported one row per CHECKED option; the panel edits
             # the question once, so fold them into a single "A; B" answer (the format the fill splits).
             filled = _merge_checkbox_groups(filled)
@@ -1023,6 +1274,35 @@ def _review_data(app_id: int) -> dict | None:
         meta = captured.get(row.get("label", "")) or {}
         if meta.get("options"):
             row["kind"], row["options"] = meta.get("kind", ""), meta["options"]
+    # Required vs optional per question (decision 164), so the panel says what must be answered
+    # before a submit will go through. Matched on the same normalised key as the edits, since a
+    # form renders the same label with different whitespace/glyphs in different places. A question
+    # the sweep never saw is left unmarked (absent), NOT reported as optional.
+    req = {answer_overrides.key(k): bool(v) for k, v in required.items() if str(k).strip()}
+    for row in filled + unanswered:
+        flag = req.get(answer_overrides.key(row.get("label", "")))
+        if flag is not None:
+            row["required"] = flag
+    for row in unanswered:
+        # `_flag_missing_required` writes the reason itself — trust it over the sweep.
+        if "REQUIRED" in (row.get("detail") or ""):
+            row["required"] = True
+    # What a generic label was read FROM (decision 167): the heading above the field, the
+    # sentence before it, the field it follows. A "Date" box is only reviewable if the user can
+    # see WHICH date the form was asking for.
+    ctx = {answer_overrides.key(k): v for k, v in context.items() if str(k).strip()}
+    for row in filled + unanswered:
+        around = ctx.get(answer_overrides.key(row.get("label", "")))
+        if around:
+            row["context"] = around
+    # Answers whose SHAPE doesn't fit their question (decision 166) — the wrong-context fills a
+    # filled-looking form hides. Computed after the edits above, so it judges what will actually
+    # be submitted, not a value the user already corrected.
+    for row in filled + unanswered:
+        flag = _answer_flag(row.get("label", ""), row.get("value", ""),
+                            row.get("control", "") or row.get("kind", ""))
+        if flag:
+            row["flag"] = flag
     rp = a.get("resume_path", "")
     has_resume = bool(rp) and Path(rp).suffix.lower() == ".pdf" and Path(rp).is_file()
     return {
@@ -1038,6 +1318,10 @@ def _review_data(app_id: int) -> dict | None:
         "skipped": skipped,
         "unanswered": unanswered,
         "when": when,
+        # Did this fill record required/optional at all? Reports written before decision 164 (and
+        # Workday runs, which fill through their own driver) carry none — the panel says so and
+        # offers a rescan instead of silently showing every question as unmarked.
+        "required_known": bool(req),
         "has_resume": has_resume,
         "has_screenshot": (adir / "filled.png").is_file(),
     }
@@ -1225,7 +1509,8 @@ def list_resumes() -> list[dict[str, str]]:
 
 
 def list_fixtures() -> list[dict[str, str]]:
-    """Job postings selectable in the Review tab: the shipped example fixtures plus any the user
+    """Job postings selectable in Discover's "a posting I paste" dry run: the shipped example
+    fixtures plus any the user
     saved from the Track tab. A shipped fixture's `path` is relative to REPO_ROOT; a saved one's
     is relative to DATA_ROOT (they resolve in different roots — see `_fixture_path`). User-saved
     ones are labeled "· saved" and listed first so they're easy to find."""
@@ -1671,6 +1956,17 @@ class Handler(BaseHTTPRequestHandler):
                 })
             self._json(200, {"parked": out})
             return
+        if path == "/test-run/resume":
+            rp = ((_TEST_STATE.get("tailored") or {}).get("pdf") or "")
+            f = Path(rp) if rp else None
+            if not f or f.suffix.lower() != ".pdf" or not f.is_file():
+                self._json(404, {"error": "No tailored résumé yet. Run a dry-run with "
+                                          "“Tailor the résumé only” first."})
+                return
+            self._send(200, f.read_bytes(), "application/pdf",
+                       {"Content-Disposition": 'inline; filename="' + f.name + '"',
+                        "Cache-Control": "no-store"})
+            return
         if path == "/track/resume":
             # Stream the tailored PDF a Track row used, so the Track tab can link to it
             # (decision 029). Serves only an existing .pdf the row points at; the path
@@ -2082,6 +2378,11 @@ class Handler(BaseHTTPRequestHandler):
                 # fill/submit of that application.
                 p = json.loads(raw or b"{}")
                 self._json(200, save_answers(int(p["id"]), p.get("answers", {})))
+            elif path == "/track/rescan":
+                # Re-read one posting's form so the review panel shows current questions, control
+                # types, required marks and answers (decision 164). Headless; never submits.
+                p = json.loads(raw or b"{}")
+                self._json(200, queue_rescan(int(p["id"])))
             elif path == "/track/delete":
                 p = json.loads(raw or b"{}")
                 deleted = tracker.delete_application(int(p["id"]))
@@ -2102,7 +2403,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, start_reapply(int(p["id"]), arm=bool(p.get("arm")),
                                               retailor=bool(p.get("retailor"))))
             elif path == "/test-run":
-                self._json(200, start_test_run(bool(json.loads(raw or b"{}").get("fresh"))))
+                p = json.loads(raw or b"{}")
+                self._json(200, start_test_run(bool(p.get("fresh")),
+                                               mode="tailor" if p.get("mode") == "tailor" else "apply"))
             elif path == "/test-run/close":
                 _TEST_HOLD.set()  # release the review hold so the browser closes
                 self._json(200, {"ok": True})
@@ -2249,7 +2552,7 @@ INDEX_HTML = """<!doctype html>
   /* Persistent brand mark, top-right of the content area (theme-aware var --lm; decorative). */
   .brandmark { position:absolute; top:20px; right:32px; z-index:6; pointer-events:none;
     width:38px; height:38px; background:var(--lm) center/contain no-repeat; }
-  /* Review controls bar */
+  /* Tailor/profile controls bar */
   .controls { display:flex; flex-wrap:wrap; gap:12px 16px; align-items:flex-end; background:var(--surface); border:1px solid var(--line); border-radius:var(--radius); padding:16px 18px; margin-bottom:22px; box-shadow:var(--shadow); }
   .controls .ctrl { display:flex; flex-direction:column; gap:5px; flex:1 1 160px; min-width:140px; }
   .controls .ctrl.wide { flex-basis:100%; }
@@ -2259,6 +2562,8 @@ INDEX_HTML = """<!doctype html>
   .controls button { width:auto; margin:0; padding:10px 18px; white-space:nowrap; }
   .controls .ctrl-go { flex:0 0 auto; }
   .controls .ctrl.hidden { display:none; }
+  .controls .ctrl .rl-h { color:var(--muted); font-size:12px; line-height:1.4; }
+  #resume-pick .ctrl { flex-basis:100%; }
   .editor { max-width:none; }
   .editor h3 { margin:22px 0 8px; font-size:15px; }
   .editing { font-size:13px; color:var(--muted); line-height:1.5; }
@@ -2497,6 +2802,13 @@ INDEX_HTML = """<!doctype html>
   .linkedin input[type=file] { width:auto; border:0; padding:0; }
   .linkedin button { width:auto; margin:8px 8px 0 0; padding:7px 14px; }
   .linkedin code { background:var(--surface-2); padding:1px 4px; border-radius:3px; font-size:12px; }
+  /* LinkedIn import is the rarer path: a small secondary button that opens an inline panel. */
+  .linkedin button.li-alt { background:transparent; color:var(--accent); border:1px solid var(--line);
+    font-size:12px; font-weight:600; padding:6px 11px; }
+  .linkedin button.li-alt:hover { filter:none; background:var(--surface-2); }
+  .li-panel { border:1px solid var(--line); border-radius:8px; padding:12px; margin-top:12px;
+    background:var(--surface-2); }
+  .li-panel .editing { margin-top:0; }
   /* Kept résumé files (decision 152): one row per uploaded PDF that jobs may be sent as-is. */
   .kept-row { display:flex; align-items:center; justify-content:space-between; gap:10px;
     border:1px solid var(--line); border-radius:8px; padding:7px 11px; margin-top:6px;
@@ -2717,11 +3029,29 @@ INDEX_HTML = """<!doctype html>
              background:var(--field); border:1px solid var(--line); border-radius:5px;
              color:inherit; line-height:1.45; }
   .rv-edit:focus { outline:2px solid var(--accent); outline-offset:1px; }
-  .rv-ctl, .rv-edited { display:inline-block; margin-top:3px; font-size:11px; font-weight:700;
-                        border-radius:9px; padding:1px 7px; }
+  .rv-ctl, .rv-edited, .rv-req, .rv-opt, .rv-ai, .rv-flagbadge {
+                        display:inline-block; margin-top:3px; font-size:11px;
+                        font-weight:700; border-radius:9px; padding:1px 7px; }
   .rv-ctl { color:var(--muted); background:var(--field); border:1px solid var(--line); }
   .rv-edited { color:var(--accent-text); background:var(--accent-weak); border:1px solid var(--accent); }
+  /* Required vs optional (decision 164): required is what must be answered to submit. */
+  .rv-req { color:var(--warn); background:var(--warn-bg); border:1px solid var(--warn-line); }
+  .rv-opt { color:var(--muted); background:transparent; border:1px dashed var(--line); }
+  /* Answer doesn't fit its question (decision 166) — the wrong-context fill, called out on the
+     row itself with the reason, so the fix is the edit box already next to it. */
+  .rv-flagbadge { color:var(--bad); background:var(--warn-bg); border:1px solid var(--bad); }
+  .rv-flagged td { background:var(--warn-bg); }
+  .rv-flagged td:first-child { box-shadow:inset 3px 0 0 var(--bad); }
+  .rv-flagwhy { margin-top:3px; font-size:11.5px; color:var(--bad); font-weight:600; }
+  /* The form text a generic label was read from (decision 167). */
+  .rv-around { margin-top:3px; font-size:11px; color:var(--muted); font-style:italic;
+               overflow-wrap:anywhere; }
+  /* How the answer was produced, when a model produced it — the rows worth a human glance. */
+  .rv-ai { color:var(--muted); background:var(--field); border:1px dashed var(--line); }
   .rv-save { margin-top:10px; }
+  .rv-rescan { margin-top:10px; }
+  /* "Type a different value…" escape from a captured dropdown, and the way back to the list. */
+  .rv-choice-back { margin-top:5px; font-size:11.5px; padding:3px 8px; }
   .rv-note.rv-ok { color:var(--ok-text); font-weight:700; }
   .rv-note.rv-err { color:var(--bad); font-weight:700; }
   .rv-jd { margin-top:8px; padding:10px; max-height:280px; overflow:auto; background:var(--field);
@@ -2808,6 +3138,12 @@ INDEX_HTML = """<!doctype html>
   .viewtog button { width:auto; margin:0; padding:6px 13px; background:var(--surface); color:var(--muted); font-size:12.5px; font-weight:600; border:0; border-radius:0; }
   .viewtog button.on { background:var(--surface-2); color:var(--ink); }
   .viewtog button + button { border-left:1px solid var(--line); }
+  .viewtog button[disabled] { opacity:.45; cursor:not-allowed; }
+  /* Dry-run options: one labelled segmented control per choice (job source · how far to go) */
+  .dryopts { display:flex; flex-wrap:wrap; gap:18px; margin:2px 0 10px; }
+  .dryopt { display:flex; align-items:center; gap:8px; }
+  .dryopt-l { font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); }
+  #dry-paste { margin-bottom:10px; }
   /* Application feed — uniform vertical cards (company/role/site metadata + status dot). */
   .feed { display:flex; flex-direction:column; gap:8px; }
   .feed.hidden { display:none; }
@@ -2927,8 +3263,7 @@ INDEX_HTML = """<!doctype html>
   <aside class="nav">
     <div class="brand"><span class="brand-logo" aria-hidden="true"></span>ApplicationBot</div>
     <nav class="navlist">
-      <button class="tab active" data-view="review"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.375 2.625a1 1 0 0 1 3 3l-9.013 9.014a2 2 0 0 1-.853.505l-2.873.84a.5.5 0 0 1-.62-.62l.84-2.873a2 2 0 0 1 .506-.852z"/></svg>Review</button>
-      <button class="tab" data-view="discover"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>Discover</button>
+      <button class="tab active" data-view="discover"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>Discover</button>
       <button class="tab" data-view="profile"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="8" r="5"/><path d="M20 21a8 8 0 0 0-16 0"/></svg>Profile</button>
       <button class="tab" data-view="track"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 3v16a2 2 0 0 0 2 2h16"/><path d="M18 17V9"/><path d="M13 17V5"/><path d="M8 17v-3"/></svg>Track</button>
       <button class="tab" data-view="notifications"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg>Notifications<span class="nav-badge" id="notif-badge" hidden></span></button>
@@ -2943,7 +3278,7 @@ INDEX_HTML = """<!doctype html>
 
   <main>
     <div class="brandmark" aria-hidden="true"></div>
-    <div id="view-discover" class="hidden">
+    <div id="view-discover">
       <div id="discover-nudge" class="nudge hidden">
         <div class="nudge-b">First, tell the bot <b>what jobs to find</b> — set your roles, keywords,
           location, and pay in <b>Discovery settings</b> below. Then run a dry-run and watch it
@@ -3004,13 +3339,80 @@ INDEX_HTML = """<!doctype html>
           <h3>Run a dry-run</h3>
           <button id="test-run" type="button">▶ Find &amp; fill one (dry-run)</button>
         </div>
-        <p class="editing tight">One end-to-end pass: searches, ranks every posting by fit, then
-          tailors and auto-fills the single best match in a browser you can watch. <b>Never
-          submits</b> — review it, click Finish. Recorded in Track.</p>
+        <div class="dryopts">
+          <div class="dryopt"><span class="dryopt-l">Job</span>
+            <div class="viewtog">
+              <button id="dry-job-find" type="button" class="on">Best match it finds</button>
+              <button id="dry-job-paste" type="button">A posting I paste</button>
+            </div>
+          </div>
+          <div class="dryopt"><span class="dryopt-l">How far to go</span>
+            <div class="viewtog">
+              <button id="dry-mode-apply" type="button" class="on">Tailor + fill the form</button>
+              <button id="dry-mode-tailor" type="button">Tailor the résumé only</button>
+            </div>
+          </div>
+        </div>
+        <p class="editing tight" id="dry-run-blurb"></p>
+        <!-- Tailor a posting the search never found (a job someone sent you). Only the tailoring
+             half can run here: a pasted posting has no application form to fill. -->
+        <div id="dry-paste" class="hidden">
+          <div class="controls">
+            <div class="ctrl"><label for="jobmode">Posting</label>
+              <select id="jobmode">
+                <option value="fixture">From a saved posting</option>
+                <option value="custom">Paste a posting</option>
+              </select>
+            </div>
+            <div id="fixtureBox" class="ctrl"><label for="fixture">Saved posting</label><select id="fixture"></select></div>
+            <div id="customBox" class="ctrl wide hidden">
+              <label for="title">Posting details</label>
+              <input id="title" placeholder="Job title (optional)">
+              <input id="company" placeholder="Company (optional)" style="margin-top:6px">
+              <textarea id="body" placeholder="Paste the job description here…"></textarea>
+            </div>
+            <div class="ctrl"><label for="backend">Engine</label>
+              <select id="backend">
+                <option value="auto">auto (subscription → API key → rules)</option>
+                <option value="claude-code">claude-code (your subscription)</option>
+                <option value="anthropic-api">anthropic-api (your API key — fallback)</option>
+                <option value="rules">rules (no account)</option>
+              </select>
+            </div>
+            <div class="ctrl"><label for="quality">Quality</label>
+              <select id="quality">
+                <option value="fast">Fast — Sonnet, ~30s</option>
+                <option value="balanced" selected>Balanced — Opus, ~40s (recommended)</option>
+                <option value="max">Max quality — Opus + deep reasoning, ~2 min</option>
+              </select>
+            </div>
+            <div class="ctrl"><label for="pages">Length</label>
+              <select id="pages">
+                <option value="1">1 page</option>
+                <option value="1.5">1.5 pages</option>
+                <option value="2">2 pages</option>
+              </select>
+            </div>
+            <div class="ctrl"><label for="linechars">Line length</label>
+              <input id="linechars" type="number" value="100" min="40" max="220">
+            </div>
+          </div>
+        </div>
         <span id="test-msg" class="msg"></span>
         <div id="test-progress" class="testprog hidden"></div>
         <div id="test-chosen" class="testchosen hidden"></div>
         <div id="test-judged" class="testjudged hidden"></div>
+        <!-- The tailored résumé itself: rendered preview, drift warnings, and the PDF. Shared by
+             both tailor-only paths (a discovered match and a pasted posting). -->
+        <div id="tailor-out" class="hidden">
+          <div id="meta" class="meta hidden"></div>
+          <button id="dl-pdf" class="hidden">⬇ Download PDF</button>
+          <span id="pdf-msg" class="msg"></span>
+          <div class="reviewwrap">
+            <div id="result"></div>
+            <aside id="why-panel" class="why-panel hidden"></aside>
+          </div>
+        </div>
       </div>
       <div class="editor" id="parked-panel" style="display:none">
         <h3 style="margin-top:0">Applications waiting on you</h3>
@@ -3040,64 +3442,6 @@ INDEX_HTML = """<!doctype html>
       </div>
     </div>
 
-    <div id="view-review">
-      <header class="page-head">
-        <h2 class="page-title">Review &amp; tailor</h2>
-        <p class="page-sub">Pick a résumé and a job posting, tailor it with your chosen engine,
-          and read the result — relevance notes, factual-drift warnings, and which engine ran.</p>
-      </header>
-      <div class="controls">
-        <div class="ctrl"><label for="resume">Résumé</label><select id="resume"></select></div>
-        <div class="ctrl"><label for="jobmode">Job posting</label>
-          <select id="jobmode">
-            <option value="fixture">From a saved fixture</option>
-            <option value="custom">Paste a posting</option>
-          </select>
-        </div>
-        <div id="fixtureBox" class="ctrl"><label for="fixture">Fixture</label><select id="fixture"></select></div>
-        <div id="customBox" class="ctrl wide hidden">
-          <label for="title">Posting details</label>
-          <input id="title" placeholder="Job title (optional)">
-          <input id="company" placeholder="Company (optional)" style="margin-top:6px">
-          <textarea id="body" placeholder="Paste the job description here…"></textarea>
-        </div>
-        <div class="ctrl"><label for="backend">Engine</label>
-          <select id="backend">
-            <option value="auto">auto (subscription → API key → rules)</option>
-            <option value="claude-code">claude-code (your subscription)</option>
-            <option value="anthropic-api">anthropic-api (your API key — fallback)</option>
-            <option value="rules">rules (no account)</option>
-          </select>
-        </div>
-        <div class="ctrl"><label for="quality">Quality</label>
-          <select id="quality">
-            <option value="fast">Fast — Sonnet, ~30s</option>
-            <option value="balanced" selected>Balanced — Opus, ~40s (recommended)</option>
-            <option value="max">Max quality — Opus + deep reasoning, ~2 min</option>
-          </select>
-        </div>
-        <div class="ctrl"><label for="pages">Length</label>
-          <select id="pages">
-            <option value="1">1 page</option>
-            <option value="1.5">1.5 pages</option>
-            <option value="2">2 pages</option>
-          </select>
-        </div>
-        <div class="ctrl"><label for="linechars">Line length</label>
-          <input id="linechars" type="number" value="100" min="40" max="220">
-        </div>
-        <div class="ctrl ctrl-go"><button id="go">Tailor résumé</button></div>
-      </div>
-      <div id="status" class="empty">Pick a resume and job, then tailor.</div>
-      <div id="meta" class="meta hidden"></div>
-      <button id="dl-pdf" class="hidden">⬇ Download PDF</button>
-      <span id="pdf-msg" class="msg"></span>
-      <div class="reviewwrap">
-        <div id="result"></div>
-        <aside id="why-panel" class="why-panel hidden"></aside>
-      </div>
-    </div>
-
     <div id="view-profile" class="hidden">
       <div class="editor">
         <div id="profile-nudge" class="nudge hidden">
@@ -3115,17 +3459,42 @@ INDEX_HTML = """<!doctype html>
             picks the relevant parts per job.</p>
         </header>
 
-        <div id="profile-form">Loading…</div>
+        <!-- Picks the profile the whole app works from: the sections below edit it, imports merge
+             into it, and discovery/tailoring/applying all read it. Lived on the old Review tab.
+             The hint is exact on purpose — switching it does NOT switch your applicant details,
+             which are one shared file (profile/application_profile.yaml). -->
+        <div class="controls" id="resume-pick">
+          <div class="ctrl"><label for="resume">Profile you're working on</label><select id="resume"></select>
+            <span class="rl-h">The résumé this page edits, imports merge into, and every application
+              is tailored from. Your applicant details below are shared by all of them.</span>
+          </div>
+        </div>
 
         <div id="s-upload" class="linkedin">
-          <h3 style="margin-top:0">Upload your résumé</h3>
+          <h3 style="margin-top:0">Start here — upload your résumé</h3>
           <p class="editing">Have a résumé already? Upload the <b>PDF or Word (.docx)</b> file and
-            Claude reads it into the sections above — experience, projects, education, and skills.
+            Claude reads it into the sections below — experience, projects, education, and skills.
             New entries are merged in; anything you've already filled is left untouched. No résumé
-            file? Fill the fields directly, or import from LinkedIn below.</p>
+            file? Fill the fields below directly, or import from LinkedIn.</p>
           <input id="rf-file" type="file" accept=".pdf,.docx,.txt,.md">
           <button id="rf-import" type="button">Upload &amp; parse</button>
+          <button id="li-toggle" type="button" class="li-alt"
+                  aria-expanded="false" aria-controls="s-linkedin">Import from LinkedIn instead</button>
           <span id="rf-msg" class="msg"></span>
+
+          <div id="s-linkedin" class="li-panel hidden">
+            <h4 style="margin:0 0 6px">Import from LinkedIn</h4>
+            <p class="editing">LinkedIn can't be linked live (their API restricts it and
+              scraping breaks their terms). Instead, on LinkedIn go to <b>Settings → Data
+              Privacy → Get a copy of your data</b>, download the archive, and upload it here
+              (the <code>.zip</code>, or the Positions/Education/Skills <code>.csv</code>
+              files). We'll merge new experience, education, and skills into the sections below
+              (existing entries aren't touched).</p>
+            <input id="li-file" type="file" accept=".zip,.csv">
+            <button id="li-import" type="button">Import</button>
+            <span id="li-msg" class="msg"></span>
+          </div>
+
           <p class="editing" style="margin-bottom:0">A <b>PDF</b> you upload is also kept as a file:
             when a job asks for essentially only skills that résumé already shows, we send it
             as-is instead of a tailored one — your real résumé beats a generated one. Word and text
@@ -3133,18 +3502,7 @@ INDEX_HTML = """<!doctype html>
           <div id="rf-kept"></div>
         </div>
 
-        <div id="s-linkedin" class="linkedin">
-          <h3 style="margin-top:0">Import from LinkedIn</h3>
-          <p class="editing">LinkedIn can't be linked live (their API restricts it and
-            scraping breaks their terms). Instead, on LinkedIn go to <b>Settings → Data
-            Privacy → Get a copy of your data</b>, download the archive, and upload it here
-            (the <code>.zip</code>, or the Positions/Education/Skills <code>.csv</code>
-            files). We'll merge new experience, education, and skills into the sections above
-            (existing entries aren't touched).</p>
-          <input id="li-file" type="file" accept=".zip,.csv">
-          <button id="li-import" type="button">Import</button>
-          <span id="li-msg" class="msg"></span>
-        </div>
+        <div id="profile-form">Loading…</div>
 
         <div class="saverow">
           <button id="save-profile">Save profile</button>
@@ -3402,6 +3760,44 @@ async function disconnectKey() {
   } catch (e) { btnDone(btn); }
 }
 
+// ---- Dry-run options (decision 163) -----------------------------------------
+// Two choices, one button. Job: the best match the search finds, or a posting you paste (a job
+// nobody discovered for you). How far: tailor + fill the form, or stop at the tailored résumé.
+// A pasted posting has no application form, so it can only tailor — the fill option says why
+// rather than silently failing (UI Principle #3).
+const DRY = { job: "find", mode: "apply" };
+function renderDryOpts() {
+  const pasted = DRY.job === "paste";
+  if (pasted) DRY.mode = "tailor";
+  $("dry-job-find").classList.toggle("on", !pasted);
+  $("dry-job-paste").classList.toggle("on", pasted);
+  $("dry-mode-apply").classList.toggle("on", DRY.mode === "apply");
+  $("dry-mode-tailor").classList.toggle("on", DRY.mode === "tailor");
+  $("dry-mode-apply").disabled = pasted;
+  $("dry-mode-apply").title = pasted
+    ? "A pasted posting has no application form to fill — it can only be tailored for."
+    : "";
+  $("dry-paste").classList.toggle("hidden", !pasted);
+  $("test-run").textContent = pasted ? "▶ Tailor for this posting"
+                            : DRY.mode === "tailor" ? "▶ Find one & tailor (dry-run)"
+                            : "▶ Find & fill one (dry-run)";
+  $("dry-run-blurb").innerHTML = pasted
+    ? "Tailors your résumé to the posting below and shows the result — nothing is searched, "
+      + "filled, or submitted. Use it for a job someone sent you."
+    : DRY.mode === "tailor"
+    ? "Searches, ranks every posting by fit, and tailors your résumé for the single best match — "
+      + "then stops. <b>No browser opens and no form is filled.</b> The PDF is kept, so a later "
+      + "apply run reuses it instead of paying for the tailoring twice."
+    : "One end-to-end pass: searches, ranks every posting by fit, then tailors and auto-fills the "
+      + "single best match in a browser you can watch. <b>Never submits</b> — review it, click "
+      + "Finish. Recorded in Track.";
+}
+$("dry-job-find").addEventListener("click", () => { DRY.job = "find"; renderDryOpts(); });
+$("dry-job-paste").addEventListener("click", () => { DRY.job = "paste"; renderDryOpts(); });
+$("dry-mode-apply").addEventListener("click", () => { DRY.mode = "apply"; renderDryOpts(); });
+$("dry-mode-tailor").addEventListener("click", () => { DRY.mode = "tailor"; renderDryOpts(); });
+renderDryOpts();
+
 $("jobmode").addEventListener("change", () => {
   const custom = $("jobmode").value === "custom";
   $("customBox").classList.toggle("hidden", !custom);
@@ -3423,46 +3819,61 @@ $("dl-pdf").addEventListener("click", async () => {
     msg.className = "msg err"; msg.textContent = String(e.message || e);
   } finally { btnDone(btn); }
 });
-$("go").addEventListener("click", async () => {
-  const mode = $("jobmode").value;
+// Tailor for a posting the user pasted or saved (no discovery, no form fill) — the manual half of
+// the dry run. Renders into the same #tailor-out block a tailor-only discovered run uses.
+function clearTailorOut() {
+  $("tailor-out").classList.add("hidden");
+  $("meta").classList.add("hidden"); $("dl-pdf").classList.add("hidden"); $("pdf-msg").textContent = "";
+  $("result").innerHTML = ""; $("why-panel").classList.add("hidden");
+}
+function showTailored({html, notes, warnings, backend, pages, title, company, pdfHref}) {
+  $("tailor-out").classList.remove("hidden");
+  let meta = `<span class="badge">engine: ${escapeHtml(backend || "")}</span>`
+    + (pages ? ` <span class="badge">${pages}pg</span>` : "")
+    + ` &nbsp; <b>${escapeHtml(title || "")}</b>${company ? " @ " + escapeHtml(company) : ""}`;
+  if (notes && notes.length) meta += `<div class="notes"><b>Notes:</b> ${notes.map(escapeHtml).join(" ")}</div>`;
+  if (warnings && warnings.length) meta += `<div class="warn"><b>⚠ Drift warnings:</b> ${warnings.map(escapeHtml).join("; ")}</div>`;
+  $("meta").innerHTML = meta; $("meta").classList.remove("hidden");
+  $("result").innerHTML = `<div class="resume">${html || ""}</div>`;
+  if (pdfHref) {                       // already-rendered PDF (a discovered tailor-only run)
+    $("dl-pdf").classList.add("hidden");
+    $("pdf-msg").innerHTML = `<a href="${pdfHref}" target="_blank" rel="noopener">Open the tailored PDF ↗</a>`;
+  } else {                             // pasted posting: render on demand from what we just got
+    $("dl-pdf").classList.remove("hidden");
+  }
+  showWhyIntro();
+}
+async function tailorPastedPosting() {
+  const jobmode = $("jobmode").value;
   const payload = {
-    resume: $("resume").value,
+    resume: currentResume(),
     backend: $("backend").value,
     quality: $("quality").value,
     pages: parseFloat($("pages").value),
     line_chars: parseInt($("linechars").value) || 100,
-    job: mode === "custom"
+    job: jobmode === "custom"
       ? { mode:"custom", title:$("title").value, company:$("company").value, body:$("body").value }
       : { mode:"fixture", fixture:$("fixture").value },
   };
-  const btn = $("go");
+  const btn = $("test-run"), msg = $("test-msg");
   const est = { fast: "~30s", balanced: "~40s", max: "up to ~2 min" }[$("quality").value] || "";
   btnBusy(btn, "Tailoring…");
-  $("status").className = "empty"; $("status").classList.remove("hidden");
-  const stop = busyInto($("status"), `Tailoring your résumé to this job (${est})…`, true);   // long Claude call — show elapsed
-  $("meta").classList.add("hidden"); $("dl-pdf").classList.add("hidden"); $("pdf-msg").textContent = "";
-  $("result").innerHTML = ""; $("why-panel").classList.add("hidden");
+  msg.className = "msg busy";
+  const stop = busyInto(msg, `Tailoring your résumé to this posting (${est})…`, true);  // long Claude call — show elapsed
+  clearTailorOut();
   try {
     const res = await fetch("/tailor", { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(payload) });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || "request failed");
-    $("status").classList.add("hidden");
-    let meta = `<span class="badge">engine: ${data.backend}</span> <span class="badge">${data.pages}pg</span> &nbsp; <b>${data.title}</b>${data.company ? " @ " + data.company : ""}`;
-    if (data.notes && data.notes.length) meta += `<div class="notes"><b>Notes:</b> ${data.notes.map(escapeHtml).join(" ")}</div>`;
-    if (data.warnings && data.warnings.length) meta += `<div class="warn"><b>⚠ Drift warnings:</b> ${data.warnings.map(escapeHtml).join("; ")}</div>`;
-    $("meta").innerHTML = meta; $("meta").classList.remove("hidden");
-    $("result").innerHTML = `<div class="resume">${data.html}</div>`;
-    lastReq = { resume: $("resume").value, tailored: data.tailored };
-    $("dl-pdf").classList.remove("hidden");
-    showWhyIntro();
-
+    lastReq = { resume: currentResume(), tailored: data.tailored };
+    showTailored(data);
+    msg.className = "msg ok"; msg.textContent = "Tailored ✓ — nothing was filled or submitted.";
   } catch (e) {
-    $("status").classList.remove("hidden");
-    $("status").innerHTML = `<div class="warn">${escapeHtml(String(e.message || e))}</div>`;
+    msg.className = "msg err"; msg.textContent = String(e.message || e);
   } finally {
     stop(); btnDone(btn);
   }
-});
+}
 
 // ---- "Why was this tailored this way" — per-entry rationale panel ----
 function showWhyIntro() {
@@ -3630,11 +4041,12 @@ function collect() {
   };
 }
 
-document.querySelectorAll(".tab").forEach(t => t.addEventListener("click", () => {
-  document.querySelectorAll(".tab").forEach(x => x.classList.remove("active"));
-  t.classList.add("active");
-  const v = t.dataset.view;
-  $("view-review").classList.toggle("hidden", v !== "review");
+// One definition of "show this section": the nav clicks, the deep-link router, the tour, and the
+// initial landing all go through it, so a view can never be shown without the data it needs.
+// `nudge:false` is for the landing call — a first-visit nudge belongs to navigating INTO a section,
+// and at load /setup/status hasn't answered yet, so it would prompt users who are already set up.
+function showView(v, {nudge = true} = {}) {
+  document.querySelectorAll(".tab").forEach(x => x.classList.toggle("active", x.dataset.view === v));
   $("view-discover").classList.toggle("hidden", v !== "discover");
   $("view-profile").classList.toggle("hidden", v !== "profile");
   $("view-track").classList.toggle("hidden", v !== "track");
@@ -3645,26 +4057,30 @@ document.querySelectorAll(".tab").forEach(t => t.addEventListener("click", () =>
   if (v === "discover") { pollLoop(); loadParked(); loadSources(); loadFitInsights(); loadCandidates(); loadDisc(); pollTest(); }
   if (v === "notifications") loadInbox();
   if (v === "settings") loadSettings();
-  maybeShowNudge(v);
-}));
+  if (nudge) maybeShowNudge(v);
+}
+document.querySelectorAll(".tab").forEach(t => t.addEventListener("click", () => showView(t.dataset.view)));
 
 // Deep-link support: /#<view> selects that tab on load and on hash change. The loop's push
 // notifications link to /#notifications (decision 138), and a desktop notification that opens the
 // app lands there too. Previously the #hash in those links did nothing (no router existed).
+// Returns whether the hash named a real view, so the landing call knows to fall back to Discover.
 function applyHash() {
   const h = (location.hash || "").replace(/^#/, "");
-  const t = h && document.querySelector('.tab[data-view="' + h + '"]');
-  if (t) t.click();
+  const known = h && document.querySelector('.tab[data-view="' + h + '"]');
+  if (known) showView(h);
+  return !!known;
 }
 window.addEventListener("hashchange", applyHash);
 
 // Nav badge = count of items needing the user; keep it live in the background (cheap /inbox poll).
 refreshBadge();
 setInterval(refreshBadge, 30000);
-// Honor an initial /#notifications (etc.). Deferred a tick so it runs AFTER the whole script has
-// initialized — a tab click reaches maybeShowNudge, which reads TOUR_ACTIVE (declared later); firing
-// during synchronous init would hit that binding in its temporal dead zone.
-setTimeout(applyHash, 0);
+// Land on Discover — the stage the user actually starts from (find jobs), not Review & tailor, which
+// only has something to show once a posting exists. Honors an initial /#notifications (etc.) first.
+// Deferred a tick so it runs AFTER the whole script has initialized — showView reaches maybeShowNudge,
+// which reads TOUR_ACTIVE (declared later); firing during synchronous init would hit its dead zone.
+setTimeout(() => { if (!applyHash()) showView("discover", {nudge: false}); }, 0);
 
 // ---- First-visit nudges — the one thing to do in Profile / Discover, shown once per section --
 // (moved out of the old up-front checklist: résumé import auto-fills the Profile fields, so the
@@ -3706,12 +4122,14 @@ $("resume").addEventListener("change", () => { if (!$("view-profile").classList.
 // ---- Discover: run one full dry-run test ------------------------------------
 let TEST_TIMER = null, TEST_T0 = null;
 async function startTestRun(fresh) {
+  if (DRY.job === "paste" && !fresh) return tailorPastedPosting();   // no search to run
   const btn = $("test-run"), msg = $("test-msg");
   msg.className = "msg"; msg.textContent = "";
+  clearTailorOut();
   btnBusy(btn, fresh ? "Re-searching…" : "Starting…");
   try {
     const r = await (await fetch("/test-run", {method:"POST", headers:{"Content-Type":"application/json"},
-                                               body: JSON.stringify({fresh: !!fresh})})).json();
+                                               body: JSON.stringify({fresh: !!fresh, mode: DRY.mode})})).json();
     if (!r.ok) { msg.className = "msg err"; msg.textContent = r.error || "Could not start."; btnDone(btn); return; }
     TEST_T0 = Date.now();
     pollTest();
@@ -3720,9 +4138,10 @@ async function startTestRun(fresh) {
 $("test-run").addEventListener("click", () => startTestRun(false));
 
 function testStepList(s) {
+  // A tailor-only run stops after the PDF — don't show fill/review steps it will never reach.
   const steps = [["discover","Discovering postings"],["match","Judging fit"],
-                 ["tailor","Tailoring résumé"],["pdf","Exporting PDF"],
-                 ["apply","Filling the form"],["review","Filled — review"]];
+                 ["tailor","Tailoring résumé"],["pdf","Exporting PDF"]];
+  if (s.mode !== "tailor") steps.push(["apply","Filling the form"],["review","Filled — review"]);
   const order = steps.map(x => x[0]);
   const cur = order.indexOf(s.step);
   return steps.map(([k,label],i) => {
@@ -3871,7 +4290,14 @@ async function pollTest() {
   if (s.errors && s.errors.length && (s.phase==="error")) {
     msg.className = "msg err"; msg.textContent = s.errors.join(" · ");
   }
-  if (s.phase === "done") { btnDone(btn); msg.className = "msg ok"; msg.textContent = s.message || "Done — recorded a dry-run row in Track."; loadFitInsights(); loadParked(); }
+  if (s.phase === "done") {
+    btnDone(btn); msg.className = "msg ok";
+    msg.textContent = s.message || "Done — recorded a dry-run row in Track.";
+    // Tailor-only: show the résumé it produced right here, with its drift warnings and the PDF.
+    if (s.tailored && $("tailor-out").classList.contains("hidden"))
+      showTailored({...s.tailored, pdfHref: "/test-run/resume"});
+    loadFitInsights(); loadParked();
+  }
   if (s.phase === "error") { btnDone(btn); loadFitInsights(); loadParked(); }
 
   if (running || filled) { clearTimeout(TEST_TIMER); TEST_TIMER = setTimeout(pollTest, 1200); }
@@ -4026,6 +4452,9 @@ async function toggleReview(id, panel, btn, title, signoff) {
 // so each card type keeps its own submit endpoint + messaging. Defaults to the goal-loop actions.
 function renderReview(panel, r, title, signoff) {
   panel.innerHTML = "";
+  // A rescan re-renders this panel; drop the old edit boxes' registration so a later save can
+  // never write from inputs that are no longer on screen.
+  delete REVIEW_EDITS[r.id];
   const p = r.posting || {};
   // Posting details — the facts we matched and are applying against.
   const meta = [];
@@ -4064,6 +4493,31 @@ function renderReview(panel, r, title, signoff) {
   const edits = [];  // {label, inp, initial} — collected for save + the pre-submit auto-save
   fieldWrap.appendChild(el("div", {class:"rv-h",
     text:"Answers it will submit (" + filled.length + ")"}));
+  // Required vs optional (decision 164): what MUST be answered before a submit goes through,
+  // counted across both tables, so the user knows the size of the job before reading the rows.
+  const rows = filled.concat(unanswered);
+  const nReq = rows.filter(f => f.required === true).length;
+  const nOpt = rows.filter(f => f.required === false).length;
+  const nUnmarked = rows.length - nReq - nOpt;
+  if (r.required_known) {
+    fieldWrap.appendChild(el("div", {class:"rv-note", text:
+      nReq + " required · " + nOpt + " optional"
+      + (nUnmarked ? " · " + nUnmarked + " the form didn't mark" : "")
+      + ". Only required fields have to be answered to submit."}));
+  } else if (rows.length) {
+    fieldWrap.appendChild(el("div", {class:"rv-note", text:
+      "This fill didn't record which questions are required — click “Rescan questions” below to "
+      + "re-read the form and mark them."}));
+  }
+  // Answers that don't fit their question (decision 166) — counted up front, because the failure
+  // they catch looks fine field-by-field: a filled box holding the answer to a different question.
+  const flagged = rows.filter(f => f.flag);
+  if (flagged.length) {
+    fieldWrap.appendChild(el("div", {class:"rv-h rv-warn", text:
+      flagged.length + (flagged.length === 1 ? " answer doesn't" : " answers don't")
+      + " match what the question asks — highlighted below with what to check. Edit them here; "
+      + "your edit is what gets submitted."}));
+  }
   if (filled.length) {
     const tbl = el("table", {class:"rv-fields"});
     filled.forEach(f => tbl.appendChild(answerRow(f.label, f.value, f.control, f.edited, edits, false, f)));
@@ -4076,8 +4530,12 @@ function renderReview(panel, r, title, signoff) {
   // is required. Editable too, so the fix is right here instead of a read-only warning.
   if (unanswered.length) {
     const open = unanswered.filter(u => !(u.value || "").trim()).length;
+    // Blocking vs merely missing: only an unanswered REQUIRED field stops a real submit.
+    const blocking = unanswered.filter(u => u.required === true && !(u.value || "").trim()).length;
     fieldWrap.appendChild(el("div", {class:"rv-h rv-warn",
-      text:"Needs attention — unanswered (" + open + " of " + unanswered.length + ")"}));
+      text:"Needs attention — unanswered (" + open + " of " + unanswered.length + ")"
+        + (blocking ? " — " + blocking + " required, which block a real submit"
+                    : (r.required_known && open ? " — none required, so a submit isn't blocked" : ""))}));
     const tbl = el("table", {class:"rv-fields"});
     unanswered.forEach(u => tbl.appendChild(
       answerRow(u.label, u.value, u.detail, u.edited, edits, true, u)));
@@ -4097,6 +4555,24 @@ function renderReview(panel, r, title, signoff) {
          + "your answer bank so future applications don't ask again. Unsaved edits are saved for "
          + "you when you click Watch it fill or Apply."}));
   }
+  // Rescan (decision 164): re-read the posting's form so the questions, their control types,
+  // their required marks and the bot's answers are current. Headless dry-run — never submits.
+  const rescanNote = el("span", {class:"rv-note"});
+  if (RESCAN_MSG[r.id]) {  // outcome of the rescan that just rebuilt this panel
+    rescanNote.className = "rv-note rv-ok";
+    rescanNote.textContent = RESCAN_MSG[r.id];
+    delete RESCAN_MSG[r.id];
+  }
+  const rescanBtn = el("button", {class:"rv-btn", type:"button", text:"Rescan questions",
+    title:"Re-read this posting's form in the background — refreshes every question, whether it's "
+        + "required, and the answers. No window opens and nothing is submitted.",
+    on:{click:()=>rescanReview(r.id, rescanBtn, rescanNote, panel, title, signoff)}});
+  fieldWrap.appendChild(el("div", {class:"rv-acts rv-rescan"}, [rescanBtn, rescanNote]));
+  fieldWrap.appendChild(el("div", {class:"rv-note",
+    text:(r.when ? "Form last read " + r.when.replace("T", " ") + ". " : "")
+       + "Rescan when the posting has changed its form, or when a question above looks stale — it "
+       + "re-reads the live form and refreshes the questions, their required marks and the answers."}));
+  panel.dataset.when = r.when || "";  // the rescan watches this for "the new report landed"
   panel.appendChild(fieldWrap);
 
   // The JD it tailored against (collapsible — long).
@@ -4132,6 +4608,10 @@ function answerRow(label, value, note, edited, edits, isBlank, row) {
   if (isMultiAnswer(row.kind, row.options)) {
     const w = multiCheckboxes(row.options, v);
     cell = w.node; inp = w.hidden;
+  } else if (isSingleChoice(row.kind, row.options)) {
+    // The form offers a fixed list here — edit it as that list, not as free text (decision 165).
+    const w = singleChoiceInput(row.options, v);
+    cell = w.node; inp = w.hidden;
   } else {
     const long = v.length > 60;
     inp = long ? el("textarea", {class:"rv-edit", rows:"3", value:v})
@@ -4141,9 +4621,33 @@ function answerRow(label, value, note, edited, edits, isBlank, row) {
   }
   edits.push({label: label, inp: inp, initial: v});
   const marks = [el("div", {text: label || "—"})];
+  // Does the form make this one mandatory (decision 164)? Shown first — it decides whether the
+  // user has to fill the row at all. Absent when the fill couldn't tell (no badge, never a guess).
+  if (row.required === true) marks.push(el("span", {class:"rv-req", text:"Required",
+    title:"The form marks this field required — a real submit is blocked until it's answered"}));
+  else if (row.required === false) marks.push(el("span", {class:"rv-opt", text:"Optional",
+    title:"The form does not require this field — it can be left blank"}));
   if (edited) marks.push(el("span", {class:"rv-edited", text:"your edit"}));
   else if (note && note !== "text") marks.push(el("span", {class:"rv-ctl", text:note}));
-  return el("tr", {}, [el("td", {class:"rv-fl"}, marks), el("td", {class:"rv-fv"}, [cell])]);
+  // Who produced the answer, when it wasn't a straight lookup from your profile or answer bank.
+  // A drafted or model-picked answer is the one most likely to be right in form and wrong in
+  // context, so it says so on the row.
+  if (!edited && row.source === "generated") marks.push(el("span", {class:"rv-ai",
+    text:"AI-drafted", title:"Claude wrote this from your résumé — check it answers THIS question"}));
+  else if (!edited && row.source === "option:claude") marks.push(el("span", {class:"rv-ai",
+    text:"AI-picked", title:"Claude chose this from the options the form offered"}));
+  // What a generic label was read from (decision 167) — "Date" alone is not reviewable, "Date"
+  // under "Applicant certification · follows the field: Signature" is.
+  if (row.context) marks.push(el("div", {class:"rv-around", text:"on the form: " + row.context,
+    title:"The text around this field, which is how the bot worked out what it asks for"}));
+  // The answer doesn't fit what the question asks (decision 166): badge + the reason, right
+  // above the box that fixes it.
+  if (row.flag) {
+    marks.push(el("span", {class:"rv-flagbadge", text:"Check this", title:row.flag}));
+    marks.push(el("div", {class:"rv-flagwhy", text:row.flag}));
+  }
+  return el("tr", {class: row.flag ? "rv-flagged" : ""},
+    [el("td", {class:"rv-fl"}, marks), el("td", {class:"rv-fv"}, [cell])]);
 }
 
 // Save a review panel's changed answers. `quiet` = the pre-submit auto-save (no "nothing to
@@ -4200,6 +4704,78 @@ async function saveAnswers(id, quiet) {
     st.status.className = "rv-note rv-err";
     st.status.textContent = "Could not save the answers: " + (e.message || e);
     return {ok:false, changed:0};
+  }
+}
+
+// Outcome of a rescan, handed to the panel the rescan itself rebuilds: id -> message. Read and
+// cleared by renderReview, so the result lands next to the button that was clicked.
+const RESCAN_MSG = {};
+
+// Re-read one posting's application form, then re-render this panel from the fresh report
+// (decision 164) — the questions the form asks now, their control types, which ones it marks
+// REQUIRED, and the answers the bot produces today. Headless dry-run: no window opens and nothing
+// is ever submitted. It runs on the loop thread while the loop is running (queued behind its
+// current step) and immediately otherwise; either way it has landed once this application's
+// archived report carries a NEW timestamp, which is what this polls for.
+async function rescanReview(id, btn, note, panel, title, signoff) {
+  const before = panel.dataset.when || "";
+  // The re-render replaces every edit box, so flush unsaved edits first — and they're also what
+  // the rescan's own fill should submit (decision 153).
+  const saved = await saveAnswers(id, true);
+  if (!saved.ok) {
+    note.className = "rv-note rv-err";
+    note.textContent = "Your edited answers could not be saved, so nothing was rescanned. Fix the "
+      + "error above the Save answers button, then try again.";
+    return;
+  }
+  const label = btn.textContent;
+  btn.disabled = true; btn.textContent = "Rescanning…";
+  note.className = "rv-note"; note.textContent = "Re-reading the form…";
+  const t0 = Date.now();
+  let queued = false;
+  const tick = setInterval(() => {
+    note.textContent = (queued ? "Queued — the running loop rescans this at its next step… "
+                               : "Re-reading the form… ") + Math.round((Date.now() - t0)/1000) + "s";
+  }, 1000);
+  const stop = (cls, msg) => {
+    clearInterval(tick);
+    btn.disabled = false; btn.textContent = label;
+    note.className = "rv-note" + (cls ? " " + cls : ""); note.textContent = msg;
+  };
+  const wait = ms => new Promise(res => setTimeout(res, ms));
+  try {
+    const r = await (await fetch("/track/rescan", {method:"POST",
+      headers:{"Content-Type":"application/json"}, body: JSON.stringify({id: id})})).json();
+    if (!r.ok) { stop("rv-err", r.error || "Could not start the rescan."); return; }
+    queued = !!r.queued;
+    const deadline = Date.now() + 10 * 60 * 1000;  // a long form + Claude drafting can take minutes
+    while (Date.now() < deadline) {
+      await wait(2000);
+      let fresh = null;
+      try { fresh = await (await fetch("/track/review?id=" + id)).json(); } catch (e) { fresh = null; }
+      if (fresh && !fresh.error && (fresh.when || "") !== before) {
+        clearInterval(tick);
+        const open = (fresh.unanswered || []).filter(u => !(u.value || "").trim()).length;
+        RESCAN_MSG[id] = "Rescanned ✓ — " + (fresh.filled || []).length + " answer(s) ready, "
+          + open + " unanswered. Nothing was submitted.";
+        renderReview(panel, fresh, title, signoff);
+        return;
+      }
+      if (!queued) {
+        // A direct run reports its own failure (browser launch, dead posting) — surface it
+        // instead of spinning until the timeout.
+        let s = null;
+        try { s = await (await fetch("/test-run/status")).json(); } catch (e) { s = null; }
+        if (s && s.phase === "error") {
+          stop("rv-err", "The rescan failed: " + ((s.errors || []).join(" ") || "see Discover for details."));
+          return;
+        }
+      }
+    }
+    stop("rv-err", "The rescan hasn't finished after 10 minutes. Check the Discover tab for the "
+      + "run's status, then try again.");
+  } catch (e) {
+    stop("rv-err", "Could not rescan: " + (e.message || e));
   }
 }
 
@@ -4800,10 +5376,10 @@ function openDrawer(app) {
       title:"Re-fill this posting in a watchable browser (dry-run — nothing is submitted)",
       on:{click:(ev) => rerunDry(app, ev.target, false)}}));
   acts.append(el("button", {class:"tbtn", type:"button", text:"Retailor résumé →",
-    title:"Open the Review tab with this posting loaded and tailor a résumé to it — with the option to save it to your reusable fixtures first",
+    title:"Open Discover's dry-run with this posting loaded and tailor a résumé to it — with the option to save it to your reusable postings first",
     on:{click:(ev) => retailorApp(app, ev.target)}}));
   acts.append(el("button", {class:"tbtn", type:"button", text:"Save to fixtures",
-    title:"Add this posting to your saved fixtures so you can tailor against it anytime from the Review tab",
+    title:"Add this posting to your saved postings so you can tailor against it anytime from Discover",
     on:{click:(ev) => saveAppFixture(app, ev.target)}}));
   if (acts.childElementCount)
     body.append(el("div", {}, [el("div", {class:"drawer-sec-label", text:"Actions"}), acts]));
@@ -4885,8 +5461,11 @@ async function retailorApp(app, btn) {
       alert("Couldn't save to fixtures: " + (e.message || e) + "\\nContinuing to tailor without saving.");
     }
   }
-  document.querySelector('.tab[data-view="review"]').click();
+  // Land on Discover's dry-run with this posting loaded and the run set to tailor-only, so the
+  // user is one click from re-tailoring it (decision 163 — this used to open the Review tab).
+  showView("discover");
   closeDrawer();
+  DRY.job = "paste"; renderDryOpts();
   if (fixtureToken) {
     $("jobmode").value = "fixture"; $("jobmode").dispatchEvent(new Event("change"));
     $("fixture").value = fixtureToken;
@@ -4894,8 +5473,8 @@ async function retailorApp(app, btn) {
     $("jobmode").value = "custom"; $("jobmode").dispatchEvent(new Event("change"));
     $("title").value = app.role || ""; $("company").value = app.company || ""; $("body").value = jd;
   }
-  $("go").scrollIntoView({behavior:"smooth", block:"center"});
-  $("go").focus();
+  $("test-run").scrollIntoView({behavior:"smooth", block:"center"});
+  $("test-run").focus();
 }
 
 // The discovery→offer funnel (survey #4): one metric tile per stage. The count is the value;
@@ -5512,9 +6091,15 @@ $("rf-import").addEventListener("click", async () => {
     if ((d.contact_filled||[]).length) bits.push("contact (" + d.contact_filled.join(", ") + ")");
     await loadProfile();
     msg.className = "msg ok";
+    // Say what was matched against the existing profile instead of re-added — silence would read
+    // as "it ignored half my résumé" (and the match is fuzzy, so the user must be able to check it).
+    const uniq = a => [...new Set(a || [])];
+    const dup = uniq(d.skipped), enr = uniq(d.enriched);
     msg.textContent = (d.created ? "Created your résumé from that file — added " : "Merged — added ")
       + (bits.length ? bits.join(", ") + "." : "nothing new (everything was already in your résumé).")
-      + " Review the sections above and Save."
+      + (enr.length ? " Filled in missing details on " + enr.join(", ") + "." : "")
+      + (dup.length ? " Already in your résumé, so not duplicated: " + dup.join(", ") + "." : "")
+      + " Review the sections below and Save."
       + (d.kept_document ? " Kept the PDF: jobs whose demanded skills it already covers get this"
                          + " file as-is, instead of a tailored résumé." : "");
   } catch (e) { msg.className = "msg err"; msg.textContent = String(e.message || e); }
@@ -5558,6 +6143,12 @@ async function loadKeptResumes() {
     renderKeptResumes(d.docs || []);
   } catch (e) { /* the list is informational; a fetch failure must not break the Profile page */ }
 }
+$("li-toggle").addEventListener("click", () => {
+  const p = $("s-linkedin"), open = p.classList.toggle("hidden") === false;
+  $("li-toggle").setAttribute("aria-expanded", String(open));
+  $("li-toggle").textContent = open ? "Hide LinkedIn import" : "Import from LinkedIn instead";
+  if (open) p.scrollIntoView({behavior:"smooth", block:"nearest"});
+});
 $("li-import").addEventListener("click", async () => {
   const f = $("li-file").files[0], msg = $("li-msg"), btn = $("li-import");
   if (!f) { msg.className = "msg err"; msg.textContent = "Choose your LinkedIn export file first."; return; }
@@ -5568,10 +6159,16 @@ $("li-import").addEventListener("click", async () => {
       body: JSON.stringify({ resume: currentResume(), filename: f.name, data_b64: await fileB64(f) }) })).json();
     if (!d.ok) throw new Error(d.error || "import failed");
     const a = d.added || {};
+    // Same reporting as the résumé upload: entries matched against what's already on file are named,
+    // because a fuzzy match the user cannot see reads as "it ignored half my export".
+    const uniq = x => [...new Set(x || [])];
+    const dup = uniq(d.skipped), enr = uniq(d.enriched);
     await loadProfile();
     msg.className = "msg ok";
     msg.textContent = `Imported ${a.experience||0} experience, ${a.education||0} education, ${a.skills||0} skills`
-      + ((d.found_files||[]).length ? " (from " + d.found_files.join(", ") + ")." : " — no LinkedIn CSVs found in that file.");
+      + ((d.found_files||[]).length ? " (from " + d.found_files.join(", ") + ")." : " — no LinkedIn CSVs found in that file.")
+      + (enr.length ? " Filled in missing details on " + enr.join(", ") + "." : "")
+      + (dup.length ? " Already in your résumé, so not duplicated: " + dup.join(", ") + "." : "");
   } catch (e) { msg.className = "msg err"; msg.textContent = String(e.message || e); }
   finally { stop(); btnDone(btn); }
 });
@@ -5710,6 +6307,46 @@ function multiCheckboxes(options, value) {
   return {node: el("div", {}, [
     el("div", {class:"qa-multihint", text:"Check every option that applies — all checked answers get selected on the form."}),
     box, hidden]), hidden: hidden};
+}
+// ---- One-of-many answers: the form offered a fixed list of choices (select / radio / combobox) ----
+// Editing one as a free-text box invites a value no option matches, which then fills as blank or
+// forces the fill to guess — so the review panel offers the form's own options (decision 165).
+const isSingleChoice = (kind, options) => (kind||"") !== "checkbox" &&
+  (Array.isArray(options) ? options.filter(Boolean).length : 0) > 1;
+const OTHER_CHOICE = "__applicationbot_type_your_own__";  // sentinel option, never a real answer
+// A dropdown over the captured options, mirrored into a hidden input so every caller reads the
+// answer from `.value` exactly like a text box. The captured list can fall short of the form's
+// real one (long lists are truncated when scanned, and a posting can change its options), so
+// "Type a different value…" always keeps a text box one click away — never a dead end.
+function singleChoiceInput(options, value) {
+  const opts = options.filter(Boolean);
+  const hidden = el("input", {type:"hidden", value: value||""});
+  const box = el("div", {});
+  const asText = () => {
+    const inp = el("input", {class:"rv-edit", type:"text", value: hidden.value||"",
+                             placeholder:"Type the answer to submit…"});
+    inp.addEventListener("input", () => { hidden.value = inp.value; });
+    const back = el("button", {class:"rv-btn rv-choice-back", type:"button",
+      text:"Choose from the form's options instead", on:{click:asSelect}});
+    box.innerHTML = ""; box.appendChild(inp); box.appendChild(back);
+    inp.focus();
+  };
+  const asSelect = () => {
+    const list = [["", "— choose an option —"]].concat(opts.map(o => [o, o]));
+    // A value the form no longer offers still shows, so an answer is never silently dropped.
+    if ((hidden.value||"") && !opts.includes(hidden.value))
+      list.push([hidden.value, hidden.value + " (not in this form)"]);
+    list.push([OTHER_CHOICE, "Type a different value…"]);
+    const sel = el("select", {class:"rv-edit"}, list.map(([v,l]) => el("option", {value:v, text:l})));
+    sel.value = hidden.value || "";
+    sel.addEventListener("change", () => {
+      if (sel.value === OTHER_CHOICE) { asText(); return; }
+      hidden.value = sel.value;
+    });
+    box.innerHTML = ""; box.appendChild(sel);
+  };
+  asSelect();
+  return {node: el("div", {}, [box, hidden]), hidden: hidden};
 }
 // Profile-screen wrapper: the same widget, with the hidden field named for the save round-trip.
 function qaMultiInput(qa, cls, opts) {
@@ -5985,6 +6622,9 @@ function renderProfileForm() {
     row2(fld("Email","email",P.email), fld("Phone","phone",P.phone)),
     selField("Country","country", P.country || "United States", COUNTRIES),
     row2(selField("State","state", loc.state, STATE_OPTS), fld("City","city", loc.city)),
+    // Portals that split the address into four required boxes (Jobvite, BambooHR) need these two;
+    // City and State above are what fill the other two. Left blank, those forms stop for review.
+    row2(fld("Street address","street_address",P.street_address), fld("ZIP / postal code","postal_code",P.postal_code)),
     row2(fld("LinkedIn URL","linkedin_url",P.linkedin_url), fld("GitHub URL","github_url",P.github_url)),
     fld("Portfolio / website","portfolio_url",P.portfolio_url),
     row2(boolSel("Authorized to work?","work_authorized",P.work_authorized), boolSel("Requires sponsorship?","requires_sponsorship",P.requires_sponsorship)),
@@ -6072,14 +6712,14 @@ function renderProfileForm() {
   put("s-logins", el("div", {class:"sec"}, [el("h3", {text:"Native autofill logins (optional)"}), creds]));
   // The linked inbox (bot email for Workday verification / email-alert reading) now lives in Settings.
 
-  // Section-jump nav (s-linkedin is the static import block below the form).
+  // Section-jump nav (s-upload is the static import block above the form).
   const jump = [
+    ["s-upload","Import résumé"],
     ["s-applicant","Applicant details"], ["s-languages","Languages"],
     ["s-experience","Experience"], ["s-activities","Activities"],
     ["s-projects","Projects"], ["s-education","Education"], ["s-skills","Skills"],
     ["s-resume-header","Résumé header"], ["s-screening","Screening answers"],
     ["s-accounts","Autofill accounts"], ["s-logins","Logins"],
-    ["s-linkedin","LinkedIn import"],
   ];
   const nav = el("div", {class:"pnav"}, jump.map(([id,label]) =>
     el("a", {href:"#", text:label, on:{click:(ev)=>{ ev.preventDefault(); const t = $(id); if (t) t.scrollIntoView({behavior:"smooth", block:"start"}); }}})));
@@ -6097,6 +6737,7 @@ function collectProfile() {
   return {
     first_name:t("first_name"), last_name:t("last_name"), email:t("email"), phone:t("phone"), location:location,
     country:t("country"), how_heard:t("how_heard"),
+    street_address:t("street_address"), postal_code:t("postal_code"),
     linkedin_url:t("linkedin_url"), github_url:t("github_url"), portfolio_url:t("portfolio_url"),
     work_authorized:tri("work_authorized"), requires_sponsorship:tri("requires_sponsorship"), us_citizen:tri("us_citizen"),
     willing_to_relocate:tri("willing_to_relocate"), open_to_remote:tri("open_to_remote"),
@@ -6684,11 +7325,10 @@ function escapeHtml(s){ const d=document.createElement("div"); d.textContent=s; 
   const DONE_KEY = "ab-tour-done";
   const overlay = $("tour-overlay"), pop = $("tour-pop"), nav = document.querySelector("aside.nav");
   const STEPS = [
-    { view:null, title:"👋 Welcome to ApplicationBot", body:"It finds jobs, tailors your résumé, and fills out applications for you — everything runs as a safe dry-run until you arm it. Here's a 20-second tour of the five sections." },
+    { view:null, title:"👋 Welcome to ApplicationBot", body:"It finds jobs, tailors your résumé, and fills out applications for you — everything runs as a safe dry-run until you arm it. Here's a 20-second tour of the four sections." },
     { view:null, title:"🔑 How Claude tailors your résumé", body:"Primary: your Claude subscription via Claude Code (recommended — not metered; sign in inside Claude Code). Fallback: your own Anthropic API key (pay-per-token, separate from your subscription) — a third-party app can't use the subscription any other way. Neither? The free rules engine runs. Manage it anytime from the connection panel in the bottom-left, or in Settings." },
     { view:"profile", title:"👤 Profile", body:"Your details and résumé. Import your résumé and it fills these in automatically — the bot uses them to answer application questions truthfully." },
-    { view:"discover", title:"🔍 Discover", body:"Choose what jobs to find, then let the bot search, rank every posting by how well it fits you, tailor your résumé, and fill the application — a dry-run you can watch." },
-    { view:"review", title:"📝 Review", body:"See each tailored résumé and why it was written that way, and fine-tune it before it's used." },
+    { view:"discover", title:"🔍 Discover", body:"Choose what jobs to find, then run a dry-run: it searches, ranks every posting by fit, and either tailors your résumé only, or goes all the way and fills the application in a browser you can watch. You can also paste a posting nobody found for you." },
     { view:"track", title:"📊 Track", body:"Every application the bot discovered, tailored, and filled — with status, notes, and how much Claude each one cost." },
     { view:"settings", title:"⚙️ Settings", body:"Set-once configuration: your Claude connection, push notifications (desktop + phone), your linked inbox for account-gated portals, and light/dark theme." },
   ];
@@ -6708,7 +7348,7 @@ function escapeHtml(s){ const d=document.createElement("div"); d.textContent=s; 
 
   function show(){
     const s = STEPS[i];
-    if (s.view){ const t = document.querySelector('.tab[data-view="' + s.view + '"]'); if (t) t.click(); }
+    if (s.view) showView(s.view);
     spot(s.view);
     $("tour-count").textContent = "Step " + (i + 1) + " of " + STEPS.length;
     $("tour-title").textContent = s.title;
@@ -6723,7 +7363,7 @@ function escapeHtml(s){ const d=document.createElement("div"); d.textContent=s; 
   function open(){
     running = true; TOUR_ACTIVE = true;
     const active = document.querySelector(".tab.active");
-    startView = active ? active.dataset.view : "review";
+    startView = active ? active.dataset.view : "discover";
     document.body.classList.add("tour-on");
     overlay.classList.remove("hidden"); pop.classList.remove("hidden");
     i = 0; show();
@@ -6734,8 +7374,7 @@ function escapeHtml(s){ const d=document.createElement("div"); d.textContent=s; 
     spot(null);
     document.body.classList.remove("tour-on");
     overlay.classList.add("hidden"); pop.classList.add("hidden");
-    const to = goProfile ? "profile" : (startView || "review");
-    const t = document.querySelector('.tab[data-view="' + to + '"]'); if (t) t.click();
+    showView(goProfile ? "profile" : (startView || "discover"));
   }
 
   $("tour-next").addEventListener("click", () => { if (i < STEPS.length - 1){ i++; show(); } else close(true); });

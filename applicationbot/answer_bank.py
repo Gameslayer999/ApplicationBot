@@ -210,9 +210,23 @@ def valid_mapping(question: str, key: str) -> bool:
         and not is_demographic(question)
         and not is_company_specific(question)
         and not any(t in n for t in _ENUMERATED)
+        and not is_context_dependent(question)
         and not (key == "languages" and any(t in n for t in _CODE_LANGUAGE))
         and not (key == "role_commitment" and any(t in n for t in _NOT_A_YES_NO))
     )
+
+
+def is_context_dependent(question: str) -> bool:
+    """True if the question means nothing without the form around it — "Date", "Other", "If yes,
+    please explain". Such a label must never enter the shared answer bank: the entry would be
+    keyed on a word, not a question, and would answer a *different* field on the next form. This
+    is exactly how a bare "Date" came to hold an availability sentence (decision 166); the fill
+    answers these from their surrounding text instead (decision 167)."""
+    from .apply import _is_generic_label, _question  # lazy: apply imports this module
+
+    # A field KEY ("Date #2") is not a question at all — it names one control on one form
+    # (decision 169). Its question is what may be banked, and only if that is not generic.
+    return _question(question) != question or _is_generic_label(question)
 
 
 def is_reusable_answer(question: str) -> bool:
@@ -220,10 +234,11 @@ def is_reusable_answer(question: str) -> bool:
     reused on every future form (decision 155). Same policy as the caching rules above:
     company-specific answers ("Why us?") are wrong at the next employer, and demographic/EEO
     self-identification belongs to the structured profile fields, never the bank. Very short
-    labels are garbage captures ("yes", stray tokens) and are never banked."""
+    labels are garbage captures ("yes", stray tokens) and are never banked, and neither are
+    context-dependent ones ("Date", "Other") — see `is_context_dependent`."""
     n = _norm(question)
     return bool(n) and len(n) >= 4 and not is_company_specific(question) \
-        and not is_demographic(question)
+        and not is_demographic(question) and not is_context_dependent(question)
 
 
 def _json_reply(out: str, key: str):
@@ -247,13 +262,37 @@ def _classifiable(question: str) -> bool:
         and not any(t in n for t in _ENUMERATED)
 
 
+def _context_block(context: Optional[str]) -> str:
+    """The form text around a question, as a prompt block (decision 167). A generic label — "Date",
+    "Other", "If yes" — doesn't say what the form wants; the heading above it and the field before
+    it do. Empty string when there is no context, so a self-describing question's prompt is
+    byte-for-byte what it was."""
+    c = " ".join((context or "").split())[:300]
+    if not c:
+        return ""
+    return ("SURROUNDING FORM TEXT (what appears around this field on the page — use it to tell "
+            f"WHICH question is being asked; it is NOT the question, and never the answer): {c!r}\n\n")
+
+
+def _with_context(questions: list[str], contexts: Optional[dict]) -> str:
+    """`questions` numbered for a batch prompt, each with its own surrounding form text."""
+    lines = []
+    for i, q in enumerate(questions):
+        lines.append(f"{i}. {q!r}")
+        c = " ".join(((contexts or {}).get(q) or "").split())[:300]
+        if c:
+            lines.append(f"   (surrounding form text: {c!r})")
+    return "\n".join(lines)
+
+
 _CLASSIFY_RULES = (
     "A type matches only if answering that field would correctly answer the question "
     "(functional equivalence, not just topical similarity)."
 )
 
 
-def classify_question(question: str, *, model: Optional[str] = None) -> Optional[str]:
+def classify_question(question: str, *, context: Optional[str] = None,
+                      model: Optional[str] = None) -> Optional[str]:
     """Use Claude to map a novel question onto a known structured field type (a key of
     CLASSIFIABLE_TYPES), or None if it doesn't correspond to any. This catches semantic
     variants the keyword resolver misses — e.g. "Are you willing to work out of our NYC or SF
@@ -269,7 +308,8 @@ def classify_question(question: str, *, model: Optional[str] = None) -> Optional
         "Map a job-application question to ONE of these known answer types, or 'none'.\n\n"
         f"TYPES:\n{types}\n- none: does not correspond to any type above.\n\n"
         f"QUESTION: {question!r}\n\n"
-        f"{_CLASSIFY_RULES}\n"
+        + _context_block(context)
+        + f"{_CLASSIFY_RULES}\n"
         'Reply with JSON: {"type": "<type key or none>"}.'
     )
     schema = {"type": "object",
@@ -288,8 +328,8 @@ def classify_question(question: str, *, model: Optional[str] = None) -> Optional
     return key if key in CLASSIFIABLE_TYPES and valid_mapping(question, key) else None
 
 
-def classify_questions(questions: list[str], *, model: Optional[str] = None
-                       ) -> dict[str, Optional[str]]:
+def classify_questions(questions: list[str], *, contexts: Optional[dict] = None,
+                       model: Optional[str] = None) -> dict[str, Optional[str]]:
     """Batch classify_question: ONE schema-constrained call maps every eligible question onto
     a known type (or none) — N novel questions on a form page cost one CLI spawn instead of N.
     The reply is an enum array pinned to exactly len(questions) items, so answers can't shift
@@ -301,7 +341,7 @@ def classify_questions(questions: list[str], *, model: Optional[str] = None
     from . import backends  # lazy
 
     types = "\n".join(f"- {k}: {v}" for k, v in CLASSIFIABLE_TYPES.items())
-    numbered = "\n".join(f"{i}. {q!r}" for i, q in enumerate(askable))
+    numbered = _with_context(askable, contexts)
     prompt = (
         "Map EACH job-application question below to ONE of these known answer types, "
         "or 'none'.\n\n"
@@ -332,6 +372,7 @@ def classify_questions(questions: list[str], *, model: Optional[str] = None
 
 
 def match_banked_question(question: str, banked: list[tuple[str, str]], *,
+                          context: Optional[str] = None,
                           model: Optional[str] = None) -> Optional[int]:
     """Use Claude to find the banked Q&A whose saved answer already answers `question`, or
     None. Catches rephrasings the literal bank match misses (e.g. banked "Are you willing to
@@ -353,7 +394,8 @@ def match_banked_question(question: str, banked: list[tuple[str, str]], *,
         "applicant has already saved. Find the saved pair that is the SAME question "
         "reworded — i.e. its saved answer is a correct, complete answer to the new "
         "question as asked.\n\n"
-        f"NEW QUESTION: {question!r}\n\nSAVED PAIRS:\n{numbered}\n\n"
+        f"NEW QUESTION: {question!r}\n\n" + _context_block(context)
+        + f"SAVED PAIRS:\n{numbered}\n\n"
         "Match on functional equivalence, not topical similarity: if the new question asks "
         "for different information, a different scope, or a different answer format than "
         "the saved answer provides, it is NOT a match.\n"
@@ -378,6 +420,7 @@ _BANK_MATCH_RULES = (
 
 
 def match_banked_questions(questions: list[str], banked: list[tuple[str, str]], *,
+                           contexts: Optional[dict] = None,
                            model: Optional[str] = None) -> dict[str, Optional[int]]:
     """Batch match_banked_question: ONE call matches every eligible question against the saved
     bank (the bank is sent once, not once per question). Returns question → matched bank index
@@ -391,7 +434,7 @@ def match_banked_questions(questions: list[str], banked: list[tuple[str, str]], 
     from . import backends  # lazy
 
     pairs = "\n".join(f"{i}. Q: {q}\n   A: {a[:120]}" for i, (q, a) in enumerate(cands))
-    numbered = "\n".join(f"{i}. {q!r}" for i, q in enumerate(askable))
+    numbered = _with_context(askable, contexts)
     prompt = (
         "A job-application form asks several questions. Below are question→answer pairs the "
         "applicant has already saved. For EACH new question, find the saved pair that is the "
@@ -481,6 +524,7 @@ def choose_required_option(
     *,
     company: Optional[str] = None,
     jd: Optional[str] = None,
+    context: Optional[str] = None,
     model: Optional[str] = None,
 ) -> Optional[str]:
     """Choose the best-fitting OFFERED option for a REQUIRED dropdown/select we have NO mapped
@@ -499,17 +543,18 @@ def choose_required_option(
         return None
     from . import backends  # lazy
 
-    context = ("RÉSUMÉ (JSON — the only source of truth about the applicant):\n"
-               f"{resume.model_dump_json(exclude_none=True, exclude_defaults=True)}\n")
+    grounding = ("RÉSUMÉ (JSON — the only source of truth about the applicant):\n"
+                 f"{resume.model_dump_json(exclude_none=True, exclude_defaults=True)}\n")
     if company:
-        context += f"COMPANY: {company}\n"
+        grounding += f"COMPANY: {company}\n"
     if jd:
-        context += f"JOB DESCRIPTION:\n{jd[:1500]}\n"
+        grounding += f"JOB DESCRIPTION:\n{jd[:1500]}\n"
     numbered = "\n".join(f"{i}. {o}" for i, o in enumerate(opts))
     prompt = (
-        context
+        grounding
         + f"\nA REQUIRED job-application dropdown labelled {question!r} must be answered.\n"
-        f"OPTIONS:\n{numbered}\n\n"
+        + _context_block(context)
+        + f"OPTIONS:\n{numbered}\n\n"
         "Choose the option that is TRUE for this applicant per the résumé, or — when the question "
         "is a preference with no résumé fact — the most reasonable, honest choice. Use ONLY the "
         "résumé; NEVER guess a fact the applicant must own (citizenship, work authorization, a "
@@ -590,6 +635,7 @@ def generate_answer(
     *,
     company: Optional[str] = None,
     jd: Optional[str] = None,
+    context: Optional[str] = None,
     max_chars: int = 700,
     model: Optional[str] = None,
 ) -> Optional[str]:
@@ -599,16 +645,17 @@ def generate_answer(
 
     model = model or DRAFT_MODEL
 
-    context = ("RÉSUMÉ (source of truth, JSON):\n"
-               f"{resume.model_dump_json(exclude_none=True, exclude_defaults=True)}\n\n")
+    grounding = ("RÉSUMÉ (source of truth, JSON):\n"
+                 f"{resume.model_dump_json(exclude_none=True, exclude_defaults=True)}\n\n")
     if company:
-        context += f"COMPANY: {company}\n"
+        grounding += f"COMPANY: {company}\n"
     if jd:
-        context += f"JOB DESCRIPTION:\n{jd[:2000]}\n\n"
+        grounding += f"JOB DESCRIPTION:\n{jd[:2000]}\n\n"
     prompt = (
         _SYSTEM.format(max_chars=max_chars)
-        + "\n\n" + context
+        + "\n\n" + grounding
         + f"QUESTION: {question}\n\n"
+        + _context_block(context)
         + "Write the answer now (plain text only)."
     )
     try:

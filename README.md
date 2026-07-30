@@ -47,12 +47,21 @@ Five stages, each of which you can run on its own or chain into one autonomous l
 Configure  →  Discover  →  Tailor  →  Apply  →  Track
 ```
 
-1. **Configure** — set up your profile: contact details, a base résumé (structured YAML, the source of
+1. **Configure** — set up your profile: contact details (including **street address** and **ZIP** —
+   portals that split the address into four required boxes, such as Jobvite and BambooHR, need them;
+   City and State are derived from your location), a base résumé (structured YAML, the source of
    truth), and filters (roles, keywords, location/remote, pay range, seniority, company type). Filters
    drive both what gets discovered and what gets auto-applied to. Edit it all from the web UI or in
-   `profile/*.yaml`. Already have a résumé? **Upload the PDF or Word (.docx) file** on the Profile page and
+   `profile/*.yaml`. Already have a résumé? **Upload the PDF or Word (.docx) file** in the import box at the
+   top of the Profile page (LinkedIn export import lives behind a button in the same box) and
    Claude reads it into your sections — merging in anything new and leaving what you've already filled
-   untouched (or import from a LinkedIn data export). Screening questions the bot couldn't answer are
+   untouched (or import from a LinkedIn data export). Uploading a second, differently-worded résumé does
+   **not** duplicate your history: a role already on file is recognised through its re-wording ("Acme
+   Corp." = "Acme Corporation", "SWE Intern" = "Software Engineer Intern"), and the page names every
+   entry it matched instead of adding, plus any blanks it filled in on them. A genuine second stint at
+   the same employer — different years — is still kept as its own entry. The LinkedIn import dedupes
+   the same way, so an export imported on top of your résumé won't re-add a job under LinkedIn's
+   wording of the company name or title. Screening questions the bot couldn't answer are
    listed on the same page in the form's own controls — a dropdown question as a dropdown, and a
    **"check all that apply"** question as checkboxes, so you can pick every option that applies and all of
    them get ticked at fill time. A **Languages** section holds the languages you speak and how well
@@ -74,15 +83,23 @@ Configure  →  Discover  →  Tailor  →  Apply  →  Track
    so it stays factual, and every exported PDF is re-checked to confirm its text layer is machine-readable.
    To save tokens, when a new posting demands essentially the same skills as one it already tailored for,
    it **reuses that résumé** instead of making another Claude call (use "Re-tailor" to force a fresh pass).
+   A dry run can stop here: pick **Tailor the résumé only** and it searches, ranks, and tailors for the best
+   match without opening a browser or touching a form — or paste a posting nobody found for you and tailor
+   against that. The rendered résumé, its drift warnings, and the PDF appear right there.
    **Your own résumé outranks any generated one:** upload a PDF résumé on the Profile tab and any job whose
    demanded skills it already covers is sent that exact file — no tailoring at all. Kept résumés are listed
    under the upload box and removable in one click.
    Track, the ready-to-apply notification, and the review panel each show whether a submission used a
    **freshly tailored** résumé, a **reused** one, or **your uploaded file**, so it is never a surprise.
 4. **Apply** — a real browser (Playwright) fills and submits the application through the posting's own
-   ATS, including multi-page wizards and account-gated **Workday** (automated account creation, credentials
-   in your OS keychain). Applications that get blocked (a question it can't answer, a login, a CAPTCHA) are
-   *parked* so you can resolve and resume them. Every submit is gated by the safety switch above.
+   ATS: Greenhouse · Lever · Ashby · SmartRecruiters · Recruitee · Workable · **Jobvite** · **BambooHR**,
+   including multi-page wizards and account-gated **Workday** (automated account creation, credentials
+   in your OS keychain). Portals that put the form behind an account it cannot create yet —
+   **iCIMS, Taleo, Avature** — are named as needing a sign-in and parked there rather than half-filled,
+   and are kept out of the search so they don't spend judging on openings that can't be applied to.
+   A **honeypot** field (a box the form expects to come back empty, used to catch bots) is left alone
+   and reported, never filled. Applications that get blocked (a question it can't answer, a login, a
+   CAPTCHA) are *parked* so you can resolve and resume them. Every submit is gated by the safety switch above.
    A site that **refuses automated traffic** (a bot wall, e.g. DataDome's "Access is temporarily restricted")
    is reported as exactly that — not as a missing form and not as a CAPTCHA you could solve — and parked as
    **Try again**, since nothing on your side is broken. ApplicationBot never tries to get around such a wall.
@@ -93,14 +110,40 @@ Configure  →  Discover  →  Tailor  →  Apply  →  Track
    Dropdowns don't have to spell things your way: a school picker that lists *"Penn State
    University-University Park"* still matches a résumé that says *"The Pennsylvania State University"*
    (abbreviations and typos included, main campus preferred over a branch), and when a school genuinely
-   isn't in the list it picks the form's own **"Other"** — then tells you in Review that your real answer
-   wasn't offered, instead of leaving a required field blank.
-   Before you sign off, **Review** shows the exact answers it will submit — and every one of them is
+   isn't in the list it picks the form's own **"Other"** — then tells you in the application's review
+   panel that your real answer wasn't offered, instead of leaving a required field blank.
+   Before you sign off, that **review panel** shows the exact answers it will submit — and every one of them is
    **editable**. Type over any answer (or fill in one it couldn't answer) and that value is what gets
    submitted the next time this application is filled, including the real submit; unsaved edits are saved
    for you when you click *Watch it fill* or *Apply*. Clearing a box hands the field back to the bot.
    A **"check all that apply"** question is edited there as checkboxes too — the same widget as the
-   Profile page — so every option you tick is ticked on the form.
+   Profile page — so every option you tick is ticked on the form. A **dropdown** (or a Yes/No
+   question) is edited as that dropdown, offering the form's own options, so you can't accidentally
+   type an answer no option matches — and "Type a different value…" is always there when the list
+   doesn't carry your answer.
+   **A field whose label says nothing is read in context.** `Date`, `Name`, `Other`, *"If yes,
+   please explain"* — these name a format, not a question, and the form says what they mean in the
+   heading above them and the field before them. The fill reads that neighbourhood and answers from
+   it: a `Date` after a **Signature** gets the day you apply, the same `Date` inside an education or
+   employment block is left for you rather than stamped with today, and anything it has to ask
+   Claude about is asked *with* the surrounding text so the question is the one the form is really
+   asking. The review panel prints what it read under each such answer ("on the form: Applicant
+   certification · follows the field: Signature").
+   **Answers that don't fit their question are called out.** A filled box can still be wrong: a form's
+   bottom-of-page **Date** once got *"I'm available immediately…"* — the right answer to a different
+   question. Every answer is checked against the shape its question asks for (a date field answered with
+   prose, a "how many" with no number, an email without an `@`, a Yes/No answered with a paragraph, a
+   *which/why* answered *"Yes"*), and a mismatch turns the row amber with **Check this** and the reason
+   printed right above the box that fixes it. Answers Claude drafted or picked are labelled
+   **AI-drafted** / **AI-picked** for the same reason. That bottom **Date** now fills with the day you
+   apply, and a native date picker is filled too.
+   Every question is badged **Required** or **Optional** exactly as the form marks it, with the counts
+   above the list, so you can see at a glance what actually has to be answered to submit — and the
+   unanswered list says how many of *those* are required and therefore blocking. **Rescan questions**
+   re-reads the live form in the background (no window opens, nothing is submitted) and refreshes the
+   whole panel: the questions the posting asks now, their control types, their required marks, and the
+   answers the bot produces today. Use it when a posting changes its form, or on an application prepared
+   before a feature landed.
    **It also learns from your edits:** a reusable answer ("How many years of Python do you have?") is added
    to your answer bank, so the next posting that asks it is filled in instead of coming back blank — and
    an answer you correct replaces the one it got wrong. Company-specific answers ("Why Acme?") and EEO
@@ -184,8 +227,8 @@ Whichever way you installed, the flow is the same:
 2. **Connect Claude (optional but recommended).** Sign in with Claude Code for the best tailoring on your
    subscription, or add an Anthropic API key in the bottom-left **"Claude connection"** panel. With neither, the
    free `rules` engine works with no account.
-3. **Discover + dry-run apply.** Hit **Find & fill one application (dry-run)** in the Discover tab (or, from the
-   CLI, `python -m applicationbot.pipeline --apply-first`). Watch it discover a match, tailor your résumé, and
+3. **Discover + dry-run apply.** The app opens on **Discover** — hit **Find & fill one application (dry-run)**
+   there (or, from the CLI, `python -m applicationbot.pipeline --apply-first`). Watch it discover a match, tailor your résumé, and
    fill the form live. **It never submits.**
 4. **Arm it when you're ready.** Set `armed: true` in `profile/safety.yaml` (with a submission cap) to let it
    submit for real. Drop a `profile/KILL` file to stop everything instantly.

@@ -56,14 +56,15 @@ class PipelineResult:
 
 
 def _is_fillable(p) -> bool:
-    """Can the Apply stage drive this posting's form? True for the six public-API ATSs, for
-    **Workday** (the deterministic adapter, decision 059 — M1 dry-run), and for aggregator hits
-    not yet bridge-resolved (which redirect to one of them or get marked auto_applyable=False by
-    the bridge). iCIMS / unresolved links are not."""
-    from .discovery import _AGGREGATOR_ATS, ATS_SOURCES
+    """Can the Apply stage drive this posting's form? True for `discovery.FILLABLE_ATS` — the six
+    public-API ATSs plus Workday (the deterministic adapter, decision 059 — M1 dry-run) and
+    Jobvite/BambooHR (open forms, decision 168) — and for aggregator hits not yet bridge-resolved
+    (which redirect to one of them or get marked auto_applyable=False by the bridge).
+    `discovery.ACCOUNT_GATED_ATS` (iCIMS / Taleo / Avature) and unresolved links are not."""
+    from .discovery import _AGGREGATOR_ATS, FILLABLE_ATS
     if p.extra.get("auto_applyable") is False:
         return False
-    return p.ats in ATS_SOURCES or p.ats in _AGGREGATOR_ATS or p.ats == "workday"
+    return p.ats in FILLABLE_ATS or p.ats in _AGGREGATOR_ATS
 
 
 def _revisit_canonical_urls(revisit: bool = True) -> set:
@@ -631,12 +632,16 @@ def _resolve(path) -> str | None:
 
 
 def tailor_and_render(resume: Resume, profile: ApplicationProfile, jd, company: str, role: str,
-                      url: str, *, backend: str = "auto", status_cb=None) -> str:
+                      url: str, *, backend: str = "auto", status_cb=None, on_result=None) -> str:
     """Tailor `resume` to `jd`, render the PDF, write it to the per-posting path with its reuse
     stamp, run the ATS text-layer check, and return the PDF path. This is the tailor+render half
     of `run_testing_mode`, extracted so the Track "Re-run → re-tailor" can regenerate a résumé
     from the saved JD without re-scraping (decision 086). Does NOT write the JD sidecar — the
-    caller owns that (run_testing_mode stores it; a re-tailor already has it)."""
+    caller owns that (run_testing_mode stores it; a re-tailor already has it).
+
+    `on_result(TailorResult)` hands the structured tailoring to the caller as well — the web UI
+    renders it (preview + drift warnings) for a tailor-only dry run. Additive: the return value
+    is still the PDF path."""
     from . import usage
     from .ats_check import verify_pdf
     from .pdf import render_pdf
@@ -652,6 +657,8 @@ def tailor_and_render(resume: Resume, profile: ApplicationProfile, jd, company: 
     # Claude call inside is tagged activity="tailoring" by the backend.
     with usage.for_posting(url):
         result = tailor_resume(resume, jd, backend=backend)
+    if on_result is not None:
+        on_result(result)
     print(f"  tailored via {result.backend}" + (f" — {'; '.join(result.warnings)}" if result.warnings else ""))
     for note in result.tailored.relevance_notes:
         print(f"  note: {note}")

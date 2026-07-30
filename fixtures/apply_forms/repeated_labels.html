@@ -1,0 +1,24 @@
+<!doctype html>
+<!-- Two education blocks — the "Add another" pattern, pre-rendered. Every field label repeats
+     verbatim, which is the case label-keyed answers could not represent: the second block was
+     silently skipped as already-done (decision 169). Each control now gets a " #2" key while
+     still being answered as the question it asks. -->
+<html>
+<head><meta charset="utf-8"><title>Education history</title></head>
+<body>
+<form>
+  <fieldset>
+    <legend>Education 1</legend>
+    <div><label for="s1">School</label><input id="s1" type="text" required></div>
+    <div><label for="d1">Degree</label><input id="d1" type="text"></div>
+    <div><label for="e1">Email</label><input id="e1" type="email"></div>
+  </fieldset>
+  <fieldset>
+    <legend>Education 2</legend>
+    <div><label for="s2">School</label><input id="s2" type="text"></div>
+    <div><label for="d2">Degree</label><input id="d2" type="text"></div>
+    <div><label for="e2">Email</label><input id="e2" type="email" required></div>
+  </fieldset>
+</form>
+</body>
+</html>
