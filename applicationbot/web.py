@@ -1190,6 +1190,18 @@ def test_aggregators(data: dict | None) -> dict:
     return {"ok": True, "results": results, "resume": resume is not None}
 
 
+# Config files that live in profile/ beside the résumés. `list_resumes` decides what is a résumé
+# by trying to LOAD each file, which is normally enough — but a listed file also becomes a WRITE
+# target for /resume/update, so anything wrongly listed gets a résumé written over it. That is not
+# hypothetical: a test that stubbed `load_resume` to succeed for any path made every config file
+# validate, and the save posted a résumé over the user's real `application_profile.yaml`,
+# destroying it (decision 159). Names are cheap, and no résumé is ever called these.
+_NOT_RESUMES = frozenset({
+    "application_profile.yaml", "discovery.yaml", "mailbox.yaml", "safety.yaml",
+    "notifications.yaml",
+})
+
+
 def list_resumes() -> list[dict[str, str]]:
     # The apply profile and discovery filters live alongside résumés in profile/ but are not
     # résumés — exclude them so they never show up as a selectable resume (they fail to load
@@ -1202,6 +1214,8 @@ def list_resumes() -> list[dict[str, str]]:
     out = []
     for folder in ("profile", "examples"):
         for p in sorted((REPO_ROOT / folder).glob("*.yaml")):
+            if p.name in _NOT_RESUMES:
+                continue
             try:
                 load_resume(p)
             except Exception:
@@ -3575,6 +3589,16 @@ function skillCard(s) {
     fld("Category","category",s.category),
     fld("Items (comma-separated)","items",(s.items||[]).join(", ")),
   ], c => { const d = cardData(c); return [d.category, d.items].filter(Boolean).join(": "); });
+}
+// A spoken/written language. Proficiency uses the wording application forms offer, so the stored
+// value matches their dropdown options directly; selField keeps any other saved wording.
+const PROFICIENCY_OPTS = [["","— not stated —"],"Native","Fluent","Professional","Conversational","Basic"];
+function langCard(l) {
+  l = l || {};
+  return entryCard([
+    row2(fld("Language — e.g. Spanish","name",l.name),
+         selField("Proficiency","proficiency",l.proficiency,PROFICIENCY_OPTS)),
+  ], c => { const d = cardData(c); return [d.name, d.proficiency].filter(Boolean).join(" — "); });
 }
 function section(title, id, items, addLabel, blank) {
   const body = el("div", {id:id, class:"cards"}, items);
@@ -5982,6 +6006,12 @@ function renderProfileForm() {
     el("p", {class:"subhint", text:"Contact, work eligibility, and optional EEO — used to auto-fill application forms."}),
     applicant]));
 
+  // Spoken/written languages (apply profile) — nothing on the résumé carries these, and forms
+  // ask for them as check-all-that-apply groups and per-language proficiency dropdowns.
+  const langSec = section("Languages","sec-languages",(P.languages||[]).map(langCard),"+ Add language",()=>langCard());
+  langSec.insertBefore(el("p", {class:"subhint", text:"Languages you speak, most proficient first. Fills \\"Language Skill(s) (check all that apply)\\" groups and language-proficiency questions on application forms."}), langSec.querySelector(".cards"));
+  put("s-languages", langSec);
+
   // Résumé content (source of truth for tailoring) — collapsible entries.
   put("s-experience", section("Experience","sec-experience",(R.experience||[]).map(expCard),"+ Add experience",()=>expCard()));
   put("s-activities", section("Leadership & activities","sec-activities",(R.activities||[]).map(expCard),"+ Add activity",()=>expCard()));
@@ -6044,7 +6074,8 @@ function renderProfileForm() {
 
   // Section-jump nav (s-linkedin is the static import block below the form).
   const jump = [
-    ["s-applicant","Applicant details"], ["s-experience","Experience"], ["s-activities","Activities"],
+    ["s-applicant","Applicant details"], ["s-languages","Languages"],
+    ["s-experience","Experience"], ["s-activities","Activities"],
     ["s-projects","Projects"], ["s-education","Education"], ["s-skills","Skills"],
     ["s-resume-header","Résumé header"], ["s-screening","Screening answers"],
     ["s-accounts","Autofill accounts"], ["s-logins","Logins"],
@@ -6073,6 +6104,7 @@ function collectProfile() {
     max_commute_miles: (parseInt(t("max_commute_miles"),10) || null),
     preferred_locations: (d["preferred_locations"]||"").split("\\n").map(s=>s.trim()).filter(Boolean),
     desired_salary:t("desired_salary"), earliest_start_date:earliest_start_date, years_experience:t("years_experience"),
+    languages: cardsIn("sec-languages").map(c => { const d = cardData(c); return {name:(d.name||"").trim(), proficiency:(d.proficiency||"").trim()}; }).filter(x => x.name),
     gender:t("gender"), pronouns:t("pronouns"), race_ethnicity:t("race_ethnicity"), veteran_status:t("veteran_status"), disability_status:t("disability_status"),
     greenhouse_email:t("greenhouse_email"), greenhouse_password:t("greenhouse_password"),
     custom_answers: [...$("sec-qa").querySelectorAll(".card")].map(c => { const q = cardData(c); let opts=[]; try { opts = JSON.parse(q.options||"[]"); } catch(e){} return { question:(q.question||"").trim(), answer:(q.answer||"").trim(), maps_to:(q.maps_to||"").trim(), generated: q.generated === "1", seen_count: parseInt(q.seen_count||"0",10)||0, input_kind:(q.input_kind||""), options: Array.isArray(opts)?opts:[] }; }).filter(x => x.question || x.answer || x.maps_to),

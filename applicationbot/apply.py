@@ -138,6 +138,16 @@ _VAGUE_PLACE = (
 )
 
 
+# Words that mark a "language"/"proficiency" question as being about PROGRAMMING languages, not
+# spoken ones. The two phrasings are nearly identical ("Which languages are you proficient in?"),
+# and answering a tech-stack question with "English; Mandarin" is confidently wrong — so the
+# spoken-language rules stand down whenever one of these appears.
+_CODE_LANGUAGE = (
+    "programming", "coding", "code in", "scripting", "software language", "query language",
+    "markup", "tech stack", "technolog", "framework", "language model",
+)
+
+
 def _degree_hints(degree_text: str) -> Optional[list[str]]:
     """Map a verbose résumé degree ("Bachelor of Science in Computer Science, …") to the
     standard option texts a degree dropdown uses, most-specific first, so the combobox/select
@@ -484,6 +494,35 @@ class AnswerResolver:
                 out.append(h)
         return out or None
 
+    def _languages(self) -> list:
+        """The applicant's stored languages that actually name a language."""
+        return [ln for ln in self.profile.languages if (ln.name or "").strip()]
+
+    def _languages_answer(self) -> Optional[str]:
+        """Every stored language, "; "-joined — the multi-answer format a checkbox group splits
+        on to tick each option, and a string a single-select or text field still matches (an
+        "English" option is a substring of it)."""
+        names = [ln.name.strip() for ln in self._languages()]
+        return "; ".join(names) or None
+
+    def _language_proficiency(self, n: str) -> Optional[str]:
+        """The stored proficiency for whichever language the question names ("How proficient are
+        you in Spanish?"), falling back to the first language's level for a question that names
+        none. None when the named language isn't one of the applicant's — never guess a level."""
+        langs = self._languages()
+        if not langs:
+            return None
+        for ln in langs:
+            word = ln.name.strip().lower()
+            if word and re.search(r"\b" + re.escape(word) + r"\b", n):
+                return ln.proficiency.strip() or None
+        # No language named: only a generic "language proficiency" question, answered for the
+        # primary (first-listed) language. A question naming a language we don't have falls to
+        # the user rather than claiming a level for it.
+        if any(w in n for w in ("language", "languages")):
+            return langs[0].proficiency.strip() or None
+        return None
+
     def _pronouns(self) -> Optional[str]:
         """The explicit pronouns field if set; otherwise derived from the stored gender, for a
         "preferred pronouns" field. None for an unset/non-binary gender — never guess pronouns."""
@@ -648,6 +687,19 @@ class AnswerResolver:
             return p.earliest_start_date or None
         if _has(n, "years of experience", "years experience"):
             return p.years_experience or None
+        # Spoken/written languages (decision 158). Guarded against PROGRAMMING-language questions,
+        # which read almost identically ("Which languages are you proficient in?") but must be
+        # answered from the résumé's skills, never from this field. A proficiency question gets
+        # the level for the language it names; a plain language question gets the whole list.
+        if not _has(n, *_CODE_LANGUAGE):
+            if _has(n, "proficiency", "proficient", "fluency", "fluent", "how well", "skill level"):
+                prof = self._language_proficiency(n)
+                if prof:
+                    return prof
+            if _has(n, "language"):
+                langs = self._languages_answer()
+                if langs:
+                    return langs
         # ADA: "Can you perform the essential functions of this role, with or without reasonable
         # accommodation?" — answered Yes (the applicant can do the job); a standard required Yes/No.
         if _has(n, "essential functions", "perform the essential", "essential function",
@@ -766,6 +818,7 @@ class AnswerResolver:
             "how_heard": p.how_heard or None,
             "location": p.location or c.location or None,
             "country": p.country or None,
+            "languages": self._languages_answer(),
         }.get(key)
 
     def resolve_semantic(self, label: str) -> Optional[str]:

@@ -524,6 +524,22 @@ value ÷ effort:
 
 ## Next
 
+### Re-enter the apply-profile fields that could not be recovered (2026-07-30, decision 159)
+
+- [ ] A test destroyed `profile/application_profile.yaml` (decision 159 — fixed, and pinned by
+      `tests/test_resume_list_excludes_config.py`). `scripts/recover_apply_profile.py` rebuilt 16
+      fields from the archives, but these had no unambiguous archived evidence and were
+      deliberately **not guessed** — set them on the Profile screen if you had them:
+      `portfolio_url`, `desired_salary`, `earliest_start_date`, `years_experience`,
+      `work_arrangement`, `max_commute_miles`, `preferred_locations`.
+- [ ] Also gone and not reconstructible: the **answer bank** (`custom_answers`) and
+      **`dropdown_aliases`** (learned dropdown matches, decision 033). Both regrow on their own as
+      you run applications — the aliases cost one extra Claude call each the first time a dropdown
+      is met again, and the bank refills as questions are captured.
+- [ ] Consider a **rolling backup** of the apply profile (e.g. keep the last N versions beside it
+      on every `save_profile`). It is git-ignored PII with no other copy, so any bug that writes to
+      that path is unrecoverable by definition — which is exactly what 159 was.
+
 ### A "form did not load" posting is mis-parked as `login` (found 2026-07-30, decision 157)
 
 - [ ] `parking.classify` scans the joined error prose for `_LOGIN_MARKERS`, and the generic timeout
@@ -2468,6 +2484,58 @@ Record each decision in [DECISIONS.md](DECISIONS.md) once the user chooses.
 ---
 
 ## Recently completed
+
+- 2026-07-30 — **A test was destroying the real apply profile; config files can no longer be written
+  over as résumés, and "which/why" questions can no longer be answered "Yes" (decision 159).**
+  User: "fix 1 and commit". While verifying 158 the full suite twice replaced
+  `profile/application_profile.yaml` — git-ignored PII, no backup — with a *"Jane Doe" résumé*.
+  `web.list_resumes()` identifies a résumé by **trying to load** each `profile/*.yaml`, and
+  `tests/test_web_multi_select.py` stubbed `web.load_resume` to succeed for **any** path; every
+  config file then validated, the résumé dropdown listed `application_profile.yaml`, and
+  `/resume/update` wrote over it under the **real** `REPO_ROOT` (the test redirected
+  `apply_profile.DEFAULT_PATH` but not `REPO_ROOT`). Reproduced with a canary and bisected to that
+  file. Fixed on both sides: the test now redirects `web.REPO_ROOT` into `tmp_path` with its own
+  `profile/` tree, and `list_resumes()` gained a `_NOT_RESUMES` name check **alongside** the load
+  check — a listed path is a WRITE target, so "it failed to load" is too weak a guarantee for
+  something that can overwrite PII. Pinned by `tests/test_resume_list_excludes_config.py`, which
+  reproduces the exact trigger. **Recovery:** no backup existed, so new
+  `scripts/recover_apply_profile.py` (idempotent, dry-run by default) mines
+  `profile/applications/*/report.json` — every submitted answer is tagged with its source — and
+  restored **16 fields**, ranking a verbatim `resolver` answer above a matched `option:*` one. It
+  refuses to guess the rest (see Next). **Corrects 158's write-up:** the six fields reported there
+  as "blank because your profile is blank" were blank because the first suite run had already
+  destroyed the profile. **Also fixed** the defect 158's dry-run logged: `role_commitment` answers a
+  flat "Yes", so `valid_mapping` now refuses it for any which/why/tell-us/describe question — scoped
+  to that one type, since the other yes/no types back descriptive dropdowns where "Yes" is matched
+  onto an offered option. Suite **642 passed**; the profile is byte-identical after a full run.
+
+- 2026-07-30 — **Spoken languages are a structured profile field, not a question you answer forever
+  (decision 158).** User: "language skills is not a mutiple choice like in the application… consider
+  adding language skills to the profile since many more applications will likely ask about it".
+  **The multiple-choice half was already built and the archives were stale:** the review panel renders
+  a check-all-that-apply group as checkboxes (`isMultiAnswer`/`multiCheckboxes`) and `_record_capture`
+  writes the group's `{kind, options}` — but that `captured` plumbing shipped in decision 157's commit
+  earlier the same day, so **all 20 archived `report.json` files have no `captured` key** (newest
+  2026-07-29 15:44) and the panel falls back to a text box for them. Any fresh fill renders it right.
+  **What was genuinely missing:** `"Language Skill(s) (Check all that apply)"` is in `skipped` as *"no
+  saved answer"* on all four Palantir runs, because nothing in the résumé or the profile carried spoken
+  languages. New `apply_profile.Language{name, proficiency}` + `ApplicationProfile.languages`, a
+  **Languages** section on the Profile screen (repeating name + proficiency cards), and resolver rules:
+  the names `"; "`-joined (the format `_fill_checkboxes` splits on, and a substring match for a
+  single-select "English" option), plus the stored level for whichever language a proficiency question
+  names — never a level for a language you didn't list. `answer_for_type("languages")` and a
+  `languages` entry in `CLASSIFIABLE_TYPES` cover rephrasings. **The guard:** "Which languages are you
+  proficient in?" is usually a tech-stack question, so `_CODE_LANGUAGE` stands the rules down,
+  `valid_mapping` refuses to bank such a question as `languages`, and `classify_question(s)` now filter
+  their own result through `valid_mapping` so a misclassification isn't used even for the current run.
+  10 new tests (`tests/test_languages.py`), including a headless-Chromium fill of the literal Palantir
+  question in `fixtures/apply_forms/multi_select.html`; full suite **640 passed**. **Verified live:**
+  a headless dry-run re-fill of the real Palantir *Software Engineer, New Grad — Defense* posting
+  (`gate=None`, `submitted=False`, `submit_state=dry-run`) ticked **English (ENG)** and **Cantonese
+  (CANT)** out of the form's 33 options, dropped the question from `skipped`, and wrote it into the
+  refreshed `report.json` as `kind=checkbox` + 33 options — so `_review_data` now hands the panel a
+  row that renders as checkboxes. The answer bank gained **no** `maps_to: languages` entry and no
+  longer holds the question as a blank. Two unrelated defects the run exposed are logged under Next.
 
 - 2026-07-30 — **The suite is fully green: decision 076/077's missing `apply.py` half is restored,
   not deleted (decision 157).** User: "lets get rid of these build errors that pop up in every test:

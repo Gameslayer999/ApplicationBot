@@ -23,8 +23,17 @@ DROPDOWN_Q = "Highest level of education completed"
 
 @pytest.fixture
 def ui(monkeypatch, tmp_path):
-    """The real UI on a free port, with the apply profile in a temp dir (never the user's own)."""
-    prof = tmp_path / "application_profile.yaml"
+    """The real UI on a free port, rooted entirely in a temp dir — never the user's own files.
+
+    REPO_ROOT is redirected too, not just `apply_profile.DEFAULT_PATH`: stubbing `load_resume` to
+    succeed for ANY path makes `list_resumes()` accept every `profile/*.yaml`, and a listed file is
+    a WRITE target for /resume/update. Against the real root that posted a résumé over the real
+    `profile/application_profile.yaml` and destroyed it (decision 159).
+    """
+    (tmp_path / "profile").mkdir()
+    (tmp_path / "examples").mkdir()
+    monkeypatch.setattr(web, "REPO_ROOT", tmp_path)
+    prof = tmp_path / "profile" / "application_profile.yaml"
     monkeypatch.setattr(apply_profile, "DEFAULT_PATH", str(prof))
     save_profile(ApplicationProfile(
         first_name="Jane", email="jane@example.com",
@@ -33,6 +42,7 @@ def ui(monkeypatch, tmp_path):
             QA(question=DROPDOWN_Q, answer="", seen_count=1, input_kind="dropdown",
                options=["Bachelor's Degree", "Master's Degree"]),
         ]), prof)
+    (tmp_path / "profile" / "resume.yaml").write_text("contact:\n  name: Jane Doe\n", encoding="utf-8")
     monkeypatch.setattr(web, "load_resume",
                         lambda _p: Resume(contact=Contact(name="Jane Doe", email="jane@example.com")))
     srv = ThreadingHTTPServer(("127.0.0.1", 0), web.Handler)

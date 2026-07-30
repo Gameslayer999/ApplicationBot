@@ -165,12 +165,35 @@ CLASSIFIABLE_TYPES: dict[str, str] = {
     "role_commitment": "A readiness/commitment check — asks whether the applicant is up for, "
                        "ready for, or committed to the role or its described demands "
                        "(yes/no), e.g. 'Are you up for it?', 'Are you ready for this "
-                       "challenge?'. NOT a specific logistical fact (start date, relocation, "
-                       "remote/onsite, travel).",
+                       "challenge?'. Answered with a flat 'Yes', so it fits ONLY a whether "
+                       "question — never one asking WHICH option the applicant prefers or WHY, "
+                       "which wants a choice or an explanation. NOT a specific logistical fact "
+                       "(start date, relocation, remote/onsite, travel).",
     "how_heard": "How they heard about or found this job.",
     "location": "Their current city / where they are based.",
     "country": "The country they live in.",
+    "languages": "Which SPOKEN/written human languages they know or speak (e.g. 'Language "
+                 "Skill(s)', 'What languages are you fluent in?'). NEVER programming or "
+                 "markup languages, tech stacks, or frameworks.",
 }
+
+# `role_commitment` answers a flat "Yes" with no option-matching behind it, so it is valid ONLY for
+# a WHETHER question ("Are you up for it?"). A question that asks WHICH option or WHY wants a choice
+# or an explanation, and "Yes" is nonsense there — a live Palantir dry-run banked "…Which of these
+# roles resonates the most with your job search and why?" as role_commitment and would have
+# submitted "Yes" on every Palantir posting (decision 159). Deliberately scoped to this one type:
+# the other yes/no types back DESCRIPTIVE dropdowns ("Which best describes your work
+# authorization?") where "Yes" is then matched onto an offered option by `option_hints`, so the
+# same gate there would regress a working path.
+_NOT_A_YES_NO = ("which", "why", "tell us", "tell me", "describe", "explain",
+                 "in your own words", "what kind", "what type")
+
+# A PROGRAMMING-language question must never be mapped onto the spoken-languages profile field:
+# the two phrasings read alike and answering a tech-stack question with "English; Mandarin" is
+# confidently wrong. Mirrors apply._CODE_LANGUAGE, enforced here at persistence time.
+_CODE_LANGUAGE = ("programming", "coding", "code in", "scripting", "software language",
+                  "query language", "markup", "tech stack", "technolog", "framework",
+                  "language model")
 
 
 def valid_mapping(question: str, key: str) -> bool:
@@ -187,6 +210,8 @@ def valid_mapping(question: str, key: str) -> bool:
         and not is_demographic(question)
         and not is_company_specific(question)
         and not any(t in n for t in _ENUMERATED)
+        and not (key == "languages" and any(t in n for t in _CODE_LANGUAGE))
+        and not (key == "role_commitment" and any(t in n for t in _NOT_A_YES_NO))
     )
 
 
@@ -257,7 +282,10 @@ def classify_question(question: str, *, model: Optional[str] = None) -> Optional
     except Exception:
         return None
     key = _json_reply(out, "type")
-    return key if key in CLASSIFIABLE_TYPES else None
+    # valid_mapping, not a bare membership check: it also rejects a classification the question
+    # itself forbids (e.g. a programming-language question mapped onto `languages`), so a wrong
+    # answer is never even USED this run, let alone banked.
+    return key if key in CLASSIFIABLE_TYPES and valid_mapping(question, key) else None
 
 
 def classify_questions(questions: list[str], *, model: Optional[str] = None
@@ -298,7 +326,7 @@ def classify_questions(questions: list[str], *, model: Optional[str] = None
     if not isinstance(keys, list) or len(keys) != len(askable):
         return out
     for q, k in zip(askable, keys):
-        if k in CLASSIFIABLE_TYPES:
+        if k in CLASSIFIABLE_TYPES and valid_mapping(q, k):
             out[q] = k
     return out
 

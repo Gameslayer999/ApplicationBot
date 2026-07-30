@@ -42,6 +42,14 @@ class QA(BaseModel):
     #                    if the profile changes, and records how the question was interpreted.
 
 
+class Language(BaseModel):
+    """A spoken/written language the applicant knows. `proficiency` uses the wording application
+    forms offer (Native, Fluent, Professional, Conversational, Basic) so it matches their
+    dropdown options directly; "" = stated language, unstated level."""
+    name: str
+    proficiency: str = ""
+
+
 class ApplicationProfile(BaseModel):
     # Identity / contact
     first_name: str = ""
@@ -81,6 +89,11 @@ class ApplicationProfile(BaseModel):
     desired_salary: str = ""
     earliest_start_date: str = ""
     years_experience: str = ""
+
+    # Spoken/written languages, most proficient first (decision 158). Nothing on the résumé
+    # carries these, so "Language Skill(s) (Check all that apply)" checkbox groups and
+    # per-language proficiency questions were captured blank on every form that asked.
+    languages: list[Language] = Field(default_factory=list)
 
     # "How did you hear about this job?" — we discover roles via online search, so this is the
     # default answer: used verbatim in a text field, or matched to a dropdown's options.

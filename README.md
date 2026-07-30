@@ -55,7 +55,11 @@ Configure  →  Discover  →  Tailor  →  Apply  →  Track
    untouched (or import from a LinkedIn data export). Screening questions the bot couldn't answer are
    listed on the same page in the form's own controls — a dropdown question as a dropdown, and a
    **"check all that apply"** question as checkboxes, so you can pick every option that applies and all of
-   them get ticked at fill time.
+   them get ticked at fill time. A **Languages** section holds the languages you speak and how well
+   ("Spanish — Conversational"), which forms ask for constantly and no résumé field carries: a
+   *"Language Skill(s) (check all that apply)"* group gets every one of yours ticked, and a
+   proficiency question gets the level for the language it names. Questions about **programming**
+   languages are never answered from it.
 2. **Discover** — pull openings that match your filters from public ATS APIs
    (Greenhouse · Lever · Ashby · SmartRecruiters · Recruitee · Workable), keyless aggregators
    (Adzuna · Jooble · Remotive and other JSON sources), and forwarded job-alert emails. A cheap keyword

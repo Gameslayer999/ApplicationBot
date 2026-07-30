@@ -56,6 +56,24 @@ def test_valid_mapping_rejects_pollution_vectors():
     assert not valid_mapping("Where are you located?", "not_a_real_type")
 
 
+def test_valid_mapping_rejects_role_commitment_on_a_choice_or_why_question():
+    """role_commitment answers a flat "Yes", so it fits a WHETHER question only. A live Palantir
+    dry-run banked the question below and would have submitted "Yes" to it (decision 159)."""
+    assert not valid_mapping(
+        "At Palantir we have two main Software Engineering roles: Forward Deployed Software "
+        "Engineer and Software Engineer. Which of these roles resonates the most with your job "
+        "search and why?", "role_commitment")
+    assert not valid_mapping("Which of these describes you best?", "role_commitment")
+    assert not valid_mapping("Tell us why this role excites you.", "role_commitment")
+    # Genuine readiness checks are untouched — they ask *whether*, not *which*.
+    assert valid_mapping("Are you up for the challenge?", "role_commitment")
+    assert valid_mapping("Does this sound like you?", "role_commitment")
+    # Scoped to role_commitment: a DESCRIPTIVE work-auth dropdown still maps (its "Yes" is then
+    # matched onto an offered option by option_hints), so this gate can't regress that path.
+    assert valid_mapping("Which of the following best describes your work authorization?",
+                         "work_authorized")
+
+
 # ------------------------------------------------------------------ remember_answers gate
 
 def _tmp_profile() -> Path:
