@@ -174,25 +174,27 @@ def _migrate_greenhouse_password(profile: "ApplicationProfile", path: str | Path
         pass
 
 
-def load_profile(path: str | Path = DEFAULT_PATH) -> ApplicationProfile:
-    p = Path(path)
+def load_profile(path: str | Path | None = None) -> ApplicationProfile:
+    # `path or DEFAULT_PATH` (not a default argument) so the location is read at CALL time —
+    # an import-time default would bind the original path and ignore a redirected DEFAULT_PATH.
+    p = Path(path or DEFAULT_PATH)
     if not p.exists():
         return ApplicationProfile()
     data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
     profile = ApplicationProfile.model_validate(data)
-    _migrate_greenhouse_password(profile, path)  # plaintext YAML password → keychain (once)
+    _migrate_greenhouse_password(profile, p)  # plaintext YAML password → keychain (once)
     return profile
 
 
-def save_profile(profile: ApplicationProfile, path: str | Path = DEFAULT_PATH) -> None:
+def save_profile(profile: ApplicationProfile, path: str | Path | None = None) -> None:
     # The password is never persisted to YAML — it lives in the keychain (decision 060).
     data = profile.model_dump()
     data.pop("greenhouse_password", None)
     body = yaml.safe_dump(data, sort_keys=False, allow_unicode=True)
-    Path(path).write_text(_HEADER + body, encoding="utf-8")
+    Path(path or DEFAULT_PATH).write_text(_HEADER + body, encoding="utf-8")
 
 
-def replace_profile(data: dict, path: str | Path = DEFAULT_PATH) -> ApplicationProfile:
+def replace_profile(data: dict, path: str | Path | None = None) -> ApplicationProfile:
     """Validate an edited profile and save it. Preserve the server-managed learning store
     (`dropdown_aliases`) that the UI editor doesn't send, so saving the Profile tab doesn't
     wipe dropdown mappings learned during autofill (decision 033)."""
@@ -284,6 +286,55 @@ def remember_answers(new: list[QA], path: str | Path = DEFAULT_PATH) -> int:
     if added:
         save_profile(profile, path)
     return added
+
+
+def upsert_answers(pairs: dict[str, str], path: str | Path | None = None,
+                   meta: dict | None = None) -> int:
+    """Write USER-authored answers into the bank, replacing any existing entry for the same
+    question (matched case/space-insensitively). Used by the review panel (decision 155): an
+    answer the user typed while reviewing an application is ground truth, so it overwrites a
+    blank entry `capture_questions` banked, a Claude draft, and any `maps_to` mapping whose
+    live answer the user just replaced — re-deriving it would reproduce the answer they
+    rejected. Blank values are ignored (clearing a review edit drops that posting's override
+    only; it does not erase what the bank already learned). Returns entries written.
+
+    Unlike `remember_answers` (which appends what a RUN learned and never touches an existing
+    entry), this deliberately overwrites — the caller is the user, not the bot.
+
+    `meta` maps a question to the control it was answered in ({kind, options}, from the fill
+    report), so a question first answered in the review panel still shows in the profile editor
+    as its real control — a check-all-that-apply group as checkboxes, not a text box.
+    """
+    meta = meta or {}
+    profile = load_profile(path or DEFAULT_PATH)
+    by_key = {_norm_q(qa.question): qa for qa in profile.custom_answers}
+    written = 0
+    for question, answer in (pairs or {}).items():
+        question = str(question).strip()
+        answer = str(answer if answer is not None else "").strip()
+        key = _norm_q(question)
+        if not (key and answer) or len(key) < 4:
+            continue
+        m = meta.get(question) or {}
+        kind, options = (m.get("kind") or ""), list(m.get("options") or [])
+        qa = by_key.get(key)
+        if qa is None:
+            qa = QA(question=question, answer=answer, input_kind=kind, options=options)
+            profile.custom_answers.append(qa)
+            by_key[key] = qa
+        elif qa.answer == answer and not qa.maps_to and not qa.generated \
+                and (qa.input_kind or not kind):
+            continue  # already banked exactly this — nothing to write
+        else:
+            qa.answer, qa.maps_to, qa.generated = answer, "", False
+            if kind and not qa.input_kind:      # backfill control info if we now have it
+                qa.input_kind = kind
+            if options and not qa.options:
+                qa.options = options
+        written += 1
+    if written:
+        save_profile(profile, path or DEFAULT_PATH)
+    return written
 
 
 def capture_questions(questions: list[str], path: str | Path = DEFAULT_PATH,

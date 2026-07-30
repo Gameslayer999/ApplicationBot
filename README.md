@@ -52,7 +52,10 @@ Configure  →  Discover  →  Tailor  →  Apply  →  Track
    drive both what gets discovered and what gets auto-applied to. Edit it all from the web UI or in
    `profile/*.yaml`. Already have a résumé? **Upload the PDF or Word (.docx) file** on the Profile page and
    Claude reads it into your sections — merging in anything new and leaving what you've already filled
-   untouched (or import from a LinkedIn data export).
+   untouched (or import from a LinkedIn data export). Screening questions the bot couldn't answer are
+   listed on the same page in the form's own controls — a dropdown question as a dropdown, and a
+   **"check all that apply"** question as checkboxes, so you can pick every option that applies and all of
+   them get ticked at fill time.
 2. **Discover** — pull openings that match your filters from public ATS APIs
    (Greenhouse · Lever · Ashby · SmartRecruiters · Recruitee · Workable), keyless aggregators
    (Adzuna · Jooble · Remotive and other JSON sources), and forwarded job-alert emails. A cheap keyword
@@ -76,6 +79,13 @@ Configure  →  Discover  →  Tailor  →  Apply  →  Track
    ATS, including multi-page wizards and account-gated **Workday** (automated account creation, credentials
    in your OS keychain). Applications that get blocked (a question it can't answer, a login, a CAPTCHA) are
    *parked* so you can resolve and resume them. Every submit is gated by the safety switch above.
+   A site that **refuses automated traffic** (a bot wall, e.g. DataDome's "Access is temporarily restricted")
+   is reported as exactly that — not as a missing form and not as a CAPTCHA you could solve — and parked as
+   **Try again**, since nothing on your side is broken. ApplicationBot never tries to get around such a wall.
+   Sites word the button that opens their form differently ("Apply", "I'm interested", "Join our team"); the
+   known wordings are built in, and setting `nav_agentic: true` in `profile/safety.yaml` (off by default,
+   spends Claude tokens) lets a Claude worker open an unknown one **once** and remember the route, so every
+   later posting on that site opens for free.
    Dropdowns don't have to spell things your way: a school picker that lists *"Penn State
    University-University Park"* still matches a résumé that says *"The Pennsylvania State University"*
    (abbreviations and typos included, main campus preferred over a branch), and when a school genuinely
@@ -85,6 +95,13 @@ Configure  →  Discover  →  Tailor  →  Apply  →  Track
    **editable**. Type over any answer (or fill in one it couldn't answer) and that value is what gets
    submitted the next time this application is filled, including the real submit; unsaved edits are saved
    for you when you click *Watch it fill* or *Apply*. Clearing a box hands the field back to the bot.
+   A **"check all that apply"** question is edited there as checkboxes too — the same widget as the
+   Profile page — so every option you tick is ticked on the form.
+   **It also learns from your edits:** a reusable answer ("How many years of Python do you have?") is added
+   to your answer bank, so the next posting that asks it is filled in instead of coming back blank — and
+   an answer you correct replaces the one it got wrong. Company-specific answers ("Why Acme?") and EEO
+   questions stay on that posting alone, and if the field is one your apply profile owns (email, work
+   authorization) the panel says so and links you to the profile, rather than pretending it was learned.
    The web UI's **auto-apply loop** can run to a goal — *"keep going until 5 applications are ready for me"* —
    and it means it: when a pass turns up nothing new it backs off (1 min, then longer, up to 30 min) and
    searches again, each pass judging the next-best postings it hasn't scored yet, until that many are ready
@@ -213,7 +230,8 @@ Everything specific to you lives in the git-ignored **`profile/`** folder (from 
 
 - `resume.yaml` — your base résumé, the factual source of truth.
 - `discovery.yaml` — filters, boards, and sources (roles, keywords, location, pay, seniority, gates).
-- `safety.yaml` — the arm switch and per-run submission cap.
+- `safety.yaml` — the arm switch, the per-run submission cap, and the opt-in agentic fallbacks
+  (`nav_agentic`, `workday_agentic` — both off by default; they spend Claude tokens to learn a site once).
 - `notifications.yaml`, `mailbox.yaml` — optional desktop/phone push (also logged in the
   **Notifications** tab, so every alert is kept and dismissible) and the bot inbox link.
 - `applications.db` + `applications/` — your tracked history and per-application archives.

@@ -190,6 +190,17 @@ def valid_mapping(question: str, key: str) -> bool:
     )
 
 
+def is_reusable_answer(question: str) -> bool:
+    """True if an answer the USER wrote for one posting may be saved to the shared bank and
+    reused on every future form (decision 155). Same policy as the caching rules above:
+    company-specific answers ("Why us?") are wrong at the next employer, and demographic/EEO
+    self-identification belongs to the structured profile fields, never the bank. Very short
+    labels are garbage captures ("yes", stray tokens) and are never banked."""
+    n = _norm(question)
+    return bool(n) and len(n) >= 4 and not is_company_specific(question) \
+        and not is_demographic(question)
+
+
 def _json_reply(out: str, key: str):
     """Parse a schema-constrained CLI reply and return `key`'s value, or None. The CLI enforces
     the schema, so this is normally a plain json.loads — the fallback tolerates a wrapper."""

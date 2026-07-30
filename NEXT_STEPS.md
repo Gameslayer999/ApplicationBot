@@ -145,9 +145,8 @@ still owed from the user's network.
   ```
   - **Fields fill** → decision 098 was the whole story; nothing further to do.
   - **"form did not load" still** (no wall) → the reveal click landed but a *later* page gates the
-    form; arm `nav_agentic: true` and let the learner take it (note: the full nav-recipes learn/replay
-    machinery from 076 is still not committed to `apply.py` — see the standing `test_nav_recipes.py`
-    collection error).
+    form; arm `nav_agentic: true` in `profile/safety.yaml` and let the learner take it — the
+    nav-recipes learn/replay machinery is now in `apply.py` (decision 157).
   - **"blocked automated access"** → SmartRecruiters walls the user too. Apply there by hand —
     **do not** build evasion (Guideline #4). Consider **dropping SmartRecruiters from discovery** so
     the pipeline stops queueing postings it can never submit (~298 of the 074 unlock).
@@ -524,6 +523,16 @@ value ÷ effort:
       `check_factual_drift`, `select_backend`).
 
 ## Next
+
+### A "form did not load" posting is mis-parked as `login` (found 2026-07-30, decision 157)
+
+- [ ] `parking.classify` scans the joined error prose for `_LOGIN_MARKERS`, and the generic timeout
+      error itself says the page "may **require sign-in**" — so any posting whose form never loaded is
+      parked as **"The site needs you to sign in… store the login, then re-run"**, deep-linking the user
+      to Credentials for a site that may need no account at all (UI Principle #3 violation: the card
+      names the wrong fix). Pre-existing and deliberately left untouched by 157 (Guideline #7). Fix by
+      classifying from a structured flag as `bot_wall` now does — e.g. `report.form_missing` — rather
+      than by pattern-matching our own message text.
 
 ### Discovery quality: staffing-spam down-ranking (decision 122 → 123)
 
@@ -2460,6 +2469,65 @@ Record each decision in [DECISIONS.md](DECISIONS.md) once the user chooses.
 
 ## Recently completed
 
+- 2026-07-30 — **The suite is fully green: decision 076/077's missing `apply.py` half is restored,
+  not deleted (decision 157).** User: "lets get rid of these build errors that pop up in every test:
+  test_parking.py bot_wall failure and the test_nav_recipes.py import error". Those two failures had
+  been logged as "pre-existing" in five sessions; they were in fact the only evidence that shipped,
+  logged behaviour was missing — `git log -S` finds `_bot_wall_evidence`, `_distil_nav`,
+  `run_agent_nav`, `nav_agentic_enabled`, and `ApplyReport.bot_wall` **in no commit**, while
+  `nav_recipes.py`, `parking.py`'s `bot_wall` kind, both fixtures, and 20 tests were all present.
+  Restored in `apply.py`: the bot-wall detector walks **every frame** (the real DataDome 403 renders
+  in an iframe over an empty body), a wall now suppresses the misleading "form did not load" timeout
+  error, names the site, parks the row as **`blocked` / "Try again"** (never "ready to apply"), and is
+  **excluded from the agentic fallback** — same browser, same IP, same wall, and aiming an agent at it
+  is evasion (Guideline #4). Nav recipes replay for free on every run (`_open_application_form`
+  `replay`/`url_hint`/`recipe_path`); `nav_agentic: true` in `profile/safety.yaml` (off by default)
+  lets a Claude+Playwright-MCP worker — the same `workday._spawn_claude_agent`, forbidden to fill,
+  upload, submit, or touch a CAPTCHA — open an unknown wording once, and `_distil_nav` learns the
+  route by DOM diff (cookie-banner decoys filtered, opaque routes learn nothing). `detect_ats` learned
+  `smartrecruiters`. Verified by driving `run_apply` headless against all three fixtures, not only by
+  tests: the wall reports a refusal and spends no Claude call, the SmartRecruiters posting fills 5
+  fields through "I'm interested", the unknown wording fails deterministically and names the flag that
+  fixes it. Suite **630 passed, 0 failed** (was 610 passed + 2 failed + 1 collection error). README,
+  `examples/safety.example.yaml`, and decision 076's entry updated.
+- 2026-07-30 — **"Check all that apply" screening questions are multi-answer end to end
+  (decision 156).** User: "a screening that told users to mark all that apply was not shown as a
+  multiple answer question in the screening questions section of profile" — the banked entry was
+  `Language Skill(s) (Check all that apply)` with 33 options. Autofill captured the checkbox group
+  correctly (`input_kind: checkbox` + every option label), but the Profile screen rendered any
+  question with options as a single-choice `<select>`, so only one of the 33 could ever be stored.
+  `qaAnswerInput` now routes checkbox-group questions to a new `qaMultiInput` — one checkbox per
+  option in a scrollable grid, pre-checked from the stored answer, mirrored into the hidden
+  `data-k="answer"` field (a stored value the form no longer offers stays visible, marked "not in
+  this form", instead of disappearing on save); dropdown and single-checkbox questions are
+  untouched. The answer stays one `"A; B"` string, and `_fill_checkboxes` splits it on `;`/newline
+  so every chosen option is ticked. **The Review panel uses the same widget** — one shared
+  `multiCheckboxes` implementation — so the last screen before an irreversible submit doesn't ask
+  the user to hand-type `"A; B"`: `_record_capture` now also runs for an *answered* group and the
+  control map is persisted in the archived `report.json`; new `web._merge_checkbox_groups` folds
+  the report's one-row-per-checked-option into a single editable question (they previously showed
+  as duplicate rows whose edits overwrote each other); and an answer first given in Review is
+  banked with its control (`upsert_answers(meta=…)`), so it shows as checkboxes in Profile too.
+  New `tests/test_multi_select.py` (headless fill of new `fixtures/apply_forms/multi_select.html`),
+  `tests/test_web_multi_select.py` (real Profile screen → saved YAML) and
+  `tests/test_web_multi_select_review.py` (real Review panel → override + bank). Suite: 610 passed;
+  the 2 `test_parking.py` `bot_wall` failures and the `test_nav_recipes.py` import error are
+  pre-existing and untouched.
+- 2026-07-29 — **Review edits are learned, not just applied to that posting (decision 155).**
+  User: "their edited answers should also be saved so that the program can learn from them and
+  won't have to have it unfilled/wrong in the future." Decision 153 stored an edit per posting
+  only, so the same generic screening question came back blank on every posting and a wrong
+  banked answer stayed wrong. `web._learn_reviewed_answers` now sorts each edit into **learned**
+  (reusable → upserted into the answer bank via new `apply_profile.upsert_answers`, filling the
+  blank entry autofill captured or overwriting the rejected answer and its `maps_to`),
+  **profile-owned** (a structured rule answers that label and outranks the bank — kept per
+  posting, with the panel naming the field and linking to Profile), or **posting-only**
+  (company-specific / EEO, refused by new `answer_bank.is_reusable_answer`). Bucketing uses the
+  resolver itself (new `AnswerResolver.banked_qa`, extracted from `resolve()`), so there is no
+  second copy of the precedence rules. Also fixed: `load_profile`/`save_profile` bound
+  `DEFAULT_PATH` as an import-time default, so a redirected profile path was ignored. New
+  `tests/test_answer_learning.py` (15) + the headless UI test now asserts the bank write.
+  Suite: 604 passed.
 - 2026-07-29 — **School dropdowns: fuzzy identity-token matching, then "Other" when the school
   really isn't listed (decision 154).** User: "we dont know what to do if the school dropdown doesnt
   have an option for Penn state." Option matching was equality-or-substring, so a list spelling it

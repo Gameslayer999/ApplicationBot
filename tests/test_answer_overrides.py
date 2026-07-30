@@ -125,8 +125,11 @@ def test_review_panel_shows_the_edit_and_offers_unanswered_fields(monkeypatch, t
     assert r["unanswered"] == [{"label": "Why Acme?", "detail": "no saved answer",
                                 "value": "", "edited": False}]
 
-    # Saving through the web layer writes the same store the next fill reads.
-    assert web.save_answers(3, {"Why Acme?": "Your latency work."}) == {"ok": True, "saved": 2}
+    # Saving through the web layer writes the same store the next fill reads. "Why Acme?" is
+    # company-specific, so it stays on this posting and is never learned (decision 155,
+    # covered in test_answer_learning.py).
+    out = web.save_answers(3, {"Why Acme?": "Your latency work."})
+    assert (out["ok"], out["saved"], out["learned"], out["posting_only"]) == (True, 2, 0, 1)
     assert answer_overrides.load(*POSTING)["Why Acme?"] == "Your latency work."
     assert web._review_data(3)["unanswered"][0]["value"] == "Your latency work."
 

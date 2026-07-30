@@ -20,6 +20,7 @@ import difflib
 import json
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 from . import answer_bank, salary
@@ -69,6 +70,12 @@ class ApplyReport:
     # Provenance of the résumé this run used — freshly tailored vs reused (decision 144). Set from
     # meta by run_apply so the review panel / notification can show it before it's persisted.
     resume_source: str = ""
+    # The site REFUSED us as automated traffic (decision 076): the text signal or vendor host that
+    # proves it. A structured flag rather than error prose, because the wall's own vendor host is
+    # "captcha-delivery.com" and parking.classify must not read that as a solvable CAPTCHA.
+    bot_wall: str = ""
+    # Things the run learned that aren't errors or fields (e.g. "Learned nav recipe for host X").
+    notes: list[str] = field(default_factory=list)
 
     def summary(self) -> str:
         native = sum(1 for f in self.filled if f.source == "native")
@@ -91,9 +98,12 @@ class ApplyReport:
         if self.skipped:
             lines.append(f"  needs attention ({len(self.skipped)}):")
             lines += [f"    - {s}" for s in self.skipped]
+        if self.bot_wall:
+            lines.append(f"  refused as a bot by: {self.bot_wall}")
         if self.errors:
             lines.append(f"  errors ({len(self.errors)}):")
             lines += [f"    - {e}" for e in self.errors]
+        lines += [f"  note: {n}" for n in self.notes]
         if self.screenshot:
             lines.append(f"  screenshot: {self.screenshot}")
         return "\n".join(lines)
@@ -716,12 +726,25 @@ class AnswerResolver:
         # Saved answer bank for custom screening questions (conservative match). An entry with
         # `maps_to` was Claude-classified onto a structured field — answer it LIVE from that
         # field so it stays correct if the profile changes.
-        for qa in p.custom_answers:
+        qa = self.banked_qa(label)
+        if qa is not None:
+            mt = getattr(qa, "maps_to", "")
+            return self.answer_for_type(mt) if mt else (qa.answer or None)
+
+        return None
+
+    def banked_qa(self, label: str) -> Optional[QA]:
+        """The saved answer-bank entry that answers `label` (the conservative match `resolve`
+        uses), or None. Exposed so callers can tell a BANK-answered field from a field the
+        structured profile rules answer — the bank is consulted last, so teaching it a label the
+        rules already answer would have no effect (web._learn_reviewed_answers, decision 155)."""
+        n = _norm(label)
+        if not n:
+            return None
+        for qa in self.profile.custom_answers:
             qn = _norm(qa.question)
             if qn and (qn == n or (len(qn) > 15 and (qn in n or n in qn))):
-                mt = getattr(qa, "maps_to", "")
-                return self.answer_for_type(mt) if mt else (qa.answer or None)
-
+                return qa
         return None
 
     def answer_for_type(self, key: str) -> Optional[str]:
@@ -1121,6 +1144,8 @@ def detect_ats(url: str) -> str:
         return "workday"
     if "icims" in u:
         return "icims"
+    if "smartrecruiters" in u:
+        return "smartrecruiters"
     return "generic"
 
 
@@ -1256,7 +1281,7 @@ def _ats_from_frame(frame, fallback: str) -> str:
     company domain (stripe.com) is detected as 'generic' from the outer URL but is really
     greenhouse — the embed frame URL reveals it."""
     u = (getattr(frame, "url", "") or "").lower()
-    for name in ("greenhouse", "lever", "ashby", "workday", "icims"):
+    for name in ("greenhouse", "lever", "ashby", "workday", "icims", "smartrecruiters"):
         if name in u:
             return "greenhouse" if name == "greenhouse" else name
     return fallback
@@ -1274,12 +1299,204 @@ def _is_adzuna_access_wall(page) -> bool:
         return False
 
 
-def _open_application_form(page, ats: str, report: "ApplyReport", timeout_ms: int = 25000):
+# --------------------------------------------------------------- bot walls (decision 076)
+
+# Text a bot-detection wall renders instead of the posting. Taken from what jobs.smartrecruiters.com
+# actually served on a live dry-run (HTTP 403 + DataDome), plus the other vendors' standard copy.
+# Deliberately specific phrases: a posting that merely mentions "access" or "robot" must not trip.
+_BOT_WALL_TEXT = (
+    "access is temporarily restricted",
+    "automated (bot) activity",
+    "unusual activity from your device",
+    "verify you are a human",
+    "verify you are human",
+    "are you a robot",
+    "pardon our interruption",
+    "enable javascript and cookies to continue",
+)
+
+# Vendors that serve the wall from their OWN host. The frame's presence IS the block, before any
+# text renders — which is the only signal available when the wall is still loading.
+_BOT_WALL_HOSTS = ("captcha-delivery.com", "datadome", "perimeterx", "px-cloud",
+                   "challenges.cloudflare.com", "incapsula", "imperva")
+
+
+def _bot_wall_evidence(page) -> str:
+    """The evidence that this page is a bot-detection wall rather than a posting, or "".
+
+    Walks EVERY frame: the real SmartRecruiters 403 renders the wall in a vendor IFRAME while the
+    host page's body is empty, so a main-frame-only text scan returned "" and the run misreported a
+    refusal as "form did not load". Returns the matched text signal or vendor host so the caller can
+    quote it (`report.bot_wall`)."""
+    for fr in getattr(page, "frames", None) or []:
+        try:
+            text = (fr.inner_text("body") or "").lower()
+        except Exception:
+            text = ""
+        for sig in _BOT_WALL_TEXT:
+            if sig in text:
+                return sig
+        url = (getattr(fr, "url", "") or "").lower()
+        for host in _BOT_WALL_HOSTS:
+            if host in url:
+                return host
+    return ""
+
+
+def _park_bot_wall(page, ats: str, report: "ApplyReport") -> bool:
+    """If this page is a bot wall, flag it on the report with an actionable error and return True.
+    The flag (not the prose) is what `parking.classify` reads, and the caller must NOT then append
+    the "form did not load" timeout error — the form was never served, so a timeout is a lie."""
+    from . import nav_recipes
+
+    evidence = _bot_wall_evidence(page)
+    if not evidence:
+        return False
+    report.bot_wall = evidence
+    # Name the site, not "generic": the user reads this to decide whether to open the posting.
+    who = ats if ats and ats != "generic" else (nav_recipes.host_of(getattr(page, "url", "")) or "The site")
+    report.errors.append(
+        f"{who} blocked automated access to this posting (page says: '{evidence}') — the form was "
+        "never served, so nothing was filled. ApplicationBot will not try to evade the block. "
+        "Retry later or from a different network, or open the URL and apply in your own browser."
+    )
+    return True
+
+
+# --------------------------------------------------------------- nav recipes (decision 076)
+
+# Accessible names of every clickable control on the page — the "before" half of the DOM diff that
+# distils what the agentic nav worker clicked (mirrors decision 061's empty→filled field diff).
+_CONTROL_LABELS_JS = r"""() => Array.from(
+    document.querySelectorAll('a, button, [role=button], [role=link], input[type=submit]'))
+  .map(el => (el.innerText || el.value || el.getAttribute('aria-label') || '').trim())
+  .filter(Boolean)"""
+
+# Page chrome that also vanishes when clicked but is NOT a reveal control. A dismissed cookie banner
+# must never become a recipe replayed on every posting of that host.
+_NAV_DECOY = re.compile(r"cookie|consent|accept|agree|privacy|dismiss|close|got it|no thanks|"
+                        r"subscribe|share|sign in|log in|^ok$|^x$|^×$", re.I)
+
+
+def _control_labels(page) -> list[str]:
+    try:
+        return [str(s) for s in (page.evaluate(_CONTROL_LABELS_JS) or [])]
+    except Exception:
+        return []
+
+
+def _distil_nav(start_url: str, before_labels: list[str], page) -> "NavRecipe":
+    """Distil "how the form was reached" by DIFFING the DOM, not by reading the agent: whichever
+    control VANISHED (and what the URL gained) is the route. Returns an EMPTY recipe when the route
+    is opaque (cross-domain redirect, modal with no vanishing control) — a wrong recipe would be
+    replayed on every posting of that host, so refusing to guess is the safer failure."""
+    from .nav_recipes import NavRecipe, host_of
+
+    now = set(_control_labels(page))
+    vanished = [s for s in before_labels if s not in now and not _NAV_DECOY.search(s)]
+    here = (getattr(page, "url", "") or "").split("?")[0].rstrip("/")
+    base = (start_url or "").split("?")[0].rstrip("/")
+    suffix = here[len(base):] if here.startswith(base + "/") else ""
+    return NavRecipe(host=host_of(start_url), url_suffix=suffix, reveal_labels=vanished)
+
+
+def _reveal_matcher(recipe) -> "re.Pattern":
+    """The control-name pattern the reveal click looks for: the built-in wording plus whatever this
+    host taught us. Replay is always on and free — only LEARNING a new host is gated."""
+    if not (recipe and recipe.reveal_labels):
+        return _REVEAL_CONTROL
+    return re.compile("|".join([_REVEAL_CONTROL.pattern] +
+                               [re.escape(s) for s in recipe.reveal_labels]), re.I)
+
+
+def nav_agentic_enabled(path=None) -> bool:
+    """Whether the agentic nav fallback is ON — **off by default** (decision 076), mirroring
+    `workday.agentic_enabled` so both agentic fallbacks are gated the same way: set
+    `nav_agentic: true` in profile/safety.yaml. Recipe REPLAY is always on and costs nothing;
+    only learning a NEW host spends a Claude call."""
+    import yaml
+
+    from .safety import DEFAULT_SAFETY
+    p = Path(path or DEFAULT_SAFETY)
+    if not p.exists():
+        return False
+    try:
+        return bool((yaml.safe_load(p.read_text(encoding="utf-8")) or {}).get("nav_agentic", False))
+    except Exception:
+        return False
+
+
+def nav_agent_prompt(url: str) -> str:
+    """The nav worker's instruction — the inverse of the Workday fill worker's (decision 061):
+    navigation is the whole job, and filling/uploading/submitting are hard-barred, so the fallback
+    can never touch an answer or reach the submit path (Guideline #3)."""
+    return (
+        "You are opening the APPLICATION FORM of a job posting in the attached browser (use the "
+        f"Playwright MCP tools — the posting is already open at {url}).\n\n"
+        "Your ONLY job is navigation: find and click whatever control reveals the application form "
+        "— the wording varies by site (\"Apply\", \"I'm interested\", \"Join our team\", \"Start "
+        "application\") — follow it, and STOP as soon as the form's input fields are on screen.\n\n"
+        "HARD RULES:\n"
+        "  - Do NOT fill in ANY field, do NOT upload a file, do NOT create an account, and do NOT "
+        "click Submit — someone else fills the form after you.\n"
+        "  - Do NOT solve, bypass, or work around a CAPTCHA or bot-detection wall. If the site says "
+        "it has blocked automated access, stop and report that.\n"
+        "  - Stay on this posting's own site; do not sign in.\n"
+    )
+
+
+def run_agent_nav(page, url: str, report: "ApplyReport", *, cdp_port: Optional[int] = None,
+                  model: str = "claude-sonnet-5", recipe_path=None, _spawn=None) -> bool:
+    """Last resort when the deterministic reveal + any learned recipe failed: let a Claude +
+    Playwright-MCP worker open the form ONCE in OUR browser (over CDP), then distil the route into
+    a host-keyed nav recipe so every later posting on that host replays it with no agent. Returns
+    whether a form is now open. `_spawn` is injectable so tests drive a fake agent (no Claude, no
+    CDP). Never raises — a failure is recorded as an actionable error."""
+    from . import nav_recipes
+    from .workday import _spawn_claude_agent
+
+    before = _control_labels(page)
+    spawn = _spawn or _spawn_claude_agent
+    try:
+        spawn(page, [], nav_agent_prompt(url), cdp_port=cdp_port, model=model, report=report)
+    except Exception as e:
+        report.errors.append(
+            f"The agentic nav worker could not open the application form: {type(e).__name__}: {e}. "
+            "Check that the Claude CLI and npx are installed, or open the posting URL and apply in "
+            "your own browser."
+        )
+        return False
+
+    _, n = _find_form_frame(page)
+    if n < 2:
+        report.errors.append(
+            f"The agentic nav worker ran but no application form appeared at {getattr(page, 'url', url)} "
+            "— the posting may apply by email or through a portal ApplicationBot can't reach. "
+            "Open the URL to apply manually."
+        )
+        return False
+
+    recipe = _distil_nav(url, before, page)
+    if not recipe.is_empty():
+        nav_recipes.save_recipe(recipe, **({"path": recipe_path} if recipe_path else {}))
+        route = recipe.url_suffix or ", ".join(recipe.reveal_labels)
+        report.notes.append(f"Learned nav recipe for {recipe.host} ({route}) — later postings on "
+                            "this site will open the form with no Claude call.")
+    return True
+
+
+def _open_application_form(page, ats: str, report: "ApplyReport", timeout_ms: int = 25000, *,
+                           replay: bool = True, url_hint: str = "", recipe_path=None):
     """Reveal the application form (click an Apply control if needed) and WAIT until it has
     actually rendered — IN WHICHEVER FRAME it lives (main page or an embedded iframe). Returns
     (loaded, frame, ats): the frame to fill and the ATS re-derived from that frame. On failure
     returns (False, main_frame, ats) with an actionable error, and the caller must not fill.
-    This is what makes 'verify the application loaded before filling' true rather than assumed."""
+    This is what makes 'verify the application loaded before filling' true rather than assumed.
+
+    `replay` consults the learned nav-recipe library for this host (decision 076) — free and always
+    on in a real run; tests turn it off to exercise the deterministic path alone. `url_hint` is the
+    POSTING url (the recipe key) when `page` may already have navigated; `recipe_path` overrides the
+    committed store."""
     import time
 
     # Adzuna gates its apply link behind www.adzuna.com/land/, which is fronted by a CloudFront
@@ -1296,6 +1513,27 @@ def _open_application_form(page, ats: str, report: "ApplyReport", timeout_ms: in
         )
         return False, page.main_frame, ats
 
+    # A bot-detection wall is not a slow form: the site REFUSED us, so polling for 25s and then
+    # reporting a timeout would misname the failure (decision 076). Checked up front, and again
+    # after the reveal click — the real SmartRecruiters 403 arrived in answer to that click.
+    if _park_bot_wall(page, ats, report):
+        return False, page.main_frame, ats
+
+    # Replay whatever we already learned about this host: a URL suffix that goes straight to the
+    # form, and/or the accessible name of the control that reveals it. Deterministic and free.
+    recipe = None
+    if replay:
+        from . import nav_recipes
+        posting_url = url_hint or (getattr(page, "url", "") or "")
+        recipe = nav_recipes.get_recipe(posting_url, **({"path": recipe_path} if recipe_path else {}))
+        if recipe and recipe.url_suffix:
+            try:
+                page.goto(posting_url.split("?")[0].rstrip("/") + recipe.url_suffix,
+                          wait_until="domcontentloaded")
+            except Exception:
+                pass
+    reveal_control = _reveal_matcher(recipe)
+
     # Poll every frame until one holds a real form (covers navigation + async/iframe mounts).
     # If no form is visible yet, keep trying to reveal it via an "Apply" control on EACH pass:
     # SPA ATS pages (e.g. Ashby, whose form lives at <posting>/application) mount the Apply
@@ -1303,7 +1541,13 @@ def _open_application_form(page, ats: str, report: "ApplyReport", timeout_ms: in
     # and never navigates — the poll then just watches an empty posting page until it times out.
     deadline = time.time() + timeout_ms / 1000
     revealed = False
+    wall_checked = False
     while time.time() < deadline:
+        if revealed and not wall_checked:
+            # One check on the pass after the reveal click — what the click loaded may be the wall.
+            wall_checked = True
+            if _park_bot_wall(page, ats, report):
+                return False, page.main_frame, ats
         frame, n = _find_form_frame(page)
         if n >= 2:
             # Settle: wait for a labelled field to be visible in that frame, then a beat for the rest.
@@ -1316,7 +1560,7 @@ def _open_application_form(page, ats: str, report: "ApplyReport", timeout_ms: in
         if not revealed:
             for role in ("link", "button"):
                 try:
-                    btn = page.get_by_role(role, name=_REVEAL_CONTROL).first
+                    btn = page.get_by_role(role, name=reveal_control).first
                     if btn.count() and btn.is_visible():
                         btn.click(timeout=4000)
                         revealed = True
@@ -1324,6 +1568,11 @@ def _open_application_form(page, ats: str, report: "ApplyReport", timeout_ms: in
                 except Exception:
                     continue
         page.wait_for_timeout(500)
+
+    # Out of time: a wall found now is the real reason, and the timeout error must be withheld —
+    # "did not load" would send the user hunting for a form the site never served.
+    if _park_bot_wall(page, ats, report):
+        return False, page.main_frame, ats
 
     report.errors.append(
         f"Application form did not load within {timeout_ms // 1000}s at {page.url}. "
@@ -1642,8 +1891,11 @@ def _open_options_and_texts(page):
 
 
 def _record_capture(report: "ApplyReport", question: str, kind: str, options=None) -> None:
-    """Remember an unanswered field's control TYPE and options so the Profile UI can recreate it
-    faithfully (a dropdown question becomes a dropdown, not a free-text box)."""
+    """Remember a field's control TYPE and options so the UI can recreate it faithfully (a
+    dropdown question becomes a dropdown, not a free-text box; a check-all-that-apply group
+    becomes checkboxes). Recorded for unanswered fields — which the answer bank then captures
+    with this control info — and for answered checkbox GROUPS, whose answer the review panel
+    must also edit as checkboxes (`_persist_learning` only reads the unanswered ones)."""
     report.captured[question] = {"kind": kind, "options": [o for o in (options or []) if o][:40]}
 
 
@@ -2233,15 +2485,21 @@ def _fill_checkboxes(page, resolver: AnswerResolver, report: "ApplyReport", done
         for i in idxs:
             handled.add(i)
         value = resolver.resolve(q) or resolver.resolve_semantic(q)
+        # A check-all-that-apply answer is stored as one "A; B; C" string (the profile UI's
+        # multi-select widget) — split it so EVERY chosen option gets checked, not just a
+        # literal whole-string match that would tick nothing.
+        chosen = [p.strip() for p in re.split(r"[;\n]", value) if p.strip()] if value else []
         # Also consult option_hints — e.g. a "US" checkbox vs our "United States" value (Stripe's
         # country list uses abbreviations UAE/UK/US), matched via the country aliases.
-        candidates = [c for c in ([value] if value else []) + (resolver.option_hints(q) or []) if c]
+        candidates = [c for c in chosen + (resolver.option_hints(q) or []) if c]
         if not candidates and resolver.pending is not None and resolver.pending.has(q):
             resolver.pending.enrich(q, "checkbox", [info[i]["lbl"] for i in idxs])
             continue  # deferred to the batched decision step — round 2 revisits
         done.add(q)
+        # Recorded whether or not we answered it: the review panel edits an ANSWERED group as
+        # checkboxes too, and that needs the group's options.
+        _record_capture(report, q, "checkbox", [info[i]["lbl"] for i in idxs])
         if not candidates:
-            _record_capture(report, q, "checkbox", [info[i]["lbl"] for i in idxs])
             report.skipped.append(f"{q} — no saved answer")
             continue
         matched = False
@@ -2795,6 +3053,9 @@ def _report_snapshot(report: ApplyReport) -> dict:
         # box can say whether the value has to match one of the form's options (decision 153).
         "filled": [{"label": f.label, "value": f.value, "source": f.source, "control": f.control}
                    for f in report.filled],
+        # question -> {kind, options}: the real control each answer came from, so the review
+        # panel offers a check-all-that-apply group as checkboxes instead of a text box.
+        "captured": report.captured,
         "skipped": report.skipped,
         "errors": report.errors,
     }
@@ -2836,7 +3097,10 @@ def _record_run(report: ApplyReport, resume_pdf: str, role: str, company: str,
     reason = parking.classify(report)
     if report.submitted:
         status = "applied"
-    elif report.submit_state == "blocked":
+    elif report.submit_state == "blocked" or report.bot_wall:
+        # A bot wall never reaches the submit path, so `submit_state` stays "dry-run" — and the UI
+        # advertises any dry-run row as "ready to apply". A posting we were REFUSED on is parked
+        # `blocked` instead, so it sits in the retry-later queue, not the ready queue (decision 077).
         status = "blocked"
     else:
         status = "dry-run"
@@ -2864,6 +3128,10 @@ def _record_run(report: ApplyReport, resume_pdf: str, role: str, company: str,
     detail = (f"{what}: {len(report.filled)} field(s) filled "
               f"({native} native, {drafted} AI-drafted); {len(report.skipped)} need attention."
               + blocked + src_note)
+    if report.bot_wall and not report.submitted:
+        # Not a dry-run of the form — none was served. Say what actually happened (Guideline #11).
+        detail = (f"Refused by {report.bot_wall}: the site blocked automated access, so the form "
+                  "was never shown and nothing was filled. Retryable later." + src_note)
 
     existing = tracker.find_by_source_url(source_url)
     if existing:
@@ -2969,11 +3237,12 @@ def run_apply(
     # The Workday agentic fallback (decision 061) needs the browser to expose a CDP endpoint the
     # Playwright-MCP worker attaches to. Only opened for a Workday run with the fallback armed
     # (`workday_agentic: true` in profile/safety.yaml); recipe replay works without it.
-    wd_agentic = False
-    if ats == "workday":
-        from . import workday as _workday
-        wd_agentic = _workday.agentic_enabled()
-    cdp_port = _workday._free_port() if wd_agentic else None
+    # The agentic nav fallback (decision 076) needs the same endpoint when it's armed for a
+    # non-Workday posting whose form we can't reach deterministically.
+    from . import workday as _workday
+    wd_agentic = _workday.agentic_enabled() if ats == "workday" else False
+    nav_agentic = nav_agentic_enabled() if ats != "workday" else False
+    cdp_port = _workday._free_port() if (wd_agentic or nav_agentic) else None
 
     with sync_playwright() as pw:
         launch_kwargs = {"headless": not headed, "slow_mo": slow_mo}
@@ -3023,7 +3292,23 @@ def run_apply(
                     resume_pdf=resume_pdf, mailbox_config=mailbox.load_config(),
                     resolver=resolver, agentic=wd_agentic, cdp_port=cdp_port, gate=gate)
             else:
-                form_loaded, frame, ats = _open_application_form(page, ats, report)
+                form_loaded, frame, ats = _open_application_form(page, ats, report, url_hint=url)
+                if not form_loaded and not report.bot_wall:
+                    # The deterministic reveal + every learned recipe failed. A bot wall is
+                    # EXCLUDED: the agent drives this same browser from this same IP into the
+                    # identical wall, so it would spend a Claude call to fail — and aiming an agent
+                    # at a bot wall is evasion (Guideline #4).
+                    if nav_agentic:
+                        if run_agent_nav(page, url, report, cdp_port=cdp_port):
+                            frame, _ = _find_form_frame(page)
+                            ats = _ats_from_frame(frame, ats)
+                            form_loaded = True
+                    else:
+                        report.errors.append(
+                            "ApplicationBot doesn't know how this site reveals its application form. "
+                            "Set `nav_agentic: true` in profile/safety.yaml to let a Claude worker "
+                            "open it once and learn the route for every later posting on this site."
+                        )
                 report.ats = ats  # re-derived from the form's frame (e.g. greenhouse embedded on stripe.com)
 
                 # Role + company from the page title: grounds Claude-drafted answers AND labels

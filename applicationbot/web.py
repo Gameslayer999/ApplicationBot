@@ -922,6 +922,31 @@ def queue_watch(app_id: int) -> dict:
     return start_reapply(app_id, arm=False)
 
 
+def _merge_checkbox_groups(filled: list[dict]) -> list[dict]:
+    """Fold a check-all-that-apply group's per-option rows into ONE answer row.
+
+    `_fill_checkboxes` reports each checked option separately (label repeated, control
+    "checkbox"), which the panel would show as the same question several times — and each
+    edit box would save to the same label, so only the last would survive. Joined with "; ",
+    the exact format `_fill_checkboxes` splits when it re-fills the form."""
+    out: list[dict] = []
+    at: dict[str, int] = {}
+    for f in filled:
+        label = f.get("label", "")
+        if f.get("control") != "checkbox" or label not in at:
+            if f.get("control") == "checkbox":
+                at[label] = len(out)
+            out.append(f)
+            continue
+        row = out[at[label]]
+        parts = [p for p in str(row.get("value", "")).split("; ") if p]
+        v = str(f.get("value", ""))
+        if v and v not in parts:
+            parts.append(v)
+        row["value"] = "; ".join(parts)
+    return out
+
+
 def _review_data(app_id: int) -> dict | None:
     """Everything the "Review before you apply" panel shows for one prepared application, joined
     by app id: the posting metadata from the tracker, and the exact fill outcome (field values
@@ -936,12 +961,17 @@ def _review_data(app_id: int) -> dict | None:
     adir = archive.dir_for(a["company"], a["role"], a["source_url"])
     filled: list[dict] = []
     skipped: list[str] = []
+    captured: dict = {}
     when = ""
     rj = adir / "report.json"
     if rj.is_file():
         try:
             data = json.loads(rj.read_text(encoding="utf-8"))
             filled = data.get("filled", []) or []
+            captured = data.get("captured", {}) or {}
+            # A check-all-that-apply group is reported one row per CHECKED option; the panel edits
+            # the question once, so fold them into a single "A; B" answer (the format the fill splits).
+            filled = _merge_checkbox_groups(filled)
             # A file-upload answer's value is the local PDF path we upload — show just the file
             # name in the preview (the full path is noise; the résumé button opens the file).
             for f in filled:
@@ -988,6 +1018,11 @@ def _review_data(app_id: int) -> dict | None:
         seen_labels.add(k)
         unanswered.append({"label": label.strip(), "detail": detail.strip(),
                            "value": by_key.get(k, ""), "edited": k in by_key})
+    # The control each answer came from, so the panel recreates it (checkbox group → checkboxes).
+    for row in filled + unanswered:
+        meta = captured.get(row.get("label", "")) or {}
+        if meta.get("options"):
+            row["kind"], row["options"] = meta.get("kind", ""), meta["options"]
     rp = a.get("resume_path", "")
     has_resume = bool(rp) and Path(rp).suffix.lower() == ".pdf" and Path(rp).is_file()
     return {
@@ -1013,7 +1048,11 @@ def save_answers(app_id: int, answers: dict) -> dict:
 
     Stored against the posting, not the form: the next fill of this application — the dry-run
     re-fill, "Watch it fill", and the real submit alike — resolves these labels to these values.
-    A blank value clears that edit, so the bot answers the field from the profile again."""
+    A blank value clears that edit, so the bot answers the field from the profile again.
+
+    Reusable answers are ALSO taught to the shared answer bank (decision 155), so a question the
+    user fixed here is answered the same way on every future posting instead of coming back
+    blank or wrong. See `_learn_reviewed_answers` for which edits qualify."""
     a = tracker.get_application(app_id)
     if not a:
         return {"ok": False, "error": "That application is no longer in the tracker."}
@@ -1024,7 +1063,72 @@ def save_answers(app_id: int, answers: dict) -> dict:
         saved = answer_overrides.save(a["company"], a["role"], a["source_url"], answers)
     except OSError as e:
         return {"ok": False, "error": f"Could not write the edited answers: {e}"}
-    return {"ok": True, "saved": len(saved)}
+    out = {"ok": True, "saved": len(saved)}
+    try:
+        out.update(_learn_reviewed_answers(answers, _captured_controls(a)))
+    except (OSError, ValueError) as e:
+        # The posting override IS saved (this application will submit the edits); only the
+        # cross-application learning failed — say exactly that instead of a false success.
+        out.update({"learned": 0, "posting_only": 0, "profile_owned": [],
+                    "learn_error": f"Saved for this posting, but could not add the answers to "
+                                   f"your answer bank: {e}"})
+    return out
+
+
+def _captured_controls(a: dict) -> dict:
+    """The {kind, options} the last fill recorded per question for this posting, from its archived
+    report — so an answer learned here keeps the control it was asked in. {} if unavailable."""
+    from . import archive
+    rj = archive.dir_for(a.get("company", ""), a.get("role", ""), a.get("source_url", "")) / "report.json"
+    try:
+        return json.loads(rj.read_text(encoding="utf-8")).get("captured", {}) or {}
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
+def _learn_reviewed_answers(edits: dict, controls: dict | None = None) -> dict:
+    """Teach the shared answer bank the answers the user edited in a review panel, so the NEXT
+    posting asking the same question is answered with what they typed instead of being left
+    blank or repeating an answer they rejected (decision 155). Each edit lands in one bucket:
+
+      learned      — a reusable question: banked, overwriting the blank entry autofill captured
+                     or the answer the user replaced. Future applications reuse it.
+      profile_owned— a structured profile rule already answers this label (email, work
+                     authorization, start date…), and those rules outrank the bank — banking it
+                     would change nothing, so the edit stays per-posting and the user is told
+                     where the answer actually lives.
+      posting_only — company-specific ("Why us?") or demographic/EEO: never shared across
+                     employers, so it stays on this posting alone.
+
+    Returns those buckets (counts, plus the profile-owned labels to name in the UI). `controls`
+    carries each question's form control ({kind, options}) into the bank, so a check-all-that-apply
+    answer learned here is editable as checkboxes in the profile, not as a text box.
+    """
+    from . import answer_bank
+
+    learned: dict[str, str] = {}
+    profile_owned: list[str] = []
+    posting_only = 0
+    resolver = None
+    try:
+        from .apply import AnswerResolver
+        resolver = AnswerResolver(resume=load_resume("profile/resume.yaml"),
+                                  profile=apply_profile.load_profile())
+    except Exception:
+        resolver = None  # no résumé/profile yet — bank every reusable edit rather than none
+    for label, value in (edits or {}).items():
+        label, value = str(label).strip(), str(value if value is not None else "").strip()
+        if not (label and value):
+            continue  # a cleared edit only drops this posting's override
+        if not answer_bank.is_reusable_answer(label):
+            posting_only += 1
+        elif resolver is not None and resolver.banked_qa(label) is None \
+                and resolver.resolve(label) is not None:
+            profile_owned.append(label)
+        else:
+            learned[label] = value
+    written = apply_profile.upsert_answers(learned, meta=controls) if learned else 0
+    return {"learned": written, "profile_owned": profile_owned[:3], "posting_only": posting_only}
 
 
 def test_aggregators(data: dict | None) -> dict:
@@ -2360,6 +2464,16 @@ INDEX_HTML = """<!doctype html>
     border-radius:99px; padding:2px 9px; white-space:nowrap; margin-top:1px; }
   .qa-q { flex:1; font-weight:600; font-size:14px; line-height:1.35; }
   .card.qa-open textarea.qa-a { min-height:56px; }
+  /* Check-all-that-apply questions: every captured option as a checkbox, not a single-pick dropdown. */
+  /* Instruction copy, not a value — always the UI font, even in the Review panel's mono cells. */
+  .qa-multihint { font-size:11.5px; color:var(--muted); margin-bottom:5px;
+    font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif; }
+  .qa-multi { display:grid; grid-template-columns:repeat(auto-fill, minmax(190px, 1fr)); gap:2px 12px;
+    max-height:210px; overflow-y:auto; border:1px solid var(--line); border-radius:8px;
+    padding:8px 10px; background:var(--field); }
+  .qa-multi label.qa-opt { display:flex; align-items:center; gap:7px; font-size:13px; line-height:1.3;
+    cursor:pointer; margin:0; text-transform:none; letter-spacing:0; font-weight:400; color:var(--ink); }
+  .qa-multi label.qa-opt input[type=checkbox] { width:auto; flex:none; margin:0; padding:0; }
   .card.qa-open .del { top:8px; right:8px; }
   /* Answered / auto-handled: compact two-column grid of collapsed cards to use the width. */
   .qa-answered { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
@@ -3928,7 +4042,7 @@ function renderReview(panel, r, title, signoff) {
     text:"Answers it will submit (" + filled.length + ")"}));
   if (filled.length) {
     const tbl = el("table", {class:"rv-fields"});
-    filled.forEach(f => tbl.appendChild(answerRow(f.label, f.value, f.control, f.edited, edits)));
+    filled.forEach(f => tbl.appendChild(answerRow(f.label, f.value, f.control, f.edited, edits, false, f)));
     fieldWrap.appendChild(tbl);
   } else {
     fieldWrap.appendChild(el("div", {class:"rv-note",
@@ -3942,20 +4056,22 @@ function renderReview(panel, r, title, signoff) {
       text:"Needs attention — unanswered (" + open + " of " + unanswered.length + ")"}));
     const tbl = el("table", {class:"rv-fields"});
     unanswered.forEach(u => tbl.appendChild(
-      answerRow(u.label, u.value, u.detail, u.edited, edits, true)));
+      answerRow(u.label, u.value, u.detail, u.edited, edits, true, u)));
     fieldWrap.appendChild(tbl);
   }
   if (edits.length) {
     const status = el("span", {class:"rv-note"});
     const save = el("button", {class:"rv-btn", type:"button", text:"Save answers",
-      title:"Save your edits — the next fill of this application submits these values",
+      title:"Save your edits — the next fill of this application submits these values, and "
+          + "reusable answers are added to your answer bank",
       on:{click:()=>saveAnswers(r.id)}});
     REVIEW_EDITS[r.id] = {edits: edits, btn: save, status: status};
     fieldWrap.appendChild(el("div", {class:"rv-acts rv-save"}, [save, status]));
     fieldWrap.appendChild(el("div", {class:"rv-note",
       text:"Edit any answer above — it replaces the bot's own answer the next time this "
-         + "application is filled, including the real submit. Unsaved edits are saved for you "
-         + "when you click Watch it fill or Apply."}));
+         + "application is filled, including the real submit, and reusable answers are added to "
+         + "your answer bank so future applications don't ask again. Unsaved edits are saved for "
+         + "you when you click Watch it fill or Apply."}));
   }
   panel.appendChild(fieldWrap);
 
@@ -3979,21 +4095,31 @@ function renderReview(panel, r, title, signoff) {
 const REVIEW_EDITS = {};
 
 // One answer row: the label (plus how it was filled, or why it wasn't) and an input holding the
-// value that will be submitted. The résumé upload is not editable — the file is the answer.
-function answerRow(label, value, note, edited, edits, isBlank) {
+// value that will be submitted. A check-all-that-apply question gets the same checkbox widget the
+// Profile screen uses — the answer is multi-valued there, so it must be here too. The résumé
+// upload is not editable — the file is the answer.
+function answerRow(label, value, note, edited, edits, isBlank, row) {
   const v = (value == null) ? "" : String(value);
   if (note === "file") return el("tr", {}, [
     el("td", {class:"rv-fl", text:label || "—"}),
     el("td", {class:"rv-fv", text:v || "—"})]);
-  const long = v.length > 60;
-  const inp = long ? el("textarea", {class:"rv-edit", rows:"3", value:v})
-                   : el("input", {class:"rv-edit", type:"text", value:v});
-  inp.placeholder = isBlank ? "Type the answer to submit…" : "";
+  row = row || {};
+  let cell, inp;
+  if (isMultiAnswer(row.kind, row.options)) {
+    const w = multiCheckboxes(row.options, v);
+    cell = w.node; inp = w.hidden;
+  } else {
+    const long = v.length > 60;
+    inp = long ? el("textarea", {class:"rv-edit", rows:"3", value:v})
+               : el("input", {class:"rv-edit", type:"text", value:v});
+    inp.placeholder = isBlank ? "Type the answer to submit…" : "";
+    cell = inp;
+  }
   edits.push({label: label, inp: inp, initial: v});
   const marks = [el("div", {text: label || "—"})];
   if (edited) marks.push(el("span", {class:"rv-edited", text:"your edit"}));
   else if (note && note !== "text") marks.push(el("span", {class:"rv-ctl", text:note}));
-  return el("tr", {}, [el("td", {class:"rv-fl"}, marks), el("td", {class:"rv-fv"}, [inp])]);
+  return el("tr", {}, [el("td", {class:"rv-fl"}, marks), el("td", {class:"rv-fv"}, [cell])]);
 }
 
 // Save a review panel's changed answers. `quiet` = the pre-submit auto-save (no "nothing to
@@ -4024,9 +4150,26 @@ async function saveAnswers(id, quiet) {
       return {ok:false, changed:0};
     }
     st.edits.forEach(e => { e.initial = e.inp.value; });
-    st.status.className = "rv-note rv-ok";
-    st.status.textContent = "Saved ✓ — " + n + " edited answer" + (n === 1 ? "" : "s")
+    st.status.className = r.learn_error ? "rv-note rv-err" : "rv-note rv-ok";
+    // Say what was saved AND what was learned — an edit the bot can't reuse (company-specific,
+    // EEO, or a field your profile owns) must not read as "learned" (UI Principle #5).
+    let msg = "Saved ✓ — " + n + " edited answer" + (n === 1 ? "" : "s")
       + " will be submitted instead of the bot's.";
+    if (r.learned) msg += " " + r.learned + " saved to your answer bank — future applications "
+      + "asking " + (r.learned === 1 ? "it" : "them") + " are answered this way.";
+    if (r.posting_only) msg += " " + r.posting_only + " kept for this posting only "
+      + "(company-specific and EEO answers are never reused).";
+    if (r.learn_error) msg += " " + r.learn_error;
+    st.status.textContent = msg;
+    const owned = r.profile_owned || [];
+    if (owned.length) {
+      st.status.appendChild(el("span", {text:" " + owned.join(", ")
+        + (owned.length === 1 ? " is" : " are") + " answered from your apply profile, which "
+        + "outranks the answer bank — this edit applies to this posting only. "}));
+      st.status.appendChild(el("a", {href:"#", text:"Change it in Profile →",
+        on:{click:(ev)=>{ ev.preventDefault();
+          const t = document.querySelector('.tab[data-view="profile"]'); if (t) t.click(); }}}));
+    }
     return {ok:true, changed:n};
   } catch (e) {
     st.btn.disabled = false; st.btn.textContent = label;
@@ -5516,10 +5659,47 @@ function qaHidden(qa) {
     el("input", {type:"hidden", "data-k":"options", value: JSON.stringify(qa.options||[])}),
   ];
 }
-// The answer input, recreated as the form's real control: a dropdown when the field had options
-// (so the answer matches at fill time), else a free-text box.
+// ---- Check-all-that-apply answers (shared by the Profile screen and the Review panel) ----
+// A question that takes MORE THAN ONE answer: captured from a checkbox GROUP — several checkboxes
+// under one question ("Language Skill(s) (Check all that apply)"). Rendering it as a single-choice
+// dropdown or one text box loses every answer but one, so BOTH editors use the widget below.
+const isMultiAnswer = (kind, options) => (kind||"") === "checkbox" &&
+  (Array.isArray(options) ? options.filter(Boolean).length : 0) > 1;
+// Multi answers live in one string, "; "-joined — the format the form-fill splits on to tick each box.
+const splitMulti = v => (v||"").split(";").map(s => s.trim()).filter(Boolean);
+// One checkbox per captured option, mirrored into a hidden input so every caller reads the answer
+// from `.value` exactly like a text box. Returns {node, hidden}.
+function multiCheckboxes(options, value) {
+  const opts = options.filter(Boolean);
+  const chosen = new Set(splitMulti(value));
+  const hidden = el("input", {type:"hidden", value: value||""});
+  const box = el("div", {class:"qa-multi"});
+  const sync = () => { hidden.value = [...box.querySelectorAll("input:checked")].map(i => i.value).join("; "); };
+  const add = (v, label, checked) => {
+    const cb = el("input", {type:"checkbox", value:v, on:{change:sync}});
+    cb.checked = checked;
+    box.appendChild(el("label", {class:"qa-opt"}, [cb, el("span", {text:label})]));
+  };
+  opts.forEach(o => add(o, o, chosen.has(o)));
+  // A stored answer whose option the form no longer offers still shows, so it is never silently dropped.
+  splitMulti(value).filter(v => !opts.includes(v)).forEach(v => add(v, v + " (not in this form)", true));
+  return {node: el("div", {}, [
+    el("div", {class:"qa-multihint", text:"Check every option that applies — all checked answers get selected on the form."}),
+    box, hidden]), hidden: hidden};
+}
+// Profile-screen wrapper: the same widget, with the hidden field named for the save round-trip.
+function qaMultiInput(qa, cls, opts) {
+  const w = multiCheckboxes(opts, qa.answer);
+  w.hidden.setAttribute("data-k", "answer");
+  w.node.className = cls;
+  return w.node;
+}
+// The answer input, recreated as the form's real control: checkboxes when the form had a
+// check-all-that-apply group, a dropdown when the field had options (so the answer matches at
+// fill time), else a free-text box.
 function qaAnswerInput(qa, cls) {
   const opts = Array.isArray(qa.options) ? qa.options.filter(Boolean) : [];
+  if (isMultiAnswer(qa.input_kind, qa.options)) return qaMultiInput(qa, cls, opts);
   if (opts.length) {
     const list = [["","— choose an option —"]].concat(opts.map(o => [o, o]));
     if ((qa.answer||"") && !opts.includes(qa.answer)) list.push([qa.answer, qa.answer]);  // keep a stored value

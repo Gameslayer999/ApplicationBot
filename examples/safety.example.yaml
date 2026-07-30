@@ -10,3 +10,13 @@ armed: false
 
 # Hard cap on real submissions in one run, even while armed.
 max_submissions_per_run: 10
+
+# Agentic fallbacks (decisions 061/076) — both OFF by default because they spend Claude tokens.
+# Each one learns a site ONCE and stores a reusable recipe; replaying what is already learned is
+# always on and free.
+#   nav_agentic     — a Claude worker opens the application form on a site whose reveal button uses
+#                     wording ApplicationBot doesn't know ("Join our team"). It is forbidden to fill,
+#                     upload, or submit, and is never aimed at a site that blocked automated access.
+#   workday_agentic — a Claude worker fills a Workday tenant's unrecognized custom fields.
+nav_agentic: false
+workday_agentic: false
