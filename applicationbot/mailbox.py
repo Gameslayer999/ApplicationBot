@@ -346,11 +346,18 @@ def test_connection(config: MailboxConfig, *, _connect=None) -> "tuple[bool, str
     return True, f"Connected to {config.host} as {config.email}."
 
 
-def extract_verification(body: str, *, hints=_LINK_HINTS) -> str:
+def extract_verification(body: str, *, hints=_LINK_HINTS, prefer_code: bool = False) -> str:
     """The verification link (preferring one whose URL mentions a hint word) or, failing that, a
-    6–8 digit code, from an email body. '' if neither is present."""
+    6–8 digit code, from an email body. '' if neither is present.
+
+    `prefer_code` flips the order for senders whose email is a **code** sign-in but still carries
+    verify-ish links (MyGreenhouse, decision 182): take the digits, never the link."""
     if not body:
         return ""
+    if prefer_code:
+        m = _CODE_RE.search(body)
+        if m:
+            return m.group(1)
     links = _LINK_RE.findall(body)
     for link in links:
         low = link.lower()
@@ -611,7 +618,38 @@ def fetch_messages(config: MailboxConfig, *, limit: int = 50, newer_than_days: i
             pass
 
 
+def _sent_epoch(msg) -> Optional[float]:
+    """When an email.message.Message was sent, as a POSIX timestamp — None if its Date header is
+    missing or unparseable."""
+    from datetime import timezone
+    from email.utils import parsedate_to_datetime
+
+    try:
+        dt = parsedate_to_datetime(msg.get("Date") or "")
+        if dt is None:
+            return None
+        if dt.tzinfo is None:
+            # RFC 2822 "-0000" (an unknown offset) parses to a NAIVE datetime, and .timestamp()
+            # would then read it as local time — shifting the send time by the machine's UTC
+            # offset and letting a stale code look fresh. Those headers are UTC in practice.
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except Exception:
+        return None
+
+
+def _stale(sent: Optional[float], since_epoch: Optional[float]) -> bool:
+    """True when a message must be skipped as older than the code we're waiting for. With no
+    `since_epoch` nothing is stale (Workday's account-creation flow, decision 053). With one, a
+    message of unknown age is treated as stale: a login code is only ever valid if it arrived
+    AFTER we asked for it, and replaying a previous code fails the sign-in silently (decision 182)."""
+    if since_epoch is None:
+        return False
+    return sent is None or sent < since_epoch
+
+
 def _gmail_fetch_verification(config: MailboxConfig, *, sender_contains: str = "workday",
+                              since_epoch: Optional[float] = None, prefer_code: bool = False,
                               _token=None, _get=None) -> str:
     """OAuth read: newest-first, return the verification link/code from the most recent Gmail
     message whose From matches `sender_contains`. '' if none. Never raises (returns '' on error)."""
@@ -633,21 +671,33 @@ def _gmail_fetch_verification(config: MailboxConfig, *, sender_contains: str = "
             msg = email_mod.message_from_bytes(raw)
         except Exception:
             continue
-        v = extract_verification(_body_text(msg))
+        # Gmail's own internalDate (ms) is authoritative for arrival time; fall back to the header.
+        try:
+            sent = float(full["internalDate"]) / 1000.0
+        except Exception:
+            sent = _sent_epoch(msg)
+        if _stale(sent, since_epoch):
+            continue
+        v = extract_verification(_body_text(msg), prefer_code=prefer_code)
         if v:
             return v
     return ""
 
 
 def fetch_verification(config: MailboxConfig, *, sender_contains: str = "workday",
-                       mailbox: str = "INBOX", _connect=_connect_imap) -> str:
+                       mailbox: str = "INBOX", since_epoch: Optional[float] = None,
+                       prefer_code: bool = False, _connect=_connect_imap) -> str:
     """One pass, newest-first: the verification link/code from the most recent message whose From
     matches `sender_contains`. '' if none. Never raises. OAuth reads via the Gmail REST API; a
-    password/env link reads via IMAP."""
+    password/env link reads via IMAP.
+
+    `since_epoch` (POSIX seconds) skips anything sent earlier — pass the moment you triggered the
+    send so a previous code can never be replayed. `prefer_code` takes the digits over a link."""
     import email as email_mod
 
     if config.auth == "oauth":
-        return _gmail_fetch_verification(config, sender_contains=sender_contains)
+        return _gmail_fetch_verification(config, sender_contains=sender_contains,
+                                         since_epoch=since_epoch, prefer_code=prefer_code)
     try:
         m = _connect(config)
     except Exception:
@@ -666,7 +716,9 @@ def fetch_verification(config: MailboxConfig, *, sender_contains: str = "workday
             frm = (msg.get("From") or "").lower()
             if sender_contains and sender_contains.lower() not in frm:
                 continue
-            v = extract_verification(_body_text(msg))
+            if _stale(_sent_epoch(msg), since_epoch):
+                continue
+            v = extract_verification(_body_text(msg), prefer_code=prefer_code)
             if v:
                 return v
         return ""
@@ -680,11 +732,15 @@ def fetch_verification(config: MailboxConfig, *, sender_contains: str = "workday
 
 
 def wait_for_verification(config: MailboxConfig, *, sender_contains: str = "workday",
-                          timeout: int = 120, poll: int = 5, _connect=_connect_imap,
+                          timeout: int = 120, poll: int = 5, since_epoch: Optional[float] = None,
+                          prefer_code: bool = False, _connect=_connect_imap,
                           _sleep=time.sleep, _fetch=None) -> str:
     """Poll the inbox until a matching verification link/code arrives or `timeout` elapses.
-    Returns '' on timeout. `_fetch`/`_sleep` injectable for tests."""
-    fetch = _fetch or (lambda: fetch_verification(config, sender_contains=sender_contains, _connect=_connect))
+    Returns '' on timeout. `since_epoch`/`prefer_code` pass through to `fetch_verification`.
+    `_fetch`/`_sleep` injectable for tests."""
+    fetch = _fetch or (lambda: fetch_verification(config, sender_contains=sender_contains,
+                                                  since_epoch=since_epoch, prefer_code=prefer_code,
+                                                  _connect=_connect))
     waited = 0
     while True:
         v = fetch()

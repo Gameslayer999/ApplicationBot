@@ -41,6 +41,18 @@ top_n: 10                 # how many keyword-ranked survivors Claude judges for 
 min_fit: 50               # only follow through (dry-run/apply) on matches Claude scores >= this
                           # (0-100). Raise toward 70-80 to apply only to close-fit roles.
 
+# Which résumé the auto-apply loop sends with each application (decision 178). Edited in the UI
+# under the loop panel's "⚙ Loop settings"; these defaults are the long-standing behaviour.
+tailor_mode: smart        # smart  = tailor with Claude, reusing an earlier tailored résumé when a
+                          #          new posting demands the same skills (no second Claude call)
+                          # always = re-tailor from scratch every time (spends Claude every posting)
+                          # under  = tailor only when the fit score is below `tailor_below_fit`;
+                          #          at or above it your résumé already fits, so it is sent as-is
+                          # never  = never tailor — send your résumé as-is, no Claude call
+tailor_below_fit: 70      # the `under` threshold (0-100)
+reuse_threshold: 0.9      # how similar two postings' demanded skills must be (0-1) before an
+                          # already-tailored résumé is reused. Higher = stricter; 0 never reuses.
+
 # keywords: []            # optional aggregator search terms; empty = derive from your résumé
 
 # Early-career feeds (GitHub job boards: SimplifyJobs new-grad + internship lists) — great when

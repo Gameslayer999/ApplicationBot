@@ -96,9 +96,9 @@ def test_review_panel_edits_multi_answers_as_checkboxes_and_learns_them(ui):
         page.reload()
         page.click('.tab[data-view="discover"]')
         page.click("#loop-ready .pkcard .review-toggle")
-        page.wait_for_selector("#loop-ready .review .qa-multi", timeout=10_000)
+        page.wait_for_selector("#review-panel .qa-multi", timeout=10_000)
 
-        grids = page.query_selector_all("#loop-ready .review .qa-multi")
+        grids = page.query_selector_all("#review-panel .qa-multi")
         assert len(grids) == 2, "both the answered and the unanswered group render as checkboxes"
         # The answered group: every option offered, the two it filled already checked.
         assert [(o.inner_text() or "").strip() for o in grids[0].query_selector_all(".qa-opt")] == LANG_OPTS
@@ -109,8 +109,8 @@ def test_review_panel_edits_multi_answers_as_checkboxes_and_learns_them(ui):
         shifts[0].check()
         shifts[2].check()
         grids[0].query_selector_all('input[type="checkbox"]')[2].check()   # + French
-        page.click("#loop-ready .review .rv-save button")
-        page.wait_for_selector("#loop-ready .review .rv-note.rv-ok", timeout=10_000)
+        page.click("#review-panel .rv-save button")
+        page.wait_for_selector("#review-panel .rv-note.rv-ok", timeout=10_000)
 
         assert answer_overrides.load(*KEY) == {
             LANG_Q: "English (ENG); Spanish (SPA); French (FRA)",

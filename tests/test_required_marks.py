@@ -145,10 +145,10 @@ def test_review_panel_badges_required_and_optional_and_offers_a_rescan(ui):
         page.reload()
         page.click('.tab[data-view="discover"]')
         page.click("#loop-ready .pkcard .review-toggle")
-        page.wait_for_selector("#loop-ready .review .rv-fields", timeout=10_000)
+        page.wait_for_selector("#review-panel .rv-fields", timeout=10_000)
 
         rows = {}
-        for tr in page.query_selector_all("#loop-ready .review .rv-fields tr"):
+        for tr in page.query_selector_all("#review-panel .rv-fields tr"):
             label = tr.query_selector(".rv-fl div").inner_text().strip()
             rows[label] = [b.inner_text().strip() for b in tr.query_selector_all(".rv-req, .rv-opt")]
         assert rows["Full name"] == ["Required"]
@@ -156,10 +156,10 @@ def test_review_panel_badges_required_and_optional_and_offers_a_rescan(ui):
         assert rows[WHY] == ["Required"]
         assert rows["Portfolio link"] == []           # the form never said — no badge, no guess
         # The counts, and the fact that an unanswered REQUIRED field is what blocks a submit.
-        body = page.inner_text("#loop-ready .review")
+        body = page.inner_text("#review-panel")
         assert "2 required · 2 optional · 1 the form didn't mark" in body
         assert "1 required, which block a real submit" in body
-        assert page.query_selector("#loop-ready .review .rv-rescan button").inner_text() \
+        assert page.query_selector("#review-panel .rv-rescan button").inner_text() \
             .strip() == "Rescan questions"
         assert errors == []
         browser.close()
@@ -174,9 +174,11 @@ def test_rescan_button_refreshes_the_panel_from_the_new_report(ui, monkeypatch):
 
     rescanned: list[int] = []
 
-    def fake_rescan(app_id: int) -> dict:
+    def fake_rescan(app_id: int, retailor: bool = False) -> dict:
         """Stand in for the headless dry-run: rewrite the archive the way a real re-fill would —
         a question that has since become required, and one that has gone away."""
+        # "Rescan questions" re-reads the form; re-tailoring is the OTHER button (decision 180).
+        assert retailor is False
         rescanned.append(app_id)
         fresh = dict(REPORT)
         fresh["when"] = "2026-07-30T18:30:00"
@@ -200,12 +202,12 @@ def test_rescan_button_refreshes_the_panel_from_the_new_report(ui, monkeypatch):
         page.reload()
         page.click('.tab[data-view="discover"]')
         page.click("#loop-ready .pkcard .review-toggle")
-        page.wait_for_selector("#loop-ready .review .rv-rescan button", timeout=10_000)
-        page.click("#loop-ready .review .rv-rescan button")
-        page.wait_for_selector("#loop-ready .review .rv-rescan .rv-note.rv-ok", timeout=20_000)
+        page.wait_for_selector("#review-panel .rv-rescan button", timeout=10_000)
+        page.click("#review-panel .rv-rescan button")
+        page.wait_for_selector("#review-panel .rv-rescan .rv-note.rv-ok", timeout=20_000)
 
         assert rescanned == [READY["id"]]
-        body = page.inner_text("#loop-ready .review")
+        body = page.inner_text("#review-panel")
         assert "Rescanned ✓ — 2 answer(s) ready, 1 unanswered." in body
         assert "Start date" in body and WHY not in body   # the panel shows the NEW question set
         assert "3 required · 0 optional" in body          # …and its refreshed required marks

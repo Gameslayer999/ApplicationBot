@@ -7,9 +7,9 @@
 # Safe to re-run in any state. macOS/Linux; Windows users run scripts\run.bat.
 #
 # Usage:
-#   ./scripts/run.sh            # browser tab on http://127.0.0.1:8000
+#   ./scripts/run.sh            # serve http://127.0.0.1:8000 (no browser is opened — reload your tab)
 #   ./scripts/run.sh 9000       # choose a port
-#   ./scripts/run.sh --window   # standalone desktop window (native, not a browser tab)
+#   ./scripts/run.sh --window   # standalone desktop window (native; this one does open a window)
 #   ./scripts/run.sh --dev      # auto-reload on code changes (dev mode)
 #   ./scripts/run.sh --window --dev   # desktop window that reloads on code changes
 #
@@ -110,13 +110,8 @@ else
   echo "→ ApplicationBot v${VERSION} — starting at ${URL}  (Ctrl-C to stop)"
 fi
 
-# Open the browser shortly after the server comes up (macOS `open` / Linux `xdg-open`).
-(
-  sleep 1
-  if command -v open >/dev/null 2>&1; then open "$URL"
-  elif command -v xdg-open >/dev/null 2>&1; then xdg-open "$URL"
-  fi
-) >/dev/null 2>&1 &
+# No browser is opened: the server just serves ${URL}, so an already-open tab picks the new
+# process up on reload. Want a window of its own? Use --window.
 
 # Foreground so this terminal owns the process and Ctrl-C stops it. In --dev, the supervisor
 # watches applicationbot/ and restarts the server on every edit (browser refreshes itself).

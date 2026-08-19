@@ -125,7 +125,7 @@ def _open_review(page, url):
     page.reload()
     page.click('.tab[data-view="discover"]')
     page.click("#loop-ready .pkcard .review-toggle")
-    page.wait_for_selector("#loop-ready .review .rv-fields", timeout=10_000)
+    page.wait_for_selector("#review-panel .rv-fields", timeout=10_000)
 
 
 def test_review_panel_edits_a_dropdown_answer_as_a_dropdown(ui):
@@ -139,7 +139,7 @@ def test_review_panel_edits_a_dropdown_answer_as_a_dropdown(ui):
         _open_review(page, ui)
 
         rows = {tr.query_selector(".rv-fl div").inner_text().strip(): tr
-                for tr in page.query_selector_all("#loop-ready .review .rv-fields tr")}
+                for tr in page.query_selector_all("#review-panel .rv-fields tr")}
         # An ANSWERED dropdown is a <select> holding its current answer, offering the form's list.
         gender = rows["Gender"].query_selector("select")
         assert gender is not None, "an answered dropdown must not be edited as a text box"
@@ -156,8 +156,8 @@ def test_review_panel_edits_a_dropdown_answer_as_a_dropdown(ui):
 
         gender.select_option("Decline to self-identify")
         rows["Veteran status"].query_selector("select").select_option("I am not a veteran")
-        page.click("#loop-ready .review .rv-save button")
-        page.wait_for_selector("#loop-ready .review .rv-save .rv-note.rv-ok", timeout=10_000)
+        page.click("#review-panel .rv-save button")
+        page.wait_for_selector("#review-panel .rv-save .rv-note.rv-ok", timeout=10_000)
 
         assert answer_overrides.load(*KEY) == {"Gender": "Decline to self-identify",
                                               "Veteran status": "I am not a veteran"}
@@ -177,14 +177,14 @@ def test_dropdown_editor_can_still_type_a_value_the_captured_list_lacks(ui):
         page.on("pageerror", lambda e: errors.append(str(e)))
         _open_review(page, ui)
 
-        row = [tr for tr in page.query_selector_all("#loop-ready .review .rv-fields tr")
+        row = [tr for tr in page.query_selector_all("#review-panel .rv-fields tr")
                if tr.query_selector(".rv-fl div").inner_text().strip() == "Gender"][0]
         row.query_selector("select").select_option("__applicationbot_type_your_own__")
-        page.wait_for_selector("#loop-ready .review .rv-fields tr .rv-choice-back", timeout=5_000)
+        page.wait_for_selector("#review-panel .rv-fields tr .rv-choice-back", timeout=5_000)
         box = row.query_selector('input[type="text"]')
         box.fill("Non-binary")
-        page.click("#loop-ready .review .rv-save button")
-        page.wait_for_selector("#loop-ready .review .rv-save .rv-note.rv-ok", timeout=10_000)
+        page.click("#review-panel .rv-save button")
+        page.wait_for_selector("#review-panel .rv-save .rv-note.rv-ok", timeout=10_000)
 
         assert answer_overrides.load(*KEY) == {"Gender": "Non-binary"}
         # …and the way back to the form's own options is one click.

@@ -19,6 +19,7 @@ from __future__ import annotations
 import difflib
 import json
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
@@ -40,6 +41,8 @@ class FilledField:
     value: str
     control: str = "text"  # text | select | combobox | radio | file
     source: str = "resolver"  # resolver | native (ATS autofill) | generated (Claude draft) |
+    #                           derived (Claude read it out of the applicant's own data —
+    #                           decision 187; the user should see these, they were inferred) |
     #                           option:<tier> (combobox: literal/learned/hint/claude/substring —
     #                           how the option matched, the determinism audit trail)
 
@@ -101,7 +104,9 @@ class ApplyReport:
             lines.append(f"  submit control (not clicked): {self.submit_probe}")
         if self.native_autofill:
             lines.append(f"  native autofill: {self.native_autofill} — {native} field(s) prefilled")
-        breakdown = f"{native} native, {generated} AI-drafted, {len(self.filled) - native - generated} banked/direct"
+        derived = sum(1 for f in self.filled if f.source == "derived")
+        breakdown = (f"{native} native, {generated} AI-drafted, {derived} AI-derived from your data, "
+                     f"{len(self.filled) - native - generated - derived} banked/direct")
         lines.append(f"  filled ({len(self.filled)}; {breakdown}):")
         lines += [f"    - {f.label}: {f.value!r} [{f.control}·{f.source}]" for f in self.filled]
         if self.skipped:
@@ -244,9 +249,9 @@ def _degree_hints(degree_text: str) -> Optional[list[str]]:
 @dataclass
 class PendingDecisions:
     """Unresolved decisions collected during round 1 of a page fill (the deterministic pass).
-    Between rounds they are adjudicated by at most 3 BATCHED Claude calls (classify,
-    bank-match, dropdown picks) instead of one CLI spawn per field; round 2 is the same
-    deterministic loop, now resolving from the injected results."""
+    Between rounds they are adjudicated by at most 4 BATCHED Claude calls (classify, bank-match,
+    derive-from-the-applicant's-data, dropdown picks) instead of one CLI spawn per field; round 2
+    is the same deterministic loop, now resolving from the injected results."""
     questions: dict = field(default_factory=dict)  # label -> {"kind": str, "options": [str]}
     picks: dict = field(default_factory=dict)      # label -> (value, [option texts shown])
 
@@ -269,6 +274,12 @@ class PendingDecisions:
 
     def __bool__(self) -> bool:
         return bool(self.questions or self.picks)
+
+
+def _tri(v: Optional[bool]) -> str:
+    """A tri-state profile flag as words for a prompt — "" when the user never set it, so an
+    unset field reads as absent data rather than as "No"."""
+    return "" if v is None else ("Yes" if v else "No")
 
 
 @dataclass
@@ -305,6 +316,14 @@ class AnswerResolver:
     # (decision 167). Read by the date rule and passed to every model call as grounding. Empty
     # off-page (the review panel's preview resolver has no browser), which is the old behaviour.
     context: dict = field(default_factory=dict)
+    # Answers the derive stage read out of the applicant's own data this run (decision 187),
+    # {normalised question: answer}. Consulted by `resolve` as the LAST resort — after every
+    # structured rule and the answer bank, because a question that maps to a profile field the
+    # user left EMPTY gives up before it ever reaches the bank, and that is exactly the gap this
+    # fills. Kept as a map (not a flag) so the report can name which answers were inferred.
+    derived: dict = field(default_factory=dict)
+    derive_asked: int = 0  # questions sent to the derive stage this run (for the report's note)
+    _facts: Optional[str] = None  # data_facts(), built once per run
 
     def note_context(self, label: str, text: str) -> None:
         """Record the form text surrounding `label` as read off the live page. Keyed normalised
@@ -654,9 +673,35 @@ class AnswerResolver:
         return date.today().isoformat()
 
     def resolve(self, label: str) -> Optional[str]:
-        """Return the answer for the field keyed `label`, or None if we can't answer it. `label` is
-        a field KEY, so the rules below read the question out of it (`_question`) while the
-        per-field lookups — the user's edit, this field's surrounding text — use the key."""
+        """The answer for the field keyed `label`, or None if we still can't answer it.
+
+        Rules and the answer bank decide first (`_resolve_rules`); only when they come up empty
+        does this fall back to what the derive stage read out of the applicant's own data this run
+        (decision 187). The fallback has to sit OUT HERE rather than at the end of the rule chain:
+        most rules return None the moment their profile field is unset ("Portfolio URL" with no
+        `portfolio_url`), so they never reach the end — and a question whose profile field is empty
+        is precisely the gap the derive stage exists to close. Ordering is unchanged for everything
+        else: a structured field or a saved answer always outranks an inferred answer."""
+        answer = self._resolve_rules(label)
+        if answer is not None:
+            return answer
+        # A structured rule that gave up because ITS profile field is empty never reached the bank
+        # lookup at the end of the chain — so an answer the user HAS given was being dropped as
+        # "no saved answer" ("What is your anticipated start date?" is banked, but the start-date
+        # rule returns None when `earliest_start_date` is unset). Consult the bank here for that
+        # case: the user's own saved answer must be used before anything is called unanswerable.
+        qa = self.banked_qa(label)
+        if qa is not None:
+            mt = getattr(qa, "maps_to", "")
+            banked = self.answer_for_type(mt) if mt else (qa.answer or None)
+            if banked:
+                return banked
+        return self.derived.get(_norm(_question(label))) or None
+
+    def _resolve_rules(self, label: str) -> Optional[str]:
+        """The structured rules + the answer bank. `label` is a field KEY, so the rules below read
+        the question out of it (`_question`) while the per-field lookups — the user's edit, this
+        field's surrounding text — use the key."""
         n = _norm(_question(label))
         if not n:
             return None
@@ -1146,6 +1191,52 @@ class AnswerResolver:
                 return [st] + ([abbr] if abbr else [])
         return None
 
+    def data_facts(self) -> str:
+        """Everything the applicant has told us, as one block for the derive stage (decision 187),
+        built once per run.
+
+        Deliberately NOT included (Guideline #5 — never send more personal data than the task
+        needs): contact details (email, phone, street address, postal code), which no derived
+        answer needs because the resolver fills them deterministically; and EEO
+        self-identification (gender, race, veteran, disability), which only the applicant may
+        declare — `derive_answers` refuses demographic questions outright.
+        """
+        if self._facts is not None:
+            return self._facts
+        parts = [f"RÉSUMÉ (JSON):\n{self.resume.model_dump_json(exclude_none=True, exclude_defaults=True)}"]
+        p = self.profile
+        fields = [
+            ("Home city/state", p.location), ("Country", p.country),
+            ("LinkedIn", p.linkedin_url), ("GitHub", p.github_url), ("Portfolio", p.portfolio_url),
+            ("Authorized to work", _tri(p.work_authorized)),
+            ("Requires visa sponsorship", _tri(p.requires_sponsorship)),
+            ("US citizen", _tri(p.us_citizen)),
+            ("Willing to relocate", _tri(p.willing_to_relocate)),
+            ("Open to remote", _tri(p.open_to_remote)),
+            ("Preferred work arrangement", p.work_arrangement),
+            ("Preferred locations", ", ".join(p.preferred_locations)),
+            ("Max commute (miles)", str(p.max_commute_miles or "")),
+            ("Desired salary", p.desired_salary),
+            ("Earliest start date", p.earliest_start_date),
+            ("Years of experience", p.years_experience),
+            ("Languages", ", ".join(f"{lg.name} ({lg.proficiency})" if getattr(lg, "proficiency", "")
+                                    else lg.name for lg in p.languages)),
+            ("How they found this role", p.how_heard),
+        ]
+        stated = [f"- {k}: {v}" for k, v in fields if str(v).strip()]
+        if stated:
+            parts.append("PROFILE FACTS:\n" + "\n".join(stated))
+        banked = []
+        for qa in p.custom_answers[:40]:
+            ans = self.answer_for_type(getattr(qa, "maps_to", "")) if getattr(qa, "maps_to", "") \
+                else (qa.answer or "").strip()
+            if (qa.question or "").strip() and ans:
+                banked.append(f"- Q: {qa.question}\n  A: {ans[:200]}")
+        if banked:
+            parts.append("ANSWERS THEY HAVE ALREADY GIVEN:\n" + "\n".join(banked))
+        self._facts = "\n\n".join(parts)
+        return self._facts
+
     def freetext_answer(self, label: str, is_textarea: bool = False,
                         required: bool = False) -> tuple[Optional[str], str]:
         """Answer a free-text field. Banked/structured answer first; else a grounded Claude draft
@@ -1553,35 +1644,86 @@ def _trigger_native_autofill(frame, ats: str, report: "ApplyReport") -> None:
             continue
 
 
-def _greenhouse_native_autofill(page, ctx, profile, report: "ApplyReport") -> None:
-    """Quick Apply with MyGreenhouse using stored credentials (decision 017: store credentials +
-    auto-login). Gated behind having credentials; a login failure is logged, not fatal — we
-    just fall back to filling the form ourselves.
+# The security-code box on the MyGreenhouse sign-in: either one field or one box per digit.
+# `:visible` on every alternative because a hidden autofill decoy would otherwise swallow the code.
+_CODE_FIELD = ", ".join(f"{s}:visible" for s in (
+    'input[autocomplete="one-time-code"]', 'input[name*="code" i]', 'input[id*="code" i]',
+    'input[inputmode="numeric"]', 'input[type="tel"]'))
 
-    NOTE: this drives the real my.greenhouse.io sign-in; it is best-effort and UNVERIFIED
-    against a live account (needs a real MyGreenhouse login to confirm the exact flow)."""
+
+def _fill_security_code(popup, code: str) -> bool:
+    """Type `code` into whichever shape the sign-in uses — a single field, or one box per digit
+    (the common OTP widget). False when the page shows no code input at all."""
+    boxes = popup.locator(_CODE_FIELD)
+    n = boxes.count()
+    if not n:
+        return False
+    if n >= len(code):          # one box per digit
+        for i, ch in enumerate(code):
+            boxes.nth(i).fill(ch, timeout=3000)
+    else:
+        boxes.first.fill(code, timeout=4000)
+    return True
+
+
+def _greenhouse_native_autofill(page, ctx, profile, report: "ApplyReport", *,
+                                verify_wait: int = 120) -> None:
+    """Quick Apply with MyGreenhouse — OPT-IN (decision 182, reworking decision 017).
+
+    Greenhouse replaced the password sign-in with an emailed security code, so the flow is:
+    email → Continue → read the 6-digit code out of the linked inbox → submit it. That makes the
+    login depend on mailbox access for a native autofill our own resolver doesn't need (decision
+    017 measured 15/15 fields filled on a live Greenhouse form with no account), so it stays off
+    unless the user turns `greenhouse_quick_apply` on.
+
+    Never fatal: any failure is recorded on the report and we fall back to filling the form
+    ourselves. UNVERIFIED against a live MyGreenhouse account."""
     from . import apply_profile
-    email, pw = apply_profile.greenhouse_credentials(profile)  # password from the OS keychain
-    if not (email and pw):
+
+    if not profile.greenhouse_quick_apply:
+        return  # off by default — not a problem to report
+    problem = apply_profile.greenhouse_quick_apply_problem(profile)
+    if problem:
+        report.errors.append(f"{problem} (Filling the form without it.)")
         return
+    from . import mailbox as mbox
+
+    config = mbox.load_config()
+    email = profile.greenhouse_email.strip()
+    popup = None
     try:
         btn = page.get_by_role("button", name=re.compile("quick apply with mygreenhouse", re.I)).first
         if not (btn.count() and btn.is_visible()):
-            return
+            return  # this posting doesn't offer Quick Apply
         with ctx.expect_page(timeout=8000) as pi:
             btn.click()
         popup = pi.value
         popup.wait_for_load_state("domcontentloaded")
         popup.get_by_label(re.compile("email", re.I)).first.fill(email, timeout=6000)
-        # Password may be on the same page or a second step — try both.
-        for nm in (r"continue|next", r"sign in|log in"):
-            try:
-                popup.get_by_role("button", name=re.compile(nm, re.I)).first.click(timeout=3000)
-            except Exception:
-                pass
-        try:
-            popup.get_by_label(re.compile("password", re.I)).first.fill(pw, timeout=6000)
-            popup.get_by_role("button", name=re.compile("sign in|log in|continue", re.I)).first.click(timeout=4000)
+        # Stamp the request time BEFORE asking for the code, minus a minute of clock skew between
+        # this machine and the mail server — anything older than this is a previous code, and
+        # replaying one fails the sign-in with no visible error (that's what `since_epoch` blocks).
+        asked_at = time.time() - 60
+        popup.get_by_role("button", name=re.compile(r"continue|next|send|sign in|log in", re.I)
+                          ).first.click(timeout=6000)
+        code = mbox.wait_for_verification(config, sender_contains="greenhouse", timeout=verify_wait,
+                                          since_epoch=asked_at, prefer_code=True)
+        if not code:
+            report.errors.append(
+                f"MyGreenhouse security code never arrived in {config.email} within {verify_wait}s, "
+                f"so Quick Apply was skipped (the form is filled by ApplicationBot instead). Check "
+                f"that {email} is really your MyGreenhouse account and that Settings → Linked inbox "
+                f"still tests green.")
+            return
+        if not _fill_security_code(popup, code):
+            report.errors.append(
+                "MyGreenhouse asked for something other than a security code at sign-in — no code "
+                "field was on the page. Quick Apply skipped; the form is filled by ApplicationBot "
+                "instead. Turn Quick Apply off under Profile → Native autofill logins if this repeats.")
+            return
+        try:  # many OTP widgets submit themselves once the last digit lands
+            popup.get_by_role("button", name=re.compile(r"verify|continue|sign in|log in|submit", re.I)
+                              ).first.click(timeout=4000)
         except Exception:
             pass
         try:
@@ -1592,6 +1734,12 @@ def _greenhouse_native_autofill(page, ctx, profile, report: "ApplyReport") -> No
         report.native_autofill = "greenhouse: MyGreenhouse (Quick Apply)"
     except Exception as e:
         report.errors.append(f"MyGreenhouse autofill (falling back to our autofill): {type(e).__name__}: {e}")
+    finally:
+        if popup is not None and not report.native_autofill:
+            try:
+                popup.close()  # don't leave a half-finished sign-in tab behind
+            except Exception:
+                pass
 
 
 # A visible field that reliably signals the real application form has rendered. ATS forms
@@ -3336,14 +3484,39 @@ def _advance_page(page, frame, nxt, report: "ApplyReport"):
     return False, frame
 
 
+def _inject_answer(resolver: AnswerResolver, question: str, answer: str = "",
+                   maps_to: str = "") -> QA:
+    """Make `question` resolvable for the rest of THIS run, and queue it for the answer bank.
+
+    Injecting is not just an append: a question the bot could not answer on an earlier run is
+    already in the bank as a BLANK placeholder ("Portfolio URL" with no answer, captured so the
+    user fills it once). `resolve()` reads the first entry it matches, so appending beside a
+    placeholder leaves the blank winning and the freshly-decided answer is silently ignored — the
+    fill then reports "no saved answer" for a question it had just answered. So the placeholder is
+    dropped from the IN-MEMORY profile first; the on-disk one is untouched, and the user is still
+    asked to answer it once themselves."""
+    qn = _norm(question)
+    resolver.profile.custom_answers = [
+        qa for qa in resolver.profile.custom_answers
+        if not (_norm(qa.question) == qn and not (qa.answer or "").strip()
+                and not getattr(qa, "maps_to", ""))]
+    qa = QA(question=question, answer=answer, maps_to=maps_to, generated=True)
+    resolver.learned.append(qa)
+    resolver.profile.custom_answers.append(qa)
+    return qa
+
+
 def _resolve_pending(resolver: AnswerResolver, pending: PendingDecisions) -> None:
-    """Adjudicate round 1's deferred decisions with at most 3 BATCHED Claude calls, then inject
+    """Adjudicate round 1's deferred decisions with at most 4 BATCHED Claude calls, then inject
     the results so round 2 (the same deterministic loop) fills without any per-field call:
       1. classify — novel questions → structured types, answered live from the profile;
       2. bank-match — the rest → a reworded saved answer;
          both injected as in-memory bank entries (resolve() hits them in round 2; persistence
          still goes through remember_answers' valid_mapping gate);
-      3. dropdown picks — the deferred static-list picks, plus any just-classified dropdown
+      3. derive (decision 187) — whatever is STILL unanswered is read against the applicant's own
+         data (résumé + profile facts + banked answers) before it can be called unanswerable;
+         answers only what that data settles, so a gap stays a gap instead of becoming a guess;
+      4. dropdown picks — the deferred static-list picks, plus any just-classified dropdown
          whose new answer doesn't literally match its recorded options → decided_options,
          recommitted by exact text in round 2.
     Every deferred label is marked adjudicated regardless of outcome, so round 2 captures the
@@ -3360,9 +3533,7 @@ def _resolve_pending(resolver: AnswerResolver, pending: PendingDecisions) -> Non
         key = types.get(_question(label))
         ans = resolver.answer_for_type(key) if key else None
         if key and ans is not None:
-            qa = QA(question=_question(label), answer="", maps_to=key, generated=True)
-            resolver.learned.append(qa)
-            resolver.profile.custom_answers.append(qa)
+            _inject_answer(resolver, _question(label), maps_to=key)
         else:
             unresolved.append(label)
     if unresolved:
@@ -3381,10 +3552,25 @@ def _resolve_pending(resolver: AnswerResolver, pending: PendingDecisions) -> Non
                 if idx is None:
                     continue
                 qa, _ = cands[idx]
-                alias = QA(question=_question(label), answer="" if qa.maps_to else qa.answer,
-                           maps_to=qa.maps_to, generated=True)
-                resolver.learned.append(alias)
-                resolver.profile.custom_answers.append(alias)
+                _inject_answer(resolver, _question(label),
+                               answer="" if qa.maps_to else qa.answer, maps_to=qa.maps_to)
+    # 3. derive — the last chance before these become "no saved answer" (decision 187). Whatever
+    #    is STILL unresolved goes back to Claude once more, this time with the applicant's own data
+    #    (résumé + profile facts + banked answers) and one instruction: answer only what the data
+    #    settles, else return nothing. Runs before the dropdown picks below, so a derived value
+    #    ("Yes") is mapped onto a field's real options like any other answer.
+    still = [label for label in labels if resolver.resolve(label) is None]
+    resolver.derive_asked += len(still)
+    if still:
+        derived = answer_bank.derive_answers(
+            [_question(label) for label in still], resolver.data_facts(),
+            contexts=contexts, model=resolver.model)
+        for label in still:
+            ans = (derived.get(_question(label)) or "").strip()
+            if not ans:
+                continue
+            _inject_answer(resolver, _question(label), answer=ans)
+            resolver.derived[_norm(_question(label))] = ans
     resolver.semantic_done.update(labels)
 
     items = [(label, value, opts) for label, (value, opts) in pending.picks.items()]
@@ -3409,7 +3595,7 @@ def _resolve_pending(resolver: AnswerResolver, pending: PendingDecisions) -> Non
 def _fill_page(frame, resolver: AnswerResolver, report: "ApplyReport", done: set) -> None:
     """Fill one form page in two deterministic passes with ONE batched decision step between
     them (decision 041). Round 1 fills everything the rules/bank/hints/aliases resolve and
-    DEFERS the unresolved decisions; ≤3 batched Claude calls adjudicate them all; round 2
+    DEFERS the unresolved decisions; ≤4 batched Claude calls adjudicate them all; round 2
     re-runs the same loop, which now fills from the injected results. Claude cost is per PAGE,
     not per field — and no model call ever runs while a menu is open (decision 040). Typeahead
     searches stay inline (their options only exist as you type). With generation disabled the
@@ -3721,6 +3907,25 @@ def _show_done_banner(page, report: "ApplyReport", ok: bool = True) -> None:
         )
     except Exception:
         pass  # a cosmetic banner must never break the run
+
+
+def _mark_derived(resolver: AnswerResolver, report: "ApplyReport") -> None:
+    """Relabel the fields the derive stage answered (decision 187). Round 2 fills them through
+    `resolve()` like any banked answer, so without this they would report as `resolver` — and an
+    answer Claude read out of the applicant's data is not the same as one the applicant wrote.
+    The review panel and the report both key off `source`, so this is what makes an inferred
+    answer visible to the person whose application it is."""
+    for f in report.filled:
+        if f.source == "resolver" and _norm(_question(f.label)) in resolver.derived:
+            f.source = "derived"
+    if resolver.derive_asked:
+        # Say that the last-chance look happened and what it found. Without this line a report
+        # cannot distinguish "your data had no answer" from "nobody looked" — and the first is a
+        # fact about the profile the user can fix, the second would be a bug.
+        found = len(resolver.derived)
+        report.notes.append(
+            f"Re-read your résumé and profile for {resolver.derive_asked} question(s) no rule or "
+            f"saved answer covered — answered {found}, left {resolver.derive_asked - found} for you.")
 
 
 def _persist_learning(resolver: AnswerResolver, report: "ApplyReport", profile_path: str) -> None:
@@ -4093,6 +4298,12 @@ def run_apply(
                         except Exception:
                             pass
             _show_done_banner(page, report, ok=form_loaded)  # visible signal in the browser
+
+            # Relabel the answers the derive stage supplied and note that the look happened —
+            # BEFORE the summary is printed and before `on_filled` hands the report to the UI.
+            # Both read `source` and `notes`, so doing this afterwards would show the user a
+            # report that hides which answers were inferred for them (decision 187).
+            _mark_derived(resolver, report)
 
             # Surface the filled result to the UI NOW — the moment filling finishes — before the
             # full-page screenshot, answer-bank learning, tracker write, and archive below. On a

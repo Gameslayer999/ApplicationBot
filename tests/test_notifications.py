@@ -346,3 +346,28 @@ def test_build_inbox_dedupes_in_memory_and_log(tmp_path):
     tracker.add_notification("approval_needed", "Ready", "Acme ready", application_id=aid, path=db)
     inbox = web._build_inbox([aid], path=db)
     assert [r["id"] for r in inbox["ready"]] == [aid]  # not [aid, aid]
+
+
+def test_ready_cards_shared_by_discover_and_notifications(tmp_path):
+    """Decision 183: the Discover loop panel lists the same ready work the Notifications tab does.
+    An application prepared in an earlier run (or before a restart) is gone from the in-memory
+    queue, but must still be reviewable/submittable in Discover — and a submitted one drops out."""
+    from applicationbot import web
+    db = tmp_path / "applications.db"
+    old = tracker.add_application(
+        {"company": "Acme", "role": "Engineer", "status": "dry-run", "source_url": "u1",
+         "portal": "greenhouse", "fit_score": "88"}, path=db)
+    sent = tracker.add_application(
+        {"company": "Delta", "role": "PM", "status": "applied", "source_url": "u2"}, path=db)
+    fresh = tracker.add_application(
+        {"company": "Beta", "role": "Analyst", "status": "dry-run", "source_url": "u3"}, path=db)
+    tracker.add_notification("approval_needed", "Ready", "Acme", application_id=old, path=db)
+    tracker.add_notification("approval_needed", "Ready", "Delta", application_id=sent, path=db)
+
+    # This run's queue holds only `fresh`; the earlier run's `old` is restored from the log, and
+    # the already-submitted `sent` is not offered again.
+    cards = web._ready_cards([fresh], path=db)
+    assert [c["id"] for c in cards] == [fresh, old]      # this run's first, then the held-over one
+    assert cards[0]["company"] == "Beta" and cards[1]["fit"] == "88"
+    # Same list the Notifications tab builds — one source of truth for both.
+    assert [c["id"] for c in web._build_inbox([fresh], path=db)["ready"]] == [fresh, old]

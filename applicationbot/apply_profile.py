@@ -112,12 +112,12 @@ class ApplicationProfile(BaseModel):
     veteran_status: str = ""
     disability_status: str = ""
 
-    # ATS-native autofill credentials (decision 017). The email is non-secret and lives here;
-    # the PASSWORD is NOT stored here — it lives in the OS keychain (decision 060, mirroring
-    # credentials.py/mailbox.py). This field remains only as the write-only transport for the UI
-    # and to migrate a legacy plaintext value out of the YAML; it is never persisted with a value.
-    greenhouse_email: str = ""
-    greenhouse_password: str = ""
+    # MyGreenhouse Quick Apply (decision 017, reworked by 172). Greenhouse replaced its password
+    # sign-in with an emailed security code, so there is no password to store any more: signing in
+    # means reading the code out of the linked inbox. Our own resolver already fills a Greenhouse
+    # form 15/15 without an account, so this is OPT-IN — off unless the user turns it on.
+    greenhouse_quick_apply: bool = False
+    greenhouse_email: str = ""  # the MyGreenhouse account address (must be the linked inbox)
 
     # Growing bank of answers to custom screening questions.
     custom_answers: list[QA] = Field(default_factory=list)
@@ -129,10 +129,10 @@ class ApplicationProfile(BaseModel):
     dropdown_aliases: dict[str, list[str]] = Field(default_factory=dict)
 
 
-# ------------------------------------------------ MyGreenhouse password (OS keychain, decision 060)
+# ------------------------------------------------ MyGreenhouse Quick Apply (decision 182)
 
 _GH_SERVICE = "applicationbot-greenhouse"
-_GH_ACCOUNT = "mygreenhouse"  # a single MyGreenhouse login (not per-tenant, unlike Workday)
+_GH_ACCOUNT = "mygreenhouse"  # decision 060's keychain slot — now only ever deleted, never read
 
 
 def _gh_keyring():
@@ -141,56 +141,67 @@ def _gh_keyring():
     return keyring
 
 
-def set_greenhouse_password(password: str, *, backend=None) -> None:
-    """Store (or, given ''/None, clear) the MyGreenhouse password in the OS keychain — never in
-    plaintext YAML (Guideline #12). Mirrors credentials.py/mailbox.py."""
-    backend = backend or _gh_keyring()
-    if password:
-        backend.set_password(_GH_SERVICE, _GH_ACCOUNT, password)
-    else:
-        try:
-            backend.delete_password(_GH_SERVICE, _GH_ACCOUNT)
-        except Exception:
-            pass
+def greenhouse_quick_apply_problem(profile: "ApplicationProfile", *, config=None) -> str:
+    """'' when MyGreenhouse Quick Apply can actually run; otherwise the exact reason it can't,
+    naming the fix (UI principle #3). Every failure mode is a setup gap the user can close:
 
+      • the feature is off (the default — our resolver fills Greenhouse forms without it);
+      • no MyGreenhouse email;
+      • no linked inbox, so nothing can read the emailed security code;
+      • the MyGreenhouse address isn't the linked inbox, so the code lands where we can't see it.
 
-def get_greenhouse_password(*, backend=None) -> str:
-    """The stored MyGreenhouse password from the keychain, or '' if none/unavailable."""
-    backend = backend or _gh_keyring()
-    try:
-        return backend.get_password(_GH_SERVICE, _GH_ACCOUNT) or ""
-    except Exception:
-        return ""
-
-
-def greenhouse_linked(profile: "ApplicationProfile", *, backend=None) -> bool:
-    """True when MyGreenhouse is usable — an email in the profile AND a password in the keychain."""
-    return bool((profile.greenhouse_email or "").strip() and get_greenhouse_password(backend=backend))
-
-
-def greenhouse_credentials(profile: "ApplicationProfile", *, backend=None) -> tuple[str, str]:
-    """(email, password) for MyGreenhouse autofill: email from the profile, password from the
-    keychain — falling back to a not-yet-migrated legacy plaintext field only if the keychain
-    is empty, so an un-migrated profile still works."""
+    `config` (a mailbox.MailboxConfig or None) is injectable for tests; by default the linked
+    inbox is looked up."""
+    if not profile.greenhouse_quick_apply:
+        return ("MyGreenhouse Quick Apply is off — turn it on under Profile → Native autofill "
+                "logins. (Off is fine: the form still gets filled by ApplicationBot itself.)")
     email = (profile.greenhouse_email or "").strip()
-    pw = get_greenhouse_password(backend=backend) or (profile.greenhouse_password or "").strip()
-    return email, pw
+    if not email:
+        return ("MyGreenhouse Quick Apply is on but has no account email — add your MyGreenhouse "
+                "address under Profile → Native autofill logins.")
+    if config is None:
+        from . import mailbox
+
+        config = mailbox.load_config()
+    if config is None:
+        return ("MyGreenhouse Quick Apply needs a linked inbox to read the security code Greenhouse "
+                "emails at sign-in — link one under Settings → Linked inbox, or turn Quick Apply off.")
+    if email.lower() != (config.email or "").strip().lower():
+        return (f"MyGreenhouse Quick Apply can't read its security code: the code goes to {email}, "
+                f"but the linked inbox is {config.email}. Set the MyGreenhouse email to "
+                f"{config.email} under Profile → Native autofill logins, or link {email} instead "
+                f"under Settings → Linked inbox.")
+    return ""
 
 
-def _migrate_greenhouse_password(profile: "ApplicationProfile", path: str | Path) -> None:
-    """One-time: move a legacy plaintext `greenhouse_password` out of the YAML into the keychain,
-    then blank it on disk (Guideline #8/#12). Idempotent — a no-op once the field is empty.
-    Best-effort: if the keychain is unavailable the plaintext is left in place (still usable via
-    the fallback in `greenhouse_credentials`)."""
-    pw = (getattr(profile, "greenhouse_password", "") or "").strip()
-    if not pw:
+def _drop_dead_greenhouse_password(path: str | Path) -> None:
+    """Delete the MyGreenhouse password decision 060 stored — from the keychain and from any
+    legacy plaintext still in the YAML.
+
+    Greenhouse no longer accepts a password at all (decision 182), so the stored one cannot sign in
+    anywhere; keeping a live secret that buys nothing is exactly what Guideline #12 is about. Runs
+    once per process (the keychain read is not free) and is best-effort — a keychain that refuses
+    is not worth failing a profile load over."""
+    global _GH_PW_CLEARED
+    if _GH_PW_CLEARED:
         return
+    _GH_PW_CLEARED = True
     try:
-        set_greenhouse_password(pw)
-        profile.greenhouse_password = ""
-        save_profile(profile, path)  # rewrite the YAML without the plaintext secret
+        _gh_keyring().delete_password(_GH_SERVICE, _GH_ACCOUNT)
     except Exception:
         pass
+    try:
+        p = Path(path)
+        data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+        if "greenhouse_password" in data:
+            data.pop("greenhouse_password")
+            p.write_text(_HEADER + yaml.safe_dump(data, sort_keys=False, allow_unicode=True),
+                         encoding="utf-8")
+    except Exception:
+        pass
+
+
+_GH_PW_CLEARED = False
 
 
 def load_profile(path: str | Path | None = None) -> ApplicationProfile:
@@ -200,15 +211,13 @@ def load_profile(path: str | Path | None = None) -> ApplicationProfile:
     if not p.exists():
         return ApplicationProfile()
     data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
-    profile = ApplicationProfile.model_validate(data)
-    _migrate_greenhouse_password(profile, p)  # plaintext YAML password → keychain (once)
+    profile = ApplicationProfile.model_validate(data)  # a legacy `greenhouse_password:` key is ignored
+    _drop_dead_greenhouse_password(p)  # the password Greenhouse no longer accepts (decision 182)
     return profile
 
 
 def save_profile(profile: ApplicationProfile, path: str | Path | None = None) -> None:
-    # The password is never persisted to YAML — it lives in the keychain (decision 060).
     data = profile.model_dump()
-    data.pop("greenhouse_password", None)
     body = yaml.safe_dump(data, sort_keys=False, allow_unicode=True)
     Path(path or DEFAULT_PATH).write_text(_HEADER + body, encoding="utf-8")
 

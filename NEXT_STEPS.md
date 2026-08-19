@@ -97,6 +97,49 @@ and free-form notes.
 
 ## Now
 
+### Fill the profile gaps the last-chance data check surfaced (decision 187)
+
+The derive stage now says exactly which questions the applicant's own data cannot answer. On a live
+Palantir form the honest remainder was: **Portfolio URL** (`portfolio_url` is empty — it declines to
+substitute the GitHub URL, correctly), **upcoming offer deadlines**, **"Will this be your final
+internship before graduating?"**, and **"If so, what are the dates?"** (a follow-up to the clearance
+question). These are not bugs — they are facts nobody has told the bot.
+
+- [ ] **USER:** answer these once in Profile → Answers (or set `portfolio_url`), and every future
+  application fills them with no Claude call at all.
+- [ ] Watch a night's reports for the "Re-read your résumé and profile …" line: a high *left for you*
+  count across many postings is the cheapest possible list of what the profile is missing.
+
+### Drive a full armed night end-to-end (decision 185) — NEEDS USER
+
+The night driver is verified by unit tests and by a real **dry-run** night; no ARMED night has been run
+yet, so the numbers a 100-application run produces — and the review's verdict on them — are unproven at
+scale. When you want a real run:
+
+- [ ] **USER:** `./scripts/night.sh --goal 25 --until 07:00 --arm` (start smaller than 100 the first
+  time). In the morning, read `nights/<timestamp>/review.md` and check the review's confirmed count
+  against your inboxes. If it exits **2**, the tracker disagrees with what the loop claimed — that is the
+  first thing to fix, before any bigger night.
+- [ ] Then raise the goal. `--dangerously-unlimited` removes the cap entirely (deadline, kill switch,
+  breaker and the Claude usage limit remain the only stops).
+- Open question the first armed night will answer: whether the **per-cycle discovery cache** (reused
+  unless `--fresh`) supplies enough new postings to sustain 100 submissions in one night, or whether the
+  night should force a fresh board search every N cycles. Left un-tuned deliberately — real numbers
+  should set it, not a guess.
+
+### Confirm the MyGreenhouse code sign-in against a live account (decision 182) — NEEDS USER
+
+The Quick Apply sign-in is written against the code flow the user described, but no one has driven
+it on a real MyGreenhouse account, so the selectors (the email field, the Continue button, the code
+box) are best-effort. It is off by default, so nothing depends on it today.
+
+- [ ] **USER:** set Profile → Native autofill logins → MyGreenhouse Quick Apply = **On** with the
+  same address as your linked inbox, then dry-run apply to a Greenhouse posting that offers "Quick
+  Apply with MyGreenhouse" and report what the report says: signed in, "code never arrived", or
+  "asked for something other than a security code".
+- If it fails, the fix is selector work in `_greenhouse_native_autofill` / `_fill_security_code`
+  ([apply.py](applicationbot/apply.py)) — the mailbox half (fresh-code fetch) is unit-tested.
+
 ### Confirm Adzuna auto-apply click-through (decision 120) — BLOCKED ON USER
 
 The user flagged that Adzuna postings gate the real ATS behind an **"Apply for this job"** button.
@@ -515,8 +558,10 @@ value ÷ effort:
       confirm the Claude-judged pick + Claude-tailor + visible fill all behave.
 - [x] **Autonomous runner over ALL qualified matches** — done two ways: the CLI
       `runner.run_queue` (decision 035) loops every cleared match dry-run/armed, and the web
-      **auto-apply loop** (decision 069) prepares each cleared match into a "Ready to apply"
-      queue and submits one per Apply click. Both dry-run by default, kill-file/Stop halted.
+      **auto-apply loop** (decision 069) prepares each cleared match and, since decision 176,
+      **submits it immediately** — its "Dry run" switch restores the prepare-into-"Ready to apply"
+      behaviour, one submit per Apply click. The CLI runner is still dry-run until armed in
+      `safety.yaml`; both are kill-file/Stop halted.
       *Remaining live step:* one real web-loop run end-to-end (see below).
 - [~] **Surface Discover in the web UI** — **done (first cut):** a **"Discover" tab** with a
       one-click **"Find & fill one application (dry-run)"** button that runs the whole
@@ -657,8 +702,8 @@ value ÷ effort:
       desktop/phone notification each cycle a role is ready to apply (decision 140); test it live with
       `runner --continuous --headed --fresh --dry-run` (visible autofill, never submits). (2) Web —
       a **"Keep watching"** toggle on the Discover auto-apply loop (decision 143) keeps re-checking the
-      boards every N min, autofills each new match, and holds it as a "Ready to apply" card you approve
-      per-application (never submits on its own). Accept the boards first, then run either.
+      boards every N min and applies to each newly-posted match as it appears — or, with the loop's
+      "Dry run" switch on, holds each one as a "Ready to apply" card you approve per-application. Accept the boards first, then run either.
       For reference, all 64 returned ≥1 posting against the live ATS API:
       ~46 Greenhouse (anduril `andurilindustries` 2132, databricks 811, stripe 533, doordash
       `doordashusa`, datadog, anthropic, samsara, toast, verkada, cloudflare, brex, roblox, block,
@@ -932,6 +977,22 @@ Posted to the agent bus 2026-07-06; independent of the engine work above.
 ---
 
 ## Recently added (this session, latest first)
+
+- 2026-08-12 — **MyGreenhouse Quick Apply is opt-in and signs in with an emailed code (decision
+  182).** The user found that MyGreenhouse now logs in with an email + security code, not a
+  password — which made decision 017's stored-password sign-in unrunnable (it would fail the
+  password step on every Greenhouse posting and waste ~30s before falling back). Since decision 017
+  itself measured our own resolver filling a Greenhouse form **15/15 with no account**, Quick Apply
+  is now **off by default** and, when turned on, reads the code out of the linked inbox. The stored
+  password is **deleted** from the keychain and any legacy YAML rather than migrated — it can't sign
+  in anywhere now, so keeping it is pure liability (Guideline #12). `greenhouse_quick_apply_problem`
+  is the one source of truth for whether it can run, and each blocked state names its fix — including
+  the one that would otherwise hang forever: the MyGreenhouse address not being the linked inbox.
+  Two reusable mailbox additions: `since_epoch` (never replay a code from before we asked — the
+  silent failure this whole flow would otherwise hit) and `prefer_code`. Fixing that guard exposed a
+  latent date bug: RFC 2822 `-0000` parsed to a naive datetime read as **local** time, shifting send
+  times by the machine's UTC offset. 16 tests, suite 827 green; drove the real Profile UI end to end.
+  **Still unverified against a live MyGreenhouse account** — the sign-in selectors are best-effort.
 
 - 2026-07-30 — **Oracle Recruiting Cloud reached and filling (decision 171).** The largest block of
   postings we drop (3,553) turned out **not** to be account-gated — it is email-verified, and a live
@@ -2592,6 +2653,266 @@ Record each decision in [DECISIONS.md](DECISIONS.md) once the user chooses.
 ---
 
 ## Recently completed
+
+- 2026-08-18 — **Nothing is marked unanswerable until Claude has checked the applicant's own data
+  (decision 187).** User: "make sure that unanswered form questions are fed through ai first to figure
+  out if there is an answer anywhere in available data before being marked as unanswerable." The page
+  fill's batched decision step (decision 041) gains a 4th stage: whatever classify and bank-match still
+  cannot answer goes back in ONE call with `AnswerResolver.data_facts()` — résumé JSON, the profile's
+  stated facts, and the answers already given — with one instruction: answer only what that data
+  settles, empty otherwise, never treat absence as evidence. Extraction, not drafting (`generate_answer`
+  still owns prose). Demographic questions are never derived, company-specific ones stay with drafting,
+  placeholder replies ("N/A", "TBD") are dropped, and an over-long reply is refused. Runs at the batch
+  model tier, not the cheap drafting model — measured: the weak model gave 0/5 then 3/7 on repeat runs;
+  the batch tier gives the same 1/6 twice.
+  **Precedence unchanged:** user edit → structured rules → answer bank → derived. `resolve()` is now a
+  thin wrapper over `_resolve_rules`, because most rules `return p.field or None` and never reach the
+  end of the chain.
+  **Two defects this work exposed, both fixed — they were losing the user's OWN answers:** (1) a
+  question whose structured profile field is empty never reached the bank lookup, so "What is your
+  anticipated start date?" (banked as *September 2026*) reported "no saved answer" on a live form; the
+  wrapper now consults the bank in that case, at no token cost. (2) Every injection site appended
+  beside the BLANK placeholder captured for that same question on an earlier run, and `resolve()` reads
+  the first match — so freshly-decided answers were silently ignored. One `_inject_answer` helper drops
+  the in-memory placeholder first (the on-disk one is untouched); all three stages use it.
+  **Visible, not silent:** derived answers are labelled `derived` (not `resolver`), and every report
+  carries "Re-read your résumé and profile for N question(s) … answered M, left K for you". Cost: one
+  extra batched call per page, only when questions remain unanswered. 32 new tests
+  (`tests/test_derive_answers.py`); five live dry-run fills of a real Palantir form took its unanswered
+  list from 9 to 6, each recovered answer traceable to the user's own data.
+
+- 2026-08-18 — **A night can run without tailoring, and one policy now governs both the app and the CLI
+  (decision 186).** User: "we should be able to run the night loop without tailoring as well (saves tokens,
+  uses the resume i personally tailored vs the one the agent tailored that i have never seen)."
+  `python -m applicationbot.night --no-tailor` sends the user's own résumé verbatim — decision 174's
+  `untailored_pdf` path: their best uploaded résumé document if they have one, else their base résumé
+  rendered exactly as stored, with **no Claude tailoring call per application**. Unflagged, the night now
+  reads the résumé policy saved in ⚙ Loop settings (`smart` / `always` / `under N` / `never`, decisions
+  178/180) and applies it per posting, so the CLI and the app can no longer disagree about which résumé
+  goes out. To make that possible, `_loop_policy` / `_tailor_choice` moved verbatim out of `web.py` into
+  `pipeline.py` as public `loop_policy` / `tailor_choice`; `web.py` keeps the old private names as import
+  aliases, so every existing call site and both existing test modules are untouched. Because the choice
+  changes what is actually SENT, it is now recorded everywhere a night is read: the console line at start,
+  `summary.json` (`resume_policy`, `resume_note`), `report.md` ("Résumé sent: …"), and a `resume_policy`
+  journal event. 6 new tests plus a real `--no-tailor` dry-run night; the run-queue fake now really calls
+  `apply_one`, so the per-posting résumé decision is exercised rather than assumed.
+
+- 2026-08-18 — **An agent can run the whole night alone (decision 185).** User: "lets add stuff to this
+  repo so that an agent (hermes, claude, etc) would be able to run the loop overnight … without ever
+  needing to come back to the user." Two new modules and a runbook, built on the EXISTING submit path
+  (`pipeline.run_testing_mode`) — no second way to submit was created.
+  **`applicationbot/night.py`** — a session driver: `python -m applicationbot.night --goal 100 --until
+  07:00 --arm` loops discover→judge→fill→submit across as many cycles as it takes until the goal, the
+  wall-clock deadline, `profile/KILL`, a circuit breaker (5 failures in a row, or 10 of one kind), or a
+  fatal stop. Blocked applications are recorded and skipped, never waited on; an empty board backs off
+  and re-searches (decision 146's rule) instead of ending an unmet goal. Writes
+  `nights/<timestamp>/events.jsonl` + `summary.json` + `report.md` and exits **0** goal · **3** deadline ·
+  **4** kill · **5** breaker · **6** preflight · **7** fatal, so an agent branches on a code, not prose.
+  Preflight (`--preflight-only`) reuses `doctor.run_checks` and adds what only a night cares about: the
+  kill file, a submission budget that can actually reach the goal, and a deadline in the future.
+  **`applicationbot/night_review.py`** — the morning audit: every claimed submission matched against its
+  tracker row (status + `date_applied`), `unconfirmed` submits called out as possible false successes
+  (**exit 2** = the night's own count cannot be trusted), failures grouped by kind and by ATS and trended
+  against earlier nights, plus decision 043's fit calibration. Output is `review.md` and a ranked
+  `findings.json` where every item names its evidence and the file that fixes it.
+  **Arming** is the user's call and temporary: `--arm` writes `armed: true` + sets the cap to the goal via
+  the new `safety.save_arming` (which preserves every other key) and restores `profile/safety.yaml`
+  exactly as it was when the night ends, on Ctrl-C, or on a crash. `--dangerously-unlimited` is the
+  user's explicit no-ceiling mode. `safety.py`'s gate itself is unchanged — armed + KILL + cap are still
+  checked immediately before every submit click. **[docs/AGENT_NIGHT_RUN.md](docs/AGENT_NIGHT_RUN.md)** is
+  the agent contract (never ask; data tuning always allowed, code fixes on `development` only behind a
+  failing-first repro test and a fully green suite, anything touching safety/boundaries/schema is proposed
+  not done; what to report and in what order). **`scripts/night.sh`** runs preflight → night → review as
+  one idempotent command a cron line can call. `nights/` is git-ignored (it names real companies and URLs).
+  61 new tests (`tests/test_night.py`, `tests/test_night_review.py`), and two real dry-run nights driven
+  end-to-end (2 applications filled per night, tracker rows written, `report.md`/`review.md` produced).
+  **Two defects the real runs exposed, both fixed:** (1) only the FIRST cycle may `revisit` — decision
+  149 re-surfaces prepared-but-unreviewed applications, and with nobody reviewing overnight every
+  application a night prepares stays unreviewed forever, so cycles 1 and 2 both prepared the same
+  Palantir posting; with the fix, cycle 2's cleared queue dropped 5→2 and moved on to a different
+  company. (2) A discovery-time exception used to kill the whole night — it now backs off and
+  re-searches, giving up only after 5 consecutive failures (`MAX_DISCOVERY_FAILURES`), and an
+  unexpected crash still writes `summary.json`/`report.md` so an agent always has a record to read.
+
+- 2026-08-12 — **Review is a popup, not an in-card panel (decision 184).** User: "make the review a
+  popup instead so it makes the site less cluttered." Every card owned a hidden `.review` panel and
+  expanded in place, which pushed the rest of a now 13-card list (decision 183) far down the page.
+  One `#review-modal` (the existing `.modal-scrim` chrome, widened to 1020px) now holds the panel for
+  whichever card you clicked; `openReview(id, title, signoff)` replaces `toggleReview`, and
+  `renderReview` / `rescanReview` / `saveAnswers` / both sign-off builders are untouched. Reloaded on
+  every open (a cached panel would misreport what will be submitted after a rescan or an edit), with
+  `REVIEW_OPEN` gating every late paint so a response for a closed or swapped-away review is dropped.
+  Closes with ✕, `Esc`, the scrim, or *Close review*; Watch/Apply/Re-apply close it themselves once
+  the answer save succeeds, so their progress in Discover isn't hidden behind it. Front-end only —
+  no endpoint, request, or submission path changed. `tests/test_web_loop_review.py` rewritten for the
+  popup; five other review UI tests repointed to `#review-panel`.
+
+- 2026-08-12 — **Discover lists the same durable "Ready to apply" work the Notifications tab does
+  (decision 183).** User: "add review functionality from the notifications into loop discover."
+  `GET /loop/status` read the in-memory `ready_ids` only, which `_loop_reset()` clears at the start of
+  every run and a restart wipes entirely — so a prepared, unsubmitted application disappeared from
+  Discover the moment the loop stopped, and its review was reachable only from Notifications.
+  `_ready_cards()` (lifted out of `_build_inbox`, union of the loop queue + the still-`dry-run`
+  applications named by `approval_needed` log rows) now feeds both, and `/loop/status` also returns
+  `ready_run` so goal progress keeps counting *this* run ("2 of 5 goal · 3 more prepared earlier";
+  "Ready to apply (13) — prepared earlier, waiting for you" when the loop is idle). Cards, review
+  panel, and every button were already shared — no submission path, endpoint, or gate changed.
+  Verified against the live server: 13 ready cards and a full review panel in Discover with the loop
+  stopped, identical to `/inbox`. New test in `tests/test_notifications.py`.
+
+- 2026-08-12 — **One "Location" section on the Profile screen (decision 181).** User: "where does the
+  profile list location preferences? I am trying to set that i have no preference but I dont see it" →
+  "lets consolidate all those options into one location tab so its easier for other people." Nothing was
+  missing (*"No preference"* has been the first work-arrangement option since decision 094) — it was
+  spread across four rows of Applicant details with unrelated fields between them. New `#s-location`
+  section, second on the page and second in the section-jump nav, with two labelled groups:
+  - **Where you live** — Country · State/City · Street address/ZIP (moved out of Applicant details).
+  - **Where you'll work** — Willing to relocate · Open to remote · Preferred work arrangement · Max
+    commute (miles) · Preferred office locations, under one line saying that leaving them all at
+    "—"/"No preference"/blank *is* a complete answer.
+  Layout only — no endpoint, model field, or stored format changed. `collectProfile()` now merges
+  `#location-card` with `#profile-card`, so the moved fields still save; a test asserts every field the
+  card renders is read back (a miss there would silently wipe a saved answer — decision 159's failure
+  shape). Discovery's `remote_only` deliberately stayed on the Discover tab; the section says so.
+  Verified in the browser (fields, order, values round-trip, zero console errors). 4 new tests in
+  `tests/test_profile_location_section.py`; suite 813.
+
+- 2026-08-12 — **Tailoring is decided per application, not by a checkbox (decision 180).** User: "since
+  the loop settings exist, get rid of the tailor resume checkbox in the autoapply loop" → "remove from
+  both but when pressing apply (and while reviewing) for single applications, have the button in there".
+  Both mode checkboxes are gone — the loop panel's "Don't tailor" switch (added the same day by 179) and
+  the search breakdown's "Tailor my résumé to the posting first" — so **⚙ Loop settings alone** governs
+  what the loop prepares on its own, and a single application carries its own choice:
+  - **Judged rows** now show two actions instead of a mode: **Apply ▶** (tailor, fill, submit) and
+    **Apply as-is ▶** (résumé exactly as it stands, no Claude call), each with its own confirm wording;
+    below the cutoff they read *Apply anyway ▶* / *Apply anyway as-is ▶*.
+  - **The review panel** gains **Re-tailor résumé** (or **Tailor this résumé**, when that application is
+    set to send yours as-is): it re-tailors from the job description saved when the application was
+    prepared, records the new PDF, flips the provenance to freshly tailored, and re-fills the form so the
+    answers match what will be sent. It rides the existing rescan path — headless, `gate=None`, queued on
+    the loop thread via `_LOOP_RETAILORS` when the loop owns the browser — so no new endpoint, no new
+    autoloop drain, and the panel's existing "landed when the report timestamp changes" polling works
+    unchanged. No saved JD → it says exactly that and re-fills nothing.
+  Verified in the real app (both labels, the as-is confirm firing no request when dismissed, the POST
+  body, and the missing-PDF error). 9 new tests in `tests/test_per_app_tailoring.py`; `test_required_marks`
+  updated; suite 812.
+
+- 2026-08-12 — **Watch the bot actually submit; a per-run "don't tailor" switch; review above the
+  judged list (decision 179).** User: "lets have a way to watch the bot actualy send in an
+  application. Also … a toggle to tell the loop to not retailor resumes … Lets move the review above
+  the list of found applications and have a way to collapse". Three things, all in the loop panel and
+  the review panel:
+  - **Watching a real submit.** Until now nothing visible ever submitted — "Watch it fill" is a dry
+    run and the loop's submits were headless. `_armed_submit` gained `headed`/`hold` (identical gate,
+    fill and recording; only visibility changes), reached two ways: **Watch it apply ▶** in a
+    prepared application's review (`POST /loop/watch-apply` → the same `_LOOP_SUBMITS` queue plus a
+    `_LOOP_WATCH_SUBMITS` tag, so the cap still governs it; the window holds open on the result) and
+    **Show the browser while it applies** on the panel, which shows every submit in the run and holds
+    none. Forced off in a dry run, which submits nothing. Stop still releases a held window, and the
+    hold is never re-armed after a stop.
+  - **Don't tailor — send my résumé as it is:** a per-run switch, **removed the same day by decision
+    180**, which put the tailoring choice on the individual application instead.
+  - **Layout:** `#loop-ready` moved above the search breakdown, and a review panel now also collapses
+    from its bottom ("▴ Collapse this review") back to the slim one-line row on top of that list.
+  Verified in the real app with Playwright against a throwaway `APPLICATIONBOT_DATA` (panel order,
+  the dry-run gating and its hint, the panel's button row, the 410px→73px collapse, the confirm text,
+  and `/loop/watch-apply` stopping on the actionable missing-PDF error before any browser opened).
+  11 new tests in `tests/test_watch_submit.py`; two decision-176/178 tests updated for the new worker
+  signature; suite 806.
+
+- 2026-08-11 — **⚙ Loop settings popup: set what governs a run before starting it (decision 178).**
+  User: "we should also be able to set all settings before starting the loop (ex: don't retailor,
+  retailor only if under some fit score, etc)" → "actually, lets place it on a popup in the loop
+  panel". Four settings, one popup: the **résumé policy** (tailor + reuse · always re-tailor · only
+  tailor when the fit is under N/100 · never tailor), the **fit cutoff** (the same `min_fit` as
+  Discovery settings), **reuse strictness** (how similar two postings must be before an
+  already-tailored résumé is reused; 0% never reuses), and a **submission cap** on one run. Stored
+  where they belong — three new optional fields on `DiscoveryFilters` plus safety.yaml's existing
+  `max_submissions_per_run`, so the CLI runner honours the same cap — and read once when a run
+  starts, so a run keeps the settings it began with. The old "Re-tailor from scratch" checkbox is
+  now the policy's *always* choice. The cap ends the run (with a message naming where to raise it)
+  rather than quietly preparing applications it can't send. Verified in the real app in both themes
+  against throwaway config files; the browser run caught a real bug — the popup accepted typing
+  before its values loaded and then overwrote it. 13 new tests + a worker test that the saved policy
+  reaches the prepare; suite 795.
+
+- 2026-08-11 — **Apply / Apply anyway in the search breakdown submits, loop or no loop (decision 177).**
+  Follow-on to 176: with the loop running the click was submitted, with the loop idle the same button
+  only prepared — one label, two outcomes. `_judged_prepare_worker` now prepares **and** submits on
+  its own thread, through `_armed_submit`, the submit body extracted from `_loop_submit` so both
+  paths share one implementation (armed one-shot gate, `profile/KILL`, pre-submit required-field
+  check). A blocked fill is still never submitted. A loop running in **Dry run** still serves the
+  click its own way — prepared and held — so that switch's promise stays absolute. The click confirms
+  first, naming the posting; cancelling fires no request (verified in the real app, both themes).
+  Suite 781.
+
+- 2026-08-11 — **The auto-apply loop applies by default; "Dry run" is now the switch (decision 176).**
+  User: "loop should by default actually apply. it should have a switch to dry run it". The loop only
+  ever prepared — every one of its applications needed its own **Apply ▶** click, which made the
+  "no human in the loop" claim false at the last step. `autoloop.auto_apply_loop` gained
+  `apply_immediately`; `prepare_one`/`prepare_requested_one` return the prepared application's id and
+  it is submitted immediately, before the next match is prepared. A **blocked** fill returns `None`
+  and is never sent, and **Stop** is re-checked between the prepare and the submit. The submit path
+  itself is unchanged (armed one-shot gate, `profile/KILL`, pre-submit required-field check) — what
+  moved is the arming: starting the loop confirms once, naming what will happen, instead of once per
+  application. Three forced corrections: the goal now counts applications **submitted** (it counted
+  the ready list, which apply mode empties, so a goal could never be reached), "Keep topping up" is
+  forced off outside a dry run, and the "ready for your approval" push is suppressed for an
+  application the loop is about to send. UI: **▶ Start applying** / **▶ Start loop (dry run)**, a
+  blurb that swaps with the switch, an **N submitted** status chip, and end-of-run messages that
+  report what was sent. Verified in the real app with Playwright in both themes (confirm dialog
+  dismissed ⇒ no loop, no submit). 13 new tests incl. two that drive the real `_loop_worker`;
+  suite 780.
+
+- 2026-08-11 — **Launchers stopped opening a browser (decision 175).** User: "change the start and
+  restart scripts to not open the dashboard in chrome anymore: ill just restart the existing open
+  page". `scripts/run.sh` no longer backgrounds `open "$URL"` / `xdg-open "$URL"` after the server
+  comes up, so `./scripts/run.sh`, `./scripts/dev.sh`, and `./scripts/restart.sh` (which delegates
+  to `run.sh`) now just serve `http://127.0.0.1:8000` and print it — reload the tab you already
+  have open instead of collecting a new stale one per restart. `--window` and the double-click
+  launchers (`ApplicationBot.command` / `.bat`, both `--window`) are unchanged: they open the native
+  pywebview window, not a browser. README Option B and both scripts' usage comments corrected.
+
+- 2026-08-11 — **Apply / Apply anyway on any judged posting, with a per-application "don't tailor"
+  choice; every URL in the UI is now a button (decision 174).** User: "there are some applications
+  that the system flags as not being close enough to my resume, but I would like to apply anyway…
+  also, try to never show a plain url", then "prepare then submit, but with the option to not tailor
+  the resume". The fit cutoff dropped below-bar postings before anything was tailored, so the search
+  breakdown could explain a denial but offered no way to act on it. Now every judged row carries its
+  own button — **Apply** above the cutoff, **Apply anyway** below it — which runs the loop's own
+  dry-run prepare (`gate=None`) for that one posting and lands it in **Ready to apply**; the armed
+  submit there is unchanged and still the only thing that submits. `min_fit` is untouched: it still
+  governs the automatic queue. New `pipeline.untailored_pdf` + `run_testing_mode(tailor=False)` send
+  the user's résumé verbatim with no Claude call (best uploaded document, else the base résumé
+  rendered section-for-section), outranking every reuse path *and* `force_retailor` because it is an
+  explicit instruction; provenance is a third chip state ("Untailored résumé"), never labelled a
+  reuse. While the auto-apply loop runs the click is queued to the loop thread through a fourth
+  `autoloop` request queue. Raw URLs became labelled **Open posting ↗** buttons in the chosen card,
+  every judged row, and the Track table (full URL on hover; ✎ still edits the raw value), plus two
+  settings links. Two bugs fixed on the way: `queue_prepare` would have deadlocked on `_TEST_LOCK`
+  at the first click, and the dry-run breakdown re-rendered every poll, wiping the clicked button's
+  own progress. Verified in the real app with Playwright in both themes. Suite: 767 passed.
+
+- 2026-08-11 — **Hermes rejected as a traffic router; token-cost work landed in-repo instead
+  (decision 173).** User: "lets look into if using hermes to route our traffic through would allow
+  us to more easily learn/lower our token cost", clarified to routing the Claude *subscription*
+  through it for its skill/learning features. Rejected on four counts: our primary path is a
+  `subprocess` call to the Claude Code CLI that a proxy can't intercept without breaking
+  subscription OAuth; Nous's own docs say Claude Pro can't use their OAuth path at all (Max burns
+  purchased overage credits), so routing would turn free-within-window usage into metered tokens;
+  the skill/learning features are agent-loop features and our 21 call sites are single-shot and
+  stateless; and `usage.py` (decision 095) already records finer-grained per-activity, per-posting
+  cost than Hermes's `/usage` or `/insights`. Built instead, on the two levers the user picked:
+  (a) **prompt caching on the metered API path** — `run_anthropic_api` sends its system prompt as a
+  `cache_control` block, and `_user_message` now returns `(base résumé, JD + budget)` so
+  `AnthropicAPIBackend.tailor` puts a cache breakpoint after the résumé; both halves are
+  byte-identical across a run, so from the second posting on they bill at ~0.1x. `ClaudeCodeBackend`
+  joins them and is unchanged. Verified by driving the backend against a stubbed SDK and inspecting
+  the real payload. (b) **per-activity model tiers** — the audit found tiering already mostly done
+  (prerank/inbox/answer-draft on Haiku, judge on Sonnet); the one real gap was
+  `enrich.claude_llm_extractor`, which passed no model despite being verbatim extraction over large
+  page text → now `enrich.MODEL = "haiku"`. `impact.score_projects` and `resume_import` deliberately
+  left on the higher tier (judgement-bearing / quality-critical, and both rare). Suite: 747 passed.
 
 - 2026-07-30 — **Fields are keyed by identity, not by label text (decision 169).** User: "look into
   that architecture change: we might as well get it out of the way now." Measured first: no genuine

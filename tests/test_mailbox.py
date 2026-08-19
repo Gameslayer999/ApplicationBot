@@ -114,6 +114,54 @@ def test_wait_for_verification_times_out():
     assert got == ""
 
 
+# ------------------------------------------------ freshness + code preference (decision 182)
+# A login code is only valid if it arrived AFTER we asked for it. Without `since_epoch` the
+# newest-matching-message scan happily returns LAST session's code, and replaying it fails the
+# sign-in with no visible error — the failure mode these four tests exist to prevent.
+
+def _dated_email(frm: str, body: str, when: float) -> bytes:
+    from email.utils import formatdate
+
+    m = EmailMessage()
+    m["From"] = frm
+    m["Subject"] = "Your security code"
+    m["Date"] = formatdate(when)
+    m.set_content(body)
+    return m.as_bytes()
+
+
+def test_fetch_verification_skips_a_code_sent_before_we_asked():
+    asked_at = 1_700_000_000.0
+    msgs = [_dated_email("no-reply@greenhouse.io", "code 111111", asked_at - 600)]  # last session's
+    got = mailbox.fetch_verification(_CFG, sender_contains="greenhouse", since_epoch=asked_at,
+                                     _connect=lambda cfg: _FakeIMAP(msgs))
+    assert got == ""
+
+
+def test_fetch_verification_takes_the_code_sent_after_we_asked():
+    asked_at = 1_700_000_000.0
+    msgs = [_dated_email("no-reply@greenhouse.io", "code 111111", asked_at - 600),
+            _dated_email("no-reply@greenhouse.io", "code 222222", asked_at + 20)]
+    got = mailbox.fetch_verification(_CFG, sender_contains="greenhouse", since_epoch=asked_at,
+                                     _connect=lambda cfg: _FakeIMAP(msgs))
+    assert got == "222222"
+
+
+def test_unknown_age_counts_as_stale_only_when_freshness_is_required():
+    msgs = [_email("no-reply@greenhouse.io", "code 333333")]  # no Date header at all
+    assert mailbox.fetch_verification(_CFG, sender_contains="greenhouse", since_epoch=1_700_000_000.0,
+                                      _connect=lambda cfg: _FakeIMAP(msgs)) == ""
+    # Workday's flow passes no since_epoch and must keep working exactly as before.
+    assert mailbox.fetch_verification(_CFG, sender_contains="greenhouse",
+                                      _connect=lambda cfg: _FakeIMAP(msgs)) == "333333"
+
+
+def test_prefer_code_beats_a_verify_link_in_the_same_email():
+    body = "Your code is 654321. Trouble? https://my.greenhouse.io/verify?t=zz"
+    assert mailbox.extract_verification(body) == "https://my.greenhouse.io/verify?t=zz"  # default
+    assert mailbox.extract_verification(body, prefer_code=True) == "654321"
+
+
 class _FakeKeyring:
     def __init__(self):
         self.store = {}

@@ -80,15 +80,15 @@ def test_edited_answers_are_saved_and_used(ui):
         page.reload()
         page.click('.tab[data-view="discover"]')
         page.click("#loop-ready .pkcard .review-toggle")
-        page.wait_for_selector("#loop-ready .review .rv-edit", timeout=10_000)
+        page.wait_for_selector("#review-panel .rv-edit", timeout=10_000)
 
-        boxes = page.query_selector_all("#loop-ready .review .rv-edit")
+        boxes = page.query_selector_all("#review-panel .rv-edit")
         assert len(boxes) == 3, "every answer — filled and unanswered — must be editable"
 
         boxes[0].fill("edited@example.com")           # override what it would have submitted
         boxes[2].fill("Four years.")                  # a reusable answer — learn this one
-        page.click("#loop-ready .review .rv-save button")
-        page.wait_for_selector("#loop-ready .review .rv-note.rv-ok", timeout=10_000)
+        page.click("#review-panel .rv-save button")
+        page.wait_for_selector("#review-panel .rv-note.rv-ok", timeout=10_000)
         assert answer_overrides.load(*KEY) == {"Email": "edited@example.com",
                                                YEARS_Q: "Four years."}
         # The reusable answer is banked, so the NEXT posting that asks it is answered (decision
@@ -96,13 +96,13 @@ def test_edited_answers_are_saved_and_used(ui):
         # — and the panel says so instead of claiming it was learned.
         assert [(qa.question, qa.answer) for qa in load_profile(prof).custom_answers] \
             == [(YEARS_Q, "Four years.")]
-        status = page.text_content("#loop-ready .review .rv-note.rv-ok")
+        status = page.text_content("#review-panel .rv-note.rv-ok")
         assert "1 saved to your answer bank" in status
         assert "Email is answered from your apply profile" in status
 
         # An unsaved edit is saved before the fill starts — never fill with what the user can't see.
-        page.query_selector_all("#loop-ready .review .rv-edit")[1].fill("Your latency work.")
-        page.click("#loop-ready .review .rv-signoff button")  # "Watch it fill"
+        page.query_selector_all("#review-panel .rv-edit")[1].fill("Your latency work.")
+        page.click("#review-panel .rv-signoff button")  # "Watch it fill"
         page.wait_for_function(
             "() => document.querySelector('#loop-msg') && document.querySelector('#loop-msg').textContent.includes('Queued')",
             timeout=10_000)

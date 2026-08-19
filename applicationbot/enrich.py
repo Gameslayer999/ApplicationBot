@@ -276,6 +276,11 @@ def extract_apply_url_css(html: str, base_url: str = "") -> str:
 
 _SCRIPT_STYLE_RE = re.compile(r"<(script|style|noscript)\b[^>]*>.*?</\1>", re.DOTALL | re.IGNORECASE)
 
+# Tier 3 copies the JD out of page text verbatim — a read-and-extract task with a large input
+# and no judgement, so the cheap model is enough (same rationale as inbox_import.MODEL). Left
+# unset, this ran on whatever `claude` defaults to, which is a tier above what the task needs.
+MODEL = "haiku"
+
 
 def _strip_scripts(html: str) -> str:
     return _SCRIPT_STYLE_RE.sub(" ", html or "")
@@ -301,7 +306,7 @@ def claude_llm_extractor(text: str, url: str) -> Optional[dict]:
     )
     try:
         out = run_claude_cli(
-            prompt, think=False, json_schema=schema, activity="enrichment",
+            prompt, model=MODEL, think=False, json_schema=schema, activity="enrichment",
             system="You extract structured job-posting data from web pages. Return only the requested JSON.",
         )
     except ClaudeUnavailableError:

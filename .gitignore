@@ -30,6 +30,10 @@ tracker.db
 *.sqlite
 *.sqlite3
 
+# Night-run records (decision 185) — every session's journal names real companies, roles and
+# URLs the applicant applied to, and its report embeds them. PII: never committed.
+nights/
+
 # Filled-form review screenshots — contain the applicant's PII from the filled form
 apply_review*.png
 *.review.png

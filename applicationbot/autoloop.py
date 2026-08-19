@@ -1,11 +1,14 @@
-"""Autonomous auto-apply loop (decision 069) — the "prepare-then-prompt" mode.
+"""Autonomous auto-apply loop (decision 069) — prepare, then apply.
 
-The user's ask: "look for as many matches as possible, then get started on them one by one
-and prompt me as it needs me to start applying." It sits between the two runner modes:
-  - the dry-run runner (`runner.run_queue`, gate off) prepares everything, prompts nothing;
-  - the armed runner (gate on) submits everything up to a cap, prompts nothing.
-This one prepares each cleared match as a dry-run and then waits for a per-application
-go-ahead from the user before the (armed, one-shot) submit.
+The loop finds matches and prepares each one (tailor · export · fill) as a dry run. What
+happens next is the caller's choice (decision 176):
+  - ``apply_immediately=True`` (the loop's default in the UI) — each prepared application is
+    submitted right away, no per-application click. That is the product: full automation.
+  - ``apply_immediately=False`` (the "dry run" switch) — nothing is submitted; each prepared
+    application waits in "Ready to apply" for the user's per-application go-ahead, which
+    arrives through ``take_submit_requests``.
+Either way the submit itself runs through the caller's ``submit_one``, so the safety gate
+(the KILL file, the pre-submit required-field check) is unchanged.
 
 Token-frugal (an explicit user requirement — "we don't run through tokens"): every search
 asks discovery for ONLY-NEW postings, so a posting is never re-judged. With no goal set, a
@@ -41,9 +44,12 @@ def auto_apply_loop(
     watch_one: Optional[Callable[[object], None]] = None,
     take_rescan_requests: Optional[Callable[[], list]] = None,
     rescan_one: Optional[Callable[[object], None]] = None,
+    take_prepare_requests: Optional[Callable[[], list]] = None,
+    prepare_requested_one: Optional[Callable[[object], None]] = None,
     watch: bool = False,
     watch_wait: Optional[Callable[[], None]] = None,
     hunt_wait: Optional[Callable[[int], None]] = None,
+    apply_immediately: bool = False,
 ) -> str:
     """Run until the user stops it, the boards are exhausted, or (goal mode) a target number
     of applications are ready for the user to review and submit. Returns ``"stopped"``,
@@ -53,7 +59,9 @@ def auto_apply_loop(
       - ``discover_batch()`` → the cleared, only-new matches to prepare now; ``[]`` when
         nothing new remains anywhere (⇒ caught up, stop).
       - ``prepare_one(match)`` → tailor + PDF + headless dry-run fill for one match; records
-        a tracker row. Never submits.
+        a tracker row. Never submits. Returns the prepared application's id when it came out
+        clean and submittable, else ``None`` (blocked, or nothing to submit) — that id is what
+        ``apply_immediately`` submits.
       - ``take_submit_requests()`` → the app-ids the user has clicked "Apply" on since the
         last check (and clears that queue).
       - ``submit_one(app_id)`` → armed one-shot submit of that one prepared application.
@@ -65,7 +73,23 @@ def auto_apply_loop(
         since the last check (and clears that queue); optional, defaults to none.
       - ``rescan_one(app_id)`` → HEADLESS dry-run re-fill of that one application, refreshing
         what its review panel knows about the form; never submits. Optional, no-op by default.
+      - ``take_prepare_requests()`` → the postings the user has clicked "Apply"/"Apply anyway"
+        on in the search breakdown since the last check (and clears that queue); optional,
+        defaults to none.
+      - ``prepare_requested_one(req)`` → prepare that one hand-picked posting (tailor + PDF +
+        headless dry-run fill), exactly like ``prepare_one`` but for a posting the user chose
+        rather than one ``discover_batch`` yielded — so it also serves postings below the fit
+        cutoff (decision 174). Never submits itself; returns the prepared application's id like
+        ``prepare_one``, so ``apply_immediately`` submits it too. Optional, no-op by default.
       - ``should_stop()`` → True once the user hit Stop.
+
+    Apply mode (``apply_immediately=True``, decision 176): every application this loop prepares
+    is submitted as soon as it is prepared — ``submit_one(app_id)`` on the id ``prepare_one`` /
+    ``prepare_requested_one`` returned, on this same thread, before the next match is prepared.
+    A ``None`` id (a blocked fill) is never submitted; it stays for the user. ``should_stop`` is
+    re-checked between the prepare and the submit, so a Stop lands before an unwanted send.
+    ``apply_immediately=False`` is the pre-decision-176 behaviour: prepare only, and submit
+    exactly what the user asks for through ``take_submit_requests``.
 
     Goal mode (decision 121): when ``goal`` is set, ``ready_count()`` reports how many
     applications are currently prepared and ready for review/submission. The loop stops
@@ -91,11 +115,11 @@ def auto_apply_loop(
     match and holding it for the user's review; it ends ONLY on stop. This is the "autofill every
     new role but never submit until a human approves, forever" watch. ``watch=False`` is unchanged.
 
-    Ordering each round: honor pending submits, watch and rescan requests FIRST (the user is
-    waiting on those), then — unless the goal is already met — discover a fresh only-new batch and
-    prepare each match, re-checking for stop, for new user requests, and for the goal between
-    every application, so an Apply, Watch or Rescan click is never blocked by more than one
-    in-flight preparation."""
+    Ordering each round: honor pending submits, watch, rescan and hand-picked prepare requests
+    FIRST (the user is waiting on those), then — unless the goal is already met — discover a fresh
+    only-new batch and prepare each match, re-checking for stop, for new user requests, and for
+    the goal between every application, so an Apply, Watch, Rescan or Apply-anyway click is never
+    blocked by more than one in-flight preparation."""
     on_event = on_event or (lambda kind, payload=None: None)
     wait = wait or (lambda: None)
     hunt_wait = hunt_wait or (lambda n: wait())
@@ -103,6 +127,8 @@ def auto_apply_loop(
     watch_one = watch_one or (lambda app_id: None)
     take_rescan_requests = take_rescan_requests or (lambda: [])
     rescan_one = rescan_one or (lambda app_id: None)
+    take_prepare_requests = take_prepare_requests or (lambda: [])
+    prepare_requested_one = prepare_requested_one or (lambda req: None)
 
     def _goal_met() -> bool:
         return goal is not None and ready_count is not None and ready_count() >= goal
@@ -140,9 +166,33 @@ def auto_apply_loop(
             on_event("rescanned", app_id)
         return True
 
+    def _submit_prepared(app_id) -> None:
+        """Submit one just-prepared application in apply mode. `app_id` is None when the fill
+        came out blocked — that one waits for the user instead of being sent half-filled."""
+        if not apply_immediately or app_id is None or should_stop():
+            return
+        on_event("submitting", app_id)
+        submit_one(app_id)
+        on_event("submitted", app_id)
+
+    def _drain_prepares() -> bool:
+        """Prepare each posting the user asked for by hand, in click order. A dry-run fill like
+        `prepare_one` — then submitted immediately in apply mode, exactly like a match the loop
+        found itself. Returns False if a stop landed mid-drain."""
+        for req in take_prepare_requests():
+            if should_stop():
+                return False
+            on_event("preparing_requested", req)
+            app_id = prepare_requested_one(req)
+            on_event("prepared_requested", req)
+            _submit_prepared(app_id)
+        return True
+
     def _serve_requests() -> bool:
-        """Honor pending submits, then watches, then rescans. False on a mid-drain stop."""
-        return _drain_submits() and _drain_watches() and _drain_rescans()
+        """Honor pending submits, then watches, rescans, and hand-picked prepares. False on a
+        mid-drain stop."""
+        return (_drain_submits() and _drain_watches() and _drain_rescans()
+                and _drain_prepares())
 
     dry_searches = 0  # consecutive searches that returned nothing (drives the hunt backoff)
     while not should_stop():
@@ -191,8 +241,9 @@ def auto_apply_loop(
                 # simply not prepared; the next search (only_new) won't re-surface them.
                 break
             on_event("preparing", match)
-            prepare_one(match)
+            app_id = prepare_one(match)
             on_event("prepared", match)
+            _submit_prepared(app_id)
 
     on_event("stopped", None)
     return "stopped"

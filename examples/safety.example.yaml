@@ -8,7 +8,10 @@
 # clicks submit.
 armed: false
 
-# Hard cap on real submissions in one run, even while armed.
+# Hard cap on real submissions in one run: the command-line runner's gate, and the auto-apply
+# loop's ceiling too (decision 178) — the loop stops when it reaches this and says so, whatever
+# its goal said. Editable in the UI under the loop panel's "⚙ Loop settings"; saving there
+# rewrites this file and leaves every other key (armed included) exactly as it was.
 max_submissions_per_run: 10
 
 # Agentic fallbacks (decisions 061/076) — both OFF by default because they spend Claude tokens.

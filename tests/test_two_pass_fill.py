@@ -142,7 +142,8 @@ def test_batch_failure_degrades_to_captures():
         # Batch died → round 2 captures the deferred fields; no per-field retry storm.
         for lbl in (ONSITE, TRAVEL, IMMIG):
             assert lbl in report.captured, report.captured.keys()
-        assert len(stub.calls) <= 3
+        # ≤4 batched calls: classify, bank-match, derive-from-your-data (decision 187), picks.
+        assert len(stub.calls) <= 4
     _drive(run)
 
 

@@ -684,6 +684,94 @@ def tailor_and_render(resume: Resume, profile: ApplicationProfile, jd, company: 
     return pdf_path
 
 
+def untailored_pdf(resume: Resume, profile: ApplicationProfile, jd, company: str, role: str,
+                   url: str) -> tuple[str, str]:
+    """The user's own résumé as a PDF for one posting, with NO tailoring and NO Claude call
+    (decision 174) — the "Apply without tailoring" path. Returns ``(pdf_path, resume_source)``.
+
+    Prefers the user's best-covering **uploaded** résumé document when they have one (a real file
+    they wrote beats anything we render), else renders their **base** résumé verbatim: every
+    section, entry, and bullet exactly as stored, in the stored order. Unlike
+    `find_uploaded_match`, no coverage threshold applies — the user asked for their résumé as it
+    stands, so the decision is theirs, not the matcher's.
+
+    The tailoring sidecars are cleared beside the written PDF because these bytes are not a tailor
+    of the current inputs: a later dry-run must not reuse them as this posting's tailored résumé,
+    and no other posting may pull them in as a cross-posting reuse source."""
+    from pathlib import Path
+
+    from . import resume_docs, reuse
+    from .models import TailoredResume
+    from .pdf import render_pdf
+
+    docs = resume_docs.all_docs()
+    # A threshold just above zero, not zero: `find_uploaded_match` treats `<= 0` as "matching
+    # disabled" and returns None. This keeps its ranking (best coverage wins) while accepting any
+    # non-zero coverage, which is the point of the no-threshold behaviour described above.
+    hit = find_uploaded_match(resume, jd, threshold=1e-9) if docs else None
+    if hit is None and docs:
+        # No skill signal to rank on (a JD we failed to scrape, or a résumé/JD with no overlap):
+        # `all_docs` is path-sorted, so the first is a deterministic choice rather than an
+        # arbitrary one. Its file name goes in the provenance label either way.
+        path, meta = docs[0]
+        hit = UploadHit(str(path), 0.0, str(meta.get("filename") or path.name))
+
+    if hit is not None:
+        pdf_path = resume_store.write_pdf(Path(hit.path).read_bytes(), company, role, url)
+        source = reuse.uploaded_asis_label(hit.label)
+    else:
+        verbatim = TailoredResume(
+            summary=resume.summary, skills=resume.skills, experience=resume.experience,
+            projects=resume.projects, activities=resume.activities,
+            education=resume.education, certifications=resume.certifications,
+            relevance_notes=["Sent untailored at your request — nothing was selected, reordered, "
+                             "or reworded from your base résumé."])
+        pdf_bytes = render_pdf(resume_with_profile_links(resume, profile), verbatim)
+        pdf_path = resume_store.write_pdf(pdf_bytes, company, role, url)
+        source = reuse.UNTAILORED
+    resume_store.clear_tailor_sidecars(pdf_path)
+    return pdf_path, source
+
+
+def loop_policy(filters_obj) -> dict:
+    """The loop's résumé policy for this run (decision 178), read once at start from
+    `profile/discovery.yaml` — the values the "Loop settings" popup writes. Unknown or missing
+    values fall back to the pre-178 behaviour (tailor, reuse when the skills match).
+
+    This is the ONLY thing that decides the résumé for an application the loop prepares by itself
+    (decision 180) — there is no per-run override, so what the popup says is what the run does."""
+    mode = str(getattr(filters_obj, "tailor_mode", "smart") or "smart").lower()
+    if mode not in ("smart", "always", "under", "never"):
+        mode = "smart"
+    try:
+        below = int(getattr(filters_obj, "tailor_below_fit", 70))
+    except (TypeError, ValueError):
+        below = 70
+    try:
+        thr = float(getattr(filters_obj, "reuse_threshold", 0.9))
+    except (TypeError, ValueError):
+        thr = 0.9
+    return {"mode": mode, "below": below, "reuse_threshold": thr}
+
+
+def tailor_choice(policy: dict, fit, force_retailor: bool = False) -> tuple[bool, bool]:
+    """`(tailor?, force a fresh tailor?)` for ONE posting under the loop's résumé policy:
+      - ``never``  → send the résumé as-is, no Claude call.
+      - ``always`` → re-tailor from scratch, ignoring every reuse path.
+      - ``under``  → tailor only what needs it: below the fit threshold it is tailored; at or
+        above it the résumé already fits, so it is sent as-is. An UNSCORED posting is tailored —
+        "we don't know" must not silently become "send it untailored".
+      - ``smart``  → tailor, letting the reuse paths skip the Claude call when they can."""
+    mode = policy["mode"]
+    if mode == "never":
+        return False, False
+    if mode == "always":
+        return True, True
+    if mode == "under":
+        return (fit is None or fit < policy["below"]), False
+    return True, bool(force_retailor)
+
+
 def run_testing_mode(
     resume: Resume,
     match_obj: Match,
@@ -699,6 +787,8 @@ def run_testing_mode(
     on_filled=None,
     gate=None,
     force_retailor: bool = False,
+    tailor: bool = True,
+    reuse_threshold: float | None = None,
 ):
     """Tailor → PDF → apply for ONE posting, watched live. Dry-run (never submits) unless an
     armed SafetyGate is passed (decision 035). Returns the ApplyReport. `status_cb(step,
@@ -711,7 +801,16 @@ def run_testing_mode(
     and PDF render are skipped and that PDF is reused; the fill still runs. A real armed submit
     always re-tailors, so an actual submission never rides on a reused artifact. `force_retailor`
     overrides the reuse and regenerates the résumé even when the stamp matches (the user's
-    "re-tailor anyway" escape hatch)."""
+    "re-tailor anyway" escape hatch).
+
+    `tailor=False` (decision 174) skips tailoring entirely — no Claude call and no reuse scan —
+    and sends the user's own résumé verbatim via `untailored_pdf`. It is the user's explicit
+    "apply without tailoring" choice, so it wins over every other résumé path including
+    `force_retailor`.
+
+    `reuse_threshold` (decision 178) overrides how similar two postings' demanded skills must be
+    before an earlier tailored résumé is reused instead of a fresh Claude call; None keeps
+    `reuse.DEFAULT_THRESHOLD`, and 0 disables cross-posting reuse."""
     from .apply import AnswerResolver, run_apply
 
     def say(step, message):
@@ -734,11 +833,17 @@ def run_testing_mode(
     reuse_path = resume_store.path_for(p.company, p.title, p.url)
     # Résumé precedence (decision 152): the user's OWN uploaded résumé outranks every tailored PDF,
     # so it is checked first and short-circuits both reuse scans. `force_retailor` still wins.
-    upload_hit = None if force_retailor else find_uploaded_match(resume, jd)
-    reuse_hit = (None if (force_retailor or upload_hit is not None)
-                 else find_reusable(resume, profile, jd, exclude_path=str(reuse_path)))
+    upload_hit = None if (force_retailor or not tailor) else find_uploaded_match(resume, jd)
+    reuse_hit = (None if (force_retailor or not tailor or upload_hit is not None)
+                 else find_reusable(resume, profile, jd, exclude_path=str(reuse_path),
+                                    threshold=reuse_threshold))
     from . import reuse
-    if force_retailor:
+    if not tailor:
+        # The user turned tailoring off for this application (decision 174): send their résumé
+        # exactly as it stands. No Claude call, no reuse scan, nothing rewritten or dropped.
+        pdf_path, resume_source = untailored_pdf(resume, profile, jd, p.company, p.title, p.url)
+        say("tailor", f"▶ No tailoring — {resume_source}")
+    elif force_retailor:
         pdf_path = tailor_and_render(resume, profile, jd, p.company, p.title, p.url,
                                      backend=backend, status_cb=status_cb)
         resume_source = reuse.FRESH

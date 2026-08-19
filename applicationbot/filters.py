@@ -243,6 +243,23 @@ class DiscoveryFilters(BaseModel):
     min_fit: int = 50  # only follow through (dry-run/apply) on matches Claude scores ≥ this (0-100)
     calibrate_min_fit: bool = True  # auto-raise min_fit above a fit band your recorded outcomes prove dead (decision 043)
     skip_seen: bool = True  # drop postings already in the tracker (don't re-apply to the same role)
+    # How the auto-apply loop gets a résumé for each application it prepares (decision 178).
+    # Edited in the loop's "Loop settings" popup; every value keeps the pre-178 behaviour by default.
+    tailor_mode: str = Field(
+        default="smart",
+        description="Résumé for each application the loop prepares: 'smart' = tailor with Claude, "
+        "reusing an earlier tailored résumé when the posting demands the same skills (the default); "
+        "'always' = re-tailor from scratch every time (spends Claude on every posting); 'under' = "
+        "tailor only when the fit score is below `tailor_below_fit`, and send the résumé as-is at or "
+        "above it; 'never' = never tailor — send the résumé as-is, no Claude call.",
+    )
+    tailor_below_fit: int = 70  # the 'under' threshold (0-100): tailor when fit < this, send as-is above
+    reuse_threshold: float = Field(
+        default=0.9,
+        description="How similar two postings' demanded-skill sets must be (Jaccard, 0-1) before the "
+        "loop reuses an earlier tailored résumé instead of making a new Claude call. Mirrors "
+        "`reuse.DEFAULT_THRESHOLD`; 0 disables cross-posting reuse entirely.",
+    )
     cache_ttl_hours: float = 12  # reuse the last discovery snapshot (skip board search + Claude judge) if younger than this; 0 disables
     max_posting_age_days: Optional[int] = Field(
         default=None,

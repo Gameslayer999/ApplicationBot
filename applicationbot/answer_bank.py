@@ -671,3 +671,92 @@ def generate_answer(
         end = max(cut.rfind(". "), cut.rfind("! "), cut.rfind("? "))
         text = (cut[: end + 1] if end > max_chars // 2 else cut).strip()
     return text or None
+
+
+# Answers that mean "the data does not say" — a model that ignores the empty-string instruction
+# and writes a placeholder must not have it typed into the form as if it were an answer.
+_NON_ANSWERS = {
+    "", "-", "n/a", "na", "none", "null", "unknown", "not specified", "not stated", "not provided",
+    "no answer", "no data", "not applicable", "not available", "unspecified", "not in the data",
+    "cannot determine", "can't determine", "not mentioned", "no information", "tbd",
+}
+
+# An extraction that runs this long is not an extraction — it is the model drafting prose about
+# the applicant, which is `generate_answer`'s job (grounded, and only for questions that invite it).
+_DERIVE_MAX_CHARS = 400
+
+_DERIVE_RULES = (
+    "Answer a question ONLY if the applicant's own data above states it or directly and "
+    "unambiguously implies it (e.g. a graduation date in the education history answers whether "
+    "they are still a student). "
+    "The answers they have already given are their own statements about themselves: a fact stated "
+    "in one of them settles a differently-worded question about that same fact "
+    "(\"never held a U.S. security clearance\" answers \"Do you currently hold one?\"). "
+    "If the data does not settle it, reply with an empty string for that question — an empty "
+    "string is the CORRECT answer whenever you are not sure, and is always better than a guess. "
+    "Never invent a fact, a preference, an opinion, a date, a number, or a willingness the "
+    "applicant has not stated, and never treat the absence of something as evidence about it. "
+    "Answer as the applicant, in the first person, as briefly as the question allows — "
+    "'Yes', 'No', a date, a number, or one short sentence; at most 200 characters."
+)
+
+
+def derive_answers(questions: list[str], facts: str, *, contexts: Optional[dict] = None,
+                   model: Optional[str] = None) -> dict[str, str]:
+    """Last chance before a question is marked unanswerable (decision 187): ONE batched call that
+    re-reads everything the applicant has already given us — résumé, profile facts, banked
+    answers — and answers whatever that data actually settles.
+
+    This is EXTRACTION, not drafting. `generate_answer` writes prose for questions that invite it;
+    this one looks for an answer that is already there, in a wording the deterministic rules, the
+    classifier and the bank matcher all missed ("Will this be your final internship before
+    graduating?" is answered by an education entry's graduation date). Anything the data does not
+    settle comes back empty, so the field still reaches the user as unanswered — a wrong answer on
+    a submitted application is worse than a blank one.
+
+    Demographic questions are never derived (only the applicant may declare those) and
+    company-specific ones are left to `generate_answer`. Returns question → answer, omitting
+    every question it could not answer. Best-effort: any failure → {}.
+
+    `facts` is built by the caller (`AnswerResolver.data_facts`), which decides what leaves the
+    machine — contact details and EEO self-identification are deliberately not in it (Guideline #5).
+    """
+    askable = [q for q in dict.fromkeys(questions)
+               if _norm(q) and not is_demographic(q) and not is_company_specific(q)]
+    if not (askable and (facts or "").strip()):
+        return {}
+    from . import backends  # lazy
+
+    numbered = _with_context(askable, contexts)
+    prompt = (
+        "You are filling in a job-application form as the applicant, from their own data.\n\n"
+        f"THE APPLICANT'S DATA (everything they have told us):\n{facts}\n\n"
+        f"FORM QUESTIONS:\n{numbered}\n\n"
+        f"{_DERIVE_RULES}\n"
+        f'Reply with JSON: {{"answers": [<one answer string per question in order, '
+        f'"" when their data does not answer it, {len(askable)} items>]}}.'
+    )
+    schema = {"type": "object",
+              "properties": {"answers": {"type": "array", "items": {"type": "string"},
+                                         "minItems": len(askable), "maxItems": len(askable)}},
+              "required": ["answers"], "additionalProperties": False}
+    try:
+        # Same model tier as the other batched decisions (classify / bank-match), NOT the cheap
+        # drafting model: this one decides whether a factual claim goes onto a real application,
+        # and an over-cautious cheap model just returns the field to the user unanswered.
+        reply = backends.run_claude_cli(prompt, model=model, think=False,
+                                        timeout=120, json_schema=schema)
+    except Exception:
+        return {}
+    answers = _json_reply(reply, "answers")
+    if not isinstance(answers, list) or len(answers) != len(askable):
+        return {}
+    out: dict[str, str] = {}
+    for q, a in zip(askable, answers):
+        if not isinstance(a, str):
+            continue
+        text = a.strip().strip('"').strip()
+        if text.lower().rstrip(".") in _NON_ANSWERS or len(text) > _DERIVE_MAX_CHARS:
+            continue
+        out[q] = text
+    return out

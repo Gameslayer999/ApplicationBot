@@ -269,11 +269,11 @@ def test_review_panel_highlights_it_and_says_what_to_check(ui):
         page.reload()
         page.click('.tab[data-view="discover"]')
         page.click("#loop-ready .pkcard .review-toggle")
-        page.wait_for_selector("#loop-ready .review .rv-fields", timeout=10_000)
+        page.wait_for_selector("#review-panel .rv-fields", timeout=10_000)
 
-        body = page.inner_text("#loop-ready .review")
+        body = page.inner_text("#review-panel")
         assert "1 answer doesn't match what the question asks" in body
-        flagged = page.query_selector_all("#loop-ready .review tr.rv-flagged")
+        flagged = page.query_selector_all("#review-panel tr.rv-flagged")
         assert len(flagged) == 1
         assert flagged[0].query_selector(".rv-fl div").inner_text().strip() == "Date"
         assert "asks for a date" in flagged[0].query_selector(".rv-flagwhy").inner_text()

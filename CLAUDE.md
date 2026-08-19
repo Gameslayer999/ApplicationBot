@@ -280,6 +280,35 @@ When you encounter a choice during development, follow this process:
 
 ---
 
+## Running a night unattended
+
+If the user asks you to run the pipeline overnight against a target — *"send 100 applications
+tonight"* — **read [docs/AGENT_NIGHT_RUN.md](docs/AGENT_NIGHT_RUN.md) first and follow it**
+(decision 185). It is the contract for a session where you never come back to the user: preflight,
+what you may and may not arm, the exit codes, the self-review you must run before reporting any
+number, and how far you may improve the code on your own between nights.
+
+The short version:
+
+```bash
+python -m applicationbot.night --preflight-only --goal 100      # exit 6 ⇒ do not start
+python -m applicationbot.night --dry-run --goal 1 --until 5m    # rehearsal, submits nothing
+python -m applicationbot.night --goal 100 --until 07:00 --arm   # the real night
+python -m applicationbot.night review                           # exit 2 ⇒ the count is not trustworthy
+```
+
+Add `--no-tailor` when the user wants their own résumé sent as it stands — no per-application
+Claude tailoring call (decision 186). Without it, the night follows the résumé policy saved in
+⚙ Loop settings, the same one the in-app loop uses. Either way, say in your report which résumé
+went out; it is in `summary.json` as `resume_policy`.
+
+Two rules that override anything convenient at 3am: **`--arm` only when the user asked for a real
+run** (it restores `profile/safety.yaml` afterwards, and you may never edit `safety.py` or the
+gate), and **never report the night's printed number without running the review** — that number is
+how many times the bot clicked submit, not how many applications landed.
+
+---
+
 ## Branching & releases
 
 **`master` (main) is the source of truth for releases. `development` is the working branch.**

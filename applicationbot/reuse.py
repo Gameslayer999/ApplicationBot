@@ -117,6 +117,22 @@ def stored_reuse_label() -> str:
     return "Reused this application's stored résumé"
 
 
+# Untailored labels (decision 174) always start with "Your ", so `is_untailored` badges them
+# without parsing the rest and `is_reused` stays False — an untailored send is not a reuse.
+
+UNTAILORED = "Your base résumé, sent as-is (you turned tailoring off for this application)"
+
+
+def uploaded_asis_label(name: str) -> str:
+    """The user's OWN uploaded résumé, sent verbatim because they turned tailoring off."""
+    return f"Your uploaded résumé {name}, sent as-is (you turned tailoring off for this application)"
+
+
 def is_reused(source: str) -> bool:
     """True iff `source` describes a reused résumé (vs a fresh tailor). Empty = unknown."""
     return (source or "").startswith("Reused")
+
+
+def is_untailored(source: str) -> bool:
+    """True iff `source` describes a résumé sent with NO tailoring at all (decision 174)."""
+    return (source or "").startswith("Your ")

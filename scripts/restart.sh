@@ -2,6 +2,7 @@
 #
 # Restart the ApplicationBot local review UI: stop any running instance, then start it
 # again (picking up code changes). Delegates to stop.sh + run.sh, so it stays idempotent.
+# No browser is opened — reload the dashboard tab you already have open.
 #
 # Usage:
 #   ./scripts/restart.sh          # restart on http://127.0.0.1:8000

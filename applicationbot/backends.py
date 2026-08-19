@@ -202,7 +202,14 @@ def _delta_to_tailored(base: Resume, delta: TailorDelta) -> TailoredResume:
 
 
 def _user_message(resume: Resume, jd: JobDescription, budget: LengthBudget,
-                  emphasis: Optional[list[str]] = None) -> str:
+                  emphasis: Optional[list[str]] = None) -> tuple[str, str]:
+    """Split the tailoring prompt into (stable prefix, per-posting suffix).
+
+    The prefix is the base résumé, which is byte-identical for every posting in a run; the
+    suffix is the JD and length budget, which change each time. The API backend sends them
+    as two content blocks so the prefix can sit behind a prompt-cache breakpoint; the CLI
+    backend just concatenates them. Callers that want the whole prompt use `"".join(...)`.
+    """
     # Compact JSON (no indentation, null/empty fields dropped) — the résumé is the largest
     # prompt component and indent=2 was ~12% whitespace. The JD is boilerplate-trimmed.
     # `emphasis` is the ATS retry loop's feedback (ats_requirements): keywords the target
@@ -217,16 +224,19 @@ def _user_message(resume: Resume, jd: JobDescription, budget: LengthBudget,
             "skills list and, where truthful, a bullet). Do NOT invent experience — only "
             "surface what the base résumé already supports.\n"
         )
-    return (
+    prefix = (
         "BASE RESUME (source of truth, JSON; reference entries by their 0-based index "
         "within each section):\n"
         f"{resume.model_dump_json(exclude_none=True, exclude_defaults=True)}\n\n"
+    )
+    suffix = (
         f"JOB DESCRIPTION — {jd.title} at {jd.company}:\n"
         f"{trim_for_prompt(jd.body)}\n\n"
         f"{budget.prompt()}"
         f"{emph}\n\n"
         "Produce the tailoring plan now."
     )
+    return prefix, suffix
 
 
 class TailorBackend(Protocol):
@@ -351,7 +361,7 @@ def run_claude_cli(prompt: str, *, cli: str = CLAUDE_CLI,
     return proc.stdout
 
 
-def run_anthropic_api(prompt: str, *, api_key: str, model: Optional[str] = None,
+def run_anthropic_api(prompt, *, api_key: str, model: Optional[str] = None,
                       timeout: int = 300, system: Optional[str] = None,
                       activity: Optional[str] = None) -> str:
     """Run one prompt through the metered Anthropic **API** (the fallback engine, decision 111)
@@ -359,7 +369,15 @@ def run_anthropic_api(prompt: str, *, api_key: str, model: Optional[str] = None,
     run_claude_cli — ClaudeAuthError / ClaudeRateLimitError / ClaudeUnavailableError — so
     callers handle either engine identically. Billed pay-per-token to the key's API account,
     NOT the Claude subscription (that path is Claude Code only). Thinking is left off: this is a
-    structured-JSON task, and the 'respond with ONLY JSON' instruction + retry loop cover it."""
+    structured-JSON task, and the 'respond with ONLY JSON' instruction + retry loop cover it.
+
+    `prompt` is either a string or a list of Anthropic content blocks — the tailoring backend
+    passes blocks so the base résumé can carry its own cache breakpoint.
+
+    The system prompt is sent as a cache-controlled block: it is byte-identical on every call,
+    so after the first posting in a run it bills at cache-read (~0.1x) instead of full input
+    price. Prompts shorter than the model's minimum cacheable prefix simply don't cache — no
+    error, so this is safe for the short system prompts other callers pass."""
     try:
         import anthropic
     except ImportError as e:
@@ -372,7 +390,8 @@ def run_anthropic_api(prompt: str, *, api_key: str, model: Optional[str] = None,
     try:
         resp = client.messages.create(
             model=model_id, max_tokens=16000,
-            system=system or "You are a helpful assistant.",
+            system=[{"type": "text", "text": system or "You are a helpful assistant.",
+                     "cache_control": {"type": "ephemeral"}}],
             messages=[{"role": "user", "content": prompt}],
         )
     except anthropic.AuthenticationError as e:
@@ -436,7 +455,7 @@ class ClaudeCodeBackend:
                 "'rules' engine."
             )
         base = (
-            _user_message(resume, jd, budget, emphasis)
+            "".join(_user_message(resume, jd, budget, emphasis))
             + "\n\nOutput format: respond with ONLY a single JSON object for the tailoring "
             "plan — no explanation, no markdown code fences."
         )
@@ -470,16 +489,23 @@ class AnthropicAPIBackend:
 
     def tailor(self, resume: Resume, jd: JobDescription, budget: LengthBudget,
                emphasis: Optional[list[str]] = None) -> TailoredResume:
+        # Two content blocks: the base résumé (identical for every posting in a run) sits
+        # behind a cache breakpoint; the JD and output instruction follow it uncached.
+        resume_block, jd_block = _user_message(resume, jd, budget, emphasis)
         base = (
-            _user_message(resume, jd, budget, emphasis)
+            jd_block
             + "\n\nOutput format: respond with ONLY a single JSON object for the tailoring "
             "plan — no explanation, no markdown code fences."
         )
         last_err: Optional[Exception] = None
         for attempt in range(2):
-            prompt = base if attempt == 0 else (
+            tail = base if attempt == 0 else (
                 base + "\n\nYour previous reply was not a valid tailoring plan. Return ONLY the JSON object."
             )
+            prompt = [
+                {"type": "text", "text": resume_block, "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": tail},
+            ]
             raw = run_anthropic_api(prompt, api_key=self.api_key, model=self.model,
                                     system=SYSTEM_PROMPT, activity="tailoring")
             try:
