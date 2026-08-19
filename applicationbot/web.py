@@ -2289,6 +2289,19 @@ class Handler(BaseHTTPRequestHandler):
             d["greenhouse_problem"] = apply_profile.greenhouse_quick_apply_problem(prof)
             self._json(200, {"profile": d})
             return
+        if path == "/profile/export":
+            # The portable setup as one .zip (decision 188) — apply profile, filters, every
+            # résumé, and the kept résumé PDFs. Errors come back as JSON so the button can show
+            # the exact blocker inline (UI Principle #3) rather than downloading a broken file.
+            from . import profile_export
+            try:
+                body = profile_export.build_zip()
+            except Exception as e:
+                self._json(400, {"error": str(e)})
+                return
+            self._send(200, body, "application/zip",
+                       {"Content-Disposition": f'attachment; filename="{profile_export.filename()}"'})
+            return
         if path == "/mailbox":
             # Bot-email link status for the Profile panel (decisions 057, 065). Never returns any
             # secret — the password / OAuth token live in the OS keychain. `client_id` is non-secret
@@ -4089,6 +4102,23 @@ INDEX_HTML = """<!doctype html>
         <div class="saverow">
           <button id="save-profile">Save profile</button>
           <span id="profile-msg" class="msg"></span>
+        </div>
+
+        <!-- Export the portable setup (decision 188). The zip mirrors profile/, so the restore
+             instruction below is literally true — no import step exists yet, and promising one
+             the app can't do would be worse than saying "unzip it here". -->
+        <div id="s-export" class="linkedin">
+          <h3 style="margin-top:0">Back up this profile / move it to another computer</h3>
+          <p class="editing">Downloads one <code>.zip</code> with everything you set up on this
+            page — applicant details and saved screening answers, your search filters, every
+            résumé listed above, and the résumé PDFs kept for sending as-is. To restore it,
+            unzip the file into <code>profile/</code> on the other machine and restart the app.</p>
+          <button id="export-profile" type="button">⬇ Download profile (.zip)</button>
+          <span id="export-msg" class="msg"></span>
+          <p class="editing" style="margin-bottom:0"><b>Left out on purpose:</b> your linked
+            inbox and its credentials, the arming switch and submission cap, notification
+            settings, your application history, and caches — machine-specific things you set
+            once on the new computer.</p>
         </div>
       </div>
     </div>
@@ -7750,6 +7780,7 @@ function renderProfileForm() {
     ["s-projects","Projects"], ["s-education","Education"], ["s-skills","Skills"],
     ["s-resume-header","Résumé header"], ["s-screening","Screening answers"],
     ["s-accounts","Autofill accounts"], ["s-logins","Logins"],
+    ["s-export","Back up / move"],
   ];
   const nav = el("div", {class:"pnav"}, jump.map(([id,label]) =>
     el("a", {href:"#", text:label, on:{click:(ev)=>{ ev.preventDefault(); const t = $(id); if (t) t.scrollIntoView({behavior:"smooth", block:"start"}); }}})));
@@ -7833,6 +7864,25 @@ async function saveProfile() {
   finally { stop(); btnDone(btn); }
 }
 $("save-profile").addEventListener("click", saveProfile);
+
+// Download the portable setup as a .zip (decision 188). The server returns JSON on failure, so a
+// blocker ("no profile to export yet") lands inline next to the button instead of saving a file
+// the user would only discover was broken later (UI Principle #3).
+$("export-profile").addEventListener("click", async () => {
+  const btn = $("export-profile"), msg = $("export-msg");
+  btnBusy(btn, "Preparing…"); msg.className = "msg"; msg.textContent = "";
+  try {
+    const res = await fetch("/profile/export");
+    if (!res.ok) { let e = {}; try { e = await res.json(); } catch (x) {} throw new Error(e.error || "Export failed"); }
+    const name = (res.headers.get("Content-Disposition") || "").match(/filename="([^"]+)"/);
+    const url = URL.createObjectURL(await res.blob());
+    const a = el("a", {href:url, download:(name ? name[1] : "applicationbot-profile.zip")});
+    document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+    msg.className = "msg ok"; msg.textContent = "Downloaded ✓";
+  } catch (e) {
+    msg.className = "msg err"; msg.textContent = String(e.message || e);
+  } finally { btnDone(btn); }
+});
 
 // ---- Discovery settings editor (all of profile/discovery.yaml, from the dashboard) ----
 function mkChk(key, checked) { const i = el("input", {type:"checkbox"}); i.checked = !!checked; if (key) i.dataset.k = key; return i; }

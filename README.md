@@ -326,6 +326,7 @@ The web UI covers everything, but each stage is also a module you can run direct
 | `./scripts/night.sh --goal 100 --until 07:00 --arm` | Preflight → night → review as one idempotent command (what a cron line calls) |
 | `python -m applicationbot.cli JD.md --resume R.yaml --out out.pdf` | Tailor a résumé to one job description (CLI) |
 | `python -m applicationbot.apply URL --pdf resume.pdf --dry-run` | Fill one application by URL with an already-rendered résumé PDF (`--pdf` is required; add `--resume profile/resume.yaml` for the contact details) |
+| `python -m applicationbot.profile_export [DEST]` | Export your profile as one dated `.zip` — applicant answers, filters, every résumé, and the kept résumé PDFs. `DEST` is a file (`.zip`) or a folder; restore it by unzipping into `profile/`. Same thing the Profile tab's **⬇ Download profile (.zip)** button downloads |
 | `python -m applicationbot.doctor` | Read-only health check (Claude sign-in, Chromium, résumé, safety state) |
 | `python -m scripts.prune_seen_ledger [--apply]` | One-time repair: drop postings from the "already shown" ledger that Claude never actually judged, so discovery can consider them again (dry-run without `--apply`) |
 | `python -m applicationbot.tracker [funnel\|calibration]` | Inspect tracked applications and reports |
@@ -365,6 +366,14 @@ Everything specific to you lives in the git-ignored **`profile/`** folder (from 
   instead of a tailored one (remove any of them under the Profile tab's upload box).
 - `inbox_import_seen.json` — which inbox messages have already been imported into the tracker, so a
   re-scan never duplicates a row (and each import stays undoable).
+
+**Backing it up / moving computers.** The Profile tab's **⬇ Download profile (.zip)** button (or
+`python -m applicationbot.profile_export`) packages the parts that are *yours* — `application_profile.yaml`,
+`discovery.yaml`, every résumé YAML, and `uploads/` — into one dated archive. The archive mirrors `profile/`,
+so restoring is just unzipping it into `profile/` on the other machine. It deliberately leaves behind
+`mailbox.yaml` and `safety.yaml` (a credential and an arming switch — set those on the new machine yourself),
+`notifications.yaml`, your application history, and the caches. The zip lists every exclusion and its reason
+in its own `manifest.json`.
 
 Template versions of these live in [`examples/`](examples/). Run `python -m applicationbot.doctor` any time to
 confirm your setup is healthy.

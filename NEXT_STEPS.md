@@ -602,6 +602,17 @@ value ÷ effort:
 
 ## Next
 
+### Import a profile export (follow-up to decision 188)
+
+Export ships without a matching **Import** button: restoring today means unzipping the archive into
+`profile/` by hand, which works but is a manual step (Guideline #8 wants a button). The reason it wasn't
+built alongside export is that import has a real decision behind it — **merge or replace, per file**:
+an incoming answer bank probably merges (keep answers this machine learned), an incoming `resume.yaml`
+probably replaces, and a wrong default silently destroys work. Needs the user's call on that before code.
+Would also need: a manifest `format` check with a clear message on an archive from a newer version, and
+a refusal to import anything not in `profile_export.CONFIG_FILES` + résumés + `uploads/` (an archive is
+untrusted input — a member named `../../something` must never be written).
+
 ### Re-enter the apply-profile fields that could not be recovered (2026-07-30, decision 159)
 
 - [ ] A test destroyed `profile/application_profile.yaml` (decision 159 — fixed, and pinned by
@@ -2653,6 +2664,21 @@ Record each decision in [DECISIONS.md](DECISIONS.md) once the user chooses.
 ---
 
 ## Recently completed
+
+- 2026-08-19 — **Export your profile as one dated `.zip` (decision 188).** User: "lets get started
+  on the ability to export a profile"; scope was chosen by the user up front — the *portable setup*, not
+  a full clone of `profile/`. New `applicationbot/profile_export.py` packages `application_profile.yaml`
+  (identity + the answer bank), `discovery.yaml`, **every** `profile/*.yaml` that validates as a résumé,
+  and `uploads/` into an archive that mirrors `profile/` — so restoring is `unzip` into `profile/`, no
+  importer required. It is an **allowlist**, so a config file added later can't ride along; `mailbox.yaml`
+  (credential), `safety.yaml` (arming switch) and `notifications.yaml` (ntfy topic is a readable address)
+  are excluded on purpose, each with its reason recorded in the archive's `manifest.json` and shown beside
+  the button. Surfaces: `GET /profile/export`, the Profile tab's **⬇ Download profile (.zip)** section
+  (with the restore step and a "Left out on purpose" list), and `python -m applicationbot.profile_export
+  [DEST]` for cron. Verified beyond tests: the live server's zip unzipped into a **fresh
+  `APPLICATIONBOT_DATA`** reloads the whole setup there (41 saved answers, 5 dropdown aliases, filters,
+  4 roles / 8 projects, both kept PDFs); a real Chromium drive downloads it and ends on "Downloaded ✓"
+  with zero console errors. 14 new tests; full suite **942 passed**.
 
 - 2026-08-18 — **Nothing is marked unanswerable until Claude has checked the applicant's own data
   (decision 187).** User: "make sure that unanswered form questions are fed through ai first to figure
